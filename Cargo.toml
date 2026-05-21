@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/finitechat-proto",
+  "crates/finitechat-engine",
+  "crates/finitechat-store",
+  "crates/finitechat-sim",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/finitecomputer/finitechat"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"

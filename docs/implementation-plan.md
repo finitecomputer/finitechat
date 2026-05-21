@@ -1,0 +1,196 @@
+# Implementation Plan
+
+## Problem Statement
+
+Finitecomputer has a useful chat loop, but the chat transcript and gateway
+events are plaintext inside the platform path. Justin's Finite protocol plan
+fills the missing encryption piece: an MLS room model with Nostr account
+identity and a server-ordered Delivery Service.
+
+Finite Chat must ship as the encryption layer for Finite Computer without
+breaking the product constraint that runtimes connect outward. Dashboard should
+still talk to a relay/control-plane surface, and Hermes should still talk
+through `finitec`.
+
+## Acceptance Criteria
+
+The first production-ready slice is done when:
+
+- a user can create a direct Finite Chat room for one Project runtime;
+- browser/user messages and Hermes replies are encrypted application messages;
+- reload and runtime restart preserve encrypted room history and local MLS state;
+- the room server accepts at most one Commit per epoch;
+- KeyPackages are single-use through leased add-device Commits;
+- Welcomes are claimable only after the linked Commit is durable;
+- a client never advances local MLS state from its own Commit until it observes
+  that Commit in the ordered log;
+- invalid accepted Commits fail closed to `NeedsRepair`;
+- plaintext `ChatRuntime` can remain available behind a feature flag during
+  migration;
+- local `just chat-local-up` has an encrypted mode that exercises dashboard,
+  relay, finitec, Hermes, attachments, and restart persistence.
+
+## Constraints
+
+Musts:
+
+- Keep `finitecomputer` machine-outbound relay semantics.
+- Keep Nostr account identity as the user-level identity.
+- Model every physical browser/runtime install as a separate device.
+- Keep server sequence as a cursor, not message identity.
+- Use content-derived stable message ids.
+- Do not release Welcomes for rejected or losing Commits.
+- Persist inbound events before interpretation in client/runtime code.
+- Use idempotency keys for every mutation.
+- Keep payloads opaque to the room server except routing envelopes and explicit
+  membership deltas.
+
+Must-nots:
+
+- Do not port Pika/Marmot wholesale.
+- Do not make Nostr relays authoritative for room ordering.
+- Do not attempt federation, server migration, encrypted backups, push previews,
+  or Signal-style metadata protection in v1.
+- Do not make dashboard call a runtime-local chat HTTP server.
+- Do not silently migrate existing Pika rooms or finitecomputer plaintext
+  threads into encrypted rooms.
+
+Preferences:
+
+- Start in-memory and deterministic.
+- Add SQLite before Axum production APIs.
+- Add OpenMLS only after fake-MLS invariants are tested.
+- Keep DTOs small enough that finitecomputer can vend/import them directly.
+
+Escalate:
+
+- if product requires old history recovery after total device loss;
+- if canary needs group chat before one-runtime direct rooms are stable;
+- if dashboard must show notification previews;
+- if WorkOS identity needs to replace or constrain Nostr account identity;
+- if finitecomputer wants this as a separate service instead of vendored crates.
+
+## Decomposition
+
+### Phase 0: Executable Protocol Seed
+
+Status in this repo: started.
+
+Deliverables:
+
+- DTO crate for envelopes, ids, membership deltas, KeyPackage and Welcome state.
+- In-memory Delivery Service reducer.
+- Scenario tests with fake MLS payloads.
+- Integration plan for finitecomputer.
+
+Good tests:
+
+- duplicate mutation retry returns the same result;
+- same idempotency key with different body fails;
+- same-epoch Commit race accepts one Commit;
+- rejected Commit has no Welcome release and no KeyPackage consumption;
+- removed device can fetch through its removal seq;
+- invalid Commit repair report blocks sends.
+
+### Phase 1: SQLite And API Shape
+
+Status in this repo: SQLite parity started.
+
+Deliverables:
+
+- SQLite store matching the in-memory reducer semantics.
+- Axum API matching the v1 protocol paths.
+- durable idempotency records and transaction constraints.
+- retention jobs for sessions, KeyPackages, Welcomes, idempotency records, and
+  compactable log metadata.
+
+Current SQLite scope:
+
+- normalized SQLite tables for rooms, logs, membership intervals, KeyPackages,
+  Welcomes, link sessions, and idempotency records;
+- reopen tests for accepted Commit replay, rejected Commit replay,
+  KeyPackages, Welcomes, direct-room rules, and link sessions;
+- same schema direction intended for the Postgres canary store.
+
+Good tests:
+
+- crash matrix around Commit transaction side effects;
+- SQLite unique index blocks same-epoch Commit race;
+- restart after lost response returns replayed idempotency result;
+- replayable rejects are stable.
+
+Production server store:
+
+- keep SQLite for local/dev and transaction-shape proof;
+- use Postgres for hosted canary and production room servers;
+- port the same scenarios to Postgres before deploying a canary.
+
+### Phase 2: OpenMLS Spike
+
+Deliverables:
+
+- `FiniteDeviceCredentialV1` in MLS `BasicCredential` identity bytes.
+- account-signed device binding validation.
+- parseable PublicMessage/handshake routing checks.
+- Welcome activation with ratchet tree material.
+- local MLS client store with encrypted-at-rest SQLite.
+
+Good tests:
+
+- invalid device binding rejected;
+- changed LeafNode credential validation;
+- missing ratchet tree fails activation or waits explicitly;
+- client never merges pending local Commit before observing server log.
+
+### Phase 3: Finitecomputer Local Integration
+
+Deliverables:
+
+- import/vendored crates under `finitecomputer`;
+- `finitec chat-v2` or feature-flagged `chat.encrypted.*` command set;
+- local room server mode in `finited` or a companion process;
+- dashboard route keeps current UI contract while encrypted messages shadow
+  plaintext transcript records;
+- Hermes adapter continues to use `finitec gateway`.
+
+Good tests:
+
+- `scripts/relay_e2e.sh` equivalent for encrypted chat;
+- `just chat-local-up` encrypted mode;
+- browser E2E sends message, receives Hermes reply, reloads, and sees history;
+- runtime restart preserves local MLS and pending gateway events.
+
+### Phase 4: Canary Rollout
+
+Deliverables:
+
+- WorkOS Project creates hidden web Chat Identity and runtime Chat Identity.
+- Project direct room created during runtime pairing.
+- encrypted chat enabled for new canary Projects.
+- plaintext path remains for fallback until canary is stable.
+
+Good tests:
+
+- new Project can chat through encrypted room;
+- MicroSandbox runtime only connects outward;
+- loss/retry of relay results does not duplicate messages;
+- attachments are either encrypted application payload references or explicit
+  blob objects with encrypted keys.
+
+### Phase 5: Hardening
+
+Deliverables:
+
+- push wake integration with opaque payloads;
+- repair report UI state;
+- retention and compaction jobs;
+- device linking QR/mailbox flow;
+- explicit export/backup product decision.
+
+Good tests:
+
+- push duplicate/drop/reorder never advances state;
+- link fanout resumes partial room adds;
+- expired KeyPackages and Welcomes compact;
+- app database does not persist request bodies, bearer tokens, or push tokens in
+  plaintext.
