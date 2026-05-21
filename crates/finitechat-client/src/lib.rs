@@ -1,7 +1,8 @@
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, DeliveryService,
-    EngineError, KeyPackageInventory, ListAccountRoomsPage, SubmitCommitRequest, SyncEventsPage,
-    UploadKeyPackageRequest, WelcomeRecord, envelope,
+    AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateDirectRoomRequest,
+    DeliveryService, EngineError, KeyPackageInventory, ListAccountRoomsPage,
+    ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest,
+    WelcomeRecord, envelope,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -39,7 +40,7 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 6;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 7;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
@@ -49,6 +50,8 @@ const MAX_PENDING_KEY_PACKAGE_UPLOADS: u32 = MAX_KEY_PACKAGES_PER_DEVICE;
 const MAX_LINK_FANOUTS: u32 = 16;
 const MAX_LINK_FANOUT_ROOMS: u32 = MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS;
 const MAX_RUNTIME_SYNC_PAGES_PER_ROOM: u32 = 64;
+const MAX_RUNTIME_LINK_FANOUT_DISCOVERY_PAGES_PER_TICK: u32 = MAX_LINK_FANOUT_ROOMS;
+const MAX_RUNTIME_LINK_FANOUT_COMMITS_PER_TICK: u32 = MAX_LINK_FANOUT_ROOMS;
 const MAX_OPENMLS_STORAGE_RECORDS: u32 = 8192;
 const MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
 const MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES: u32 = 1024;
@@ -78,6 +81,8 @@ const _: () = {
     assert!(MAX_LINK_FANOUTS > 0);
     assert!(MAX_LINK_FANOUT_ROOMS > 0);
     assert!(MAX_RUNTIME_SYNC_PAGES_PER_ROOM > 0);
+    assert!(MAX_RUNTIME_LINK_FANOUT_DISCOVERY_PAGES_PER_TICK > 0);
+    assert!(MAX_RUNTIME_LINK_FANOUT_COMMITS_PER_TICK > 0);
     assert!(MAX_OPENMLS_STORAGE_RECORDS > 0);
     assert!(MAX_OPENMLS_STORAGE_KEY_BYTES > 0);
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
@@ -147,6 +152,7 @@ pub struct LinkFanoutState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkFanoutRoomState {
     pub plan: LinkFanoutRoomPlan,
+    pub claimed_key_package: Option<ClaimKeyPackageResult>,
     pub status: LinkFanoutRoomStatus,
 }
 
@@ -190,6 +196,13 @@ pub struct RuntimeSyncOptions {
     pub max_sync_pages_per_room: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLinkFanoutOptions {
+    pub max_discovery_pages_per_tick: u32,
+    pub max_commit_rooms_per_tick: u32,
+    pub max_completion_sync_pages_per_room: u32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeSyncReport {
     pub uploaded_key_packages: u32,
@@ -204,6 +217,19 @@ pub struct RuntimeAppliedEntry {
     pub room_id: RoomId,
     pub seq: u64,
     pub entry: AppliedLogEntry,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeLinkFanoutReport {
+    pub discovery_pages: u32,
+    pub queued_rooms: u32,
+    pub claimed_key_packages: u32,
+    pub prepared_commits: u32,
+    pub submitted_commits: u32,
+    pub completion_sync_pages: u32,
+    pub completed_rooms: u32,
+    pub applied_entries: Vec<RuntimeAppliedEntry>,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +252,39 @@ impl RuntimeSyncOptions {
         validate_item_count(
             "runtime.max_sync_pages_per_room",
             self.max_sync_pages_per_room as usize,
+            MAX_RUNTIME_SYNC_PAGES_PER_ROOM,
+        )?;
+        Ok(())
+    }
+}
+
+impl RuntimeLinkFanoutOptions {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_bytes_non_empty(
+            "runtime_link_fanout.max_discovery_pages_per_tick",
+            self.max_discovery_pages_per_tick as usize,
+        )?;
+        validate_item_count(
+            "runtime_link_fanout.max_discovery_pages_per_tick",
+            self.max_discovery_pages_per_tick as usize,
+            MAX_RUNTIME_LINK_FANOUT_DISCOVERY_PAGES_PER_TICK,
+        )?;
+        validate_bytes_non_empty(
+            "runtime_link_fanout.max_commit_rooms_per_tick",
+            self.max_commit_rooms_per_tick as usize,
+        )?;
+        validate_item_count(
+            "runtime_link_fanout.max_commit_rooms_per_tick",
+            self.max_commit_rooms_per_tick as usize,
+            MAX_RUNTIME_LINK_FANOUT_COMMITS_PER_TICK,
+        )?;
+        validate_bytes_non_empty(
+            "runtime_link_fanout.max_completion_sync_pages_per_room",
+            self.max_completion_sync_pages_per_room as usize,
+        )?;
+        validate_item_count(
+            "runtime_link_fanout.max_completion_sync_pages_per_room",
+            self.max_completion_sync_pages_per_room as usize,
             MAX_RUNTIME_SYNC_PAGES_PER_ROOM,
         )?;
         Ok(())
@@ -261,6 +320,64 @@ impl RuntimeSyncReport {
     fn record_sync_page(&mut self) -> Result<(), ClientError> {
         self.sync_pages = self
             .sync_pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+}
+
+impl RuntimeLinkFanoutReport {
+    fn record_discovery_page(&mut self) -> Result<(), ClientError> {
+        self.discovery_pages = self
+            .discovery_pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_queued_room(&mut self) -> Result<(), ClientError> {
+        self.queued_rooms = self
+            .queued_rooms
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_claimed_key_package(&mut self) -> Result<(), ClientError> {
+        self.claimed_key_packages = self
+            .claimed_key_packages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_prepared_commit(&mut self) -> Result<(), ClientError> {
+        self.prepared_commits = self
+            .prepared_commits
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_submitted_commit(&mut self) -> Result<(), ClientError> {
+        self.submitted_commits = self
+            .submitted_commits
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_completion_sync_page(&mut self) -> Result<(), ClientError> {
+        self.completion_sync_pages = self
+            .completion_sync_pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_completed_room(&mut self) -> Result<(), ClientError> {
+        self.completed_rooms = self
+            .completed_rooms
             .checked_add(1)
             .ok_or(ClientError::RuntimeCounterOverflow)?;
         Ok(())
@@ -1399,11 +1516,96 @@ impl FiniteChatDevice {
             }
             queued.push(LinkFanoutRoomState {
                 plan,
+                claimed_key_package: None,
                 status: LinkFanoutRoomStatus::Pending,
             });
         }
         if let Some((extra_room_id, _)) = plans_by_room.into_iter().next() {
             return Err(ClientError::UnexpectedLinkFanoutRoomPlan(extra_room_id));
+        }
+
+        let fanout = self.link_fanout_mut(fanout_id)?;
+        let mut seen_rooms = fanout
+            .rooms
+            .iter()
+            .map(|room| room.plan.room_id.clone())
+            .collect::<BTreeSet<_>>();
+        for room in queued {
+            if !seen_rooms.insert(room.plan.room_id.clone()) {
+                return Err(ClientError::DuplicateLinkFanoutRoom(
+                    room.plan.room_id.clone(),
+                ));
+            }
+            fanout.rooms.push(room);
+        }
+        fanout.after_room_id = page.next_after_room_id.clone();
+        fanout.discovery_complete = !page.has_more;
+        fanout.validate_limits()?;
+        Ok(())
+    }
+
+    pub fn queue_claimed_link_fanout_page(
+        &mut self,
+        fanout_id: &str,
+        page: &ListAccountRoomsPage,
+        claimed_key_packages: &[ClaimKeyPackageResult],
+    ) -> Result<(), ClientError> {
+        page.validate_limits().map_err(ClientError::from)?;
+        validate_item_count(
+            "link_fanout.claimed_key_packages",
+            claimed_key_packages.len(),
+            MAX_LINK_FANOUT_ROOMS,
+        )?;
+        let fanout = self.link_fanout(fanout_id)?;
+        let target_device = fanout.target_device.clone();
+        let mut claims = claimed_key_packages.iter();
+        let mut queued = Vec::new();
+        for room in &page.rooms {
+            let target_already_current = room
+                .devices
+                .iter()
+                .any(|device| device.device == target_device);
+            if target_already_current {
+                continue;
+            }
+            self.group(&room.room_id)?;
+            let Some(claimed_key_package) = claims.next() else {
+                return Err(ClientError::MissingLinkFanoutClaim(room.room_id.clone()));
+            };
+            validate_claimed_key_package(claimed_key_package)?;
+            if claimed_key_package.owner != target_device {
+                return Err(ClientError::LinkFanoutClaimTargetMismatch {
+                    expected: target_device.clone(),
+                    actual: claimed_key_package.owner.clone(),
+                });
+            }
+            let plan = LinkFanoutRoomPlan {
+                room_id: room.room_id.clone(),
+                key_package_id: claimed_key_package.key_package_id.clone(),
+                welcome_id: link_fanout_derived_id(
+                    "welcome",
+                    fanout_id,
+                    &room.room_id,
+                    &claimed_key_package.key_package_id,
+                )?,
+                idempotency_key: link_fanout_derived_id(
+                    "link",
+                    fanout_id,
+                    &room.room_id,
+                    &claimed_key_package.key_package_id,
+                )?,
+            };
+            plan.validate_limits()?;
+            queued.push(LinkFanoutRoomState {
+                plan,
+                claimed_key_package: Some(claimed_key_package.clone()),
+                status: LinkFanoutRoomStatus::Pending,
+            });
+        }
+        if let Some(extra) = claims.next() {
+            return Err(ClientError::UnexpectedLinkFanoutClaim(
+                extra.key_package_id.clone(),
+            ));
         }
 
         let fanout = self.link_fanout_mut(fanout_id)?;
@@ -1457,6 +1659,55 @@ impl FiniteChatDevice {
                 actual: claimed_key_package.key_package_id.clone(),
             });
         }
+        let prepared =
+            self.prepare_link_fanout_room_commit_inner(fanout_id, room_id, claimed_key_package)?;
+        Ok(prepared)
+    }
+
+    pub fn prepare_claimed_link_fanout_room_commit(
+        &mut self,
+        fanout_id: &str,
+        room_id: &str,
+    ) -> Result<PreparedCommit, ClientError> {
+        let claimed_key_package = self
+            .link_fanout_room(fanout_id, room_id)?
+            .claimed_key_package
+            .clone()
+            .ok_or_else(|| ClientError::MissingLinkFanoutClaim(room_id.to_string()))?;
+        self.prepare_link_fanout_room_commit_inner(fanout_id, room_id, &claimed_key_package)
+    }
+
+    fn prepare_link_fanout_room_commit_inner(
+        &mut self,
+        fanout_id: &str,
+        room_id: &str,
+        claimed_key_package: &ClaimKeyPackageResult,
+    ) -> Result<PreparedCommit, ClientError> {
+        validate_room_id(room_id)?;
+        let (target_device, plan) = {
+            let fanout = self.link_fanout(fanout_id)?;
+            let room = fanout
+                .rooms
+                .iter()
+                .find(|room| room.plan.room_id == room_id)
+                .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+            if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
+                return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string()));
+            }
+            (fanout.target_device.clone(), room.plan.clone())
+        };
+        if claimed_key_package.owner != target_device {
+            return Err(ClientError::LinkFanoutClaimTargetMismatch {
+                expected: target_device,
+                actual: claimed_key_package.owner.clone(),
+            });
+        }
+        if claimed_key_package.key_package_id != plan.key_package_id {
+            return Err(ClientError::LinkFanoutClaimPackageMismatch {
+                expected: plan.key_package_id,
+                actual: claimed_key_package.key_package_id.clone(),
+            });
+        }
         let prepared = self.prepare_add_member_commit(
             &plan.room_id,
             claimed_key_package,
@@ -1470,6 +1721,7 @@ impl FiniteChatDevice {
             .iter_mut()
             .find(|room| room.plan.room_id == room_id)
             .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+        room.claimed_key_package = None;
         room.status = LinkFanoutRoomStatus::Prepared {
             prepared: Box::new(prepared.clone()),
         };
@@ -1526,6 +1778,38 @@ impl FiniteChatDevice {
 
     pub fn link_fanout_room_count(&self, fanout_id: &str) -> Result<usize, ClientError> {
         Ok(self.link_fanout(fanout_id)?.rooms.len())
+    }
+
+    fn link_fanout_target_device(&self, fanout_id: &str) -> Result<DeviceRef, ClientError> {
+        Ok(self.link_fanout(fanout_id)?.target_device.clone())
+    }
+
+    fn link_fanout_after_room_id(&self, fanout_id: &str) -> Result<Option<RoomId>, ClientError> {
+        Ok(self.link_fanout(fanout_id)?.after_room_id.clone())
+    }
+
+    fn link_fanout_discovery_complete(&self, fanout_id: &str) -> Result<bool, ClientError> {
+        Ok(self.link_fanout(fanout_id)?.discovery_complete)
+    }
+
+    fn pending_link_fanout_room_ids(&self, fanout_id: &str) -> Result<Vec<RoomId>, ClientError> {
+        Ok(self
+            .link_fanout(fanout_id)?
+            .rooms
+            .iter()
+            .filter(|room| matches!(room.status, LinkFanoutRoomStatus::Pending))
+            .map(|room| room.plan.room_id.clone())
+            .collect())
+    }
+
+    fn prepared_link_fanout_room_ids(&self, fanout_id: &str) -> Result<Vec<RoomId>, ClientError> {
+        Ok(self
+            .link_fanout(fanout_id)?
+            .rooms
+            .iter()
+            .filter(|room| matches!(room.status, LinkFanoutRoomStatus::Prepared { .. }))
+            .map(|room| room.plan.room_id.clone())
+            .collect())
     }
 
     pub fn link_fanout_is_complete(&self, fanout_id: &str) -> Result<bool, ClientError> {
@@ -1938,6 +2222,25 @@ impl LinkFanoutState {
         let mut seen_rooms = BTreeSet::<RoomId>::new();
         for room in &self.rooms {
             room.validate_limits()?;
+            if let Some(claimed_key_package) = &room.claimed_key_package {
+                if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
+                    return Err(ClientError::UnexpectedLinkFanoutClaim(
+                        claimed_key_package.key_package_id.clone(),
+                    ));
+                }
+                if claimed_key_package.owner != self.target_device {
+                    return Err(ClientError::LinkFanoutClaimTargetMismatch {
+                        expected: self.target_device.clone(),
+                        actual: claimed_key_package.owner.clone(),
+                    });
+                }
+                if claimed_key_package.key_package_id != room.plan.key_package_id {
+                    return Err(ClientError::LinkFanoutClaimPackageMismatch {
+                        expected: room.plan.key_package_id.clone(),
+                        actual: claimed_key_package.key_package_id.clone(),
+                    });
+                }
+            }
             if !seen_rooms.insert(room.plan.room_id.clone()) {
                 return Err(ClientError::DuplicateLinkFanoutRoom(
                     room.plan.room_id.clone(),
@@ -1951,6 +2254,9 @@ impl LinkFanoutState {
 impl LinkFanoutRoomState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         self.plan.validate_limits()?;
+        if let Some(claimed_key_package) = &self.claimed_key_package {
+            validate_claimed_key_package(claimed_key_package)?;
+        }
         self.status.validate_limits()?;
         Ok(())
     }
@@ -2203,6 +2509,17 @@ impl SqliteClientStore {
         self.save_device_state(device)
     }
 
+    pub fn queue_claimed_link_fanout_page_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: &str,
+        page: &ListAccountRoomsPage,
+        claimed_key_packages: &[ClaimKeyPackageResult],
+    ) -> Result<(), ClientStoreError> {
+        device.queue_claimed_link_fanout_page(fanout_id, page, claimed_key_packages)?;
+        self.save_device_state(device)
+    }
+
     pub fn prepare_link_fanout_room_commit_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
@@ -2212,6 +2529,17 @@ impl SqliteClientStore {
     ) -> Result<PreparedCommit, ClientStoreError> {
         let prepared =
             device.prepare_link_fanout_room_commit(fanout_id, room_id, claimed_key_package)?;
+        self.save_device_state(device)?;
+        Ok(prepared)
+    }
+
+    pub fn prepare_claimed_link_fanout_room_commit_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: &str,
+        room_id: &str,
+    ) -> Result<PreparedCommit, ClientStoreError> {
+        let prepared = device.prepare_claimed_link_fanout_room_commit(fanout_id, room_id)?;
         self.save_device_state(device)?;
         Ok(prepared)
     }
@@ -2300,6 +2628,21 @@ pub trait RuntimeDelivery {
 
     fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error>;
 
+    fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error>;
+
+    fn submit_commit(
+        &mut self,
+        request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, Self::Error>;
+
+    fn list_account_rooms(
+        &mut self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, Self::Error>;
+
     fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error>;
 
     fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error>;
@@ -2324,6 +2667,27 @@ impl RuntimeDelivery for DeliveryService {
 
     fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
         DeliveryService::upload_key_package(self, request)
+    }
+
+    fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error> {
+        DeliveryService::claim_key_package_for_device(self, owner)
+    }
+
+    fn submit_commit(
+        &mut self,
+        request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, Self::Error> {
+        DeliveryService::submit_commit(self, request)
+    }
+
+    fn list_account_rooms(
+        &mut self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, Self::Error> {
+        DeliveryService::list_account_rooms(self, request)
     }
 
     fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
@@ -2403,6 +2767,218 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
     }
 
     Ok(report)
+}
+
+pub fn run_link_fanout_tick<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    fanout_id: &str,
+    options: &RuntimeLinkFanoutOptions,
+) -> Result<RuntimeLinkFanoutReport, RuntimeWorkerError<D::Error>> {
+    validate_string_bytes("link_fanout.fanout_id", fanout_id, MAX_OBJECT_ID_BYTES)
+        .map_err(ClientError::from)?;
+    options.validate_limits()?;
+    let mut report = RuntimeLinkFanoutReport::default();
+
+    run_link_fanout_discovery(store, device, delivery, fanout_id, options, &mut report)?;
+    let room_ids =
+        link_fanout_rooms_to_advance(device, fanout_id, options.max_commit_rooms_per_tick)?;
+    for room_id in &room_ids.pending {
+        store.prepare_claimed_link_fanout_room_commit_and_save(device, fanout_id, room_id)?;
+        report.record_prepared_commit()?;
+    }
+    for room_id in room_ids.all_prepared() {
+        let prepared = device.prepared_link_fanout_commit(fanout_id, &room_id)?;
+        let accepted = delivery
+            .submit_commit(prepared.request.clone())
+            .map_err(RuntimeWorkerError::Delivery)?;
+        if accepted.message_id != prepared.message_id {
+            return Err(ClientError::LinkFanoutPreparedCommitMismatch {
+                expected: prepared.message_id,
+                actual: accepted.message_id,
+            }
+            .into());
+        }
+        report.record_submitted_commit()?;
+        complete_link_fanout_room_from_sync(
+            store,
+            device,
+            delivery,
+            fanout_id,
+            &room_id,
+            options,
+            &mut report,
+        )?;
+    }
+
+    report.complete = device.link_fanout_is_complete(fanout_id)?;
+    Ok(report)
+}
+
+fn run_link_fanout_discovery<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    fanout_id: &str,
+    options: &RuntimeLinkFanoutOptions,
+    report: &mut RuntimeLinkFanoutReport,
+) -> Result<(), RuntimeWorkerError<D::Error>> {
+    let target_device = device.link_fanout_target_device(fanout_id)?;
+    let mut pages = 0u32;
+    while pages < options.max_discovery_pages_per_tick
+        && !device.link_fanout_discovery_complete(fanout_id)?
+    {
+        let after_room_id = device.link_fanout_after_room_id(fanout_id)?;
+        let page = delivery
+            .list_account_rooms(ListAccountRoomsRequest {
+                account_id: device.device_ref().account_id.clone(),
+                after_room_id: after_room_id.clone(),
+                limit: 1,
+            })
+            .map_err(RuntimeWorkerError::Delivery)?;
+        if page.has_more && page.next_after_room_id == after_room_id {
+            return Err(ClientError::RuntimeLinkFanoutDiscoveryStalled {
+                fanout_id: fanout_id.to_string(),
+                after_room_id,
+            }
+            .into());
+        }
+
+        let needs_target = page.rooms.iter().any(|room| {
+            !room
+                .devices
+                .iter()
+                .any(|device| device.device == target_device)
+        });
+        let mut claimed_key_packages = Vec::new();
+        if needs_target {
+            let Some(claim) = delivery
+                .claim_key_package_for_device(&target_device)
+                .map_err(RuntimeWorkerError::Delivery)?
+            else {
+                break;
+            };
+            claimed_key_packages.push(claim);
+        }
+
+        store.queue_claimed_link_fanout_page_and_save(
+            device,
+            fanout_id,
+            &page,
+            &claimed_key_packages,
+        )?;
+        report.record_discovery_page()?;
+        if !claimed_key_packages.is_empty() {
+            report.record_claimed_key_package()?;
+            report.record_queued_room()?;
+        }
+        pages = pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+    }
+    debug_assert!(pages <= options.max_discovery_pages_per_tick);
+    Ok(())
+}
+
+struct LinkFanoutRoomsToAdvance {
+    prepared: Vec<RoomId>,
+    pending: Vec<RoomId>,
+}
+
+impl LinkFanoutRoomsToAdvance {
+    fn all_prepared(self) -> Vec<RoomId> {
+        let mut room_ids = Vec::with_capacity(self.prepared.len() + self.pending.len());
+        room_ids.extend(self.prepared);
+        room_ids.extend(self.pending);
+        room_ids
+    }
+}
+
+fn link_fanout_rooms_to_advance(
+    device: &FiniteChatDevice,
+    fanout_id: &str,
+    max_rooms: u32,
+) -> Result<LinkFanoutRoomsToAdvance, ClientError> {
+    let mut prepared = device.prepared_link_fanout_room_ids(fanout_id)?;
+    prepared.truncate(max_rooms as usize);
+    let remaining = max_rooms as usize - prepared.len();
+    let mut pending = device.pending_link_fanout_room_ids(fanout_id)?;
+    pending.truncate(remaining);
+    debug_assert!(prepared.len() + pending.len() <= max_rooms as usize);
+    Ok(LinkFanoutRoomsToAdvance { prepared, pending })
+}
+
+fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    fanout_id: &str,
+    room_id: &str,
+    options: &RuntimeLinkFanoutOptions,
+    report: &mut RuntimeLinkFanoutReport,
+) -> Result<(), RuntimeWorkerError<D::Error>> {
+    let prepared = device.prepared_link_fanout_commit(fanout_id, room_id)?;
+    let mut after_seq = device.last_applied_seq(room_id)?;
+    let mut pages = 0u32;
+    while pages < options.max_completion_sync_pages_per_room {
+        let page = delivery
+            .sync_events(room_id, device.device_ref(), after_seq)
+            .map_err(RuntimeWorkerError::Delivery)?;
+        report.record_completion_sync_page()?;
+        pages = pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        if page.next_after_seq < after_seq {
+            return Err(ClientError::RuntimeSyncCursorRegression {
+                room_id: room_id.to_string(),
+                current_seq: after_seq,
+                next_after_seq: page.next_after_seq,
+            }
+            .into());
+        }
+
+        for entry in page.entries {
+            let seq = entry.seq;
+            if entry.message_id == prepared.message_id {
+                if let Some(applied) = store.complete_link_fanout_room_from_log_and_save(
+                    device, fanout_id, room_id, &entry,
+                )? {
+                    report.applied_entries.push(RuntimeAppliedEntry {
+                        room_id: room_id.to_string(),
+                        seq,
+                        entry: applied,
+                    });
+                    report.record_completed_room()?;
+                }
+                return Ok(());
+            }
+            if let Some(applied) = store.apply_log_entry_and_save(device, room_id, &entry)? {
+                report.applied_entries.push(RuntimeAppliedEntry {
+                    room_id: room_id.to_string(),
+                    seq,
+                    entry: applied,
+                });
+            }
+        }
+
+        if page.next_after_seq > device.last_applied_seq(room_id)? {
+            store.advance_room_cursor_and_save(device, room_id, page.next_after_seq)?;
+        }
+        if !page.has_more {
+            break;
+        }
+        if page.next_after_seq == after_seq {
+            return Err(ClientError::RuntimeSyncStalled {
+                room_id: room_id.to_string(),
+                after_seq,
+            }
+            .into());
+        }
+        after_seq = page.next_after_seq;
+    }
+    debug_assert!(pages <= options.max_completion_sync_pages_per_room);
+    Ok(())
 }
 
 fn sync_room_pages<D: RuntimeDelivery>(
@@ -2695,6 +3271,10 @@ pub enum ClientError {
     MissingLinkFanoutRoomPlan(RoomId),
     #[error("unexpected link fanout room plan: {0}")]
     UnexpectedLinkFanoutRoomPlan(RoomId),
+    #[error("missing link fanout claimed KeyPackage for room: {0}")]
+    MissingLinkFanoutClaim(RoomId),
+    #[error("unexpected link fanout claimed KeyPackage: {0}")]
+    UnexpectedLinkFanoutClaim(KeyPackageId),
     #[error("link fanout target account mismatch: expected {expected}, actual {actual}")]
     LinkFanoutAccountMismatch { expected: String, actual: String },
     #[error("link fanout cannot target the current device")]
@@ -2751,6 +3331,11 @@ pub enum ClientError {
     },
     #[error("runtime sync stalled for {room_id} after seq {after_seq}")]
     RuntimeSyncStalled { room_id: RoomId, after_seq: u64 },
+    #[error("runtime link fanout discovery stalled for {fanout_id} after room {after_room_id:?}")]
+    RuntimeLinkFanoutDiscoveryStalled {
+        fanout_id: String,
+        after_room_id: Option<RoomId>,
+    },
     #[error("log entry room mismatch: expected {expected}, actual {actual}")]
     LogEntryRoomMismatch { expected: RoomId, actual: RoomId },
     #[error("log entry envelope room mismatch: entry {entry_room}, envelope {envelope_room}")]
@@ -2821,6 +3406,7 @@ fn verified_key_package_from_claim(
     claimed_key_package: &ClaimKeyPackageResult,
     now_unix_seconds: u64,
 ) -> Result<KeyPackage, ClientError> {
+    validate_claimed_key_package(claimed_key_package)?;
     let key_package_in =
         KeyPackageIn::tls_deserialize_exact(claimed_key_package.key_package_payload.as_slice())
             .map_err(|_| ClientError::ParseKeyPackage)?;
@@ -2848,6 +3434,75 @@ fn verified_key_package_from_claim(
         now_unix_seconds,
     })?;
     Ok(key_package)
+}
+
+fn validate_claimed_key_package(
+    claimed_key_package: &ClaimKeyPackageResult,
+) -> Result<(), ClientError> {
+    claimed_key_package
+        .owner
+        .validate_limits()
+        .map_err(ClientError::from)?;
+    validate_string_bytes(
+        "claimed_key_package.key_package_id",
+        &claimed_key_package.key_package_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    validate_string_bytes(
+        "claimed_key_package.key_package_ref",
+        &claimed_key_package.key_package_ref,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    validate_string_bytes(
+        "claimed_key_package.key_package_hash",
+        &claimed_key_package.key_package_hash,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    validate_bytes_non_empty(
+        "claimed_key_package.key_package_payload",
+        claimed_key_package.key_package_payload.len(),
+    )?;
+    validate_bytes_len(
+        "claimed_key_package.key_package_payload",
+        claimed_key_package.key_package_payload.len(),
+        MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    )?;
+    validate_string_bytes(
+        "claimed_key_package.lease_token",
+        &claimed_key_package.lease_token,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    Ok(())
+}
+
+fn link_fanout_derived_id(
+    prefix: &str,
+    fanout_id: &str,
+    room_id: &str,
+    key_package_id: &str,
+) -> Result<String, ClientError> {
+    validate_string_bytes("link_fanout.id_prefix", prefix, MAX_OBJECT_ID_BYTES)?;
+    validate_string_bytes("link_fanout.fanout_id", fanout_id, MAX_OBJECT_ID_BYTES)?;
+    validate_room_id(room_id)?;
+    validate_string_bytes(
+        "link_fanout.key_package_id",
+        key_package_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    let mut seed = Vec::with_capacity(
+        prefix.len() + fanout_id.len() + room_id.len() + key_package_id.len() + 4,
+    );
+    seed.extend_from_slice(prefix.as_bytes());
+    seed.push(0);
+    seed.extend_from_slice(fanout_id.as_bytes());
+    seed.push(0);
+    seed.extend_from_slice(room_id.as_bytes());
+    seed.push(0);
+    seed.extend_from_slice(key_package_id.as_bytes());
+    let value = format!("{prefix}_{}", message_id_for_bytes(&seed));
+    validate_string_bytes("link_fanout.derived_id", &value, MAX_OBJECT_ID_BYTES)?;
+    debug_assert!(value.starts_with(prefix));
+    Ok(value)
 }
 
 fn verify_staged_commit_credentials(
@@ -3668,6 +4323,10 @@ fn append_link_fanout_room_state(
 ) -> Result<(), ClientStoreError> {
     room.validate_limits()?;
     append_link_fanout_room_plan(out, &room.plan)?;
+    append_bool(out, room.claimed_key_package.is_some());
+    if let Some(claimed_key_package) = &room.claimed_key_package {
+        append_claimed_key_package(out, claimed_key_package)?;
+    }
     match &room.status {
         LinkFanoutRoomStatus::Pending => {
             out.extend_from_slice(&LINK_FANOUT_STATUS_PENDING.to_be_bytes());
@@ -3681,6 +4340,45 @@ fn append_link_fanout_room_state(
             out.extend_from_slice(&accepted_seq.to_be_bytes());
         }
     }
+    Ok(())
+}
+
+fn append_claimed_key_package(
+    out: &mut Vec<u8>,
+    claimed_key_package: &ClaimKeyPackageResult,
+) -> Result<(), ClientStoreError> {
+    validate_claimed_key_package(claimed_key_package)?;
+    append_string_field(
+        out,
+        "claimed_key_package.key_package_id",
+        &claimed_key_package.key_package_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_device_ref(out, "claimed_key_package.owner", &claimed_key_package.owner)?;
+    append_string_field(
+        out,
+        "claimed_key_package.key_package_ref",
+        &claimed_key_package.key_package_ref,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "claimed_key_package.key_package_hash",
+        &claimed_key_package.key_package_hash,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_bytes_field(
+        out,
+        "claimed_key_package.key_package_payload",
+        &claimed_key_package.key_package_payload,
+        MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "claimed_key_package.lease_token",
+        &claimed_key_package.lease_token,
+        MAX_OBJECT_ID_BYTES,
+    )?;
     Ok(())
 }
 
@@ -3942,6 +4640,9 @@ fn encoded_link_fanout_room_state_len(
 ) -> Result<usize, ClientStoreError> {
     let mut len = encoded_link_fanout_room_plan_len(&room.plan)?;
     len = checked_len_add(len, U16_BYTES)?;
+    if let Some(claimed_key_package) = &room.claimed_key_package {
+        len = checked_len_add(len, encoded_claimed_key_package_len(claimed_key_package)?)?;
+    }
     match &room.status {
         LinkFanoutRoomStatus::Pending => {}
         LinkFanoutRoomStatus::Prepared { prepared } => {
@@ -3951,6 +4652,22 @@ fn encoded_link_fanout_room_state_len(
             len = checked_len_add(len, U64_BYTES)?;
         }
     }
+    Ok(len)
+}
+
+fn encoded_claimed_key_package_len(
+    claimed_key_package: &ClaimKeyPackageResult,
+) -> Result<usize, ClientStoreError> {
+    validate_claimed_key_package(claimed_key_package)?;
+    let mut len = U32_BYTES + claimed_key_package.key_package_id.len();
+    len = checked_len_add(len, encoded_device_ref_len(&claimed_key_package.owner)?)?;
+    len = checked_len_add(len, U32_BYTES + claimed_key_package.key_package_ref.len())?;
+    len = checked_len_add(len, U32_BYTES + claimed_key_package.key_package_hash.len())?;
+    len = checked_len_add(
+        len,
+        U32_BYTES + claimed_key_package.key_package_payload.len(),
+    )?;
+    len = checked_len_add(len, U32_BYTES + claimed_key_package.lease_token.len())?;
     Ok(len)
 }
 
@@ -4188,6 +4905,11 @@ impl<'a> ClientStateCursor<'a> {
 
     fn take_link_fanout_room_state(&mut self) -> Result<LinkFanoutRoomState, ClientStoreError> {
         let plan = self.take_link_fanout_room_plan()?;
+        let claimed_key_package = if self.take_bool()? {
+            Some(self.take_claimed_key_package()?)
+        } else {
+            None
+        };
         let status = match self.take_u16()? {
             LINK_FANOUT_STATUS_PENDING => LinkFanoutRoomStatus::Pending,
             LINK_FANOUT_STATUS_PREPARED => LinkFanoutRoomStatus::Prepared {
@@ -4203,9 +4925,33 @@ impl<'a> ClientStateCursor<'a> {
                 });
             }
         };
-        let room = LinkFanoutRoomState { plan, status };
+        let room = LinkFanoutRoomState {
+            plan,
+            claimed_key_package,
+            status,
+        };
         room.validate_limits()?;
         Ok(room)
+    }
+
+    fn take_claimed_key_package(&mut self) -> Result<ClaimKeyPackageResult, ClientStoreError> {
+        let claimed_key_package = ClaimKeyPackageResult {
+            key_package_id: self
+                .take_string("claimed_key_package.key_package_id", MAX_OBJECT_ID_BYTES)?,
+            owner: self.take_device_ref("claimed_key_package.owner")?,
+            key_package_ref: self
+                .take_string("claimed_key_package.key_package_ref", MAX_OBJECT_ID_BYTES)?,
+            key_package_hash: self
+                .take_string("claimed_key_package.key_package_hash", MAX_OBJECT_ID_BYTES)?,
+            key_package_payload: self.take_vec(
+                "claimed_key_package.key_package_payload",
+                MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+            )?,
+            lease_token: self
+                .take_string("claimed_key_package.lease_token", MAX_OBJECT_ID_BYTES)?,
+        };
+        validate_claimed_key_package(&claimed_key_package)?;
+        Ok(claimed_key_package)
     }
 
     fn take_link_fanout_room_plan(&mut self) -> Result<LinkFanoutRoomPlan, ClientStoreError> {

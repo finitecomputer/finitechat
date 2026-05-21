@@ -132,6 +132,7 @@ Proven client scenarios:
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
+- `runtime_link_fanout_tick_links_later_device_after_submit_response_loss`
 - `client_link_fanout_rejects_wrong_claim_before_pending_commit`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -241,6 +242,19 @@ Checkpoint test signal:
   completes from the ordered log, and repeats for a second room before the new
   Alice device activates both Welcomes. A negative test passes a KeyPackage
   claim for the wrong target and proves no local pending Commit is created.
+- The runtime link-fanout checkpoint moves that sequence behind the API
+  finitecomputer should drive. The target device replenishes real MLS
+  KeyPackages through the runtime sync tick; Alice's existing device starts a
+  fanout, pages account rooms with bounded one-room discovery, claims one
+  target-device KeyPackage per room, persists each claimed package with the
+  encrypted fanout plan, prepares both add Commits, loses the first submit
+  response after the server accepted it, restarts from stored prepared Commits,
+  retries idempotently, completes both rooms from the ordered log, and then the
+  target device claims and activates both Welcomes through the normal runtime
+  sync tick. The first version of this proof exposed a cursor/MLS mismatch in
+  the setup: Alice had already merged the setup Commit but the encrypted cursor
+  still pointed at zero, so the worker tried to process an old epoch. The test
+  now explicitly persists the setup cursors before starting fanout.
 - The revocation checkpoint clones Charlie's client state before removal to
   model a stale/lost device. After Bob removes Charlie, that stale client can
   fetch and process the removal Commit, but the server rejects its old-epoch

@@ -1,12 +1,13 @@
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeSyncOptions,
-    RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions, run_runtime_sync_tick,
+    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions,
+    RuntimeSyncOptions, RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions,
+    run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_engine::{
-    AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
-    KeyPackageInventory, ListAccountRoomsRequest, SyncEventsPage, UploadKeyPackageRequest,
-    WelcomeRecord, envelope,
+    AppendEventRequest, CommitAccepted, CreateRoomRequest, DeliveryService, EngineError,
+    EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
+    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -1812,6 +1813,7 @@ fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let mut delivery = UploadFailureDelivery {
         server: DeliveryService::new(),
         fail_first_upload_after_server_accept: true,
+        fail_first_submit_after_server_accept: false,
     };
     let options = RuntimeSyncOptions {
         key_package_target_available: 2,
@@ -2350,6 +2352,213 @@ fn sqlite_link_fanout_worker_survives_restart_after_prepared_commit() {
         room_b,
         &mut alice_phone,
         accepted_b.seq,
+        room_b_plaintext,
+    );
+}
+
+#[test]
+fn runtime_link_fanout_tick_links_later_device_after_submit_response_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_link");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_runtime_link");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut server = DeliveryService::new();
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime_link");
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_runtime_link");
+    let room_a = "room_runtime_link_a";
+    let group_a = "mls_runtime_link_a";
+    let room_b = "room_runtime_link_b";
+    let group_b = "mls_runtime_link_b";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id: room_a,
+            mls_group_id: group_a,
+            key_package_id: "kp_bob_runtime_link_a",
+            welcome_id: "welcome_bob_runtime_link_a",
+            idempotency_key: "add_bob_runtime_link_a",
+        },
+    );
+    let dana_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut dana,
+        GroupMemberSetup {
+            room_id: room_b,
+            mls_group_id: group_b,
+            key_package_id: "kp_dana_runtime_link_b",
+            welcome_id: "welcome_dana_runtime_link_b",
+            idempotency_key: "add_dana_runtime_link_b",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_a, bob_join_seq)
+        .unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_b, dana_join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let sync_options = RuntimeSyncOptions {
+        key_package_target_available: 2,
+        max_sync_pages_per_room: 4,
+    };
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut server,
+        &sync_options,
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 2);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_runtime_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let mut delivery = UploadFailureDelivery {
+        server,
+        fail_first_upload_after_server_accept: false,
+        fail_first_submit_after_server_accept: true,
+    };
+    let options = RuntimeLinkFanoutOptions {
+        max_discovery_pages_per_tick: 4,
+        max_commit_rooms_per_tick: 4,
+        max_completion_sync_pages_per_room: 4,
+    };
+
+    let err = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_runtime_phone",
+        &options,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeWorkerError::Delivery(TestDeliveryError::InjectedSubmitAfterServerAccept)
+    ));
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert_eq!(
+        alice_browser
+            .link_fanout_room_count("fanout_runtime_phone")
+            .unwrap(),
+        2
+    );
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_runtime_phone", room_a)
+            .unwrap(),
+        LinkFanoutRoomStatus::Prepared { .. }
+    ));
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_runtime_phone", room_b)
+            .unwrap(),
+        LinkFanoutRoomStatus::Prepared { .. }
+    ));
+
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_runtime_phone",
+        &options,
+    )
+    .unwrap();
+    assert_eq!(report.submitted_commits, 2);
+    assert_eq!(report.completed_rooms, 2);
+    assert!(report.complete);
+
+    let status_a = alice_browser
+        .link_fanout_room_status("fanout_runtime_phone", room_a)
+        .unwrap();
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: accepted_a_seq,
+    } = status_a
+    else {
+        panic!("room a fanout did not complete");
+    };
+    let status_b = alice_browser
+        .link_fanout_room_status("fanout_runtime_phone", room_b)
+        .unwrap();
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: accepted_b_seq,
+    } = status_b
+    else {
+        panic!("room b fanout did not complete");
+    };
+    assert_eq!(
+        apply_one_commit_for_room(&delivery.server, room_a, &mut bob, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert_eq!(
+        apply_one_commit_for_room(&delivery.server, room_b, &mut dana, dana_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery.server,
+        &sync_options,
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 2);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 2);
+    assert_eq!(alice_phone.group_epoch(room_a).unwrap(), 2);
+    assert_eq!(alice_phone.group_epoch(room_b).unwrap(), 2);
+
+    let room_a_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"runtime fanout room a"}}"#;
+    delivery
+        .server
+        .append_event(
+            bob.create_application_request(room_a, room_a_plaintext, "bob_runtime_fanout_a")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_device_decrypts_after_for_room(
+        &delivery.server,
+        room_a,
+        &mut alice_phone,
+        accepted_a_seq,
+        room_a_plaintext,
+    );
+
+    let room_b_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"runtime fanout room b"}}"#;
+    delivery
+        .server
+        .append_event(
+            dana.create_application_request(room_b, room_b_plaintext, "dana_runtime_fanout_b")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_device_decrypts_after_for_room(
+        &delivery.server,
+        room_b,
+        &mut alice_phone,
+        accepted_b_seq,
         room_b_plaintext,
     );
 }
@@ -3075,11 +3284,13 @@ fn send_bob_messages(
 enum TestDeliveryError {
     Engine(EngineError),
     InjectedAfterServerAccept,
+    InjectedSubmitAfterServerAccept,
 }
 
 struct UploadFailureDelivery {
     server: DeliveryService,
     fail_first_upload_after_server_accept: bool,
+    fail_first_submit_after_server_accept: bool,
 }
 
 impl RuntimeDelivery for UploadFailureDelivery {
@@ -3104,6 +3315,40 @@ impl RuntimeDelivery for UploadFailureDelivery {
         }
         self.server
             .upload_key_package(request)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<finitechat_engine::ClaimKeyPackageResult>, Self::Error> {
+        self.server
+            .claim_key_package_for_device(owner)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn submit_commit(
+        &mut self,
+        request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, Self::Error> {
+        if self.fail_first_submit_after_server_accept {
+            self.fail_first_submit_after_server_accept = false;
+            self.server
+                .submit_commit(request)
+                .map_err(TestDeliveryError::Engine)?;
+            return Err(TestDeliveryError::InjectedSubmitAfterServerAccept);
+        }
+        self.server
+            .submit_commit(request)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn list_account_rooms(
+        &mut self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, Self::Error> {
+        self.server
+            .list_account_rooms(request)
             .map_err(TestDeliveryError::Engine)
     }
 

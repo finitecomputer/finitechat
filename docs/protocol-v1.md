@@ -130,6 +130,7 @@ KeyPackages:
 - `GET /v1/devices/{account_id}/{device_id}/key-packages/inventory`
 - `POST /v1/key-packages/claim`
 - `POST /v1/accounts/{account_id}/key-packages/claim`
+- `POST /v1/devices/{account_id}/{device_id}/key-packages/claim`
 - `POST /v1/key-packages/release`
 
 Uploaded KeyPackages include opaque serialized MLS KeyPackage bytes plus the
@@ -154,6 +155,12 @@ device for the target account, ordered deterministically by device id and
 KeyPackage id. This is the invite primitive for multi-device users: the server
 routes packages to devices, but the adding client still verifies every
 Nostr-rooted MLS credential before constructing the Commit.
+
+Device fanout claim returns one available KeyPackage for a specific target
+device, ordered deterministically by KeyPackage id. The runtime link-fanout
+worker uses this when adding a later-linked device to all existing rooms: each
+room gets one claimed KeyPackage, one staged Welcome, and one ordered add
+Commit.
 
 Rooms:
 

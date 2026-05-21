@@ -245,6 +245,21 @@ impl SqliteDeliveryStore {
         })
     }
 
+    pub fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<ClaimKeyPackageResult>, StoreError> {
+        owner.validate_limits().map_err(EngineError::from)?;
+        let owner = owner.clone();
+        self.with_transaction(|tx| {
+            ensure_device_not_revoked(tx, &owner)?;
+            let Some(package) = load_available_key_package_for_device(tx, &owner)? else {
+                return Ok(None);
+            };
+            Ok(Some(claim_available_key_package(tx, package)?))
+        })
+    }
+
     pub fn claim_key_packages_for_account(
         &mut self,
         account_id: &str,
@@ -2063,6 +2078,36 @@ fn load_available_key_packages_for_account(
     }
     debug_assert_eq!(packages.len(), seen_devices.len());
     Ok(packages)
+}
+
+fn load_available_key_package_for_device(
+    conn: &Connection,
+    owner: &DeviceRef,
+) -> Result<Option<KeyPackageRecord>, StoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT key_package_id, owner_account_id, owner_device_id,
+               key_package_ref, key_package_hash, key_package_payload, state, lease_token
+        FROM key_packages
+        WHERE owner_account_id = ?1
+          AND owner_device_id = ?2
+          AND state = ?3
+        ORDER BY key_package_id
+        LIMIT 1
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        owner.account_id,
+        owner.device_id,
+        encode_key_package_state(KeyPackageState::Available),
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let package = row_to_key_package(row)?;
+    validate_key_package_payload(&package.key_package_payload)?;
+    debug_assert_eq!(package.owner, *owner);
+    Ok(Some(package))
 }
 
 fn load_key_package_required(

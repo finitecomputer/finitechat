@@ -125,6 +125,38 @@ fn account_key_package_claim_returns_one_available_package_per_device() {
 }
 
 #[test]
+fn device_key_package_claim_returns_one_available_package_for_target_device() {
+    let mut server = DeliveryService::new();
+    let bob_phone = device("bob_npub", "bob_phone");
+    let bob_laptop = device("bob_npub", "bob_laptop");
+
+    upload_available_key_package(&mut server, bob_phone.clone(), "kp_bob_phone_1");
+    upload_available_key_package(&mut server, bob_phone.clone(), "kp_bob_phone_2");
+    upload_available_key_package(&mut server, bob_laptop, "kp_bob_laptop_1");
+
+    let first = server
+        .claim_key_package_for_device(&bob_phone)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.key_package_id, "kp_bob_phone_1");
+    let second = server
+        .claim_key_package_for_device(&bob_phone)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.key_package_id, "kp_bob_phone_2");
+    assert!(
+        server
+            .claim_key_package_for_device(&bob_phone)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        server.key_package("kp_bob_laptop_1").unwrap().state,
+        KeyPackageState::Available
+    );
+}
+
+#[test]
 fn revoked_device_cannot_replenish_or_claim_key_packages() {
     let mut server = DeliveryService::new();
     upload_available_key_package(&mut server, bob(), "kp_bob_revoked_1");

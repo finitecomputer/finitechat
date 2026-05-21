@@ -1027,6 +1027,38 @@ fn sqlite_account_key_package_claim_survives_reopen() {
 }
 
 #[test]
+fn sqlite_device_key_package_claim_survives_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let bob_phone = device("bob_npub", "bob_phone");
+    let bob_laptop = device("bob_npub", "bob_laptop");
+    upload_available_key_package(&mut world.server, bob_phone.clone(), "kp_bob_phone_1");
+    upload_available_key_package(&mut world.server, bob_phone.clone(), "kp_bob_phone_2");
+    upload_available_key_package(&mut world.server, bob_laptop, "kp_bob_laptop_1");
+
+    let mut reopened = world.reopen();
+    let first = reopened
+        .claim_key_package_for_device(&bob_phone)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.key_package_id, "kp_bob_phone_1");
+    let second = reopened
+        .claim_key_package_for_device(&bob_phone)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.key_package_id, "kp_bob_phone_2");
+    assert!(
+        reopened
+            .claim_key_package_for_device(&bob_phone)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        key_package(&reopened, "kp_bob_laptop_1").state,
+        KeyPackageState::Available
+    );
+}
+
+#[test]
 fn sqlite_key_package_inventory_cap_survives_reopen_and_consumed_frees_space() {
     let mut world = SqliteWorld::direct_room();
     for index in 0..MAX_KEY_PACKAGES_PER_DEVICE {

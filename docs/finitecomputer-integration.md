@@ -53,6 +53,11 @@ render model while the encrypted transcript becomes canonical.
   MLS state before upload, claims and activates Welcomes, retries pending
   Welcome acks, and applies bounded ordered room pages into the encrypted client
   store.
+- Drive later-device room fanout through `finitechat_client::run_link_fanout_tick`:
+  after a target device is registered and replenished, an existing device pages
+  the account's rooms, claims one target-device KeyPackage per room, persists
+  the room plan and prepared MLS Commit, submits idempotently, and completes
+  from the ordered room log.
 
 `crates/finite-core/src/relay.rs` and `crates/finited/src/main.rs`
 

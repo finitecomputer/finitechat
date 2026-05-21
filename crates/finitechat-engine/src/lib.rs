@@ -596,6 +596,34 @@ impl DeliveryService {
         Ok(claimed_key_package_result(package, lease_token))
     }
 
+    pub fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<ClaimKeyPackageResult>, EngineError> {
+        owner.validate_limits()?;
+        ensure_device_not_revoked(&self.devices, owner)?;
+        let key_package_id = self
+            .key_packages
+            .iter()
+            .filter(|(_, package)| {
+                package.owner == *owner && package.state == KeyPackageState::Available
+            })
+            .map(|(key_package_id, _)| key_package_id.clone())
+            .min();
+        let Some(key_package_id) = key_package_id else {
+            return Ok(None);
+        };
+        let package = self
+            .key_packages
+            .get_mut(&key_package_id)
+            .expect("available KeyPackage id was selected before mutation");
+        validate_key_package_payload(&package.key_package_payload)?;
+        let lease_token = lease_token_for(&package.key_package_id, &package.owner);
+        package.state = KeyPackageState::Leased;
+        package.lease_token = Some(lease_token.clone());
+        Ok(Some(claimed_key_package_result(package, lease_token)))
+    }
+
     pub fn claim_key_packages_for_account(
         &mut self,
         account_id: &str,

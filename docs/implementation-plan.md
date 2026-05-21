@@ -197,6 +197,12 @@ Current OpenMLS scope:
   restarts before submit, submits the recovered request, completes from the
   ordered log, and finishes a second room before the new device activates both
   Welcomes.
+- runtime link-fanout tick for finitecomputer integration: a target device
+  replenishes KeyPackages, an existing device pages account rooms with bounded
+  loops, claims one target-device package per room, persists the claimed package
+  with the fanout plan, prepares durable add Commits, retries submit after
+  response loss, completes from the ordered log, and lets the target device
+  claim both Welcomes through the normal runtime sync tick.
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
@@ -243,12 +249,12 @@ Current known gap:
   policy.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
-- Later device linking is proven at the client protocol level. The server
-  exposes bounded account-room discovery plus duplicate current/pending
-  device-add rejection, and the client persists fanout progress plus prepared
-  Commit retry state. The runtime sync tick now covers the common device loop;
-  production still needs finitecomputer CLI/API wiring that drives the fanout
-  worker against real server APIs.
+- Later device linking is proven at the client protocol level and behind a
+  bounded runtime worker API. The server exposes bounded account-room discovery,
+  duplicate current/pending device-add rejection, and target-device KeyPackage
+  claim. The client persists fanout progress, claimed per-room KeyPackages, and
+  prepared Commit retry state. Production still needs finitecomputer CLI/API
+  wiring that drives the fanout worker against real server APIs.
 - Removal/revocation is proven for stale local MLS state, server delivery
   gating, and durable server-side device status. Production still needs policy
   and UX for who may revoke which device.
@@ -307,7 +313,8 @@ Good tests:
   a retried fanout cannot add the same current/pending device twice or consume
   a fresh KeyPackage before rejection.
 - durable link-fanout tests prove a prepared MLS add Commit survives restart as
-  an encrypted client snapshot replay value; a wrong KeyPackage claim is
+  an encrypted client snapshot replay value; runtime fanout proves submit
+  response loss converges through idempotent retry; a wrong KeyPackage claim is
   rejected before local pending Commit mutation.
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
@@ -383,7 +390,7 @@ Deliverables:
 Good tests:
 
 - push duplicate/drop/reorder never advances state;
-- link fanout resumes partial room adds;
+- link fanout resumes after submit response loss and partial room adds;
 - expired KeyPackages and Welcomes compact;
 - app database does not persist request bodies, bearer tokens, or push tokens in
   plaintext.
