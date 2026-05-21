@@ -1,15 +1,17 @@
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeSyncOptions, SqliteClientStore,
-    SqliteClientStoreOptions, run_runtime_sync_tick,
+    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeSyncOptions,
+    RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions, run_runtime_sync_tick,
 };
 use finitechat_engine::{
     AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
-    ListAccountRoomsRequest, envelope,
+    KeyPackageInventory, ListAccountRoomsRequest, SyncEventsPage, UploadKeyPackageRequest,
+    WelcomeRecord, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError, WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
+    WelcomeState,
 };
 use rusqlite::{Connection, params};
 
@@ -1563,21 +1565,20 @@ fn client_key_package_replenishment_edges_use_real_packages() {
     let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_replenish");
     let mut server = DeliveryService::new();
 
-    server
-        .upload_key_package(
-            alice_phone
-                .upload_key_package_request("kp_replenish_1")
-                .unwrap(),
-        )
+    let first_request = alice_phone
+        .upload_key_package_request("kp_replenish_1")
         .unwrap();
+    server.upload_key_package(first_request.clone()).unwrap();
+    server.upload_key_package(first_request.clone()).unwrap();
+    let conflicting_request = alice_phone
+        .upload_key_package_request("kp_replenish_1")
+        .unwrap();
+    assert_ne!(
+        conflicting_request.key_package_payload,
+        first_request.key_package_payload
+    );
     assert_eq!(
-        server
-            .upload_key_package(
-                alice_phone
-                    .upload_key_package_request("kp_replenish_1")
-                    .unwrap(),
-            )
-            .unwrap_err(),
+        server.upload_key_package(conflicting_request).unwrap_err(),
         EngineError::KeyPackageAlreadyExists("kp_replenish_1".to_string())
     );
     let first_claim = server
@@ -1628,8 +1629,12 @@ fn client_key_package_replenishment_edges_use_real_packages() {
 
 #[test]
 fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
-    let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_policy");
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_policy");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice_phone = FiniteChatDevice::new(alice_config).unwrap();
     let mut server = DeliveryService::new();
+    alice_store.save_device_state(&alice_phone).unwrap();
 
     let initial_inventory = server
         .key_package_inventory(alice_phone.device_ref())
@@ -1640,9 +1645,15 @@ fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
     assert_eq!(plan.inventory, initial_inventory);
     assert_eq!(plan.target_available, 3);
     assert_eq!(plan.upload_requests.len(), 3);
+    assert_eq!(alice_phone.pending_key_package_upload_count(), 3);
+    alice_store.save_device_state(&alice_phone).unwrap();
     for request in plan.upload_requests {
-        server.upload_key_package(request).unwrap();
+        server.upload_key_package(request.clone()).unwrap();
+        alice_store
+            .clear_pending_key_package_upload_and_save(&mut alice_phone, &request.key_package_id)
+            .unwrap();
     }
+    assert_eq!(alice_phone.pending_key_package_upload_count(), 0);
     let inventory = server
         .key_package_inventory(alice_phone.device_ref())
         .unwrap();
@@ -1664,9 +1675,18 @@ fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
         .unwrap();
     assert_eq!(plan.upload_requests.len(), 1);
     assert!(plan.upload_requests[0].key_package_id.starts_with("kp_"));
+    assert_eq!(alice_phone.pending_key_package_upload_count(), 1);
+    alice_store.save_device_state(&alice_phone).unwrap();
     server
         .upload_key_package(plan.upload_requests[0].clone())
         .unwrap();
+    alice_store
+        .clear_pending_key_package_upload_and_save(
+            &mut alice_phone,
+            &plan.upload_requests[0].key_package_id,
+        )
+        .unwrap();
+    assert_eq!(alice_phone.pending_key_package_upload_count(), 0);
     let inventory = server
         .key_package_inventory(alice_phone.device_ref())
         .unwrap();
@@ -1781,6 +1801,58 @@ fn runtime_sync_tick_replenishes_welcomes_acks_and_syncs_after_restart() {
     let replay =
         run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &options).unwrap();
     assert!(replay.applied_entries.is_empty());
+}
+
+#[test]
+fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut delivery = UploadFailureDelivery {
+        server: DeliveryService::new(),
+        fail_first_upload_after_server_accept: true,
+    };
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 2,
+        max_sync_pages_per_room: 4,
+    };
+    alice_store.save_device_state(&alice).unwrap();
+
+    let err =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeWorkerError::Delivery(TestDeliveryError::InjectedAfterServerAccept)
+    ));
+    assert_eq!(alice.pending_key_package_upload_count(), 2);
+    assert_eq!(
+        delivery
+            .server
+            .key_package_inventory(alice.device_ref())
+            .unwrap()
+            .available,
+        1
+    );
+
+    let mut alice = alice_store.load_device(alice_config.clone()).unwrap();
+    assert_eq!(alice.pending_key_package_upload_count(), 2);
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(report.uploaded_key_packages, 2);
+    assert_eq!(alice.pending_key_package_upload_count(), 0);
+    let inventory = delivery
+        .server
+        .key_package_inventory(alice.device_ref())
+        .unwrap();
+    assert_eq!(inventory.available, 2);
+    assert_eq!(inventory.leased, 0);
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    assert_eq!(alice.pending_key_package_upload_count(), 0);
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(replay.uploaded_key_packages, 0);
 }
 
 #[test]
@@ -2996,6 +3068,66 @@ fn send_bob_messages(
             seq: accepted.seq,
             plaintext,
         });
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TestDeliveryError {
+    Engine(EngineError),
+    InjectedAfterServerAccept,
+}
+
+struct UploadFailureDelivery {
+    server: DeliveryService,
+    fail_first_upload_after_server_accept: bool,
+}
+
+impl RuntimeDelivery for UploadFailureDelivery {
+    type Error = TestDeliveryError;
+
+    fn key_package_inventory(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, Self::Error> {
+        self.server
+            .key_package_inventory(owner)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
+        if self.fail_first_upload_after_server_accept {
+            self.fail_first_upload_after_server_accept = false;
+            self.server
+                .upload_key_package(request)
+                .map_err(TestDeliveryError::Engine)?;
+            return Err(TestDeliveryError::InjectedAfterServerAccept);
+        }
+        self.server
+            .upload_key_package(request)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
+        self.server
+            .claim_welcomes(device)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
+        self.server
+            .ack_welcome(welcome_id, activated)
+            .map_err(TestDeliveryError::Engine)
+    }
+
+    fn sync_events(
+        &mut self,
+        room_id: &str,
+        requester: &DeviceRef,
+        after_seq: u64,
+    ) -> Result<SyncEventsPage, Self::Error> {
+        self.server
+            .sync_events(room_id, requester, after_seq)
+            .map_err(TestDeliveryError::Engine)
     }
 }
 

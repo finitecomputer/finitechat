@@ -956,11 +956,20 @@ fn sqlite_key_package_payload_survives_reopen_and_claim() {
 }
 
 #[test]
-fn sqlite_duplicate_key_package_upload_is_rejected_after_reopen() {
+fn sqlite_exact_key_package_upload_retry_is_idempotent_after_reopen() {
     let mut world = SqliteWorld::direct_room();
     upload_available_key_package(&mut world.server, bob(), "kp_bob_1");
 
     let mut reopened = world.reopen();
+    reopened
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: "kp_bob_1".to_string(),
+            owner: bob(),
+            key_package_ref: "ref_kp_bob_1".to_string(),
+            key_package_hash: "hash_kp_bob_1".to_string(),
+            key_package_payload: fake_key_package_payload("kp_bob_1"),
+        })
+        .unwrap();
     let err = reopened
         .upload_key_package(UploadKeyPackageRequest {
             key_package_id: "kp_bob_1".to_string(),

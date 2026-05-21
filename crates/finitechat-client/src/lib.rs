@@ -11,8 +11,8 @@ use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
     MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS, MAX_DEVICE_ID_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_MLS_GROUP_ID_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_MLS_GROUP_ID_BYTES, MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES,
     MAX_STAGED_WELCOMES_PER_COMMIT, MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES,
     MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId,
     RoomLogEntry, StagedWelcomeV1, WelcomeId, validate_bytes_len, validate_bytes_non_empty,
@@ -39,12 +39,13 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 5;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 6;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
 const MAX_PERSISTED_ROOMS: u32 = 1024;
 const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
+const MAX_PENDING_KEY_PACKAGE_UPLOADS: u32 = MAX_KEY_PACKAGES_PER_DEVICE;
 const MAX_LINK_FANOUTS: u32 = 16;
 const MAX_LINK_FANOUT_ROOMS: u32 = MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS;
 const MAX_RUNTIME_SYNC_PAGES_PER_ROOM: u32 = 64;
@@ -73,6 +74,7 @@ const _: () = {
     assert!(CLIENT_STORE_AEAD_TAG_BYTES == 16);
     assert!(MAX_PERSISTED_ROOMS > 0);
     assert!(MAX_PENDING_CLIENT_WELCOMES > 0);
+    assert!(MAX_PENDING_KEY_PACKAGE_UPLOADS > 0);
     assert!(MAX_LINK_FANOUTS > 0);
     assert!(MAX_LINK_FANOUT_ROOMS > 0);
     assert!(MAX_RUNTIME_SYNC_PAGES_PER_ROOM > 0);
@@ -105,6 +107,7 @@ pub struct FiniteChatDeviceState {
     pub rooms: Vec<PersistedRoomState>,
     pub pending_welcomes: Vec<PendingWelcomeState>,
     pub pending_welcome_acks: Vec<PendingWelcomeAckState>,
+    pub pending_key_package_uploads: Vec<UploadKeyPackageRequest>,
     pub link_fanouts: Vec<LinkFanoutState>,
     pub openmls_storage_records: Vec<OpenMlsStorageRecord>,
 }
@@ -275,6 +278,7 @@ pub struct FiniteChatDevice {
     room_cursors: BTreeMap<RoomId, u64>,
     pending_welcomes: BTreeMap<WelcomeId, PendingWelcomeState>,
     pending_welcome_acks: BTreeMap<WelcomeId, PendingWelcomeAckState>,
+    pending_key_package_uploads: BTreeMap<KeyPackageId, UploadKeyPackageRequest>,
     link_fanouts: BTreeMap<String, LinkFanoutState>,
 }
 
@@ -320,6 +324,7 @@ impl FiniteChatDevice {
             room_cursors: BTreeMap::new(),
             pending_welcomes: BTreeMap::new(),
             pending_welcome_acks: BTreeMap::new(),
+            pending_key_package_uploads: BTreeMap::new(),
             link_fanouts: BTreeMap::new(),
         };
         debug_assert_eq!(
@@ -410,6 +415,11 @@ impl FiniteChatDevice {
             .iter()
             .map(|ack| (ack.welcome_id.clone(), ack.clone()))
             .collect::<BTreeMap<_, _>>();
+        let pending_key_package_uploads = state
+            .pending_key_package_uploads
+            .iter()
+            .map(|request| (request.key_package_id.clone(), request.clone()))
+            .collect::<BTreeMap<_, _>>();
         let link_fanouts = state
             .link_fanouts
             .iter()
@@ -427,6 +437,7 @@ impl FiniteChatDevice {
             room_cursors,
             pending_welcomes,
             pending_welcome_acks,
+            pending_key_package_uploads,
             link_fanouts,
         };
         debug_assert_eq!(
@@ -470,6 +481,11 @@ impl FiniteChatDevice {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let pending_key_package_uploads = self
+            .pending_key_package_uploads
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let link_fanouts = self.link_fanouts.values().cloned().collect::<Vec<_>>();
 
         let state = FiniteChatDeviceState {
@@ -479,6 +495,7 @@ impl FiniteChatDevice {
             rooms,
             pending_welcomes,
             pending_welcome_acks,
+            pending_key_package_uploads,
             link_fanouts,
             openmls_storage_records,
         };
@@ -575,7 +592,7 @@ impl FiniteChatDevice {
     }
 
     pub fn key_package_replenishment_plan(
-        &self,
+        &mut self,
         inventory: KeyPackageInventory,
         target_available: u32,
     ) -> Result<KeyPackageReplenishmentPlan, ClientError> {
@@ -609,10 +626,35 @@ impl FiniteChatDevice {
             });
         }
 
-        let missing_available = target_available.saturating_sub(inventory.available);
+        validate_item_count(
+            "key_package_replenishment.pending_uploads",
+            self.pending_key_package_uploads.len(),
+            MAX_PENDING_KEY_PACKAGE_UPLOADS,
+        )?;
+        let pending_upload_count = self.pending_key_package_uploads.len() as u32;
+        let unconsumed_with_pending = inventory
+            .unconsumed()
+            .checked_add(u64::from(pending_upload_count))
+            .ok_or(ClientError::KeyPackageInventoryOverCap {
+                available: inventory.available,
+                leased: inventory.leased,
+                max: MAX_KEY_PACKAGES_PER_DEVICE,
+            })?;
+        if unconsumed_with_pending > u64::from(MAX_KEY_PACKAGES_PER_DEVICE) {
+            return Err(ClientError::KeyPackagePendingUploadOverCap {
+                available: inventory.available,
+                leased: inventory.leased,
+                pending: pending_upload_count,
+                max: MAX_KEY_PACKAGES_PER_DEVICE,
+            });
+        }
+
+        let missing_available = target_available
+            .saturating_sub(inventory.available)
+            .saturating_sub(pending_upload_count);
         let remaining_cap = u32::try_from(
             u64::from(MAX_KEY_PACKAGES_PER_DEVICE)
-                .checked_sub(inventory.unconsumed())
+                .checked_sub(unconsumed_with_pending)
                 .ok_or(ClientError::KeyPackageInventoryOverCap {
                     available: inventory.available,
                     leased: inventory.leased,
@@ -625,9 +667,13 @@ impl FiniteChatDevice {
             max: MAX_KEY_PACKAGES_PER_DEVICE,
         })?;
         let upload_count = missing_available.min(remaining_cap);
-        let mut upload_requests = Vec::with_capacity(upload_count as usize);
+        let mut upload_requests =
+            Vec::with_capacity(self.pending_key_package_uploads.len() + upload_count as usize);
+        upload_requests.extend(self.pending_key_package_uploads());
         for _ in 0..upload_count {
-            upload_requests.push(self.upload_key_package_auto_id_request()?);
+            let request = self.upload_key_package_auto_id_request()?;
+            self.store_pending_key_package_upload(request.clone())?;
+            upload_requests.push(request);
         }
 
         debug_assert!(upload_requests.len() <= MAX_KEY_PACKAGES_PER_DEVICE as usize);
@@ -635,6 +681,10 @@ impl FiniteChatDevice {
             upload_requests
                 .iter()
                 .all(|request| request.owner == self.device_ref)
+        );
+        debug_assert_eq!(
+            upload_requests.len(),
+            self.pending_key_package_uploads.len()
         );
         Ok(KeyPackageReplenishmentPlan {
             inventory,
@@ -1126,6 +1176,10 @@ impl FiniteChatDevice {
         self.pending_welcome_acks.len()
     }
 
+    pub fn pending_key_package_upload_count(&self) -> usize {
+        self.pending_key_package_uploads.len()
+    }
+
     fn store_pending_welcome(&mut self, welcome: &WelcomeRecord) -> Result<(), ClientError> {
         if welcome.recipient != self.device_ref {
             return Err(ClientError::PendingWelcomeRecipientMismatch);
@@ -1211,6 +1265,63 @@ impl FiniteChatDevice {
             ));
         }
         debug_assert!(!self.pending_welcome_acks.contains_key(welcome_id));
+        Ok(())
+    }
+
+    fn store_pending_key_package_upload(
+        &mut self,
+        request: UploadKeyPackageRequest,
+    ) -> Result<(), ClientError> {
+        request.validate_limits()?;
+        if request.owner != self.device_ref {
+            return Err(ClientError::PendingKeyPackageUploadOwnerMismatch {
+                expected: self.device_ref.clone(),
+                actual: request.owner,
+            });
+        }
+        if self
+            .pending_key_package_uploads
+            .insert(request.key_package_id.clone(), request.clone())
+            .is_some()
+        {
+            return Err(ClientError::DuplicatePendingKeyPackageUpload(
+                request.key_package_id,
+            ));
+        }
+        debug_assert!(
+            self.pending_key_package_uploads
+                .contains_key(&request.key_package_id)
+        );
+        Ok(())
+    }
+
+    fn pending_key_package_uploads(&self) -> Vec<UploadKeyPackageRequest> {
+        self.pending_key_package_uploads.values().cloned().collect()
+    }
+
+    fn clear_pending_key_package_upload(
+        &mut self,
+        key_package_id: &str,
+    ) -> Result<(), ClientError> {
+        validate_string_bytes(
+            "pending_key_package_upload.key_package_id",
+            key_package_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if self
+            .pending_key_package_uploads
+            .remove(key_package_id)
+            .is_none()
+        {
+            return Err(ClientError::PendingKeyPackageUploadNotFound(
+                key_package_id.to_string(),
+            ));
+        }
+        debug_assert!(
+            !self
+                .pending_key_package_uploads
+                .contains_key(key_package_id)
+        );
         Ok(())
     }
 
@@ -1620,6 +1731,11 @@ impl FiniteChatDeviceState {
             MAX_PENDING_CLIENT_WELCOMES,
         )?;
         validate_item_count(
+            "client_state.pending_key_package_uploads",
+            self.pending_key_package_uploads.len(),
+            MAX_PENDING_KEY_PACKAGE_UPLOADS,
+        )?;
+        validate_item_count(
             "client_state.link_fanouts",
             self.link_fanouts.len(),
             MAX_LINK_FANOUTS,
@@ -1639,6 +1755,7 @@ impl FiniteChatDeviceState {
         let mut seen_rooms = BTreeSet::<RoomId>::new();
         let mut seen_pending_welcomes = BTreeSet::<WelcomeId>::new();
         let mut seen_pending_welcome_acks = BTreeSet::<WelcomeId>::new();
+        let mut seen_pending_key_package_uploads = BTreeSet::<KeyPackageId>::new();
         let mut seen_link_fanouts = BTreeSet::<String>::new();
         for room in &self.rooms {
             if !seen_rooms.insert(room.room_id.clone()) {
@@ -1668,6 +1785,20 @@ impl FiniteChatDeviceState {
             if !seen_rooms.contains(&ack.room_id) {
                 return Err(ClientError::PendingWelcomeAckRoomMissing(
                     ack.room_id.clone(),
+                ));
+            }
+        }
+        for request in &self.pending_key_package_uploads {
+            request.validate_limits()?;
+            if request.owner != self.device_ref {
+                return Err(ClientError::PendingKeyPackageUploadOwnerMismatch {
+                    expected: self.device_ref.clone(),
+                    actual: request.owner.clone(),
+                });
+            }
+            if !seen_pending_key_package_uploads.insert(request.key_package_id.clone()) {
+                return Err(ClientError::DuplicatePendingKeyPackageUpload(
+                    request.key_package_id.clone(),
                 ));
             }
         }
@@ -2042,6 +2173,15 @@ impl SqliteClientStore {
         self.save_device_state(device)
     }
 
+    pub fn clear_pending_key_package_upload_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        key_package_id: &str,
+    ) -> Result<(), ClientStoreError> {
+        device.clear_pending_key_package_upload(key_package_id)?;
+        self.save_device_state(device)
+    }
+
     pub fn start_link_fanout_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
@@ -2224,8 +2364,9 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
     }
     for request in upload_requests {
         delivery
-            .upload_key_package(request)
+            .upload_key_package(request.clone())
             .map_err(RuntimeWorkerError::Delivery)?;
+        store.clear_pending_key_package_upload_and_save(device, &request.key_package_id)?;
         report.record_uploaded_key_package()?;
     }
 
@@ -2443,6 +2584,15 @@ pub enum ClientError {
         leased: u32,
         max: u32,
     },
+    #[error(
+        "KeyPackage replenishment exceeds cap: {available} available, {leased} leased, {pending} pending uploads, max {max}"
+    )]
+    KeyPackagePendingUploadOverCap {
+        available: u32,
+        leased: u32,
+        pending: u32,
+        max: u32,
+    },
     #[error("failed to hash OpenMLS KeyPackage ref")]
     HashKeyPackageRef,
     #[error("failed to add OpenMLS member")]
@@ -2522,6 +2672,15 @@ pub enum ClientError {
     PendingWelcomeAckNotFound(WelcomeId),
     #[error("pending Welcome recipient does not match this device")]
     PendingWelcomeRecipientMismatch,
+    #[error("pending KeyPackage upload already exists: {0}")]
+    DuplicatePendingKeyPackageUpload(KeyPackageId),
+    #[error("pending KeyPackage upload not found: {0}")]
+    PendingKeyPackageUploadNotFound(KeyPackageId),
+    #[error("pending KeyPackage upload owner mismatch: expected {expected:?}, actual {actual:?}")]
+    PendingKeyPackageUploadOwnerMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
     #[error("prepared commit message id does not match request")]
     PreparedCommitMessageIdMismatch,
     #[error("link fanout already exists: {0}")]
@@ -3219,6 +3378,16 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
     }
     append_count(
         &mut out,
+        "client_state.pending_key_package_uploads",
+        state.pending_key_package_uploads.len(),
+        MAX_PENDING_KEY_PACKAGE_UPLOADS,
+    )?;
+    for request in &state.pending_key_package_uploads {
+        request.validate_limits().map_err(ClientError::from)?;
+        append_upload_key_package_request(&mut out, request)?;
+    }
+    append_count(
+        &mut out,
         "client_state.link_fanouts",
         state.link_fanouts.len(),
         MAX_LINK_FANOUTS,
@@ -3323,6 +3492,15 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         });
     }
 
+    let pending_key_package_upload_count = cursor.take_count(
+        "client_state.pending_key_package_uploads",
+        MAX_PENDING_KEY_PACKAGE_UPLOADS,
+    )?;
+    let mut pending_key_package_uploads = Vec::with_capacity(pending_key_package_upload_count);
+    for _ in 0..pending_key_package_upload_count {
+        pending_key_package_uploads.push(cursor.take_upload_key_package_request()?);
+    }
+
     let link_fanout_count = cursor.take_count("client_state.link_fanouts", MAX_LINK_FANOUTS)?;
     let mut link_fanouts = Vec::with_capacity(link_fanout_count);
     for _ in 0..link_fanout_count {
@@ -3352,6 +3530,7 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         rooms,
         pending_welcomes,
         pending_welcome_acks,
+        pending_key_package_uploads,
         link_fanouts,
         openmls_storage_records,
     };
@@ -3386,6 +3565,10 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         len = checked_len_add(len, U64_BYTES)?;
     }
     len = checked_len_add(len, U32_BYTES)?;
+    for request in &state.pending_key_package_uploads {
+        len = checked_len_add(len, encoded_upload_key_package_request_len(request)?)?;
+    }
+    len = checked_len_add(len, U32_BYTES)?;
     for fanout in &state.link_fanouts {
         len = checked_len_add(len, encoded_link_fanout_state_len(fanout)?)?;
     }
@@ -3400,6 +3583,51 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         MAX_CLIENT_STATE_PLAINTEXT_BYTES,
     )
     .map_err(ClientError::from)?;
+    Ok(len)
+}
+
+fn append_upload_key_package_request(
+    out: &mut Vec<u8>,
+    request: &UploadKeyPackageRequest,
+) -> Result<(), ClientStoreError> {
+    request.validate_limits().map_err(ClientError::from)?;
+    append_string_field(
+        out,
+        "pending_key_package_upload.key_package_id",
+        &request.key_package_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_device_ref(out, "pending_key_package_upload.owner", &request.owner)?;
+    append_string_field(
+        out,
+        "pending_key_package_upload.key_package_ref",
+        &request.key_package_ref,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "pending_key_package_upload.key_package_hash",
+        &request.key_package_hash,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_bytes_field(
+        out,
+        "pending_key_package_upload.key_package_payload",
+        &request.key_package_payload,
+        MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    )?;
+    Ok(())
+}
+
+fn encoded_upload_key_package_request_len(
+    request: &UploadKeyPackageRequest,
+) -> Result<usize, ClientStoreError> {
+    request.validate_limits().map_err(ClientError::from)?;
+    let mut len = U32_BYTES + request.key_package_id.len();
+    len = checked_len_add(len, encoded_device_ref_len(&request.owner)?)?;
+    len = checked_len_add(len, U32_BYTES + request.key_package_ref.len())?;
+    len = checked_len_add(len, U32_BYTES + request.key_package_hash.len())?;
+    len = checked_len_add(len, U32_BYTES + request.key_package_payload.len())?;
     Ok(len)
 }
 
@@ -3910,6 +4138,32 @@ impl<'a> ClientStateCursor<'a> {
         let len = self.take_u32()? as usize;
         validate_bytes_len(field, len, max_bytes).map_err(ClientError::from)?;
         Ok(self.take_bytes(len)?.to_vec())
+    }
+
+    fn take_upload_key_package_request(
+        &mut self,
+    ) -> Result<UploadKeyPackageRequest, ClientStoreError> {
+        let request = UploadKeyPackageRequest {
+            key_package_id: self.take_string(
+                "pending_key_package_upload.key_package_id",
+                MAX_OBJECT_ID_BYTES,
+            )?,
+            owner: self.take_device_ref("pending_key_package_upload.owner")?,
+            key_package_ref: self.take_string(
+                "pending_key_package_upload.key_package_ref",
+                MAX_OBJECT_ID_BYTES,
+            )?,
+            key_package_hash: self.take_string(
+                "pending_key_package_upload.key_package_hash",
+                MAX_OBJECT_ID_BYTES,
+            )?,
+            key_package_payload: self.take_vec(
+                "pending_key_package_upload.key_package_payload",
+                MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+            )?,
+        };
+        request.validate_limits().map_err(ClientError::from)?;
+        Ok(request)
     }
 
     fn take_link_fanout_state(&mut self) -> Result<LinkFanoutState, ClientStoreError> {

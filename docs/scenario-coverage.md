@@ -128,6 +128,7 @@ Proven client scenarios:
 - `client_key_package_replenishment_edges_use_real_packages`
 - `client_key_package_replenishment_plan_maintains_bounded_inventory`
 - `runtime_sync_tick_replenishes_welcomes_acks_and_syncs_after_restart`
+- `runtime_sync_tick_retries_key_package_upload_after_response_loss`
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
@@ -262,16 +263,21 @@ Checkpoint test signal:
   pending update lost because it was removed clears pending state, cannot retry,
   cannot send locally or through the server, and stops receiving future entries.
 - The KeyPackage replenishment checkpoint uses real OpenMLS package bytes for
-  the client boundary: duplicate upload is rejected, account claim exhaustion
-  returns no packages, uploading a fresh package replenishes availability, and
-  lease expiry makes the original package reclaimable. The client planner now
-  takes server inventory, generates only the missing upload requests needed to
-  reach a target, auto-ids packages from their MLS payload hash, and refuses
-  over-cap targets. The runtime tick saves local OpenMLS state before upload so
-  a server-visible KeyPackage is not missing its local private state after
+  the client boundary: exact duplicate upload retry is idempotent, conflicting
+  duplicate upload is rejected, account claim exhaustion returns no packages,
+  uploading a fresh package replenishes availability, and lease expiry makes the
+  original package reclaimable. The client planner now takes server inventory,
+  generates only the missing upload requests needed to reach a target, auto-ids
+  packages from their MLS payload hash, persists pending upload requests in
+  encrypted client state, and refuses over-cap targets. The runtime tick saves
+  local OpenMLS state plus replayable pending uploads before upload so a
+  server-visible KeyPackage is not missing its local private state after
   restart. Sim and SQLite prove the server cap counts available plus leased
   packages, accepted add Commits free consumed package space, and cap behavior
-  survives reopen.
+  survives reopen. The response-loss runtime test proved the earlier
+  save-before-upload rule was incomplete by itself: after the server accepted
+  one upload and the client crashed before local clear, restart retried the
+  exact pending upload idempotently and did not generate extra local packages.
 - The runtime sync checkpoint exposed a gap in the earlier crash proof: we had
   durable activation before server ack, but no durable marker telling the
   automated runtime loop to send that ack after restart. The fix adds

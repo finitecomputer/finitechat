@@ -210,16 +210,17 @@ Current OpenMLS scope:
   Commit after observing the winner, rolls forward, retries when still a
   member, or becomes locally unable to send when the winning Commit removed it.
 - KeyPackage replenishment edge proof with real OpenMLS package bytes covering
-  duplicate upload rejection, account-claim exhaustion, fresh-package
-  replenishment, and lease expiry/reclaim.
+  exact duplicate upload retry, conflicting duplicate rejection, account-claim
+  exhaustion, fresh-package replenishment, and lease expiry/reclaim.
 - bounded KeyPackage inventory policy: server and SQLite cap each device at
   `64` unconsumed packages, expose available/leased counts, clients plan
   target-available replenishment without UI involvement, consumed packages free
   space, and the SQLite/reducer fuzzer compares inventory after every step.
 - synchronous runtime sync tick for finitecomputer integration: replenish
-  KeyPackages, save local OpenMLS private state before upload, claim Welcomes,
-  durably activate Welcomes, send idempotent Welcome acks, sync ordered room
-  pages with bounded loops, and persist cursors with applied MLS state.
+  KeyPackages, persist replayable pending uploads with local OpenMLS private
+  state before upload, claim Welcomes, durably activate Welcomes, send
+  idempotent Welcome acks, sync ordered room pages with bounded loops, and
+  persist cursors with applied MLS state.
 - explicit v1 history policy proof: a newly added device can sync from its
   accepted add Commit forward, but does not receive pre-membership room log
   history by default.
@@ -258,8 +259,9 @@ Current known gap:
   pending-Commit recovery branch is no longer add-only.
 - KeyPackage replenishment policy is explicit and covered across real-client,
   sim, and SQLite suites. The runtime sync tick calls the planner at startup and
-  after server interactions; production still needs finitecomputer process
-  scheduling and room-server transport wiring.
+  after server interactions, and pending upload state makes response-loss retry
+  converge without generating extra local packages. Production still needs
+  finitecomputer process scheduling and room-server transport wiring.
 - V1 history recovery is intentionally narrow: new devices get messages from
   their accepted add Commit forward. Pre-invite history requires a future
   encrypted backup or explicit member-to-member history-share protocol.
@@ -319,14 +321,15 @@ Good tests:
 - same-epoch losers observe the accepted winner, clear pending local Commit
   state, retry from the new epoch when still members, and stop sending when the
   winning Commit removed them.
-- real KeyPackage bytes cover duplicate upload, exhausted account claim,
-  replenishment by fresh upload, and lease expiry/reclaim; client/sim/SQLite
-  cover bounded inventory planning, cap enforcement, consumed-package space
-  recovery, and max-device caps.
+- real KeyPackage bytes cover exact duplicate upload retry, conflicting
+  duplicate rejection, exhausted account claim, replenishment by fresh upload,
+  and lease expiry/reclaim; client/sim/SQLite cover bounded inventory planning,
+  cap enforcement, consumed-package space recovery, and max-device caps.
 - runtime sync tick covers the canary runtime loop: local KeyPackage state is
-  saved before upload, claimed Welcomes survive activation-before-ack crashes as
-  pending ack state, Welcome ack is idempotent, ordered room sync persists MLS
-  state and cursor together, and replay does not reprocess applied entries.
+  saved with replayable pending uploads before upload, claimed Welcomes survive
+  activation-before-ack crashes as pending ack state, Welcome ack is
+  idempotent, ordered room sync persists MLS state and cursor together, and
+  replay does not reprocess applied entries.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

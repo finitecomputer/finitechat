@@ -543,7 +543,10 @@ impl DeliveryService {
     ) -> Result<(), EngineError> {
         request.validate_limits()?;
         self.observe_active_device(&request.owner)?;
-        if self.key_packages.contains_key(&request.key_package_id) {
+        if let Some(existing) = self.key_packages.get(&request.key_package_id) {
+            if key_package_request_matches_record(&request, existing) {
+                return Ok(());
+            }
             return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id));
         }
         let inventory = self.key_package_inventory(&request.owner)?;
@@ -1654,6 +1657,17 @@ fn inventory_count_to_u32(field: &str, value: usize) -> Result<u32, EngineError>
         }
         .into()
     })
+}
+
+fn key_package_request_matches_record(
+    request: &UploadKeyPackageRequest,
+    record: &KeyPackageRecord,
+) -> bool {
+    request.key_package_id == record.key_package_id
+        && request.owner == record.owner
+        && request.key_package_ref == record.key_package_ref
+        && request.key_package_hash == record.key_package_hash
+        && request.key_package_payload == record.key_package_payload
 }
 
 fn device_is_revoked(devices: &BTreeMap<String, DeviceRecord>, device: &DeviceRef) -> bool {

@@ -195,7 +195,10 @@ impl SqliteDeliveryStore {
         request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
             observe_active_device(tx, &request.owner)?;
-            if load_key_package(tx, &request.key_package_id)?.is_some() {
+            if let Some(existing) = load_key_package(tx, &request.key_package_id)? {
+                if key_package_request_matches_record(&request, &existing) {
+                    return Ok(());
+                }
                 return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id).into());
             }
             let inventory = load_key_package_inventory(tx, &request.owner)?;
@@ -2083,6 +2086,17 @@ fn row_to_key_package(row: &Row<'_>) -> Result<KeyPackageRecord, StoreError> {
         state: decode_key_package_state(row.get::<_, String>(6)?.as_str())?,
         lease_token: row.get(7)?,
     })
+}
+
+fn key_package_request_matches_record(
+    request: &UploadKeyPackageRequest,
+    record: &KeyPackageRecord,
+) -> bool {
+    request.key_package_id == record.key_package_id
+        && request.owner == record.owner
+        && request.key_package_ref == record.key_package_ref
+        && request.key_package_hash == record.key_package_hash
+        && request.key_package_payload == record.key_package_payload
 }
 
 fn load_welcome(conn: &Connection, welcome_id: &str) -> Result<Option<WelcomeRecord>, StoreError> {

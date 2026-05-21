@@ -142,9 +142,12 @@ packages plus leased packages because both are unconsumed server-held material;
 accepted add Commits consume leased packages and free inventory space. Clients
 use the inventory view to keep a small target number of available packages
 without pushing an unbounded upload pile into the Delivery Service. Runtime
-clients should persist local MLS state before uploading generated packages; v1
-client helpers derive package ids from the serialized MLS KeyPackage payload
-hash so replenishment does not need a persisted counter.
+clients persist generated upload requests in encrypted local state before
+uploading generated packages, then clear each request only after server
+acceptance. Exact duplicate uploads are idempotent retry; a duplicate id with
+different owner, ref, hash, or payload is rejected. V1 client helpers derive
+package ids from the serialized MLS KeyPackage payload hash so replenishment
+does not need a persisted counter.
 
 Account fanout claim returns at most one available KeyPackage per registered
 device for the target account, ordered deterministically by device id and

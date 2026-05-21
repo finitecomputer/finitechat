@@ -49,9 +49,10 @@ render model while the encrypted transcript becomes canonical.
 - The gateway inbox can be fed from decrypted application messages after the
   runtime device processes room sync.
 - Drive encrypted device maintenance through `finitechat_client::run_runtime_sync_tick`:
-  it replenishes KeyPackages, persists local MLS state before upload, claims and
-  activates Welcomes, retries pending Welcome acks, and applies bounded ordered
-  room pages into the encrypted client store.
+  it replenishes KeyPackages, persists replayable pending uploads with local
+  MLS state before upload, claims and activates Welcomes, retries pending
+  Welcome acks, and applies bounded ordered room pages into the encrypted client
+  store.
 
 `crates/finite-core/src/relay.rs` and `crates/finited/src/main.rs`
 
