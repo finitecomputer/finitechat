@@ -32,6 +32,26 @@ membership intervals, repair reports, and push wake outbox records.
 - Rejected mutations after idempotency admission are replayable.
 - Removed devices can fetch through their removal Commit.
 - `NeedsRepair` blocks normal sends.
+- Protocol limits are enforced before state mutation. Limit failures must not
+  create log entries, consume KeyPackages, release Welcomes, or write
+  idempotency responses.
+
+## V1 Limits
+
+These are protocol constants, not tuning hints:
+
+- envelope payload: `256 KiB`;
+- sync page: `100` entries and `4 MiB` of envelope payload bytes;
+- direct room devices per account: `8`;
+- KeyPackages claimed per request: `1`;
+- Welcomes claimed per request: `32`;
+- link-session payload: `1 MiB`;
+- idempotency key: `128` bytes;
+- account id, device id, room id, MLS group id, object ids: `128` bytes each.
+
+The numbers are intentionally small for v1. They keep WASM memory behavior
+predictable, bound retry/fanout work, and make accidental full-room reads show
+up as test failures.
 
 ## Server API Sketch
 
@@ -80,6 +100,10 @@ Device linking:
 ```text
 SHA256("finite-message-id-v1" || canonical_finite_envelope_bytes)
 ```
+
+`message_id` is unique per room log. A second mutation with a different
+idempotency key but identical envelope bytes is rejected as a duplicate message,
+not appended as a second log entry.
 
 ## Application/RPC Payloads
 

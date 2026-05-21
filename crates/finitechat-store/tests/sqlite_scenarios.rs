@@ -4,8 +4,9 @@ use finitechat_engine::{
     device, envelope,
 };
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, RoomStatus, WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, ProtocolLimitError, RoomStatus, WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
 use tempfile::TempDir;
@@ -546,5 +547,127 @@ fn sqlite_direct_room_create_or_get_and_third_account_rejection() {
     assert_eq!(
         err,
         EngineError::DirectRoomThirdAccount(charlie().account_id)
+    );
+}
+
+#[test]
+fn sqlite_oversized_application_payload_is_rejected_without_persisting_log() {
+    let mut world = SqliteWorld::direct_room();
+    let err = store_engine_error(
+        world
+            .server
+            .append_event(finitechat_engine::AppendEventRequest {
+                room_id: world.room_id.clone(),
+                sender: alice(),
+                envelope: envelope(
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    alice(),
+                    0,
+                    LogEntryKind::Application,
+                    vec![0; MAX_ENVELOPE_PAYLOAD_BYTES as usize + 1],
+                ),
+                idempotency_key: "oversized_payload".to_string(),
+            })
+            .unwrap_err(),
+    );
+
+    assert!(matches!(
+        err,
+        EngineError::ProtocolLimit(ProtocolLimitError::BytesTooLong { field, .. })
+            if field == "envelope.payload"
+    ));
+    assert_eq!(room(&world.server, &world.room_id).log.len(), 0);
+    assert_eq!(room(&world.reopen(), &world.room_id).log.len(), 0);
+}
+
+#[test]
+fn sqlite_sync_events_returns_bounded_page_after_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    for index in 0..=MAX_SYNC_PAGE_ENTRIES {
+        world
+            .server
+            .append_event(finitechat_engine::AppendEventRequest {
+                room_id: world.room_id.clone(),
+                sender: alice(),
+                envelope: envelope(
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    alice(),
+                    0,
+                    LogEntryKind::Application,
+                    format!("small_{index}").into_bytes(),
+                ),
+                idempotency_key: format!("msg_{index}"),
+            })
+            .unwrap();
+    }
+
+    let reopened = world.reopen();
+    let entries = reopened.sync_events(&world.room_id, &alice(), 0).unwrap();
+
+    assert_eq!(entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
+    assert_eq!(entries.first().unwrap().seq, 1);
+    assert_eq!(
+        entries.last().unwrap().seq,
+        u64::from(MAX_SYNC_PAGE_ENTRIES)
+    );
+}
+
+#[test]
+fn sqlite_duplicate_message_id_is_typed_engine_error() {
+    let mut world = SqliteWorld::direct_room();
+    let first = finitechat_engine::AppendEventRequest {
+        room_id: world.room_id.clone(),
+        sender: alice(),
+        envelope: envelope(
+            world.room_id.clone(),
+            world.group_id.clone(),
+            alice(),
+            0,
+            LogEntryKind::Application,
+            b"same ciphertext".to_vec(),
+        ),
+        idempotency_key: "msg_first".to_string(),
+    };
+    let duplicate = finitechat_engine::AppendEventRequest {
+        idempotency_key: "msg_second".to_string(),
+        ..first.clone()
+    };
+    let message_id = first.envelope.message_id().unwrap();
+
+    world.server.append_event(first).unwrap();
+    let err = store_engine_error(world.server.append_event(duplicate).unwrap_err());
+
+    assert_eq!(err, EngineError::DuplicateMessageId(message_id));
+    assert_eq!(room(&world.reopen(), &world.room_id).log.len(), 1);
+}
+
+#[test]
+fn sqlite_link_payload_limit_is_rejected() {
+    let mut world = SqliteWorld::direct_room();
+    world
+        .server
+        .create_link_session("link_big", "pairing_key_1")
+        .unwrap();
+    let err = store_engine_error(
+        world
+            .server
+            .upload_link_payload(
+                "link_big",
+                vec![0; MAX_LINK_SESSION_PAYLOAD_BYTES as usize + 1],
+            )
+            .unwrap_err(),
+    );
+
+    assert!(matches!(
+        err,
+        EngineError::ProtocolLimit(ProtocolLimitError::BytesTooLong { field, .. })
+            if field == "link_session.encrypted_payload"
+    ));
+    assert!(
+        link_session(&world.server, "link_big")
+            .encrypted_payload
+            .is_none()
     );
 }

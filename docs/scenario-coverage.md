@@ -47,6 +47,10 @@ Each item below has a named test in
 - `local_pending_commit_is_not_merged_until_server_log_observed`
 - `fake_changed_leaf_credential_validation_uses_same_device_binding_rules`
 - `link_fanout_existing_device_stale_isolated_to_failed_room`
+- `oversized_application_payload_is_rejected_without_log_entry`
+- `sync_events_returns_bounded_page`
+- `duplicate_message_id_with_new_idempotency_key_is_rejected`
+- `direct_room_rejects_too_many_devices_for_one_account`
 
 ## Meaning Of Fake-MLS
 
@@ -84,6 +88,10 @@ Proven SQLite restart scenarios:
 - `sqlite_terminal_welcome_failure_keeps_interval_inactive`
 - `sqlite_link_session_state_machine_survives_reopen`
 - `sqlite_direct_room_create_or_get_and_third_account_rejection`
+- `sqlite_oversized_application_payload_is_rejected_without_persisting_log`
+- `sqlite_sync_events_returns_bounded_page_after_reopen`
+- `sqlite_duplicate_message_id_is_typed_engine_error`
+- `sqlite_link_payload_limit_is_rejected`
 
 The remaining SQLite-only expansion is a crash matrix that injects failure
 after each logical side effect and verifies recovery converges to one log entry,

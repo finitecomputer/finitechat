@@ -1,10 +1,11 @@
 use finitechat_engine::{
-    CreateDirectRoomRequest, DeliveryService, EngineError, LinkSessionState,
-    UploadKeyPackageRequest, envelope,
+    AppendEventRequest, CreateDirectRoomRequest, DeliveryService, EngineError, LinkSessionState,
+    SubmitCommitRequest, UploadKeyPackageRequest, device, envelope,
 };
 use finitechat_proto::{
-    KeyPackageState, LogEntryKind, MembershipAddV1, MembershipDeltaError, MembershipDeltaV1,
-    MembershipRemoveV1, RoomStatus, WelcomeState,
+    KeyPackageState, LogEntryKind, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaError, MembershipDeltaV1,
+    MembershipRemoveV1, ProtocolLimitError, RoomStatus, WelcomeState,
 };
 use finitechat_sim::{SimWorld, alice, bob, charlie, dana};
 
@@ -1035,4 +1036,179 @@ fn link_fanout_existing_device_stale_isolated_to_failed_room() {
     assert!(second_room.server.submit_commit(stale).is_err());
     assert!(first_room.server.welcome("welcome_bob_a").is_some());
     assert!(second_room.server.welcome("welcome_bob_b").is_none());
+}
+
+#[test]
+fn oversized_application_payload_is_rejected_without_log_entry() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = AppendEventRequest {
+        room_id: world.room_id.clone(),
+        sender: alice(),
+        envelope: envelope(
+            world.room_id.clone(),
+            world.group_id.clone(),
+            alice(),
+            0,
+            LogEntryKind::Application,
+            vec![0; MAX_ENVELOPE_PAYLOAD_BYTES as usize + 1],
+        ),
+        idempotency_key: "oversized_payload".to_string(),
+    };
+
+    let err = world.server.append_event(request).unwrap_err();
+
+    assert!(matches!(
+        err,
+        EngineError::ProtocolLimit(ProtocolLimitError::BytesTooLong { field, .. })
+            if field == "envelope.payload"
+    ));
+    assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 0);
+}
+
+#[test]
+fn sync_events_returns_bounded_page() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for index in 0..=MAX_SYNC_PAGE_ENTRIES {
+        world
+            .server
+            .append_event(world.app_message_request(
+                alice(),
+                0,
+                &format!("small_{index}"),
+                &format!("msg_{index}"),
+            ))
+            .unwrap();
+    }
+
+    let entries = world
+        .server
+        .sync_events(&world.room_id, &alice(), 0)
+        .unwrap();
+
+    assert_eq!(entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
+    assert_eq!(entries.first().unwrap().seq, 1);
+    assert_eq!(
+        entries.last().unwrap().seq,
+        u64::from(MAX_SYNC_PAGE_ENTRIES)
+    );
+}
+
+#[test]
+fn duplicate_message_id_with_new_idempotency_key_is_rejected() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let first = world.app_message_request(alice(), 0, "same ciphertext", "msg_first");
+    let duplicate = world.app_message_request(alice(), 0, "same ciphertext", "msg_second");
+    let message_id = first.envelope.message_id().unwrap();
+
+    world.server.append_event(first).unwrap();
+    let err = world.server.append_event(duplicate).unwrap_err();
+
+    assert_eq!(err, EngineError::DuplicateMessageId(message_id));
+    assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 1);
+}
+
+#[test]
+fn direct_room_rejects_too_many_devices_for_one_account() {
+    let mut server = DeliveryService::new();
+    let room_id = server
+        .create_or_get_direct_room(CreateDirectRoomRequest {
+            room_id: "direct_ab".to_string(),
+            mls_group_id: "mls_ab".to_string(),
+            creator: alice(),
+            other_account_id: bob().account_id,
+        })
+        .unwrap();
+
+    for index in 0..MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT {
+        let target = device("bob_npub", format!("bob_device_{index}"));
+        let key_package_id = format!("kp_bob_{index}");
+        server
+            .upload_key_package(UploadKeyPackageRequest {
+                key_package_id: key_package_id.clone(),
+                owner: target.clone(),
+                key_package_ref: format!("ref_{key_package_id}"),
+                key_package_hash: format!("hash_{key_package_id}"),
+            })
+            .unwrap();
+        server.claim_key_package(&key_package_id).unwrap();
+        let commit = envelope(
+            room_id.clone(),
+            "mls_ab",
+            alice(),
+            u64::from(index),
+            LogEntryKind::Commit,
+            format!("add_bob_{index}").into_bytes(),
+        );
+        let commit_message_id = commit.message_id().unwrap();
+        server
+            .submit_commit(SubmitCommitRequest {
+                room_id: room_id.clone(),
+                sender: alice(),
+                expected_epoch: u64::from(index),
+                envelope: commit,
+                membership_delta: MembershipDeltaV1 {
+                    base_epoch: u64::from(index),
+                    post_commit_epoch: u64::from(index) + 1,
+                    commit_message_id,
+                    adds: vec![MembershipAddV1 {
+                        device: target,
+                        key_package_id: key_package_id.clone(),
+                        key_package_ref: format!("ref_{key_package_id}"),
+                        key_package_hash: format!("hash_{key_package_id}"),
+                        welcome_id: format!("welcome_bob_{index}"),
+                    }],
+                    removes: vec![],
+                },
+                idempotency_key: format!("add_bob_{index}"),
+            })
+            .unwrap();
+    }
+
+    let overflow = device("bob_npub", "bob_device_overflow");
+    server
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: "kp_bob_overflow".to_string(),
+            owner: overflow.clone(),
+            key_package_ref: "ref_kp_bob_overflow".to_string(),
+            key_package_hash: "hash_kp_bob_overflow".to_string(),
+        })
+        .unwrap();
+    server.claim_key_package("kp_bob_overflow").unwrap();
+    let commit = envelope(
+        room_id.clone(),
+        "mls_ab",
+        alice(),
+        u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
+        LogEntryKind::Commit,
+        b"add_bob_overflow".to_vec(),
+    );
+    let commit_message_id = commit.message_id().unwrap();
+    let err = server
+        .submit_commit(SubmitCommitRequest {
+            room_id,
+            sender: alice(),
+            expected_epoch: u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
+            envelope: commit,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
+                post_commit_epoch: u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT) + 1,
+                commit_message_id,
+                adds: vec![MembershipAddV1 {
+                    device: overflow,
+                    key_package_id: "kp_bob_overflow".to_string(),
+                    key_package_ref: "ref_kp_bob_overflow".to_string(),
+                    key_package_hash: "hash_kp_bob_overflow".to_string(),
+                    welcome_id: "welcome_bob_overflow".to_string(),
+                }],
+                removes: vec![],
+            },
+            idempotency_key: "add_bob_overflow".to_string(),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        EngineError::ProtocolLimit(ProtocolLimitError::TooManyItems { field, .. })
+            if field == "direct_room.devices_per_account"
+    ));
 }

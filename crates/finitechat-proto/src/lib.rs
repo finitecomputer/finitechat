@@ -18,6 +18,28 @@ pub type Epoch = u64;
 pub type Seq = u64;
 
 pub const MESSAGE_ID_DOMAIN: &[u8] = b"finite-message-id-v1";
+pub const MAX_ENVELOPE_PAYLOAD_BYTES: u32 = 256 * 1024;
+pub const MAX_SYNC_PAGE_ENTRIES: u32 = 100;
+pub const MAX_SYNC_PAGE_BYTES: u32 = 4 * 1024 * 1024;
+pub const MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT: u32 = 8;
+pub const MAX_WELCOME_CLAIMS_PER_REQUEST: u32 = 32;
+pub const MAX_LINK_SESSION_PAYLOAD_BYTES: u32 = 1024 * 1024;
+pub const MAX_IDEMPOTENCY_KEY_BYTES: u32 = 128;
+pub const MAX_ACCOUNT_ID_BYTES: u32 = 128;
+pub const MAX_DEVICE_ID_BYTES: u32 = 128;
+pub const MAX_ROOM_ID_BYTES: u32 = 128;
+pub const MAX_MLS_GROUP_ID_BYTES: u32 = 128;
+pub const MAX_OBJECT_ID_BYTES: u32 = 128;
+
+const _: () = {
+    assert!(MAX_ENVELOPE_PAYLOAD_BYTES > 0);
+    assert!(MAX_SYNC_PAGE_ENTRIES > 0);
+    assert!(MAX_SYNC_PAGE_BYTES >= MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT > 0);
+    assert!(MAX_WELCOME_CLAIMS_PER_REQUEST > 0);
+    assert!(MAX_LINK_SESSION_PAYLOAD_BYTES > 0);
+    assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeviceRef {
@@ -31,6 +53,12 @@ impl DeviceRef {
             account_id: account_id.into(),
             device_id: device_id.into(),
         }
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_string_bytes("account_id", &self.account_id, MAX_ACCOUNT_ID_BYTES)?;
+        validate_string_bytes("device_id", &self.device_id, MAX_DEVICE_ID_BYTES)?;
+        Ok(())
     }
 }
 
@@ -64,6 +92,18 @@ pub struct FiniteEnvelope {
 impl FiniteEnvelope {
     pub fn message_id(&self) -> Result<MessageId, serde_json::Error> {
         message_id_for_envelope(self)
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        self.sender.validate_limits()?;
+        validate_bytes_len(
+            "envelope.payload",
+            self.payload.len(),
+            MAX_ENVELOPE_PAYLOAD_BYTES,
+        )?;
+        Ok(())
     }
 }
 
@@ -158,6 +198,24 @@ impl MembershipDeltaV1 {
 
         Ok(())
     }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        for add in &self.adds {
+            add.device.validate_limits()?;
+            validate_string_bytes("key_package_id", &add.key_package_id, MAX_OBJECT_ID_BYTES)?;
+            validate_string_bytes("key_package_ref", &add.key_package_ref, MAX_OBJECT_ID_BYTES)?;
+            validate_string_bytes(
+                "key_package_hash",
+                &add.key_package_hash,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+            validate_string_bytes("welcome_id", &add.welcome_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        for remove in &self.removes {
+            remove.device.validate_limits()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +269,75 @@ pub struct RoomLogEntry {
     pub epoch: Epoch,
     pub envelope: FiniteEnvelope,
     pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ProtocolLimitError {
+    #[error("{field} has {actual_bytes} bytes, max {max_bytes}")]
+    BytesTooLong {
+        field: String,
+        max_bytes: u64,
+        actual_bytes: u64,
+    },
+    #[error("{field} has {actual_items} items, max {max_items}")]
+    TooManyItems {
+        field: String,
+        max_items: u64,
+        actual_items: u64,
+    },
+}
+
+pub fn validate_room_id(room_id: &str) -> Result<(), ProtocolLimitError> {
+    validate_string_bytes("room_id", room_id, MAX_ROOM_ID_BYTES)
+}
+
+pub fn validate_mls_group_id(mls_group_id: &str) -> Result<(), ProtocolLimitError> {
+    validate_string_bytes("mls_group_id", mls_group_id, MAX_MLS_GROUP_ID_BYTES)
+}
+
+pub fn validate_idempotency_key(key: &str) -> Result<(), ProtocolLimitError> {
+    validate_string_bytes("idempotency_key", key, MAX_IDEMPOTENCY_KEY_BYTES)
+}
+
+pub fn validate_string_bytes(
+    field: &str,
+    value: &str,
+    max_bytes: u32,
+) -> Result<(), ProtocolLimitError> {
+    validate_bytes_len(field, value.len(), max_bytes)
+}
+
+pub fn validate_bytes_len(
+    field: &str,
+    actual_bytes: usize,
+    max_bytes: u32,
+) -> Result<(), ProtocolLimitError> {
+    if actual_bytes <= max_bytes as usize {
+        Ok(())
+    } else {
+        Err(ProtocolLimitError::BytesTooLong {
+            field: field.to_string(),
+            max_bytes: u64::from(max_bytes),
+            actual_bytes: actual_bytes as u64,
+        })
+    }
+}
+
+pub fn validate_item_count(
+    field: &str,
+    actual_items: usize,
+    max_items: u32,
+) -> Result<(), ProtocolLimitError> {
+    if actual_items <= max_items as usize {
+        Ok(())
+    } else {
+        Err(ProtocolLimitError::TooManyItems {
+            field: field.to_string(),
+            max_items: u64::from(max_items),
+            actual_items: actual_items as u64,
+        })
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

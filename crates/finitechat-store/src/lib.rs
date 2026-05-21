@@ -10,7 +10,10 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
-    MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
+    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState, validate_bytes_len,
+    validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -87,6 +90,7 @@ impl SqliteDeliveryStore {
     }
 
     pub fn create_room(&mut self, request: CreateRoomRequest) -> Result<(), StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
             if room_exists(tx, &request.room_id)? {
                 return Err(EngineError::RoomAlreadyExists(request.room_id).into());
@@ -108,6 +112,7 @@ impl SqliteDeliveryStore {
         &mut self,
         request: CreateDirectRoomRequest,
     ) -> Result<RoomId, StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
             let account_pair =
                 direct_room_key(&request.creator.account_id, &request.other_account_id);
@@ -140,6 +145,7 @@ impl SqliteDeliveryStore {
         &mut self,
         request: UploadKeyPackageRequest,
     ) -> Result<(), StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
             if load_key_package(tx, &request.key_package_id)?.is_some() {
                 return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id).into());
@@ -168,6 +174,8 @@ impl SqliteDeliveryStore {
         &mut self,
         key_package_id: &str,
     ) -> Result<ClaimKeyPackageResult, StoreError> {
+        validate_string_bytes("key_package_id", key_package_id, MAX_OBJECT_ID_BYTES)
+            .map_err(EngineError::from)?;
         let key_package_id = key_package_id.to_string();
         self.with_transaction(|tx| {
             let package = load_key_package_required(tx, &key_package_id)?;
@@ -206,6 +214,7 @@ impl SqliteDeliveryStore {
         &mut self,
         request: AppendEventRequest,
     ) -> Result<EventAccepted, StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
         if request.envelope.kind == LogEntryKind::Commit {
             return Err(EngineError::WrongEnvelopeKind {
                 expected: LogEntryKind::Application,
@@ -244,6 +253,7 @@ impl SqliteDeliveryStore {
         &mut self,
         request: SubmitCommitRequest,
     ) -> Result<CommitAccepted, StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
         self.with_replayable_engine_result(|tx| {
             let request_hash = request_hash(&request)?;
             let scope_key = idempotency_scope_key(
@@ -271,6 +281,7 @@ impl SqliteDeliveryStore {
     }
 
     pub fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, StoreError> {
+        device.validate_limits().map_err(EngineError::from)?;
         let device = device.clone();
         self.with_transaction(|tx| {
             let mut claimed = Vec::new();
@@ -383,16 +394,28 @@ impl SqliteDeliveryStore {
         requester: &DeviceRef,
         after_seq: Seq,
     ) -> Result<Vec<RoomLogEntry>, StoreError> {
+        validate_room_id(room_id).map_err(EngineError::from)?;
+        requester.validate_limits().map_err(EngineError::from)?;
         let conn = self.connect()?;
         let room = load_room(&conn, room_id)?
             .ok_or_else(|| EngineError::RoomNotFound(room_id.to_string()))?;
-        let entries = room
-            .log
-            .iter()
-            .filter(|entry| entry.seq > after_seq)
-            .filter(|entry| room.device_was_member_for_seq(requester, entry.seq))
-            .cloned()
-            .collect();
+        let mut entries = Vec::with_capacity(MAX_SYNC_PAGE_ENTRIES as usize);
+        let mut page_bytes = 0usize;
+        for entry in room.log.iter().filter(|entry| entry.seq > after_seq) {
+            if room.device_was_member_for_seq(requester, entry.seq) {
+                if entries.len() >= MAX_SYNC_PAGE_ENTRIES as usize {
+                    break;
+                }
+                let next_page_bytes = page_bytes.saturating_add(entry.envelope.payload.len());
+                if next_page_bytes > MAX_SYNC_PAGE_BYTES as usize {
+                    break;
+                }
+                page_bytes = next_page_bytes;
+                entries.push(entry.clone());
+            }
+        }
+        debug_assert!(entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
+        debug_assert!(page_bytes <= MAX_SYNC_PAGE_BYTES as usize);
         Ok(entries)
     }
 
@@ -403,6 +426,14 @@ impl SqliteDeliveryStore {
     ) -> Result<(), StoreError> {
         let link_session_id = link_session_id.into();
         let pairing_public_key = pairing_public_key.into();
+        validate_string_bytes("link_session_id", &link_session_id, MAX_OBJECT_ID_BYTES)
+            .map_err(EngineError::from)?;
+        validate_string_bytes(
+            "pairing_public_key",
+            &pairing_public_key,
+            MAX_OBJECT_ID_BYTES,
+        )
+        .map_err(EngineError::from)?;
         self.with_transaction(|tx| {
             if load_link_session(tx, &link_session_id)?.is_some() {
                 return Err(EngineError::LinkSessionAlreadyExists(link_session_id).into());
@@ -428,6 +459,14 @@ impl SqliteDeliveryStore {
         link_session_id: &str,
         encrypted_payload: Vec<u8>,
     ) -> Result<(), StoreError> {
+        validate_string_bytes("link_session_id", link_session_id, MAX_OBJECT_ID_BYTES)
+            .map_err(EngineError::from)?;
+        validate_bytes_len(
+            "link_session.encrypted_payload",
+            encrypted_payload.len(),
+            MAX_LINK_SESSION_PAYLOAD_BYTES,
+        )
+        .map_err(EngineError::from)?;
         let link_session_id = link_session_id.to_string();
         self.with_transaction(|tx| {
             let session = load_link_session_required(tx, &link_session_id)?;
@@ -732,6 +771,8 @@ fn release_key_package_lease(
     store: &mut SqliteDeliveryStore,
     key_package_id: &str,
 ) -> Result<(), StoreError> {
+    validate_string_bytes("key_package_id", key_package_id, MAX_OBJECT_ID_BYTES)
+        .map_err(EngineError::from)?;
     let key_package_id = key_package_id.to_string();
     store.with_transaction(|tx| {
         let package = load_key_package_required(tx, &key_package_id)?;
@@ -766,6 +807,9 @@ fn append_event_inner(
     }
 
     let message_id = request.envelope.message_id()?;
+    if message_id_exists(tx, &request.room_id, &message_id)? {
+        return Ok(Err(EngineError::DuplicateMessageId(message_id)));
+    }
     let seq = room.last_seq + 1;
     insert_log_entry(
         tx,
@@ -799,6 +843,11 @@ fn submit_commit_inner(
     }
     if let Err(error) = validate_commit_key_packages(tx, &room, request) {
         return Ok(Err(error));
+    }
+    if message_id_exists(tx, &request.room_id, &actual_commit_message_id)? {
+        return Ok(Err(EngineError::DuplicateMessageId(
+            actual_commit_message_id,
+        )));
     }
 
     let seq = room.last_seq + 1;
@@ -913,6 +962,8 @@ fn validate_commit_key_packages(
     request: &SubmitCommitRequest,
 ) -> Result<(), EngineError> {
     let mut seen_packages = std::collections::BTreeSet::new();
+    let mut added_direct_room_devices_by_account =
+        std::collections::BTreeMap::<AccountId, usize>::new();
     for add in &request.membership_delta.adds {
         if let Some((left, right)) = &room.direct_accounts
             && add.device.account_id != *left
@@ -921,6 +972,19 @@ fn validate_commit_key_packages(
             return Err(EngineError::DirectRoomThirdAccount(
                 add.device.account_id.clone(),
             ));
+        }
+        if room.direct_accounts.is_some() {
+            let current_devices =
+                room.current_or_pending_device_count_for_account(&add.device.account_id);
+            let added_devices = added_direct_room_devices_by_account
+                .entry(add.device.account_id.clone())
+                .or_insert(0);
+            *added_devices += 1;
+            finitechat_proto::validate_item_count(
+                "direct_room.devices_per_account",
+                current_devices + *added_devices,
+                MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+            )?;
         }
         if !seen_packages.insert(add.key_package_id.clone()) {
             return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()));
@@ -1194,6 +1258,22 @@ fn direct_room_id(conn: &Connection, direct_key: &str) -> Result<Option<RoomId>,
     Ok(room_id)
 }
 
+fn message_id_exists(
+    conn: &Connection,
+    room_id: &str,
+    message_id: &str,
+) -> Result<bool, StoreError> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM room_log_entries WHERE room_id = ?1 AND message_id = ?2",
+            params![room_id, message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
 fn load_room(conn: &Connection, room_id: &str) -> Result<Option<RoomRecord>, StoreError> {
     let Some(header) = load_room_header(conn, room_id)? else {
         return Ok(None);
@@ -1448,12 +1528,14 @@ fn load_released_welcomes_for_device(
           AND recipient_device_id = ?2
           AND state = ?3
         ORDER BY room_id, commit_seq, welcome_id
+        LIMIT ?4
         "#,
     )?;
     let mut rows = statement.query(params![
         device.account_id,
         device.device_id,
         encode_welcome_state(WelcomeState::Released),
+        i64::from(MAX_WELCOME_CLAIMS_PER_REQUEST),
     ])?;
     let mut welcomes = Vec::new();
     while let Some(row) = rows.next()? {

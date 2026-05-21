@@ -1,8 +1,11 @@
 use finitechat_proto::{
     AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
-    KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind, MembershipDeltaError,
-    MembershipDeltaV1, MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeId,
-    WelcomeState,
+    KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST,
+    MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
+    RoomLogEntry, RoomStatus, Seq, WelcomeId, WelcomeState, validate_bytes_len,
+    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -155,6 +158,68 @@ pub struct EventAccepted {
     pub message_id: MessageId,
 }
 
+impl CreateRoomRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        self.creator.validate_limits()?;
+        Ok(())
+    }
+}
+
+impl CreateDirectRoomRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        self.creator.validate_limits()?;
+        validate_string_bytes(
+            "other_account_id",
+            &self.other_account_id,
+            finitechat_proto::MAX_ACCOUNT_ID_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl UploadKeyPackageRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_string_bytes("key_package_id", &self.key_package_id, MAX_OBJECT_ID_BYTES)?;
+        self.owner.validate_limits()?;
+        validate_string_bytes(
+            "key_package_ref",
+            &self.key_package_ref,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_string_bytes(
+            "key_package_hash",
+            &self.key_package_hash,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl AppendEventRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        self.sender.validate_limits()?;
+        self.envelope.validate_limits()?;
+        validate_idempotency_key(&self.idempotency_key)?;
+        Ok(())
+    }
+}
+
+impl SubmitCommitRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        self.sender.validate_limits()?;
+        self.envelope.validate_limits()?;
+        self.membership_delta.validate_limits()?;
+        validate_idempotency_key(&self.idempotency_key)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 enum IdempotencyResponse {
@@ -190,6 +255,7 @@ impl DeliveryService {
     }
 
     pub fn create_room(&mut self, request: CreateRoomRequest) -> Result<(), EngineError> {
+        request.validate_limits()?;
         if self.rooms.contains_key(&request.room_id) {
             return Err(EngineError::RoomAlreadyExists(request.room_id));
         }
@@ -226,6 +292,7 @@ impl DeliveryService {
         &mut self,
         request: CreateDirectRoomRequest,
     ) -> Result<RoomId, EngineError> {
+        request.validate_limits()?;
         let key = direct_room_key(&request.creator.account_id, &request.other_account_id);
         let direct_key = direct_room_key_string(&key);
         if let Some(room_id) = self.direct_rooms.get(&direct_key) {
@@ -269,6 +336,7 @@ impl DeliveryService {
         &mut self,
         request: UploadKeyPackageRequest,
     ) -> Result<(), EngineError> {
+        request.validate_limits()?;
         if self.key_packages.contains_key(&request.key_package_id) {
             return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id));
         }
@@ -290,6 +358,7 @@ impl DeliveryService {
         &mut self,
         key_package_id: &str,
     ) -> Result<ClaimKeyPackageResult, EngineError> {
+        validate_string_bytes("key_package_id", key_package_id, MAX_OBJECT_ID_BYTES)?;
         let package = self
             .key_packages
             .get_mut(key_package_id)
@@ -310,6 +379,7 @@ impl DeliveryService {
     }
 
     pub fn release_key_package_lease(&mut self, key_package_id: &str) -> Result<(), EngineError> {
+        validate_string_bytes("key_package_id", key_package_id, MAX_OBJECT_ID_BYTES)?;
         let package = self
             .key_packages
             .get_mut(key_package_id)
@@ -333,6 +403,7 @@ impl DeliveryService {
         &mut self,
         request: AppendEventRequest,
     ) -> Result<EventAccepted, EngineError> {
+        request.validate_limits()?;
         if request.envelope.kind == LogEntryKind::Commit {
             return Err(EngineError::WrongEnvelopeKind {
                 expected: LogEntryKind::Application,
@@ -372,6 +443,7 @@ impl DeliveryService {
         &mut self,
         request: SubmitCommitRequest,
     ) -> Result<CommitAccepted, EngineError> {
+        request.validate_limits()?;
         let request_hash = request_hash(&request)?;
         let scope = idempotency_scope_key(
             &request.room_id,
@@ -424,6 +496,9 @@ impl DeliveryService {
         }
 
         let message_id = request.envelope.message_id()?;
+        if room.log.iter().any(|entry| entry.message_id == message_id) {
+            return Err(EngineError::DuplicateMessageId(message_id));
+        }
         let seq = room.last_seq + 1;
         room.last_seq = seq;
         room.log.push(RoomLogEntry {
@@ -472,6 +547,13 @@ impl DeliveryService {
         }
         if !room.device_active_at_head(&request.sender) {
             return Err(EngineError::SenderNotActive(request.sender));
+        }
+        if room
+            .log
+            .iter()
+            .any(|entry| entry.message_id == actual_commit_message_id)
+        {
+            return Err(EngineError::DuplicateMessageId(actual_commit_message_id));
         }
 
         self.validate_commit_key_packages(room, &request.membership_delta)?;
@@ -549,6 +631,9 @@ impl DeliveryService {
     pub fn claim_welcomes(&mut self, device: &DeviceRef) -> Vec<WelcomeRecord> {
         let mut claimed = Vec::new();
         for welcome in self.welcomes.values_mut() {
+            if claimed.len() >= MAX_WELCOME_CLAIMS_PER_REQUEST as usize {
+                break;
+            }
             if &welcome.recipient == device && welcome.state == WelcomeState::Released {
                 welcome.state = WelcomeState::Claimed;
                 claimed.push(welcome.clone());
@@ -616,16 +701,29 @@ impl DeliveryService {
         requester: &DeviceRef,
         after_seq: Seq,
     ) -> Result<Vec<RoomLogEntry>, EngineError> {
+        validate_room_id(room_id)?;
+        requester.validate_limits()?;
         let room = self
             .rooms
             .get(room_id)
             .ok_or_else(|| EngineError::RoomNotFound(room_id.to_string()))?;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(MAX_SYNC_PAGE_ENTRIES as usize);
+        let mut page_bytes = 0usize;
         for entry in room.log.iter().filter(|entry| entry.seq > after_seq) {
             if room.device_was_member_for_seq(requester, entry.seq) {
+                if entries.len() >= MAX_SYNC_PAGE_ENTRIES as usize {
+                    break;
+                }
+                let next_page_bytes = page_bytes.saturating_add(entry.envelope.payload.len());
+                if next_page_bytes > MAX_SYNC_PAGE_BYTES as usize {
+                    break;
+                }
+                page_bytes = next_page_bytes;
                 entries.push(entry.clone());
             }
         }
+        debug_assert!(entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
+        debug_assert!(page_bytes <= MAX_SYNC_PAGE_BYTES as usize);
         Ok(entries)
     }
 
@@ -635,6 +733,13 @@ impl DeliveryService {
         pairing_public_key: impl Into<String>,
     ) -> Result<(), EngineError> {
         let link_session_id = link_session_id.into();
+        let pairing_public_key = pairing_public_key.into();
+        validate_string_bytes("link_session_id", &link_session_id, MAX_OBJECT_ID_BYTES)?;
+        validate_string_bytes(
+            "pairing_public_key",
+            &pairing_public_key,
+            MAX_OBJECT_ID_BYTES,
+        )?;
         if self.link_sessions.contains_key(&link_session_id) {
             return Err(EngineError::LinkSessionAlreadyExists(link_session_id));
         }
@@ -642,7 +747,7 @@ impl DeliveryService {
             link_session_id.clone(),
             LinkSessionRecord {
                 link_session_id,
-                pairing_public_key: pairing_public_key.into(),
+                pairing_public_key,
                 encrypted_payload: None,
                 state: LinkSessionState::Created,
                 claim_token: None,
@@ -656,6 +761,12 @@ impl DeliveryService {
         link_session_id: &str,
         encrypted_payload: Vec<u8>,
     ) -> Result<(), EngineError> {
+        validate_string_bytes("link_session_id", link_session_id, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_len(
+            "link_session.encrypted_payload",
+            encrypted_payload.len(),
+            MAX_LINK_SESSION_PAYLOAD_BYTES,
+        )?;
         let session = self
             .link_sessions
             .get_mut(link_session_id)
@@ -755,6 +866,7 @@ impl DeliveryService {
         delta: &MembershipDeltaV1,
     ) -> Result<(), EngineError> {
         let mut seen_packages = BTreeSet::new();
+        let mut added_direct_room_devices_by_account = BTreeMap::<AccountId, usize>::new();
         for add in &delta.adds {
             if let Some((left, right)) = &room.direct_accounts
                 && add.device.account_id != *left
@@ -763,6 +875,19 @@ impl DeliveryService {
                 return Err(EngineError::DirectRoomThirdAccount(
                     add.device.account_id.clone(),
                 ));
+            }
+            if room.direct_accounts.is_some() {
+                let current_devices =
+                    room.current_or_pending_device_count_for_account(&add.device.account_id);
+                let added_devices = added_direct_room_devices_by_account
+                    .entry(add.device.account_id.clone())
+                    .or_insert(0);
+                *added_devices += 1;
+                finitechat_proto::validate_item_count(
+                    "direct_room.devices_per_account",
+                    current_devices + *added_devices,
+                    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+                )?;
             }
             if !seen_packages.insert(add.key_package_id.clone()) {
                 return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()));
@@ -819,6 +944,19 @@ impl RoomRecord {
             .unwrap_or(false)
     }
 
+    pub fn current_or_pending_device_count_for_account(&self, account_id: &str) -> usize {
+        self.membership
+            .values()
+            .filter(|membership| membership.device.account_id == account_id)
+            .filter(|membership| {
+                membership
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.end_seq.is_none())
+            })
+            .count()
+    }
+
     fn close_active_interval(&mut self, device: &DeviceRef, seq: Seq) {
         if let Some(membership) = self.membership.get_mut(&device_membership_key(device))
             && let Some(interval) = membership
@@ -867,6 +1005,8 @@ pub enum EngineError {
     KeyPackageRefMismatch(KeyPackageId),
     #[error("duplicate key package in commit: {0}")]
     DuplicateKeyPackage(KeyPackageId),
+    #[error("duplicate message id in room log: {0}")]
+    DuplicateMessageId(MessageId),
     #[error("welcome not found: {0}")]
     WelcomeNotFound(WelcomeId),
     #[error("welcome is not claimed: {0}")]
@@ -904,6 +1044,8 @@ pub enum EngineError {
     BadLinkSessionClaimToken,
     #[error("direct room cannot add third account: {0}")]
     DirectRoomThirdAccount(AccountId),
+    #[error(transparent)]
+    ProtocolLimit(#[from] ProtocolLimitError),
     #[error(transparent)]
     MembershipDelta(#[from] MembershipDeltaError),
     #[error("json serialization failed: {0}")]
