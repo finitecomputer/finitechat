@@ -391,3 +391,6 @@ coverage before the room server owns push fanout:
 - `ephemeral_activity_epoch_mismatch_drops_without_repair`
 - `ephemeral_activity_routes_by_optional_conversation_id`
 - `conversation_id_does_not_authorize_cross_room_activity`
+- `activity_projection_keeps_devices_separate`
+- `activity_projection_rolls_up_identity_for_normal_ui`
+- `activity_projection_does_not_clear_sibling_device_activity`

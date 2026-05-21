@@ -116,6 +116,9 @@ durable sends.
 - `conversation_id` is optional server-visible routing/index metadata scoped to
   a room. It must not grant access, define identity, replace MLS membership, or
   carry activity semantics.
+- Client activity projection state is keyed by device first, then rolled up for
+  identity-level UX. A specific device can be active without every device for
+  that account or agent becoming active.
 
 ## V1 Limits
 
@@ -333,6 +336,13 @@ membership cache before forwarding or caching it. This check is not identity
 proof; clients still verify Nostr-rooted MLS credentials locally. It only keeps
 non-members, pending devices, and removed or revoked devices from creating live
 room activity.
+
+After decryption, clients project activity by
+`(room_id, conversation_id, account_id, device_id, activity_kind)`. Normal UI
+may roll this up to an identity-level display such as "Alice is typing" or
+"Runtime is working", but device remains the source of truth. Device-specific
+views can expose the exact active device when that matters, such as targeting a
+runtime device with GPU access.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
