@@ -1,5 +1,7 @@
 use finitechat_client::{ClientError, FiniteChatDevice, FiniteChatDeviceConfig};
-use finitechat_engine::{AppendEventRequest, DeliveryService, EngineError, envelope};
+use finitechat_engine::{
+    AppendEventRequest, DeliveryService, EngineError, EventAccepted, envelope,
+};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::LogEntryKind;
 
@@ -252,6 +254,31 @@ fn multi_device_invite_late_joiner_catches_up_to_new_messages() {
 }
 
 #[test]
+fn multi_device_real_mls_ordering_matrix_validates_late_catch_up() {
+    let activation_orders = [
+        ["alice_browser", "alice_phone", "alice_tablet"],
+        ["alice_browser", "alice_tablet", "alice_phone"],
+        ["alice_phone", "alice_browser", "alice_tablet"],
+        ["alice_phone", "alice_tablet", "alice_browser"],
+        ["alice_tablet", "alice_browser", "alice_phone"],
+        ["alice_tablet", "alice_phone", "alice_browser"],
+    ];
+    let message_patterns = [[2, 1, 1, 1], [0, 3, 1, 2], [4, 0, 2, 1], [1, 2, 0, 3]];
+
+    let mut scenario_index = 0usize;
+    for activation_order in activation_orders {
+        for message_pattern in message_patterns {
+            scenario_index += 1;
+            run_real_mls_multi_device_ordering_scenario(
+                scenario_index,
+                activation_order,
+                message_pattern,
+            );
+        }
+    }
+}
+
+#[test]
 fn client_refuses_to_merge_pending_commit_before_server_observation() {
     let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
     let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
@@ -419,5 +446,276 @@ fn fake_application_request(
             b"not an MLS ciphertext".to_vec(),
         ),
         idempotency_key: idempotency_key.to_string(),
+    }
+}
+
+struct ScenarioAliceDevice {
+    device: FiniteChatDevice,
+    welcome_id: String,
+    cursor: u64,
+    decrypted_count: usize,
+}
+
+#[derive(Debug)]
+struct SentPlaintext {
+    seq: u64,
+    plaintext: Vec<u8>,
+}
+
+fn run_real_mls_multi_device_ordering_scenario(
+    scenario_index: usize,
+    activation_order: [&str; 3],
+    message_pattern: [usize; 4],
+) {
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
+    let mut server = DeliveryService::new();
+    let mut alice_devices = vec![
+        ScenarioAliceDevice {
+            device: test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser"),
+            welcome_id: String::new(),
+            cursor: 0,
+            decrypted_count: 0,
+        },
+        ScenarioAliceDevice {
+            device: test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone"),
+            welcome_id: String::new(),
+            cursor: 0,
+            decrypted_count: 0,
+        },
+        ScenarioAliceDevice {
+            device: test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_tablet"),
+            welcome_id: String::new(),
+            cursor: 0,
+            decrypted_count: 0,
+        },
+    ];
+
+    server
+        .create_or_get_direct_room(bob.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            alice_devices[0].device.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    bob.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    for alice_device in &alice_devices {
+        server
+            .upload_key_package(
+                alice_device
+                    .device
+                    .upload_key_package_request(format!(
+                        "kp_{}_{}",
+                        alice_device.device.device_ref().device_id,
+                        scenario_index
+                    ))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    let claimed_key_packages = server
+        .claim_key_packages_for_account(&alice_devices[0].device.device_ref().account_id)
+        .unwrap();
+    assert_eq!(claimed_key_packages.len(), alice_devices.len());
+    let welcome_ids = claimed_key_packages
+        .iter()
+        .map(|claim| format!("welcome_{}_{}", claim.owner.device_id, scenario_index))
+        .collect::<Vec<_>>();
+    for alice_device in &mut alice_devices {
+        alice_device.welcome_id = welcome_ids
+            .iter()
+            .zip(&claimed_key_packages)
+            .find(|(_, claim)| claim.owner == *alice_device.device.device_ref())
+            .map(|(welcome_id, _)| welcome_id.clone())
+            .unwrap();
+    }
+
+    let prepared = bob
+        .prepare_add_members_commit(
+            ROOM_ID,
+            &claimed_key_packages,
+            &welcome_ids,
+            format!("invite_all_alice_devices_{scenario_index}"),
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let bob_page = server.sync_events(ROOM_ID, bob.device_ref(), 0).unwrap();
+    bob.merge_pending_commit_from_log(ROOM_ID, &bob_page.entries, &prepared.message_id)
+        .unwrap();
+    for alice_device in &mut alice_devices {
+        alice_device.cursor = accepted.seq;
+    }
+
+    let mut sent_plaintexts = Vec::new();
+    let mut next_message_index = 0usize;
+    send_bob_messages(
+        &mut server,
+        &mut bob,
+        scenario_index,
+        &mut next_message_index,
+        message_pattern[0],
+        &mut sent_plaintexts,
+    );
+    assert_pending_devices_can_sync_but_not_send(&mut server, &alice_devices, &sent_plaintexts);
+
+    for activation_step in 0..activation_order.len() {
+        let device_index = alice_devices
+            .iter()
+            .position(|alice_device| {
+                alice_device.device.device_ref().device_id == activation_order[activation_step]
+            })
+            .unwrap();
+        let alice_device = &mut alice_devices[device_index];
+        let join_seq = claim_and_activate(
+            &mut server,
+            &mut alice_device.device,
+            &alice_device.welcome_id,
+        );
+        assert_eq!(join_seq, accepted.seq);
+        drain_device_messages(&server, alice_device, &sent_plaintexts);
+
+        send_bob_messages(
+            &mut server,
+            &mut bob,
+            scenario_index,
+            &mut next_message_index,
+            message_pattern[activation_step + 1],
+            &mut sent_plaintexts,
+        );
+        for alice_device in alice_devices.iter_mut().filter(|alice_device| {
+            alice_device
+                .device
+                .group_epoch(ROOM_ID)
+                .is_ok_and(|epoch| epoch == 1)
+        }) {
+            drain_device_messages(&server, alice_device, &sent_plaintexts);
+        }
+        assert_pending_devices_can_sync_but_not_send(&mut server, &alice_devices, &sent_plaintexts);
+    }
+
+    assert_eq!(
+        server.room(ROOM_ID).unwrap().last_seq,
+        1 + sent_plaintexts.len() as u64
+    );
+    for alice_device in &mut alice_devices {
+        drain_device_messages(&server, alice_device, &sent_plaintexts);
+        assert_eq!(alice_device.decrypted_count, sent_plaintexts.len());
+        assert_eq!(alice_device.cursor, server.room(ROOM_ID).unwrap().last_seq);
+    }
+}
+
+fn send_bob_messages(
+    server: &mut DeliveryService,
+    bob: &mut FiniteChatDevice,
+    scenario_index: usize,
+    next_message_index: &mut usize,
+    count: usize,
+    sent_plaintexts: &mut Vec<SentPlaintext>,
+) {
+    for _ in 0..count {
+        *next_message_index += 1;
+        let plaintext = format!(
+            r#"{{"type":"finitecomputer.command.v1","body":{{"scenario":{scenario_index},"message":{}}}}}"#,
+            *next_message_index
+        )
+        .into_bytes();
+        let request = bob
+            .create_application_request(
+                ROOM_ID,
+                &plaintext,
+                format!("bob_msg_{scenario_index}_{}", *next_message_index),
+            )
+            .unwrap();
+        let accepted = server.append_event(request).unwrap();
+        assert_application_acceptance(&accepted, sent_plaintexts);
+        sent_plaintexts.push(SentPlaintext {
+            seq: accepted.seq,
+            plaintext,
+        });
+    }
+}
+
+fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[SentPlaintext]) {
+    let expected_seq = sent_plaintexts
+        .last()
+        .map(|message| message.seq + 1)
+        .unwrap_or(2);
+    assert_eq!(accepted.seq, expected_seq);
+}
+
+fn drain_device_messages(
+    server: &DeliveryService,
+    alice_device: &mut ScenarioAliceDevice,
+    sent_plaintexts: &[SentPlaintext],
+) {
+    let page = server
+        .sync_events(
+            ROOM_ID,
+            alice_device.device.device_ref(),
+            alice_device.cursor,
+        )
+        .unwrap();
+    assert!(!page.has_more);
+    for entry in &page.entries {
+        assert_eq!(entry.kind, LogEntryKind::Application);
+        let expected = sent_plaintexts
+            .iter()
+            .find(|message| message.seq == entry.seq)
+            .unwrap();
+        let decrypted = alice_device
+            .device
+            .decrypt_application_entry(ROOM_ID, entry)
+            .unwrap();
+        assert_eq!(decrypted, expected.plaintext);
+        alice_device.cursor = entry.seq;
+        alice_device.decrypted_count += 1;
+    }
+    assert_eq!(
+        alice_device.decrypted_count,
+        count_messages_at_or_before(sent_plaintexts, alice_device.cursor)
+    );
+}
+
+fn count_messages_at_or_before(sent_plaintexts: &[SentPlaintext], cursor: u64) -> usize {
+    sent_plaintexts
+        .iter()
+        .filter(|message| message.seq <= cursor)
+        .count()
+}
+
+fn assert_pending_devices_can_sync_but_not_send(
+    server: &mut DeliveryService,
+    alice_devices: &[ScenarioAliceDevice],
+    sent_plaintexts: &[SentPlaintext],
+) {
+    for alice_device in alice_devices {
+        if alice_device.device.group_epoch(ROOM_ID).is_ok() {
+            continue;
+        }
+        let page = server
+            .sync_events(
+                ROOM_ID,
+                alice_device.device.device_ref(),
+                alice_device.cursor,
+            )
+            .unwrap();
+        assert_eq!(
+            page.entries.len(),
+            sent_plaintexts.len() - alice_device.decrypted_count
+        );
+        assert_eq!(
+            server
+                .append_event(fake_application_request(
+                    alice_device.device.device_ref().clone(),
+                    1,
+                    &format!(
+                        "pending_send_{}_{}",
+                        alice_device.device.device_ref().device_id,
+                        sent_plaintexts.len()
+                    )
+                ))
+                .unwrap_err(),
+            EngineError::SenderNotActive(alice_device.device.device_ref().clone())
+        );
     }
 }

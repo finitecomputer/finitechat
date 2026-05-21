@@ -104,6 +104,7 @@ Proven client scenarios:
 
 - `client_state_machine_adds_device_and_decrypts_application_message`
 - `multi_device_invite_late_joiner_catches_up_to_new_messages`
+- `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
 - `client_rejects_invalid_invite_request_before_local_pending_commit`
 - `client_rejects_tampered_ratchet_tree_before_ack`
@@ -149,6 +150,10 @@ Checkpoint test signal:
   sends until each device's Welcome is acked. The real OpenMLS test then proved
   a late Alice device can activate its batch Welcome and decrypt messages sent
   before it joined locally.
+- The heavy real-MLS matrix replays that same invariant across all activation
+  orders for three Alice devices and several Bob-message timing patterns. It
+  stays in the normal test suite because it runs quickly enough to catch MLS
+  ordering regressions before they reach integration work.
 
 ## SQLite Follow-Up
 

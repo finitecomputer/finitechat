@@ -174,6 +174,8 @@ Current OpenMLS scope:
 - late multi-device Welcome activation: one Alice device can join first, another
   Alice device can activate the same batch invite later, catch up from the
   accepted Commit seq, and decrypt messages sent before it acked.
+- bounded real-MLS ordering matrix for all activation orders across three
+  devices, with varied message timing before and between activations.
 
 Good tests:
 
@@ -185,6 +187,8 @@ Good tests:
   cannot send until their own Welcome is acked.
 - deterministic action-order fuzz covers claim, ack, sync, pending send, and
   active send interleavings for several devices in one account.
+- real-MLS matrix tests keep the same multi-device invariant under several
+  OpenMLS application-message ratchet orderings.
 
 ### Phase 3: Finitecomputer Local Integration
 
