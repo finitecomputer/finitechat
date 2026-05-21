@@ -5,15 +5,15 @@ use finitechat_engine::{
     AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateDirectRoomRequest,
     CreateRoomRequest, DeviceMembership, EngineError, EventAccepted, KeyPackageRecord,
     LinkSessionId, LinkSessionRecord, LinkSessionState, MembershipInterval, RoomRecord,
-    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, direct_room_key,
+    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, direct_room_key,
     direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
+    sync_events_page_for_room,
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
-    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState, validate_bytes_len,
-    validate_room_id, validate_string_bytes,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq,
+    WelcomeState, validate_bytes_len, validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -393,30 +393,13 @@ impl SqliteDeliveryStore {
         room_id: &str,
         requester: &DeviceRef,
         after_seq: Seq,
-    ) -> Result<Vec<RoomLogEntry>, StoreError> {
+    ) -> Result<SyncEventsPage, StoreError> {
         validate_room_id(room_id).map_err(EngineError::from)?;
         requester.validate_limits().map_err(EngineError::from)?;
         let conn = self.connect()?;
         let room = load_room(&conn, room_id)?
             .ok_or_else(|| EngineError::RoomNotFound(room_id.to_string()))?;
-        let mut entries = Vec::with_capacity(MAX_SYNC_PAGE_ENTRIES as usize);
-        let mut page_bytes = 0usize;
-        for entry in room.log.iter().filter(|entry| entry.seq > after_seq) {
-            if room.device_was_member_for_seq(requester, entry.seq) {
-                if entries.len() >= MAX_SYNC_PAGE_ENTRIES as usize {
-                    break;
-                }
-                let next_page_bytes = page_bytes.saturating_add(entry.envelope.payload.len());
-                if next_page_bytes > MAX_SYNC_PAGE_BYTES as usize {
-                    break;
-                }
-                page_bytes = next_page_bytes;
-                entries.push(entry.clone());
-            }
-        }
-        debug_assert!(entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
-        debug_assert!(page_bytes <= MAX_SYNC_PAGE_BYTES as usize);
-        Ok(entries)
+        Ok(sync_events_page_for_room(&room, requester, after_seq))
     }
 
     pub fn create_link_session(

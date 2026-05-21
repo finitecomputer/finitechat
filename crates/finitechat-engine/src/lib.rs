@@ -158,6 +158,13 @@ pub struct EventAccepted {
     pub message_id: MessageId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEventsPage {
+    pub entries: Vec<RoomLogEntry>,
+    pub next_after_seq: Seq,
+    pub has_more: bool,
+}
+
 impl CreateRoomRequest {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
         validate_room_id(&self.room_id)?;
@@ -700,31 +707,14 @@ impl DeliveryService {
         room_id: &str,
         requester: &DeviceRef,
         after_seq: Seq,
-    ) -> Result<Vec<RoomLogEntry>, EngineError> {
+    ) -> Result<SyncEventsPage, EngineError> {
         validate_room_id(room_id)?;
         requester.validate_limits()?;
         let room = self
             .rooms
             .get(room_id)
             .ok_or_else(|| EngineError::RoomNotFound(room_id.to_string()))?;
-        let mut entries = Vec::with_capacity(MAX_SYNC_PAGE_ENTRIES as usize);
-        let mut page_bytes = 0usize;
-        for entry in room.log.iter().filter(|entry| entry.seq > after_seq) {
-            if room.device_was_member_for_seq(requester, entry.seq) {
-                if entries.len() >= MAX_SYNC_PAGE_ENTRIES as usize {
-                    break;
-                }
-                let next_page_bytes = page_bytes.saturating_add(entry.envelope.payload.len());
-                if next_page_bytes > MAX_SYNC_PAGE_BYTES as usize {
-                    break;
-                }
-                page_bytes = next_page_bytes;
-                entries.push(entry.clone());
-            }
-        }
-        debug_assert!(entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
-        debug_assert!(page_bytes <= MAX_SYNC_PAGE_BYTES as usize);
-        Ok(entries)
+        Ok(sync_events_page_for_room(room, requester, after_seq))
     }
 
     pub fn create_link_session(
@@ -1140,6 +1130,47 @@ pub fn lease_token_for(id: &str, device: &DeviceRef) -> String {
     hex_lower(&hasher.finalize())
 }
 
+pub fn sync_events_page_for_room(
+    room: &RoomRecord,
+    requester: &DeviceRef,
+    after_seq: Seq,
+) -> SyncEventsPage {
+    let mut entries = Vec::with_capacity(MAX_SYNC_PAGE_ENTRIES as usize);
+    let mut page_bytes = 0usize;
+    let mut scanned_to_seq = after_seq;
+    let mut has_more = false;
+
+    for entry in room.log.iter().filter(|entry| entry.seq > after_seq) {
+        scanned_to_seq = entry.seq;
+        if room.device_was_member_for_seq(requester, entry.seq) {
+            if entries.len() >= MAX_SYNC_PAGE_ENTRIES as usize {
+                has_more = true;
+                break;
+            }
+            let next_page_bytes = page_bytes.saturating_add(entry.envelope.payload.len());
+            if next_page_bytes > MAX_SYNC_PAGE_BYTES as usize {
+                has_more = true;
+                break;
+            }
+            page_bytes = next_page_bytes;
+            entries.push(entry.clone());
+        }
+    }
+
+    let next_after_seq = entries
+        .last()
+        .map(|entry| entry.seq)
+        .unwrap_or(scanned_to_seq);
+    debug_assert!(entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
+    debug_assert!(page_bytes <= MAX_SYNC_PAGE_BYTES as usize);
+    debug_assert!(next_after_seq >= after_seq);
+    SyncEventsPage {
+        entries,
+        next_after_seq,
+        has_more,
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1377,11 +1408,13 @@ mod tests {
             })
             .unwrap();
 
-        let bob_events = service
+        let bob_page = service
             .sync_events("room_1", &device("bob", "phone"), 1)
             .unwrap();
-        assert_eq!(bob_events.len(), 1);
-        assert_eq!(bob_events[0].seq, accepted.seq);
+        assert_eq!(bob_page.entries.len(), 1);
+        assert_eq!(bob_page.entries[0].seq, accepted.seq);
+        assert_eq!(bob_page.next_after_seq, accepted.seq);
+        assert!(!bob_page.has_more);
     }
 
     #[test]

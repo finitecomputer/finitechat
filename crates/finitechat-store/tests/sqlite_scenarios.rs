@@ -353,9 +353,11 @@ fn sqlite_removed_device_can_sync_through_removal_after_reopen() {
     let accepted = world.server.submit_commit(remove).unwrap();
 
     let reopened = world.reopen();
-    let bob_entries = reopened.sync_events(&world.room_id, &bob(), 1).unwrap();
-    assert_eq!(bob_entries.len(), 1);
-    assert_eq!(bob_entries[0].seq, accepted.seq);
+    let bob_page = reopened.sync_events(&world.room_id, &bob(), 1).unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(bob_page.entries[0].seq, accepted.seq);
+    assert_eq!(bob_page.next_after_seq, accepted.seq);
+    assert!(!bob_page.has_more);
 }
 
 #[test]
@@ -427,9 +429,11 @@ fn sqlite_delayed_welcome_syncs_forward_from_commit_seq() {
     world.server.ack_welcome("welcome_bob_1", true).unwrap();
 
     let reopened = world.reopen();
-    let entries = reopened.sync_events(&world.room_id, &bob(), 1).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].seq, 2);
+    let page = reopened.sync_events(&world.room_id, &bob(), 1).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, 2);
+    assert_eq!(page.next_after_seq, 2);
+    assert!(!page.has_more);
 }
 
 #[test]
@@ -604,14 +608,16 @@ fn sqlite_sync_events_returns_bounded_page_after_reopen() {
     }
 
     let reopened = world.reopen();
-    let entries = reopened.sync_events(&world.room_id, &alice(), 0).unwrap();
+    let page = reopened.sync_events(&world.room_id, &alice(), 0).unwrap();
 
-    assert_eq!(entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
-    assert_eq!(entries.first().unwrap().seq, 1);
+    assert_eq!(page.entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
+    assert_eq!(page.entries.first().unwrap().seq, 1);
     assert_eq!(
-        entries.last().unwrap().seq,
+        page.entries.last().unwrap().seq,
         u64::from(MAX_SYNC_PAGE_ENTRIES)
     );
+    assert_eq!(page.next_after_seq, u64::from(MAX_SYNC_PAGE_ENTRIES));
+    assert!(page.has_more);
 }
 
 #[test]

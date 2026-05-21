@@ -317,9 +317,11 @@ fn false_remove_delta_does_not_block_removed_device_from_validating_removal_seq(
         .unwrap();
     let accepted = world.server.submit_commit(remove).unwrap();
 
-    let bob_entries = world.server.sync_events(&world.room_id, &bob(), 1).unwrap();
-    assert_eq!(bob_entries.len(), 1);
-    assert_eq!(bob_entries[0].seq, accepted.seq);
+    let bob_page = world.server.sync_events(&world.room_id, &bob(), 1).unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(bob_page.entries[0].seq, accepted.seq);
+    assert_eq!(bob_page.next_after_seq, accepted.seq);
+    assert!(!bob_page.has_more);
 
     world
         .server
@@ -480,11 +482,13 @@ fn stale_push_for_removed_device_cannot_authorize_new_events() {
         .append_event(world.app_message_request(alice(), 2, "after removal", "msg_after_remove"))
         .unwrap();
 
-    let bob_entries = world
+    let bob_page = world
         .server
         .sync_events(&world.room_id, &bob(), removal.seq)
         .unwrap();
-    assert!(bob_entries.is_empty());
+    assert!(bob_page.entries.is_empty());
+    assert_eq!(bob_page.next_after_seq, removal.seq + 1);
+    assert!(!bob_page.has_more);
 }
 
 #[test]
@@ -615,10 +619,12 @@ fn delayed_welcome_after_later_entries_syncs_forward_from_commit_seq() {
         .unwrap();
 
     world.activate_device("welcome_bob_1", bob()).unwrap();
-    let entries = world.server.sync_events(&world.room_id, &bob(), 1).unwrap();
+    let page = world.server.sync_events(&world.room_id, &bob(), 1).unwrap();
 
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].seq, 2);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, 2);
+    assert_eq!(page.next_after_seq, 2);
+    assert!(!page.has_more);
 }
 
 #[test]
@@ -1080,17 +1086,19 @@ fn sync_events_returns_bounded_page() {
             .unwrap();
     }
 
-    let entries = world
+    let page = world
         .server
         .sync_events(&world.room_id, &alice(), 0)
         .unwrap();
 
-    assert_eq!(entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
-    assert_eq!(entries.first().unwrap().seq, 1);
+    assert_eq!(page.entries.len(), MAX_SYNC_PAGE_ENTRIES as usize);
+    assert_eq!(page.entries.first().unwrap().seq, 1);
     assert_eq!(
-        entries.last().unwrap().seq,
+        page.entries.last().unwrap().seq,
         u64::from(MAX_SYNC_PAGE_ENTRIES)
     );
+    assert_eq!(page.next_after_seq, u64::from(MAX_SYNC_PAGE_ENTRIES));
+    assert!(page.has_more);
 }
 
 #[test]

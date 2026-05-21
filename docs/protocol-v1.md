@@ -70,7 +70,7 @@ KeyPackages:
 Rooms:
 
 - `POST /v1/rooms`
-- `GET /v1/rooms/{room_id}/events?after_seq=N&limit=M`
+- `GET /v1/rooms/{room_id}/events?after_seq=N`
 - `POST /v1/rooms/{room_id}/events`
 - `POST /v1/rooms/{room_id}/commits`
 
@@ -104,6 +104,27 @@ SHA256("finite-message-id-v1" || canonical_finite_envelope_bytes)
 `message_id` is unique per room log. A second mutation with a different
 idempotency key but identical envelope bytes is rejected as a duplicate message,
 not appended as a second log entry.
+
+## Sync Page
+
+Sync returns an explicit page:
+
+```json
+{
+  "entries": [],
+  "next_after_seq": 42,
+  "has_more": false
+}
+```
+
+Clients must use `next_after_seq` as their next cursor, not the last visible
+entry they happened to receive. This matters for removed devices: the server may
+scan entries after the requested cursor that the requester is no longer allowed
+to receive, and the requester must still be able to advance past those filtered
+entries.
+
+`has_more` means the server stopped because a page bound was reached. It does
+not mean the room is quiescent forever.
 
 ## Application/RPC Payloads
 
