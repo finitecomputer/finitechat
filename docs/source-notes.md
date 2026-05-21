@@ -100,11 +100,16 @@ Relevant files:
 OpenMLS credential spike:
 
 - `openmls = 0.8.1`, MIT, used only for `BasicCredential`/`Credential`
-  identity-byte integration in this checkpoint. The RustCrypto provider,
-  OpenMLS SQLite storage, and `openmls_basic_credential` are intentionally not
-  added yet because no room traffic or KeyPackage generation is implemented in
-  this slice. Notable transitive dependencies in this slice are
-  `openmls_traits`, `tls_codec`, `zeroize`, and `rayon`.
+  identity-byte integration, KeyPackage generation, Welcome staging, and
+  encrypted application-message proof in the OpenMLS spike. OpenMLS SQLite
+  storage is intentionally not added; the local proof uses OpenMLS memory
+  storage through the RustCrypto provider. Notable transitive dependencies in
+  this slice are `openmls_traits`, `tls_codec`, `zeroize`, and `rayon`.
+- `openmls_rust_crypto = 0.5.1`, MIT/Apache-2.0, added as a dev dependency for
+  the real OpenMLS provider in credential/Welcome proof tests.
+- `openmls_basic_credential = 0.5.0`, MIT, added as a dev dependency for
+  OpenMLS `SignatureKeyPair` generation in proof tests. Finite Chat still owns
+  the account/device credential bytes; this crate only signs MLS leaves.
 - `secp256k1 = 0.29.1`, CC0-1.0, used for Nostr-compatible BIP340 Schnorr
   account signatures. The full `nostr-sdk` and bech32 parsing are intentionally
   not added; the protocol boundary stores raw 32-byte Nostr public keys.

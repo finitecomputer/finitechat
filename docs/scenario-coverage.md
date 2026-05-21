@@ -86,11 +86,27 @@ Proven credential scenarios:
 - `not_yet_valid_credential_rejects`
 - `invalid_sizes_reject_before_signing`
 - `openmls_basic_credential_round_trips_finite_identity_bytes`
+- `openmls_key_package_carries_nostr_rooted_device_credential`
+- `openmls_welcome_adds_device_after_server_ordered_commit_merge`
+- `openmls_welcome_without_ratchet_tree_material_rejects`
 
 This proves the identity refinement from the protocol docs: OpenMLS carries the
 credential bytes, but Finite Chat clients verify the Nostr-rooted account,
 device id, and MLS leaf signing key locally. The server can order room entries
 without deciding who a device is.
+
+Checkpoint test signal:
+
+- The fake-MLS pending-Commit rule mapped cleanly to OpenMLS: `add_members`
+  leaves a pending local Commit and does not advance the sender epoch until
+  `merge_pending_commit`.
+- The first real Welcome test exposed an OpenMLS storage behavior the fake
+  reducer could not model: trying to stage a Welcome without ratchet-tree
+  material can consume the local KeyPackage before failure. Production clients
+  should persist the Welcome and wait for tree material before invoking OpenMLS
+  Welcome staging.
+- The credential tests were still relevant: no Nostr binding code changed when
+  the OpenMLS provider/signer boundary was added.
 
 ## SQLite Follow-Up
 

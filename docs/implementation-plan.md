@@ -154,6 +154,10 @@ Current OpenMLS scope:
 - Nostr-compatible BIP340 Schnorr signature over the device credential binding;
 - explicit expected account/device/leaf-key verification API;
 - OpenMLS `BasicCredential` identity-byte roundtrip test.
+- real OpenMLS KeyPackage carrying the Nostr-rooted device credential;
+- real OpenMLS add-device Welcome flow with explicit ratchet tree material;
+- proof that the sender's local pending Commit is not merged before the
+  server-ordered Commit is observed.
 
 Good tests:
 

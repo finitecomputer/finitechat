@@ -7,7 +7,7 @@
 //! Nostr account, device id, and MLS leaf signing key.
 
 use finitechat_proto::{DeviceId, MAX_DEVICE_ID_BYTES, MAX_OBJECT_ID_BYTES};
-use openmls::prelude::{BasicCredential, Credential};
+use openmls::prelude::{BasicCredential, Credential, CredentialWithKey};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -216,6 +216,25 @@ impl FiniteDeviceCredentialV1 {
 
     pub fn to_basic_credential(&self) -> BasicCredential {
         BasicCredential::new(self.identity_bytes())
+    }
+
+    pub fn to_openmls_credential_with_key(&self) -> CredentialWithKey {
+        validate_binding_fields(
+            &self.device_id,
+            &self.mls_leaf_signing_public_key,
+            self.not_before_unix_seconds,
+            self.not_after_unix_seconds,
+        )
+        .expect("FiniteDeviceCredentialV1 fields are validated before construction");
+        let credential_with_key = CredentialWithKey {
+            credential: self.to_basic_credential().into(),
+            signature_key: self.mls_leaf_signing_public_key.as_slice().into(),
+        };
+        debug_assert_eq!(
+            credential_with_key.signature_key.as_slice(),
+            self.mls_leaf_signing_public_key
+        );
+        credential_with_key
     }
 
     pub fn identity_bytes(&self) -> Vec<u8> {
@@ -601,11 +620,21 @@ impl<'a> CredentialCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openmls::prelude::tls_codec::Deserialize as _;
+    use openmls::prelude::{
+        Ciphersuite, GroupId, KeyPackage, KeyPackageBundle, MlsGroup, MlsGroupCreateConfig,
+        MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider, ProcessedMessageContent,
+        ProtocolMessage, StagedWelcome, Welcome, WelcomeError,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
 
     const ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [7; NOSTR_SECRET_KEY_BYTES];
     const OTHER_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [9; NOSTR_SECRET_KEY_BYTES];
+    const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [11; NOSTR_SECRET_KEY_BYTES];
     const MLS_LEAF_KEY: &[u8] = b"openmls-leaf-signing-public-key";
     const NOW: u64 = 1_800_000_000;
+    const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
     fn account_secret() -> NostrSecretKey {
         NostrSecretKey::from_bytes(ACCOUNT_SECRET_BYTES).unwrap()
@@ -626,6 +655,82 @@ mod tests {
             NOW + 60,
         )
         .unwrap()
+    }
+
+    struct TestMlsDevice {
+        provider: OpenMlsRustCrypto,
+        account_secret: NostrSecretKey,
+        credential: FiniteDeviceCredentialV1,
+        credential_with_key: CredentialWithKey,
+        signer: SignatureKeyPair,
+    }
+
+    impl TestMlsDevice {
+        fn new(
+            account_secret_bytes: [u8; NOSTR_SECRET_KEY_BYTES],
+            device_id: &str,
+        ) -> TestMlsDevice {
+            let provider = OpenMlsRustCrypto::default();
+            let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).unwrap();
+            signer.store(provider.storage()).unwrap();
+            let account_secret = NostrSecretKey::from_bytes(account_secret_bytes).unwrap();
+            let credential = FiniteDeviceCredentialV1::sign(
+                &account_secret,
+                device_id,
+                signer.to_public_vec(),
+                NOW - 60,
+                NOW + 60,
+            )
+            .unwrap();
+            credential
+                .verify_expected(ExpectedDeviceCredential {
+                    account_public_key: account_secret.public_key(),
+                    device_id,
+                    mls_leaf_signing_public_key: signer.public(),
+                    now_unix_seconds: NOW,
+                })
+                .unwrap();
+            let credential_with_key = credential.to_openmls_credential_with_key();
+            assert_eq!(
+                credential_with_key.signature_key.as_slice(),
+                signer.public()
+            );
+
+            TestMlsDevice {
+                provider,
+                account_secret,
+                credential,
+                credential_with_key,
+                signer,
+            }
+        }
+
+        fn key_package_bundle(&self) -> KeyPackageBundle {
+            KeyPackage::builder()
+                .build(
+                    CIPHERSUITE,
+                    &self.provider,
+                    &self.signer,
+                    self.credential_with_key.clone(),
+                )
+                .unwrap()
+        }
+
+        fn expected<'a>(&'a self, device_id: &'a str) -> ExpectedDeviceCredential<'a> {
+            ExpectedDeviceCredential {
+                account_public_key: self.account_secret.public_key(),
+                device_id,
+                mls_leaf_signing_public_key: self.signer.public(),
+                now_unix_seconds: NOW,
+            }
+        }
+    }
+
+    fn group_config_requires_explicit_ratchet_tree() -> MlsGroupCreateConfig {
+        MlsGroupCreateConfig::builder()
+            .ciphersuite(CIPHERSUITE)
+            .use_ratchet_tree_extension(false)
+            .build()
     }
 
     #[test]
@@ -751,6 +856,182 @@ mod tests {
 
         assert_eq!(parsed, credential);
         parsed.verify_expected(expected_credential()).unwrap();
+    }
+
+    #[test]
+    fn openmls_key_package_carries_nostr_rooted_device_credential() {
+        let bob = TestMlsDevice::new(BOB_ACCOUNT_SECRET_BYTES, "bob-phone");
+        let bob_key_package_bundle = bob.key_package_bundle();
+        let leaf_node = bob_key_package_bundle.key_package().leaf_node();
+        let parsed = FiniteDeviceCredentialV1::from_credential(leaf_node.credential().clone())
+            .expect("key package must carry a finite device credential");
+
+        assert_eq!(parsed, bob.credential);
+        parsed
+            .verify_expected(ExpectedDeviceCredential {
+                mls_leaf_signing_public_key: leaf_node.signature_key().as_slice(),
+                ..bob.expected("bob-phone")
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn openmls_welcome_adds_device_after_server_ordered_commit_merge() {
+        let alice = TestMlsDevice::new(ACCOUNT_SECRET_BYTES, "alice-laptop");
+        let bob = TestMlsDevice::new(BOB_ACCOUNT_SECRET_BYTES, "bob-phone");
+        let bob_key_package_bundle = bob.key_package_bundle();
+        let group_config = group_config_requires_explicit_ratchet_tree();
+        let group_id = GroupId::from_slice(b"finite-room-openmls-proof");
+        let mut alice_group = MlsGroup::new_with_group_id(
+            &alice.provider,
+            &alice.signer,
+            &group_config,
+            group_id,
+            alice.credential_with_key.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(alice_group.epoch().as_u64(), 0);
+        assert_eq!(alice_group.members().count(), 1);
+        assert!(alice_group.pending_commit().is_none());
+
+        let (_commit_message, welcome_message, _group_info) = alice_group
+            .add_members(
+                &alice.provider,
+                &alice.signer,
+                &[bob_key_package_bundle.key_package().clone()],
+            )
+            .unwrap();
+
+        assert_eq!(alice_group.epoch().as_u64(), 0);
+        assert_eq!(alice_group.members().count(), 1);
+        assert!(alice_group.pending_commit().is_some());
+
+        let server_log_observed = false;
+        if server_log_observed {
+            alice_group.merge_pending_commit(&alice.provider).unwrap();
+        }
+        assert_eq!(alice_group.epoch().as_u64(), 0);
+        assert_eq!(alice_group.members().count(), 1);
+        assert!(alice_group.pending_commit().is_some());
+
+        let server_log_observed = true;
+        if server_log_observed {
+            alice_group.merge_pending_commit(&alice.provider).unwrap();
+        }
+        assert_eq!(alice_group.epoch().as_u64(), 1);
+        assert_eq!(alice_group.members().count(), 2);
+        assert!(alice_group.pending_commit().is_none());
+
+        let welcome = welcome_from_out(welcome_message);
+        let mut bob_group = StagedWelcome::new_from_welcome(
+            &bob.provider,
+            group_config.join_config(),
+            welcome,
+            Some(alice_group.export_ratchet_tree().into()),
+        )
+        .expect("Welcome with explicit ratchet tree should stage")
+        .into_group(&bob.provider)
+        .expect("staged Welcome should create Bob's group");
+
+        assert_eq!(bob_group.epoch().as_u64(), 1);
+        assert_eq!(bob_group.group_id(), alice_group.group_id());
+        assert_eq!(bob_group.members().count(), 2);
+        assert_verified_member(&bob_group, &alice, "alice-laptop");
+        assert_verified_member(&bob_group, &bob, "bob-phone");
+
+        let plaintext = b"finitecomputer.command.v1 payload";
+        let encrypted = alice_group
+            .create_message(&alice.provider, &alice.signer, plaintext)
+            .unwrap();
+        let processed = bob_group
+            .process_message(&bob.provider, protocol_message_from_out(encrypted))
+            .unwrap();
+
+        let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
+            panic!("expected decrypted application message");
+        };
+        assert_eq!(message.into_bytes(), plaintext);
+    }
+
+    #[test]
+    fn openmls_welcome_without_ratchet_tree_material_rejects() {
+        let alice = TestMlsDevice::new(ACCOUNT_SECRET_BYTES, "alice-laptop");
+        let bob = TestMlsDevice::new(BOB_ACCOUNT_SECRET_BYTES, "bob-phone");
+        let bob_key_package_bundle = bob.key_package_bundle();
+        let group_config = group_config_requires_explicit_ratchet_tree();
+        let group_id = GroupId::from_slice(b"finite-room-missing-tree-proof");
+        let mut alice_group = MlsGroup::new_with_group_id(
+            &alice.provider,
+            &alice.signer,
+            &group_config,
+            group_id,
+            alice.credential_with_key.clone(),
+        )
+        .unwrap();
+
+        let (_commit_message, welcome_message, _group_info) = alice_group
+            .add_members(
+                &alice.provider,
+                &alice.signer,
+                &[bob_key_package_bundle.key_package().clone()],
+            )
+            .unwrap();
+        let welcome = welcome_from_out(welcome_message);
+        let missing_tree_error = StagedWelcome::new_from_welcome(
+            &bob.provider,
+            group_config.join_config(),
+            welcome,
+            None,
+        )
+        .expect_err("Welcome activation must require ratchet tree material");
+
+        assert!(matches!(
+            missing_tree_error,
+            WelcomeError::MissingRatchetTree
+        ));
+    }
+
+    fn welcome_from_out(message: MlsMessageOut) -> Welcome {
+        let message = mls_message_in_from_out(message);
+        let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+            panic!("expected a Welcome message");
+        };
+        welcome
+    }
+
+    fn protocol_message_from_out(message: MlsMessageOut) -> ProtocolMessage {
+        mls_message_in_from_out(message)
+            .try_into_protocol_message()
+            .expect("expected a protocol message")
+    }
+
+    fn mls_message_in_from_out(message: MlsMessageOut) -> MlsMessageIn {
+        let bytes = message.to_bytes().expect("MlsMessageOut should serialize");
+        MlsMessageIn::tls_deserialize(&mut bytes.as_slice())
+            .expect("serialized MlsMessageOut should parse as MlsMessageIn")
+    }
+
+    fn assert_verified_member(group: &MlsGroup, device: &TestMlsDevice, device_id: &str) {
+        let matching_members: Vec<_> = group
+            .members()
+            .filter(|member| {
+                FiniteDeviceCredentialV1::from_credential(member.credential.clone())
+                    .map(|credential| credential.device_id() == device_id)
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(matching_members.len(), 1);
+
+        let member = &matching_members[0];
+        let credential =
+            FiniteDeviceCredentialV1::from_credential(member.credential.clone()).unwrap();
+        credential
+            .verify_expected(ExpectedDeviceCredential {
+                mls_leaf_signing_public_key: &member.signature_key,
+                ..device.expected(device_id)
+            })
+            .unwrap();
     }
 
     fn expected_credential<'a>() -> ExpectedDeviceCredential<'a> {
