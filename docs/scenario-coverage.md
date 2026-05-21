@@ -121,6 +121,8 @@ Proven client scenarios:
 - `client_key_package_replenishment_edges_use_real_packages`
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
+- `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
+- `client_link_fanout_rejects_wrong_claim_before_pending_commit`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
 - `client_rejects_invalid_invite_request_before_local_pending_commit`
@@ -220,6 +222,13 @@ Checkpoint test signal:
   KeyPackage or release another Welcome. The same checkpoint also makes the
   group-room devices-per-account cap executable, while direct rooms keep their
   tighter cap.
+- The durable link-fanout worker checkpoint closes the client crash boundary
+  around local pending Commits: Alice queues room plans from account discovery,
+  prepares an add Commit for one room, persists the prepared server request with
+  encrypted MLS state, restarts before submit, submits the recovered request,
+  completes from the ordered log, and repeats for a second room before the new
+  Alice device activates both Welcomes. A negative test passes a KeyPackage
+  claim for the wrong target and proves no local pending Commit is created.
 - The revocation checkpoint clones Charlie's client state before removal to
   model a stale/lost device. After Bob removes Charlie, that stale client can
   fetch and process the removal Commit, but the server rejects its old-epoch

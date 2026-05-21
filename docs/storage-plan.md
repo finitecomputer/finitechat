@@ -26,18 +26,22 @@ jobs, migrations, backups, observability, and canary rollback.
 The table stores one encrypted binary snapshot per account/device. The
 plaintext snapshot contains the Nostr-rooted device profile metadata needed to
 reload, the Finite Chat room id to MLS group id mapping, the per-room applied
-server cursor, pending claimed Welcome payloads, and OpenMLS storage records
-for signer, group, and message-secret state. The wrapping key is derived from
-the user's Nostr secret and device id using HKDF with Finite Chat domain
-separation, and the account/device lookup key is bound into AEAD AAD.
+server cursor, pending claimed Welcome payloads, durable link-fanout plans and
+prepared Commit replay values, and OpenMLS storage records for signer, group,
+and message-secret state. The wrapping key is derived from the user's Nostr
+secret and device id using HKDF with Finite Chat domain separation, and the
+account/device lookup key is bound into AEAD AAD.
 
 Client code should use store-backed operations for persisting claimed Welcomes,
-Welcome activation, and ordered-log application. These operations persist MLS
-state and the applied cursor together, so a restart after a successful write can
-skip replayed log entries instead of asking OpenMLS to reprocess an
-already-applied Commit or application message. Persisting claimed Welcomes also
-means a device can recover after the server has moved a Welcome from released
-to claimed, but before local activation has completed.
+Welcome activation, link-fanout preparation/completion, and ordered-log
+application. These operations persist MLS state and the applied cursor together,
+so a restart after a successful write can skip replayed log entries instead of
+asking OpenMLS to reprocess an already-applied Commit or application message.
+Persisting claimed Welcomes also means a device can recover after the server has
+moved a Welcome from released to claimed, but before local activation has
+completed. Persisting prepared fanout Commits means a device can restart after
+creating local pending MLS state and still submit the exact server request that
+matches that pending Commit.
 
 This is application-level SQLite encryption for the client state snapshot, not
 SQLCipher. SQLite metadata, row counts, WAL behavior, and account/device lookup

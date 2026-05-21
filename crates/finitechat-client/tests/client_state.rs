@@ -1,9 +1,10 @@
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    SqliteClientStore, SqliteClientStoreOptions,
+    LinkFanoutRoomPlan, LinkFanoutRoomStatus, SqliteClientStore, SqliteClientStoreOptions,
 };
 use finitechat_engine::{
-    AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted, envelope,
+    AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
+    ListAccountRoomsRequest, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{KeyPackageState, LogEntryKind};
@@ -1581,6 +1582,342 @@ fn client_links_new_device_into_existing_rooms_with_distinct_key_packages() {
         accepted_b.seq,
         room_b_plaintext,
     );
+}
+
+#[test]
+fn sqlite_link_fanout_worker_survives_restart_after_prepared_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_link_worker");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut server = DeliveryService::new();
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_worker");
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_link_worker");
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_link_worker");
+    let room_a = "room_worker_link_a";
+    let group_a = "mls_worker_link_a";
+    let room_b = "room_worker_link_b";
+    let group_b = "mls_worker_link_b";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id: room_a,
+            mls_group_id: group_a,
+            key_package_id: "kp_bob_worker_a",
+            welcome_id: "welcome_bob_worker_a",
+            idempotency_key: "add_bob_worker_a",
+        },
+    );
+    let dana_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut dana,
+        GroupMemberSetup {
+            room_id: room_b,
+            mls_group_id: group_b,
+            key_package_id: "kp_dana_worker_b",
+            welcome_id: "welcome_dana_worker_b",
+            idempotency_key: "add_dana_worker_b",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_alice_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_alice_phone_worker_a")
+                .unwrap(),
+        )
+        .unwrap();
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_alice_phone_worker_b")
+                .unwrap(),
+        )
+        .unwrap();
+    let page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice_browser.device_ref().account_id.clone(),
+            after_room_id: None,
+            limit: 8,
+        })
+        .unwrap();
+    alice_store
+        .queue_link_fanout_page_and_save(
+            &mut alice_browser,
+            "fanout_alice_phone",
+            &page,
+            &[
+                LinkFanoutRoomPlan {
+                    room_id: room_a.to_string(),
+                    key_package_id: "kp_alice_phone_worker_a".to_string(),
+                    welcome_id: "welcome_alice_phone_worker_a".to_string(),
+                    idempotency_key: "link_worker_room_a".to_string(),
+                },
+                LinkFanoutRoomPlan {
+                    room_id: room_b.to_string(),
+                    key_package_id: "kp_alice_phone_worker_b".to_string(),
+                    welcome_id: "welcome_alice_phone_worker_b".to_string(),
+                    idempotency_key: "link_worker_room_b".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert_eq!(
+        alice_browser
+            .link_fanout_room_count("fanout_alice_phone")
+            .unwrap(),
+        2
+    );
+    let claim_a = server.claim_key_package("kp_alice_phone_worker_a").unwrap();
+    let prepared_a = alice_store
+        .prepare_link_fanout_room_commit_and_save(
+            &mut alice_browser,
+            "fanout_alice_phone",
+            room_a,
+            &claim_a,
+        )
+        .unwrap();
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert_eq!(
+        alice_browser
+            .prepared_link_fanout_commit("fanout_alice_phone", room_a)
+            .unwrap(),
+        prepared_a
+    );
+    let accepted_a = server.submit_commit(prepared_a.request).unwrap();
+    let page_a = server
+        .sync_events(room_a, alice_browser.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(page_a.entries.len(), 1);
+    assert_eq!(
+        alice_store
+            .complete_link_fanout_room_from_log_and_save(
+                &mut alice_browser,
+                "fanout_alice_phone",
+                room_a,
+                &page_a.entries[0],
+            )
+            .unwrap(),
+        Some(AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        })
+    );
+    assert_eq!(
+        alice_browser
+            .link_fanout_room_status("fanout_alice_phone", room_a)
+            .unwrap(),
+        LinkFanoutRoomStatus::Done {
+            accepted_seq: accepted_a.seq,
+        }
+    );
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_a, &mut bob, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    let claim_b = server.claim_key_package("kp_alice_phone_worker_b").unwrap();
+    let prepared_b = alice_store
+        .prepare_link_fanout_room_commit_and_save(
+            &mut alice_browser,
+            "fanout_alice_phone",
+            room_b,
+            &claim_b,
+        )
+        .unwrap();
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    let recovered_b = alice_browser
+        .prepared_link_fanout_commit("fanout_alice_phone", room_b)
+        .unwrap();
+    assert_eq!(recovered_b, prepared_b);
+    let accepted_b = server.submit_commit(recovered_b.request).unwrap();
+    let page_b = server
+        .sync_events(room_b, alice_browser.device_ref(), dana_join_seq)
+        .unwrap();
+    assert_eq!(page_b.entries.len(), 1);
+    alice_store
+        .complete_link_fanout_room_from_log_and_save(
+            &mut alice_browser,
+            "fanout_alice_phone",
+            room_b,
+            &page_b.entries[0],
+        )
+        .unwrap();
+    assert_eq!(
+        alice_browser
+            .link_fanout_room_status("fanout_alice_phone", room_b)
+            .unwrap(),
+        LinkFanoutRoomStatus::Done {
+            accepted_seq: accepted_b.seq,
+        }
+    );
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_b, &mut dana, dana_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert!(
+        alice_browser
+            .link_fanout_is_complete("fanout_alice_phone")
+            .unwrap()
+    );
+
+    let claimed_welcomes = server.claim_welcomes(alice_phone.device_ref());
+    assert_eq!(claimed_welcomes.len(), 2);
+    let welcome_a = claimed_welcomes
+        .iter()
+        .find(|welcome| welcome.welcome_id == "welcome_alice_phone_worker_a")
+        .unwrap();
+    alice_phone
+        .activate_welcome(
+            room_a,
+            &welcome_a.welcome_payload,
+            &welcome_a.ratchet_tree_payload,
+        )
+        .unwrap();
+    server
+        .ack_welcome("welcome_alice_phone_worker_a", true)
+        .unwrap();
+    assert_eq!(welcome_a.commit_seq, accepted_a.seq);
+    let welcome_b = claimed_welcomes
+        .iter()
+        .find(|welcome| welcome.welcome_id == "welcome_alice_phone_worker_b")
+        .unwrap();
+    alice_phone
+        .activate_welcome(
+            room_b,
+            &welcome_b.welcome_payload,
+            &welcome_b.ratchet_tree_payload,
+        )
+        .unwrap();
+    server
+        .ack_welcome("welcome_alice_phone_worker_b", true)
+        .unwrap();
+    assert_eq!(welcome_b.commit_seq, accepted_b.seq);
+
+    let room_a_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"worker room a"}}"#;
+    server
+        .append_event(
+            bob.create_application_request(room_a, room_a_plaintext, "bob_worker_room_a")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_device_decrypts_after_for_room(
+        &server,
+        room_a,
+        &mut alice_phone,
+        accepted_a.seq,
+        room_a_plaintext,
+    );
+
+    let room_b_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"worker room b"}}"#;
+    server
+        .append_event(
+            dana.create_application_request(room_b, room_b_plaintext, "dana_worker_room_b")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_device_decrypts_after_for_room(
+        &server,
+        room_b,
+        &mut alice_phone,
+        accepted_b.seq,
+        room_b_plaintext,
+    );
+}
+
+#[test]
+fn client_link_fanout_rejects_wrong_claim_before_pending_commit() {
+    let mut server = DeliveryService::new();
+    let mut alice_browser = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_wrong_claim");
+    let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_wrong_claim_phone");
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_wrong_claim");
+    let room_id = "room_wrong_claim";
+    let group_id = "mls_wrong_claim";
+
+    create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_bob_wrong_claim",
+            welcome_id: "welcome_bob_wrong_claim",
+            idempotency_key: "add_bob_wrong_claim",
+        },
+    );
+    alice_browser
+        .start_link_fanout("fanout_wrong_claim", alice_phone.device_ref().clone())
+        .unwrap();
+    let page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice_browser.device_ref().account_id.clone(),
+            after_room_id: None,
+            limit: 8,
+        })
+        .unwrap();
+    alice_browser
+        .queue_link_fanout_page(
+            "fanout_wrong_claim",
+            &page,
+            &[LinkFanoutRoomPlan {
+                room_id: room_id.to_string(),
+                key_package_id: "kp_alice_phone_wrong_claim".to_string(),
+                welcome_id: "welcome_alice_phone_wrong_claim".to_string(),
+                idempotency_key: "link_wrong_claim".to_string(),
+            }],
+        )
+        .unwrap();
+
+    server
+        .upload_key_package(
+            bob.upload_key_package_request("kp_alice_phone_wrong_claim")
+                .unwrap(),
+        )
+        .unwrap();
+    let wrong_claim = server
+        .claim_key_package("kp_alice_phone_wrong_claim")
+        .unwrap();
+    let err = alice_browser
+        .prepare_link_fanout_room_commit("fanout_wrong_claim", room_id, &wrong_claim)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientError::LinkFanoutClaimTargetMismatch { expected, actual }
+            if expected == *alice_phone.device_ref() && actual == *bob.device_ref()
+    ));
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_wrong_claim", room_id)
+            .unwrap(),
+        LinkFanoutRoomStatus::Pending
+    ));
+    assert!(!alice_browser.has_pending_commit(room_id).unwrap());
 }
 
 #[test]

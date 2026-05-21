@@ -1,6 +1,6 @@
 use finitechat_engine::{
     AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, EngineError,
-    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, envelope,
+    ListAccountRoomsPage, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, envelope,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -8,8 +8,10 @@ use finitechat_mls::{
 };
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
-    DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
+    MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS, MAX_DEVICE_ID_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_MLS_GROUP_ID_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
     MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1,
     MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
     WelcomeId, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
@@ -35,12 +37,14 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 3;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 4;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
 const MAX_PERSISTED_ROOMS: u32 = 1024;
 const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
+const MAX_LINK_FANOUTS: u32 = 16;
+const MAX_LINK_FANOUT_ROOMS: u32 = MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS;
 const MAX_OPENMLS_STORAGE_RECORDS: u32 = 8192;
 const MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
 const MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES: u32 = 1024;
@@ -52,6 +56,12 @@ const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
 const U64_BYTES: usize = 8;
+const LINK_FANOUT_STATUS_PENDING: u16 = 0;
+const LINK_FANOUT_STATUS_PREPARED: u16 = 1;
+const LINK_FANOUT_STATUS_DONE: u16 = 2;
+const LOG_ENTRY_KIND_APPLICATION: u16 = 0;
+const LOG_ENTRY_KIND_PROPOSAL: u16 = 1;
+const LOG_ENTRY_KIND_COMMIT: u16 = 2;
 
 const _: () = {
     assert!(NOSTR_PUBLIC_KEY_BYTES == 32);
@@ -60,6 +70,8 @@ const _: () = {
     assert!(CLIENT_STORE_AEAD_TAG_BYTES == 16);
     assert!(MAX_PERSISTED_ROOMS > 0);
     assert!(MAX_PENDING_CLIENT_WELCOMES > 0);
+    assert!(MAX_LINK_FANOUTS > 0);
+    assert!(MAX_LINK_FANOUT_ROOMS > 0);
     assert!(MAX_OPENMLS_STORAGE_RECORDS > 0);
     assert!(MAX_OPENMLS_STORAGE_KEY_BYTES > 0);
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
@@ -88,6 +100,7 @@ pub struct FiniteChatDeviceState {
     pub credential_identity: Vec<u8>,
     pub rooms: Vec<PersistedRoomState>,
     pub pending_welcomes: Vec<PendingWelcomeState>,
+    pub link_fanouts: Vec<LinkFanoutState>,
     pub openmls_storage_records: Vec<OpenMlsStorageRecord>,
 }
 
@@ -105,6 +118,36 @@ pub struct PendingWelcomeState {
     pub commit_seq: u64,
     pub welcome_payload: Vec<u8>,
     pub ratchet_tree_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkFanoutState {
+    pub fanout_id: String,
+    pub target_device: DeviceRef,
+    pub after_room_id: Option<RoomId>,
+    pub discovery_complete: bool,
+    pub rooms: Vec<LinkFanoutRoomState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkFanoutRoomState {
+    pub plan: LinkFanoutRoomPlan,
+    pub status: LinkFanoutRoomStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkFanoutRoomPlan {
+    pub room_id: RoomId,
+    pub key_package_id: KeyPackageId,
+    pub welcome_id: WelcomeId,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkFanoutRoomStatus {
+    Pending,
+    Prepared { prepared: Box<PreparedCommit> },
+    Done { accepted_seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +172,7 @@ pub struct FiniteChatDevice {
     groups: BTreeMap<RoomId, MlsGroup>,
     room_cursors: BTreeMap<RoomId, u64>,
     pending_welcomes: BTreeMap<WelcomeId, PendingWelcomeState>,
+    link_fanouts: BTreeMap<String, LinkFanoutState>,
 }
 
 impl FiniteChatDevice {
@@ -172,6 +216,7 @@ impl FiniteChatDevice {
             groups: BTreeMap::new(),
             room_cursors: BTreeMap::new(),
             pending_welcomes: BTreeMap::new(),
+            link_fanouts: BTreeMap::new(),
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -256,6 +301,11 @@ impl FiniteChatDevice {
             .iter()
             .map(|welcome| (welcome.welcome_id.clone(), welcome.clone()))
             .collect::<BTreeMap<_, _>>();
+        let link_fanouts = state
+            .link_fanouts
+            .iter()
+            .map(|fanout| (fanout.fanout_id.clone(), fanout.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         let device = Self {
             provider,
@@ -267,6 +317,7 @@ impl FiniteChatDevice {
             groups,
             room_cursors,
             pending_welcomes,
+            link_fanouts,
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -304,6 +355,7 @@ impl FiniteChatDevice {
             .collect::<Result<Vec<_>, ClientError>>()?;
         rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
         let pending_welcomes = self.pending_welcomes.values().cloned().collect::<Vec<_>>();
+        let link_fanouts = self.link_fanouts.values().cloned().collect::<Vec<_>>();
 
         let state = FiniteChatDeviceState {
             device_ref: self.device_ref.clone(),
@@ -311,6 +363,7 @@ impl FiniteChatDevice {
             credential_identity: self.credential.identity_bytes(),
             rooms,
             pending_welcomes,
+            link_fanouts,
             openmls_storage_records,
         };
         state.validate_limits()?;
@@ -891,6 +944,245 @@ impl FiniteChatDevice {
         Ok(())
     }
 
+    pub fn start_link_fanout(
+        &mut self,
+        fanout_id: impl Into<String>,
+        target_device: DeviceRef,
+    ) -> Result<(), ClientError> {
+        let fanout_id = fanout_id.into();
+        validate_string_bytes("link_fanout.fanout_id", &fanout_id, MAX_OBJECT_ID_BYTES)?;
+        target_device.validate_limits()?;
+        if target_device.account_id != self.device_ref.account_id {
+            return Err(ClientError::LinkFanoutAccountMismatch {
+                expected: self.device_ref.account_id.clone(),
+                actual: target_device.account_id,
+            });
+        }
+        if target_device == self.device_ref {
+            return Err(ClientError::LinkFanoutCannotTargetSelf);
+        }
+        if self.link_fanouts.contains_key(&fanout_id) {
+            return Err(ClientError::DuplicateLinkFanout(fanout_id));
+        }
+        let fanout = LinkFanoutState {
+            fanout_id: fanout_id.clone(),
+            target_device,
+            after_room_id: None,
+            discovery_complete: false,
+            rooms: Vec::new(),
+        };
+        fanout.validate_limits()?;
+        self.link_fanouts.insert(fanout_id, fanout);
+        debug_assert!(!self.link_fanouts.is_empty());
+        Ok(())
+    }
+
+    pub fn queue_link_fanout_page(
+        &mut self,
+        fanout_id: &str,
+        page: &ListAccountRoomsPage,
+        plans: &[LinkFanoutRoomPlan],
+    ) -> Result<(), ClientError> {
+        page.validate_limits().map_err(ClientError::from)?;
+        validate_item_count("link_fanout.page_plans", plans.len(), MAX_LINK_FANOUT_ROOMS)?;
+        let target_device = self.link_fanout(fanout_id)?.target_device.clone();
+        let mut plans_by_room = BTreeMap::<RoomId, LinkFanoutRoomPlan>::new();
+        for plan in plans {
+            plan.validate_limits()?;
+            if plans_by_room
+                .insert(plan.room_id.clone(), plan.clone())
+                .is_some()
+            {
+                return Err(ClientError::DuplicateLinkFanoutRoom(plan.room_id.clone()));
+            }
+        }
+
+        let mut queued = Vec::new();
+        for room in &page.rooms {
+            let target_already_current = room
+                .devices
+                .iter()
+                .any(|device| device.device == target_device);
+            if target_already_current {
+                continue;
+            }
+            self.group(&room.room_id)?;
+            let plan = plans_by_room
+                .remove(&room.room_id)
+                .ok_or_else(|| ClientError::MissingLinkFanoutRoomPlan(room.room_id.clone()))?;
+            if plan.key_package_id.is_empty()
+                || plan.welcome_id.is_empty()
+                || plan.idempotency_key.is_empty()
+            {
+                return Err(ClientError::MissingLinkFanoutRoomPlan(plan.room_id));
+            }
+            queued.push(LinkFanoutRoomState {
+                plan,
+                status: LinkFanoutRoomStatus::Pending,
+            });
+        }
+        if let Some((extra_room_id, _)) = plans_by_room.into_iter().next() {
+            return Err(ClientError::UnexpectedLinkFanoutRoomPlan(extra_room_id));
+        }
+
+        let fanout = self.link_fanout_mut(fanout_id)?;
+        let mut seen_rooms = fanout
+            .rooms
+            .iter()
+            .map(|room| room.plan.room_id.clone())
+            .collect::<BTreeSet<_>>();
+        for room in queued {
+            if !seen_rooms.insert(room.plan.room_id.clone()) {
+                return Err(ClientError::DuplicateLinkFanoutRoom(
+                    room.plan.room_id.clone(),
+                ));
+            }
+            fanout.rooms.push(room);
+        }
+        fanout.after_room_id = page.next_after_room_id.clone();
+        fanout.discovery_complete = !page.has_more;
+        fanout.validate_limits()?;
+        Ok(())
+    }
+
+    pub fn prepare_link_fanout_room_commit(
+        &mut self,
+        fanout_id: &str,
+        room_id: &str,
+        claimed_key_package: &ClaimKeyPackageResult,
+    ) -> Result<PreparedCommit, ClientError> {
+        validate_room_id(room_id)?;
+        let (target_device, plan) = {
+            let fanout = self.link_fanout(fanout_id)?;
+            let room = fanout
+                .rooms
+                .iter()
+                .find(|room| room.plan.room_id == room_id)
+                .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+            if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
+                return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string()));
+            }
+            (fanout.target_device.clone(), room.plan.clone())
+        };
+        if claimed_key_package.owner != target_device {
+            return Err(ClientError::LinkFanoutClaimTargetMismatch {
+                expected: target_device,
+                actual: claimed_key_package.owner.clone(),
+            });
+        }
+        if claimed_key_package.key_package_id != plan.key_package_id {
+            return Err(ClientError::LinkFanoutClaimPackageMismatch {
+                expected: plan.key_package_id,
+                actual: claimed_key_package.key_package_id.clone(),
+            });
+        }
+        let prepared = self.prepare_add_member_commit(
+            &plan.room_id,
+            claimed_key_package,
+            plan.welcome_id.clone(),
+            plan.idempotency_key.clone(),
+        )?;
+        prepared.validate_limits()?;
+        let fanout = self.link_fanout_mut(fanout_id)?;
+        let room = fanout
+            .rooms
+            .iter_mut()
+            .find(|room| room.plan.room_id == room_id)
+            .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+        room.status = LinkFanoutRoomStatus::Prepared {
+            prepared: Box::new(prepared.clone()),
+        };
+        fanout.validate_limits()?;
+        Ok(prepared)
+    }
+
+    pub fn prepared_link_fanout_commit(
+        &self,
+        fanout_id: &str,
+        room_id: &str,
+    ) -> Result<PreparedCommit, ClientError> {
+        let room = self.link_fanout_room(fanout_id, room_id)?;
+        match &room.status {
+            LinkFanoutRoomStatus::Prepared { prepared } => Ok((**prepared).clone()),
+            _ => Err(ClientError::LinkFanoutRoomNotPrepared(room_id.to_string())),
+        }
+    }
+
+    pub fn complete_link_fanout_room_from_log(
+        &mut self,
+        fanout_id: &str,
+        room_id: &str,
+        entry: &RoomLogEntry,
+    ) -> Result<AppliedLogEntry, ClientError> {
+        let prepared = self.prepared_link_fanout_commit(fanout_id, room_id)?;
+        if entry.message_id != prepared.message_id {
+            return Err(ClientError::LinkFanoutPreparedCommitMismatch {
+                expected: prepared.message_id,
+                actual: entry.message_id.clone(),
+            });
+        }
+        let applied = self.apply_log_entry(room_id, entry)?;
+        let fanout = self.link_fanout_mut(fanout_id)?;
+        let room = fanout
+            .rooms
+            .iter_mut()
+            .find(|room| room.plan.room_id == room_id)
+            .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+        room.status = LinkFanoutRoomStatus::Done {
+            accepted_seq: entry.seq,
+        };
+        fanout.validate_limits()?;
+        Ok(applied)
+    }
+
+    pub fn link_fanout_room_status(
+        &self,
+        fanout_id: &str,
+        room_id: &str,
+    ) -> Result<LinkFanoutRoomStatus, ClientError> {
+        Ok(self.link_fanout_room(fanout_id, room_id)?.status.clone())
+    }
+
+    pub fn link_fanout_room_count(&self, fanout_id: &str) -> Result<usize, ClientError> {
+        Ok(self.link_fanout(fanout_id)?.rooms.len())
+    }
+
+    pub fn link_fanout_is_complete(&self, fanout_id: &str) -> Result<bool, ClientError> {
+        let fanout = self.link_fanout(fanout_id)?;
+        Ok(fanout.discovery_complete
+            && fanout
+                .rooms
+                .iter()
+                .all(|room| matches!(room.status, LinkFanoutRoomStatus::Done { .. })))
+    }
+
+    fn link_fanout(&self, fanout_id: &str) -> Result<&LinkFanoutState, ClientError> {
+        validate_string_bytes("link_fanout.fanout_id", fanout_id, MAX_OBJECT_ID_BYTES)?;
+        self.link_fanouts
+            .get(fanout_id)
+            .ok_or_else(|| ClientError::LinkFanoutNotFound(fanout_id.to_string()))
+    }
+
+    fn link_fanout_mut(&mut self, fanout_id: &str) -> Result<&mut LinkFanoutState, ClientError> {
+        validate_string_bytes("link_fanout.fanout_id", fanout_id, MAX_OBJECT_ID_BYTES)?;
+        self.link_fanouts
+            .get_mut(fanout_id)
+            .ok_or_else(|| ClientError::LinkFanoutNotFound(fanout_id.to_string()))
+    }
+
+    fn link_fanout_room(
+        &self,
+        fanout_id: &str,
+        room_id: &str,
+    ) -> Result<&LinkFanoutRoomState, ClientError> {
+        validate_room_id(room_id)?;
+        self.link_fanout(fanout_id)?
+            .rooms
+            .iter()
+            .find(|room| room.plan.room_id == room_id)
+            .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))
+    }
+
     pub fn create_application_request(
         &mut self,
         room_id: &str,
@@ -1053,6 +1345,11 @@ impl FiniteChatDeviceState {
             MAX_PENDING_CLIENT_WELCOMES,
         )?;
         validate_item_count(
+            "client_state.link_fanouts",
+            self.link_fanouts.len(),
+            MAX_LINK_FANOUTS,
+        )?;
+        validate_item_count(
             "client_state.openmls_storage_records",
             self.openmls_storage_records.len(),
             MAX_OPENMLS_STORAGE_RECORDS,
@@ -1066,6 +1363,7 @@ impl FiniteChatDeviceState {
         let mut seen_storage_keys = BTreeSet::<Vec<u8>>::new();
         let mut seen_rooms = BTreeSet::<RoomId>::new();
         let mut seen_pending_welcomes = BTreeSet::<WelcomeId>::new();
+        let mut seen_link_fanouts = BTreeSet::<String>::new();
         for room in &self.rooms {
             if !seen_rooms.insert(room.room_id.clone()) {
                 return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
@@ -1077,6 +1375,21 @@ impl FiniteChatDeviceState {
                 return Err(ClientError::DuplicatePendingWelcome(
                     welcome.welcome_id.clone(),
                 ));
+            }
+        }
+        for fanout in &self.link_fanouts {
+            fanout.validate_limits()?;
+            if fanout.target_device.account_id != self.device_ref.account_id {
+                return Err(ClientError::LinkFanoutAccountMismatch {
+                    expected: self.device_ref.account_id.clone(),
+                    actual: fanout.target_device.account_id.clone(),
+                });
+            }
+            if fanout.target_device == self.device_ref {
+                return Err(ClientError::LinkFanoutCannotTargetSelf);
+            }
+            if !seen_link_fanouts.insert(fanout.fanout_id.clone()) {
+                return Err(ClientError::DuplicateLinkFanout(fanout.fanout_id.clone()));
             }
         }
         for record in &self.openmls_storage_records {
@@ -1134,6 +1447,96 @@ impl PendingWelcomeState {
             MAX_RATCHET_TREE_PAYLOAD_BYTES,
         )?;
         Ok(())
+    }
+}
+
+impl PreparedCommit {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        self.request.validate_limits().map_err(ClientError::from)?;
+        validate_string_bytes(
+            "prepared_commit.message_id",
+            &self.message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("prepared_commit.message_id", self.message_id.len())?;
+        if self.request.membership_delta.commit_message_id != self.message_id {
+            return Err(ClientError::PreparedCommitMessageIdMismatch);
+        }
+        if self
+            .request
+            .envelope
+            .message_id()
+            .map_err(ClientError::EnvelopeMessageId)?
+            != self.message_id
+        {
+            return Err(ClientError::PreparedCommitMessageIdMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl LinkFanoutState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_string_bytes(
+            "link_fanout.fanout_id",
+            &self.fanout_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("link_fanout.fanout_id", self.fanout_id.len())?;
+        self.target_device.validate_limits()?;
+        if let Some(after_room_id) = &self.after_room_id {
+            validate_room_id(after_room_id)?;
+        }
+        validate_item_count("link_fanout.rooms", self.rooms.len(), MAX_LINK_FANOUT_ROOMS)?;
+        let mut seen_rooms = BTreeSet::<RoomId>::new();
+        for room in &self.rooms {
+            room.validate_limits()?;
+            if !seen_rooms.insert(room.plan.room_id.clone()) {
+                return Err(ClientError::DuplicateLinkFanoutRoom(
+                    room.plan.room_id.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LinkFanoutRoomState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        self.plan.validate_limits()?;
+        self.status.validate_limits()?;
+        Ok(())
+    }
+}
+
+impl LinkFanoutRoomPlan {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_room_id(&self.room_id)?;
+        validate_bytes_non_empty("link_fanout.key_package_id", self.key_package_id.len())?;
+        validate_string_bytes(
+            "link_fanout.key_package_id",
+            &self.key_package_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("link_fanout.welcome_id", self.welcome_id.len())?;
+        validate_string_bytes(
+            "link_fanout.welcome_id",
+            &self.welcome_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("link_fanout.idempotency_key", self.idempotency_key.len())?;
+        validate_idempotency_key(&self.idempotency_key)?;
+        Ok(())
+    }
+}
+
+impl LinkFanoutRoomStatus {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Pending => Ok(()),
+            Self::Prepared { prepared } => prepared.validate_limits(),
+            Self::Done { .. } => Ok(()),
+        }
     }
 }
 
@@ -1314,6 +1717,56 @@ impl SqliteClientStore {
         Ok(pending.commit_seq)
     }
 
+    pub fn start_link_fanout_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: impl Into<String>,
+        target_device: DeviceRef,
+    ) -> Result<(), ClientStoreError> {
+        device.start_link_fanout(fanout_id, target_device)?;
+        self.save_device_state(device)
+    }
+
+    pub fn queue_link_fanout_page_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: &str,
+        page: &ListAccountRoomsPage,
+        plans: &[LinkFanoutRoomPlan],
+    ) -> Result<(), ClientStoreError> {
+        device.queue_link_fanout_page(fanout_id, page, plans)?;
+        self.save_device_state(device)
+    }
+
+    pub fn prepare_link_fanout_room_commit_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: &str,
+        room_id: &str,
+        claimed_key_package: &ClaimKeyPackageResult,
+    ) -> Result<PreparedCommit, ClientStoreError> {
+        let prepared =
+            device.prepare_link_fanout_room_commit(fanout_id, room_id, claimed_key_package)?;
+        self.save_device_state(device)?;
+        Ok(prepared)
+    }
+
+    pub fn complete_link_fanout_room_from_log_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        fanout_id: &str,
+        room_id: &str,
+        entry: &RoomLogEntry,
+    ) -> Result<Option<AppliedLogEntry>, ClientStoreError> {
+        if entry.seq <= device.last_applied_seq(room_id)? {
+            return Ok(None);
+        }
+        let applied = device.complete_link_fanout_room_from_log(fanout_id, room_id, entry)?;
+        device.set_last_applied_seq(room_id, entry.seq)?;
+        self.save_device_state(device)?;
+        Ok(Some(applied))
+    }
+
     pub fn apply_log_entry_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
@@ -1400,6 +1853,8 @@ pub enum ClientStoreError {
     StateSnapshotTrailingBytes,
     #[error("encrypted client state snapshot has invalid UTF-8")]
     StateSnapshotUtf8,
+    #[error("encrypted client state snapshot enum {field} has unknown value {value}")]
+    StateSnapshotEnum { field: &'static str, value: u64 },
     #[error("encrypted client state snapshot length overflow")]
     StateSnapshotLengthOverflow,
     #[error("encrypted client state snapshot identity does not match lookup")]
@@ -1503,6 +1958,42 @@ pub enum ClientError {
     PendingWelcomeNotFound(WelcomeId),
     #[error("pending Welcome recipient does not match this device")]
     PendingWelcomeRecipientMismatch,
+    #[error("prepared commit message id does not match request")]
+    PreparedCommitMessageIdMismatch,
+    #[error("link fanout already exists: {0}")]
+    DuplicateLinkFanout(String),
+    #[error("link fanout not found: {0}")]
+    LinkFanoutNotFound(String),
+    #[error("link fanout room already exists: {0}")]
+    DuplicateLinkFanoutRoom(RoomId),
+    #[error("link fanout room not found: {0}")]
+    LinkFanoutRoomNotFound(RoomId),
+    #[error("missing link fanout room plan: {0}")]
+    MissingLinkFanoutRoomPlan(RoomId),
+    #[error("unexpected link fanout room plan: {0}")]
+    UnexpectedLinkFanoutRoomPlan(RoomId),
+    #[error("link fanout target account mismatch: expected {expected}, actual {actual}")]
+    LinkFanoutAccountMismatch { expected: String, actual: String },
+    #[error("link fanout cannot target the current device")]
+    LinkFanoutCannotTargetSelf,
+    #[error("link fanout room is not pending: {0}")]
+    LinkFanoutRoomNotPending(RoomId),
+    #[error("link fanout room is not prepared: {0}")]
+    LinkFanoutRoomNotPrepared(RoomId),
+    #[error(
+        "link fanout claimed KeyPackage owner mismatch: expected {expected:?}, actual {actual:?}"
+    )]
+    LinkFanoutClaimTargetMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
+    #[error("link fanout claimed KeyPackage id mismatch: expected {expected}, actual {actual}")]
+    LinkFanoutClaimPackageMismatch {
+        expected: KeyPackageId,
+        actual: KeyPackageId,
+    },
+    #[error("link fanout prepared Commit mismatch: expected {expected}, actual {actual}")]
+    LinkFanoutPreparedCommitMismatch { expected: String, actual: String },
     #[error("member credential missing or duplicated: {0:?}")]
     MemberCredentialMissing(DeviceRef),
     #[error("persisted client state account does not match config")]
@@ -2132,6 +2623,15 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
     }
     append_count(
         &mut out,
+        "client_state.link_fanouts",
+        state.link_fanouts.len(),
+        MAX_LINK_FANOUTS,
+    )?;
+    for fanout in &state.link_fanouts {
+        append_link_fanout_state(&mut out, fanout)?;
+    }
+    append_count(
+        &mut out,
         "client_state.openmls_storage_records",
         state.openmls_storage_records.len(),
         MAX_OPENMLS_STORAGE_RECORDS,
@@ -2213,6 +2713,12 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         });
     }
 
+    let link_fanout_count = cursor.take_count("client_state.link_fanouts", MAX_LINK_FANOUTS)?;
+    let mut link_fanouts = Vec::with_capacity(link_fanout_count);
+    for _ in 0..link_fanout_count {
+        link_fanouts.push(cursor.take_link_fanout_state()?);
+    }
+
     let storage_count = cursor.take_count(
         "client_state.openmls_storage_records",
         MAX_OPENMLS_STORAGE_RECORDS,
@@ -2235,6 +2741,7 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         credential_identity,
         rooms,
         pending_welcomes,
+        link_fanouts,
         openmls_storage_records,
     };
     state.validate_limits()?;
@@ -2262,6 +2769,10 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         len = checked_len_add(len, U32_BYTES + welcome.ratchet_tree_payload.len())?;
     }
     len = checked_len_add(len, U32_BYTES)?;
+    for fanout in &state.link_fanouts {
+        len = checked_len_add(len, encoded_link_fanout_state_len(fanout)?)?;
+    }
+    len = checked_len_add(len, U32_BYTES)?;
     for record in &state.openmls_storage_records {
         len = checked_len_add(len, U32_BYTES + record.key.len())?;
         len = checked_len_add(len, U32_BYTES + record.value.len())?;
@@ -2272,6 +2783,404 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         MAX_CLIENT_STATE_PLAINTEXT_BYTES,
     )
     .map_err(ClientError::from)?;
+    Ok(len)
+}
+
+fn append_link_fanout_state(
+    out: &mut Vec<u8>,
+    fanout: &LinkFanoutState,
+) -> Result<(), ClientStoreError> {
+    fanout.validate_limits()?;
+    append_string_field(
+        out,
+        "link_fanout.fanout_id",
+        &fanout.fanout_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_device_ref(out, "link_fanout.target_device", &fanout.target_device)?;
+    append_optional_string(
+        out,
+        "link_fanout.after_room_id",
+        fanout.after_room_id.as_deref(),
+        MAX_ROOM_ID_BYTES,
+    )?;
+    append_bool(out, fanout.discovery_complete);
+    append_count(
+        out,
+        "link_fanout.rooms",
+        fanout.rooms.len(),
+        MAX_LINK_FANOUT_ROOMS,
+    )?;
+    for room in &fanout.rooms {
+        append_link_fanout_room_state(out, room)?;
+    }
+    Ok(())
+}
+
+fn append_link_fanout_room_state(
+    out: &mut Vec<u8>,
+    room: &LinkFanoutRoomState,
+) -> Result<(), ClientStoreError> {
+    room.validate_limits()?;
+    append_link_fanout_room_plan(out, &room.plan)?;
+    match &room.status {
+        LinkFanoutRoomStatus::Pending => {
+            out.extend_from_slice(&LINK_FANOUT_STATUS_PENDING.to_be_bytes());
+        }
+        LinkFanoutRoomStatus::Prepared { prepared } => {
+            out.extend_from_slice(&LINK_FANOUT_STATUS_PREPARED.to_be_bytes());
+            append_prepared_commit(out, prepared)?;
+        }
+        LinkFanoutRoomStatus::Done { accepted_seq } => {
+            out.extend_from_slice(&LINK_FANOUT_STATUS_DONE.to_be_bytes());
+            out.extend_from_slice(&accepted_seq.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn append_link_fanout_room_plan(
+    out: &mut Vec<u8>,
+    plan: &LinkFanoutRoomPlan,
+) -> Result<(), ClientStoreError> {
+    plan.validate_limits()?;
+    append_string_field(out, "link_fanout.room_id", &plan.room_id, MAX_ROOM_ID_BYTES)?;
+    append_string_field(
+        out,
+        "link_fanout.key_package_id",
+        &plan.key_package_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "link_fanout.welcome_id",
+        &plan.welcome_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "link_fanout.idempotency_key",
+        &plan.idempotency_key,
+        MAX_IDEMPOTENCY_KEY_BYTES,
+    )?;
+    Ok(())
+}
+
+fn append_prepared_commit(
+    out: &mut Vec<u8>,
+    prepared: &PreparedCommit,
+) -> Result<(), ClientStoreError> {
+    prepared.validate_limits()?;
+    append_submit_commit_request(out, &prepared.request)?;
+    append_string_field(
+        out,
+        "prepared_commit.message_id",
+        &prepared.message_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    Ok(())
+}
+
+fn append_submit_commit_request(
+    out: &mut Vec<u8>,
+    request: &SubmitCommitRequest,
+) -> Result<(), ClientStoreError> {
+    request.validate_limits().map_err(ClientError::from)?;
+    append_string_field(
+        out,
+        "commit_request.room_id",
+        &request.room_id,
+        MAX_ROOM_ID_BYTES,
+    )?;
+    append_device_ref(out, "commit_request.sender", &request.sender)?;
+    out.extend_from_slice(&request.expected_epoch.to_be_bytes());
+    append_envelope(out, &request.envelope)?;
+    append_membership_delta(out, &request.membership_delta)?;
+    append_count(
+        out,
+        "commit_request.staged_welcomes",
+        request.staged_welcomes.len(),
+        MAX_STAGED_WELCOMES_PER_COMMIT,
+    )?;
+    for welcome in &request.staged_welcomes {
+        append_staged_welcome(out, welcome)?;
+    }
+    append_string_field(
+        out,
+        "commit_request.idempotency_key",
+        &request.idempotency_key,
+        MAX_IDEMPOTENCY_KEY_BYTES,
+    )?;
+    Ok(())
+}
+
+fn append_membership_delta(
+    out: &mut Vec<u8>,
+    delta: &MembershipDeltaV1,
+) -> Result<(), ClientStoreError> {
+    delta.validate_limits().map_err(ClientError::from)?;
+    out.extend_from_slice(&delta.base_epoch.to_be_bytes());
+    out.extend_from_slice(&delta.post_commit_epoch.to_be_bytes());
+    append_string_field(
+        out,
+        "membership_delta.commit_message_id",
+        &delta.commit_message_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_count(
+        out,
+        "membership_delta.adds",
+        delta.adds.len(),
+        MAX_STAGED_WELCOMES_PER_COMMIT,
+    )?;
+    for add in &delta.adds {
+        append_device_ref(out, "membership_delta.add.device", &add.device)?;
+        append_string_field(
+            out,
+            "membership_delta.add.key_package_id",
+            &add.key_package_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        append_string_field(
+            out,
+            "membership_delta.add.key_package_ref",
+            &add.key_package_ref,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        append_string_field(
+            out,
+            "membership_delta.add.key_package_hash",
+            &add.key_package_hash,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        append_string_field(
+            out,
+            "membership_delta.add.welcome_id",
+            &add.welcome_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+    }
+    append_count(
+        out,
+        "membership_delta.removes",
+        delta.removes.len(),
+        MAX_STAGED_WELCOMES_PER_COMMIT,
+    )?;
+    for remove in &delta.removes {
+        append_device_ref(out, "membership_delta.remove.device", &remove.device)?;
+        out.extend_from_slice(&remove.removed_leaf_index.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn append_envelope(
+    out: &mut Vec<u8>,
+    envelope: &finitechat_proto::FiniteEnvelope,
+) -> Result<(), ClientStoreError> {
+    envelope.validate_limits().map_err(ClientError::from)?;
+    append_string_field(
+        out,
+        "envelope.room_id",
+        &envelope.room_id,
+        MAX_ROOM_ID_BYTES,
+    )?;
+    append_string_field(
+        out,
+        "envelope.mls_group_id",
+        &envelope.mls_group_id,
+        MAX_MLS_GROUP_ID_BYTES,
+    )?;
+    out.extend_from_slice(&envelope.epoch.to_be_bytes());
+    append_device_ref(out, "envelope.sender", &envelope.sender)?;
+    out.extend_from_slice(&encode_log_entry_kind(envelope.kind).to_be_bytes());
+    append_bytes_field(
+        out,
+        "envelope.payload",
+        &envelope.payload,
+        MAX_ENVELOPE_PAYLOAD_BYTES,
+    )?;
+    Ok(())
+}
+
+fn append_staged_welcome(
+    out: &mut Vec<u8>,
+    welcome: &StagedWelcomeV1,
+) -> Result<(), ClientStoreError> {
+    welcome.validate_limits().map_err(ClientError::from)?;
+    append_string_field(
+        out,
+        "staged_welcome.welcome_id",
+        &welcome.welcome_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    append_bytes_field(
+        out,
+        "staged_welcome.welcome_payload",
+        &welcome.welcome_payload,
+        MAX_WELCOME_PAYLOAD_BYTES,
+    )?;
+    append_bytes_field(
+        out,
+        "staged_welcome.ratchet_tree_payload",
+        &welcome.ratchet_tree_payload,
+        MAX_RATCHET_TREE_PAYLOAD_BYTES,
+    )?;
+    Ok(())
+}
+
+fn append_device_ref(
+    out: &mut Vec<u8>,
+    field: &str,
+    device: &DeviceRef,
+) -> Result<(), ClientStoreError> {
+    device.validate_limits().map_err(ClientError::from)?;
+    append_string_field(out, field, &device.account_id, MAX_ACCOUNT_ID_BYTES)?;
+    append_string_field(out, field, &device.device_id, MAX_DEVICE_ID_BYTES)?;
+    Ok(())
+}
+
+fn append_optional_string(
+    out: &mut Vec<u8>,
+    field: &str,
+    value: Option<&str>,
+    max_bytes: u32,
+) -> Result<(), ClientStoreError> {
+    append_bool(out, value.is_some());
+    if let Some(value) = value {
+        append_string_field(out, field, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn append_bool(out: &mut Vec<u8>, value: bool) {
+    let encoded = if value { 1u16 } else { 0u16 };
+    out.extend_from_slice(&encoded.to_be_bytes());
+}
+
+fn encode_log_entry_kind(kind: LogEntryKind) -> u16 {
+    match kind {
+        LogEntryKind::Application => LOG_ENTRY_KIND_APPLICATION,
+        LogEntryKind::Proposal => LOG_ENTRY_KIND_PROPOSAL,
+        LogEntryKind::Commit => LOG_ENTRY_KIND_COMMIT,
+    }
+}
+
+fn decode_log_entry_kind(value: u16) -> Result<LogEntryKind, ClientStoreError> {
+    match value {
+        LOG_ENTRY_KIND_APPLICATION => Ok(LogEntryKind::Application),
+        LOG_ENTRY_KIND_PROPOSAL => Ok(LogEntryKind::Proposal),
+        LOG_ENTRY_KIND_COMMIT => Ok(LogEntryKind::Commit),
+        other => Err(ClientStoreError::StateSnapshotEnum {
+            field: "log_entry_kind",
+            value: u64::from(other),
+        }),
+    }
+}
+
+fn encoded_link_fanout_state_len(fanout: &LinkFanoutState) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + fanout.fanout_id.len();
+    len = checked_len_add(len, encoded_device_ref_len(&fanout.target_device)?)?;
+    len = checked_len_add(len, U16_BYTES)?;
+    if let Some(after_room_id) = &fanout.after_room_id {
+        len = checked_len_add(len, U32_BYTES + after_room_id.len())?;
+    }
+    len = checked_len_add(len, U16_BYTES)?;
+    len = checked_len_add(len, U32_BYTES)?;
+    for room in &fanout.rooms {
+        len = checked_len_add(len, encoded_link_fanout_room_state_len(room)?)?;
+    }
+    Ok(len)
+}
+
+fn encoded_link_fanout_room_state_len(
+    room: &LinkFanoutRoomState,
+) -> Result<usize, ClientStoreError> {
+    let mut len = encoded_link_fanout_room_plan_len(&room.plan)?;
+    len = checked_len_add(len, U16_BYTES)?;
+    match &room.status {
+        LinkFanoutRoomStatus::Pending => {}
+        LinkFanoutRoomStatus::Prepared { prepared } => {
+            len = checked_len_add(len, encoded_prepared_commit_len(prepared)?)?;
+        }
+        LinkFanoutRoomStatus::Done { .. } => {
+            len = checked_len_add(len, U64_BYTES)?;
+        }
+    }
+    Ok(len)
+}
+
+fn encoded_link_fanout_room_plan_len(plan: &LinkFanoutRoomPlan) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + plan.room_id.len();
+    len = checked_len_add(len, U32_BYTES + plan.key_package_id.len())?;
+    len = checked_len_add(len, U32_BYTES + plan.welcome_id.len())?;
+    len = checked_len_add(len, U32_BYTES + plan.idempotency_key.len())?;
+    Ok(len)
+}
+
+fn encoded_prepared_commit_len(prepared: &PreparedCommit) -> Result<usize, ClientStoreError> {
+    let mut len = encoded_submit_commit_request_len(&prepared.request)?;
+    len = checked_len_add(len, U32_BYTES + prepared.message_id.len())?;
+    Ok(len)
+}
+
+fn encoded_submit_commit_request_len(
+    request: &SubmitCommitRequest,
+) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + request.room_id.len();
+    len = checked_len_add(len, encoded_device_ref_len(&request.sender)?)?;
+    len = checked_len_add(len, U64_BYTES)?;
+    len = checked_len_add(len, encoded_envelope_len(&request.envelope)?)?;
+    len = checked_len_add(
+        len,
+        encoded_membership_delta_len(&request.membership_delta)?,
+    )?;
+    len = checked_len_add(len, U32_BYTES)?;
+    for welcome in &request.staged_welcomes {
+        len = checked_len_add(len, encoded_staged_welcome_len(welcome)?)?;
+    }
+    len = checked_len_add(len, U32_BYTES + request.idempotency_key.len())?;
+    Ok(len)
+}
+
+fn encoded_membership_delta_len(delta: &MembershipDeltaV1) -> Result<usize, ClientStoreError> {
+    let mut len = U64_BYTES + U64_BYTES + U32_BYTES + delta.commit_message_id.len() + U32_BYTES;
+    for add in &delta.adds {
+        len = checked_len_add(len, encoded_device_ref_len(&add.device)?)?;
+        len = checked_len_add(len, U32_BYTES + add.key_package_id.len())?;
+        len = checked_len_add(len, U32_BYTES + add.key_package_ref.len())?;
+        len = checked_len_add(len, U32_BYTES + add.key_package_hash.len())?;
+        len = checked_len_add(len, U32_BYTES + add.welcome_id.len())?;
+    }
+    len = checked_len_add(len, U32_BYTES)?;
+    for remove in &delta.removes {
+        len = checked_len_add(len, encoded_device_ref_len(&remove.device)?)?;
+        len = checked_len_add(len, U32_BYTES)?;
+    }
+    Ok(len)
+}
+
+fn encoded_envelope_len(
+    envelope: &finitechat_proto::FiniteEnvelope,
+) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + envelope.room_id.len();
+    len = checked_len_add(len, U32_BYTES + envelope.mls_group_id.len())?;
+    len = checked_len_add(len, U64_BYTES)?;
+    len = checked_len_add(len, encoded_device_ref_len(&envelope.sender)?)?;
+    len = checked_len_add(len, U16_BYTES)?;
+    len = checked_len_add(len, U32_BYTES + envelope.payload.len())?;
+    Ok(len)
+}
+
+fn encoded_staged_welcome_len(welcome: &StagedWelcomeV1) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + welcome.welcome_id.len();
+    len = checked_len_add(len, U32_BYTES + welcome.welcome_payload.len())?;
+    len = checked_len_add(len, U32_BYTES + welcome.ratchet_tree_payload.len())?;
+    Ok(len)
+}
+
+fn encoded_device_ref_len(device: &DeviceRef) -> Result<usize, ClientStoreError> {
+    let mut len = U32_BYTES + device.account_id.len();
+    len = checked_len_add(len, U32_BYTES + device.device_id.len())?;
     Ok(len)
 }
 
@@ -2384,6 +3293,197 @@ impl<'a> ClientStateCursor<'a> {
         let len = self.take_u32()? as usize;
         validate_bytes_len(field, len, max_bytes).map_err(ClientError::from)?;
         Ok(self.take_bytes(len)?.to_vec())
+    }
+
+    fn take_link_fanout_state(&mut self) -> Result<LinkFanoutState, ClientStoreError> {
+        let fanout = LinkFanoutState {
+            fanout_id: self.take_string("link_fanout.fanout_id", MAX_OBJECT_ID_BYTES)?,
+            target_device: self.take_device_ref("link_fanout.target_device")?,
+            after_room_id: self
+                .take_optional_string("link_fanout.after_room_id", MAX_ROOM_ID_BYTES)?,
+            discovery_complete: self.take_bool()?,
+            rooms: {
+                let count = self.take_count("link_fanout.rooms", MAX_LINK_FANOUT_ROOMS)?;
+                let mut rooms = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rooms.push(self.take_link_fanout_room_state()?);
+                }
+                rooms
+            },
+        };
+        fanout.validate_limits()?;
+        Ok(fanout)
+    }
+
+    fn take_link_fanout_room_state(&mut self) -> Result<LinkFanoutRoomState, ClientStoreError> {
+        let plan = self.take_link_fanout_room_plan()?;
+        let status = match self.take_u16()? {
+            LINK_FANOUT_STATUS_PENDING => LinkFanoutRoomStatus::Pending,
+            LINK_FANOUT_STATUS_PREPARED => LinkFanoutRoomStatus::Prepared {
+                prepared: Box::new(self.take_prepared_commit()?),
+            },
+            LINK_FANOUT_STATUS_DONE => LinkFanoutRoomStatus::Done {
+                accepted_seq: self.take_u64()?,
+            },
+            other => {
+                return Err(ClientStoreError::StateSnapshotEnum {
+                    field: "link_fanout.status",
+                    value: u64::from(other),
+                });
+            }
+        };
+        let room = LinkFanoutRoomState { plan, status };
+        room.validate_limits()?;
+        Ok(room)
+    }
+
+    fn take_link_fanout_room_plan(&mut self) -> Result<LinkFanoutRoomPlan, ClientStoreError> {
+        let plan = LinkFanoutRoomPlan {
+            room_id: self.take_string("link_fanout.room_id", MAX_ROOM_ID_BYTES)?,
+            key_package_id: self.take_string("link_fanout.key_package_id", MAX_OBJECT_ID_BYTES)?,
+            welcome_id: self.take_string("link_fanout.welcome_id", MAX_OBJECT_ID_BYTES)?,
+            idempotency_key: self
+                .take_string("link_fanout.idempotency_key", MAX_IDEMPOTENCY_KEY_BYTES)?,
+        };
+        plan.validate_limits()?;
+        Ok(plan)
+    }
+
+    fn take_prepared_commit(&mut self) -> Result<PreparedCommit, ClientStoreError> {
+        let prepared = PreparedCommit {
+            request: self.take_submit_commit_request()?,
+            message_id: self.take_string("prepared_commit.message_id", MAX_OBJECT_ID_BYTES)?,
+        };
+        prepared.validate_limits()?;
+        Ok(prepared)
+    }
+
+    fn take_submit_commit_request(&mut self) -> Result<SubmitCommitRequest, ClientStoreError> {
+        let request = SubmitCommitRequest {
+            room_id: self.take_string("commit_request.room_id", MAX_ROOM_ID_BYTES)?,
+            sender: self.take_device_ref("commit_request.sender")?,
+            expected_epoch: self.take_u64()?,
+            envelope: self.take_envelope()?,
+            membership_delta: self.take_membership_delta()?,
+            staged_welcomes: {
+                let count = self.take_count(
+                    "commit_request.staged_welcomes",
+                    MAX_STAGED_WELCOMES_PER_COMMIT,
+                )?;
+                let mut welcomes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    welcomes.push(self.take_staged_welcome()?);
+                }
+                welcomes
+            },
+            idempotency_key: self
+                .take_string("commit_request.idempotency_key", MAX_IDEMPOTENCY_KEY_BYTES)?,
+        };
+        request.validate_limits().map_err(ClientError::from)?;
+        Ok(request)
+    }
+
+    fn take_membership_delta(&mut self) -> Result<MembershipDeltaV1, ClientStoreError> {
+        let base_epoch = self.take_u64()?;
+        let post_commit_epoch = self.take_u64()?;
+        let commit_message_id =
+            self.take_string("membership_delta.commit_message_id", MAX_OBJECT_ID_BYTES)?;
+        let add_count = self.take_count("membership_delta.adds", MAX_STAGED_WELCOMES_PER_COMMIT)?;
+        let mut adds = Vec::with_capacity(add_count);
+        for _ in 0..add_count {
+            adds.push(MembershipAddV1 {
+                device: self.take_device_ref("membership_delta.add.device")?,
+                key_package_id: self
+                    .take_string("membership_delta.add.key_package_id", MAX_OBJECT_ID_BYTES)?,
+                key_package_ref: self
+                    .take_string("membership_delta.add.key_package_ref", MAX_OBJECT_ID_BYTES)?,
+                key_package_hash: self
+                    .take_string("membership_delta.add.key_package_hash", MAX_OBJECT_ID_BYTES)?,
+                welcome_id: self
+                    .take_string("membership_delta.add.welcome_id", MAX_OBJECT_ID_BYTES)?,
+            });
+        }
+        let remove_count =
+            self.take_count("membership_delta.removes", MAX_STAGED_WELCOMES_PER_COMMIT)?;
+        let mut removes = Vec::with_capacity(remove_count);
+        for _ in 0..remove_count {
+            removes.push(MembershipRemoveV1 {
+                device: self.take_device_ref("membership_delta.remove.device")?,
+                removed_leaf_index: self.take_u32()?,
+            });
+        }
+        let delta = MembershipDeltaV1 {
+            base_epoch,
+            post_commit_epoch,
+            commit_message_id,
+            adds,
+            removes,
+        };
+        delta.validate_limits().map_err(ClientError::from)?;
+        Ok(delta)
+    }
+
+    fn take_envelope(&mut self) -> Result<finitechat_proto::FiniteEnvelope, ClientStoreError> {
+        let envelope = finitechat_proto::FiniteEnvelope {
+            room_id: self.take_string("envelope.room_id", MAX_ROOM_ID_BYTES)?,
+            mls_group_id: self.take_string("envelope.mls_group_id", MAX_MLS_GROUP_ID_BYTES)?,
+            epoch: self.take_u64()?,
+            sender: self.take_device_ref("envelope.sender")?,
+            kind: self.take_log_entry_kind()?,
+            payload: self.take_vec("envelope.payload", MAX_ENVELOPE_PAYLOAD_BYTES)?,
+        };
+        envelope.validate_limits().map_err(ClientError::from)?;
+        Ok(envelope)
+    }
+
+    fn take_staged_welcome(&mut self) -> Result<StagedWelcomeV1, ClientStoreError> {
+        let welcome = StagedWelcomeV1 {
+            welcome_id: self.take_string("staged_welcome.welcome_id", MAX_OBJECT_ID_BYTES)?,
+            welcome_payload: self
+                .take_vec("staged_welcome.welcome_payload", MAX_WELCOME_PAYLOAD_BYTES)?,
+            ratchet_tree_payload: self.take_vec(
+                "staged_welcome.ratchet_tree_payload",
+                MAX_RATCHET_TREE_PAYLOAD_BYTES,
+            )?,
+        };
+        welcome.validate_limits().map_err(ClientError::from)?;
+        Ok(welcome)
+    }
+
+    fn take_device_ref(&mut self, field: &'static str) -> Result<DeviceRef, ClientStoreError> {
+        let device = DeviceRef {
+            account_id: self.take_string(field, MAX_ACCOUNT_ID_BYTES)?,
+            device_id: self.take_string(field, MAX_DEVICE_ID_BYTES)?,
+        };
+        device.validate_limits().map_err(ClientError::from)?;
+        Ok(device)
+    }
+
+    fn take_optional_string(
+        &mut self,
+        field: &str,
+        max_bytes: u32,
+    ) -> Result<Option<String>, ClientStoreError> {
+        if self.take_bool()? {
+            Ok(Some(self.take_string(field, max_bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn take_bool(&mut self) -> Result<bool, ClientStoreError> {
+        match self.take_u16()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(ClientStoreError::StateSnapshotEnum {
+                field: "bool",
+                value: u64::from(other),
+            }),
+        }
+    }
+
+    fn take_log_entry_kind(&mut self) -> Result<LogEntryKind, ClientStoreError> {
+        decode_log_entry_kind(self.take_u16()?)
     }
 
     fn take_bytes(&mut self, len: usize) -> Result<&'a [u8], ClientStoreError> {

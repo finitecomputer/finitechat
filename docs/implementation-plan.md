@@ -179,7 +179,8 @@ Current OpenMLS scope:
   devices, with varied message timing before and between activations.
 - `SqliteClientStore` for encrypted persisted client profile, room mapping, and
   OpenMLS storage snapshot rows, with per-room applied cursors, pending claimed
-  Welcomes, and restart tests covering late multi-device catch-up.
+  Welcomes, durable link-fanout progress, and restart tests covering late
+  multi-device catch-up.
 - ordered-log application API that validates log entry shape, merges an
   observed local pending Commit, or processes a remote OpenMLS staged Commit
   before accepting epoch-advanced application messages.
@@ -191,6 +192,11 @@ Current OpenMLS scope:
   rejection before KeyPackage consumption or Welcome release. Group rooms have
   an explicit devices-per-account cap; direct rooms keep the tighter direct-room
   cap.
+- durable client link-fanout worker proof where a linking device queues rooms
+  from account discovery, persists per-room plans and a prepared add Commit,
+  restarts before submit, submits the recovered request, completes from the
+  ordered log, and finishes a second room before the new device activates both
+  Welcomes.
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
@@ -221,10 +227,11 @@ Current known gap:
   policy.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
-- Later device linking is proven at the client protocol level, and the server
-  now exposes bounded account-room discovery plus duplicate current/pending
-  device-add rejection. Production still needs the client-side durable worker
-  that drives one add Commit per discovered room and records retry progress.
+- Later device linking is proven at the client protocol level. The server
+  exposes bounded account-room discovery plus duplicate current/pending
+  device-add rejection, and the client persists fanout progress plus prepared
+  Commit retry state. Production still needs the finitecomputer runtime command
+  loop that drives this worker against real server APIs.
 - Removal/revocation is proven for stale local MLS state and server delivery
   gating. Production still needs policy and UX for who may revoke which device,
   plus durable device-status records.
@@ -278,6 +285,9 @@ Good tests:
   where an account already has current membership, and duplicate-add tests prove
   a retried fanout cannot add the same current/pending device twice or consume
   a fresh KeyPackage before rejection.
+- durable link-fanout tests prove a prepared MLS add Commit survives restart as
+  an encrypted client snapshot replay value; a wrong KeyPackage claim is
+  rejected before local pending Commit mutation.
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.
