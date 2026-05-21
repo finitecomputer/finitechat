@@ -8,8 +8,9 @@ use finitechat_mls::{
 };
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, ProtocolLimitError, RoomId,
-    RoomLogEntry, StagedWelcomeV1, WelcomeId,
+    DeviceRef, KeyPackageId, LogEntryKind, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    MembershipAddV1, MembershipDeltaV1, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
+    WelcomeId, validate_idempotency_key, validate_room_id, validate_string_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
@@ -20,7 +21,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
@@ -180,15 +181,89 @@ impl FiniteChatDevice {
         welcome_id: impl Into<WelcomeId>,
         idempotency_key: impl Into<String>,
     ) -> Result<PreparedCommit, ClientError> {
-        claimed_key_package
-            .owner
-            .validate_limits()
-            .map_err(ClientError::from)?;
-        let key_package = verified_key_package_from_claim(
-            &self.provider,
-            claimed_key_package,
-            self.now_unix_seconds,
+        let welcome_ids = [welcome_id.into()];
+        self.prepare_add_members_commit(
+            room_id,
+            std::slice::from_ref(claimed_key_package),
+            &welcome_ids,
+            idempotency_key,
+        )
+    }
+
+    pub fn prepare_add_members_commit(
+        &mut self,
+        room_id: &str,
+        claimed_key_packages: &[ClaimKeyPackageResult],
+        welcome_ids: &[WelcomeId],
+        idempotency_key: impl Into<String>,
+    ) -> Result<PreparedCommit, ClientError> {
+        validate_room_id(room_id)?;
+        let idempotency_key = idempotency_key.into();
+        validate_idempotency_key(&idempotency_key)?;
+        if claimed_key_packages.is_empty() {
+            return Err(ClientError::EmptyInviteBatch);
+        }
+        if claimed_key_packages.len() != welcome_ids.len() {
+            return Err(ClientError::InviteWelcomeCountMismatch {
+                key_packages: claimed_key_packages.len(),
+                welcome_ids: welcome_ids.len(),
+            });
+        }
+        finitechat_proto::validate_item_count(
+            "claimed_key_packages",
+            claimed_key_packages.len(),
+            MAX_STAGED_WELCOMES_PER_COMMIT,
         )?;
+
+        let mut seen_devices = BTreeSet::<DeviceRef>::new();
+        let mut seen_key_packages = BTreeSet::<KeyPackageId>::new();
+        let mut seen_welcomes = BTreeSet::<WelcomeId>::new();
+        for claimed_key_package in claimed_key_packages {
+            claimed_key_package
+                .owner
+                .validate_limits()
+                .map_err(ClientError::from)?;
+            validate_string_bytes(
+                "key_package_id",
+                &claimed_key_package.key_package_id,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+            validate_string_bytes(
+                "key_package_ref",
+                &claimed_key_package.key_package_ref,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+            validate_string_bytes(
+                "key_package_hash",
+                &claimed_key_package.key_package_hash,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+            if !seen_devices.insert(claimed_key_package.owner.clone()) {
+                return Err(ClientError::DuplicateInviteDevice(
+                    claimed_key_package.owner.clone(),
+                ));
+            }
+            if !seen_key_packages.insert(claimed_key_package.key_package_id.clone()) {
+                return Err(ClientError::DuplicateInviteKeyPackage(
+                    claimed_key_package.key_package_id.clone(),
+                ));
+            }
+        }
+        for welcome_id in welcome_ids {
+            validate_string_bytes("welcome_id", welcome_id, MAX_OBJECT_ID_BYTES)?;
+            if !seen_welcomes.insert(welcome_id.clone()) {
+                return Err(ClientError::DuplicateInviteWelcome(welcome_id.clone()));
+            }
+        }
+
+        let mut key_packages = Vec::with_capacity(claimed_key_packages.len());
+        for claimed_key_package in claimed_key_packages {
+            key_packages.push(verified_key_package_from_claim(
+                &self.provider,
+                claimed_key_package,
+                self.now_unix_seconds,
+            )?);
+        }
         let provider = &self.provider;
         let signer = &self.signer;
         let sender = self.device_ref.clone();
@@ -201,7 +276,7 @@ impl FiniteChatDevice {
         }
 
         let (commit_message, welcome_message, _group_info) = group
-            .add_members(provider, signer, &[key_package])
+            .add_members(provider, signer, &key_packages)
             .map_err(|_| ClientError::AddMember)?;
         let commit_payload = mls_message_out_bytes(commit_message)?;
         let welcome_payload = mls_message_out_bytes(welcome_message)?;
@@ -227,7 +302,24 @@ impl FiniteChatDevice {
         let commit_message_id = commit_envelope
             .message_id()
             .map_err(ClientError::EnvelopeMessageId)?;
-        let welcome_id = welcome_id.into();
+        let mut adds = Vec::with_capacity(claimed_key_packages.len());
+        let mut staged_welcomes = Vec::with_capacity(claimed_key_packages.len());
+        for (claimed_key_package, welcome_id) in claimed_key_packages.iter().zip(welcome_ids) {
+            adds.push(MembershipAddV1 {
+                device: claimed_key_package.owner.clone(),
+                key_package_id: claimed_key_package.key_package_id.clone(),
+                key_package_ref: claimed_key_package.key_package_ref.clone(),
+                key_package_hash: claimed_key_package.key_package_hash.clone(),
+                welcome_id: welcome_id.clone(),
+            });
+            staged_welcomes.push(StagedWelcomeV1 {
+                welcome_id: welcome_id.clone(),
+                welcome_payload: welcome_payload.clone(),
+                ratchet_tree_payload: ratchet_tree_payload.clone(),
+            });
+        }
+        debug_assert_eq!(adds.len(), staged_welcomes.len());
+        debug_assert!(!adds.is_empty());
         let request = SubmitCommitRequest {
             room_id: room_id.to_string(),
             sender,
@@ -237,21 +329,11 @@ impl FiniteChatDevice {
                 base_epoch: expected_epoch,
                 post_commit_epoch: expected_epoch + 1,
                 commit_message_id: commit_message_id.clone(),
-                adds: vec![MembershipAddV1 {
-                    device: claimed_key_package.owner.clone(),
-                    key_package_id: claimed_key_package.key_package_id.clone(),
-                    key_package_ref: claimed_key_package.key_package_ref.clone(),
-                    key_package_hash: claimed_key_package.key_package_hash.clone(),
-                    welcome_id: welcome_id.clone(),
-                }],
+                adds,
                 removes: vec![],
             },
-            staged_welcomes: vec![StagedWelcomeV1 {
-                welcome_id,
-                welcome_payload,
-                ratchet_tree_payload,
-            }],
-            idempotency_key: idempotency_key.into(),
+            staged_welcomes,
+            idempotency_key,
         };
         request.validate_limits()?;
         Ok(PreparedCommit {
@@ -511,6 +593,19 @@ pub enum ClientError {
     MissingPendingCommit(RoomId),
     #[error("pending commit was not observed in the ordered server log: {0}")]
     PendingCommitNotObserved(String),
+    #[error("invite batch must contain at least one KeyPackage")]
+    EmptyInviteBatch,
+    #[error("invite batch has {key_packages} KeyPackages but {welcome_ids} Welcome ids")]
+    InviteWelcomeCountMismatch {
+        key_packages: usize,
+        welcome_ids: usize,
+    },
+    #[error("invite batch contains duplicate device: {0:?}")]
+    DuplicateInviteDevice(DeviceRef),
+    #[error("invite batch contains duplicate KeyPackage: {0}")]
+    DuplicateInviteKeyPackage(KeyPackageId),
+    #[error("invite batch contains duplicate Welcome id: {0}")]
+    DuplicateInviteWelcome(WelcomeId),
     #[error("member credential missing or duplicated: {0:?}")]
     MemberCredentialMissing(DeviceRef),
     #[error("account id is not a 32-byte lowercase hex Nostr public key: {0}")]

@@ -215,6 +215,22 @@ fn fake_key_package_payload(key_package_id: &str) -> Vec<u8> {
     format!("key-package:{key_package_id}").into_bytes()
 }
 
+fn upload_available_key_package(
+    store: &mut SqliteDeliveryStore,
+    owner: DeviceRef,
+    key_package_id: &str,
+) {
+    store
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: key_package_id.to_string(),
+            owner,
+            key_package_ref: format!("ref_{key_package_id}"),
+            key_package_hash: format!("hash_{key_package_id}"),
+            key_package_payload: fake_key_package_payload(key_package_id),
+        })
+        .unwrap();
+}
+
 fn store_engine_error(error: StoreError) -> EngineError {
     match error {
         StoreError::Engine(error) => error,
@@ -536,6 +552,42 @@ fn sqlite_key_package_payload_survives_reopen_and_claim() {
     assert_eq!(
         claimed.key_package_payload,
         fake_key_package_payload("kp_bob_1")
+    );
+}
+
+#[test]
+fn sqlite_account_key_package_claim_survives_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let bob_phone = device("bob_npub", "bob_phone");
+    let bob_laptop = device("bob_npub", "bob_laptop");
+    upload_available_key_package(&mut world.server, bob_phone.clone(), "kp_bob_phone_1");
+    upload_available_key_package(&mut world.server, bob_phone.clone(), "kp_bob_phone_2");
+    upload_available_key_package(&mut world.server, bob_laptop.clone(), "kp_bob_laptop_1");
+    upload_available_key_package(&mut world.server, charlie(), "kp_charlie_1");
+
+    let mut reopened = world.reopen();
+    let claimed = reopened.claim_key_packages_for_account("bob_npub").unwrap();
+
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(claimed[0].owner, bob_laptop);
+    assert_eq!(claimed[0].key_package_id, "kp_bob_laptop_1");
+    assert_eq!(claimed[1].owner, bob_phone);
+    assert_eq!(claimed[1].key_package_id, "kp_bob_phone_1");
+    assert_eq!(
+        key_package(&reopened, "kp_bob_laptop_1").state,
+        KeyPackageState::Leased
+    );
+    assert_eq!(
+        key_package(&reopened, "kp_bob_phone_1").state,
+        KeyPackageState::Leased
+    );
+    assert_eq!(
+        key_package(&reopened, "kp_bob_phone_2").state,
+        KeyPackageState::Available
+    );
+    assert_eq!(
+        key_package(&reopened, "kp_charlie_1").state,
+        KeyPackageState::Available
     );
 }
 

@@ -136,7 +136,8 @@ Production server store:
 
 ### Phase 2: OpenMLS Spike
 
-Status in this repo: credential proof started.
+Status in this repo: reusable OpenMLS client state machine and multi-device
+invite proof passing.
 
 Deliverables:
 
@@ -165,8 +166,14 @@ Current OpenMLS scope:
 - `DeliveryService` and SQLite KeyPackage paths storing opaque serialized
   KeyPackage bytes, then returning those exact bytes on KeyPackage claim.
 - `finitechat-client` crate owning the first reusable OpenMLS device state
-  machine: KeyPackage upload, add-member Commit preparation, server-observed
-  pending Commit merge, Welcome activation, and encrypted app decrypt.
+  machine: KeyPackage upload, single-device and multi-device add Commit
+  preparation, server-observed pending Commit merge, Welcome activation, and
+  encrypted app decrypt.
+- account-level KeyPackage claim in `DeliveryService` and SQLite that returns
+  one available package per device for multi-device invite fanout.
+- late multi-device Welcome activation: one Alice device can join first, another
+  Alice device can activate the same batch invite later, catch up from the
+  accepted Commit seq, and decrypt messages sent before it acked.
 
 Good tests:
 
@@ -174,6 +181,10 @@ Good tests:
 - changed LeafNode credential validation;
 - missing ratchet tree fails activation or waits explicitly;
 - client never merges pending local Commit before observing server log.
+- invited devices can sync from their accepted Commit interval before ack, but
+  cannot send until their own Welcome is acked.
+- deterministic action-order fuzz covers claim, ack, sync, pending send, and
+  active send interleavings for several devices in one account.
 
 ### Phase 3: Finitecomputer Local Integration
 

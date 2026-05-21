@@ -47,6 +47,8 @@ It proves:
 - Commit transaction rollback after intermediate side effects converges on retry;
 - same-epoch Commit losers cannot create duplicate log rows or Welcomes;
 - KeyPackage leases, consumption, and opaque payload bytes survive reopen;
+- account-level KeyPackage fanout claims return one available package per
+  device and persist the leases across reopen;
 - Welcome release, claim, ack, failure, resume states, and opaque payload bytes
   survive reopen;
 - direct-room identity constraints survive reopen;
@@ -63,6 +65,9 @@ membership, KeyPackages, Welcomes, and link sessions are schema rows.
 KeyPackage bytes are a `BLOB` column on `key_packages`. Welcome payload and
 ratchet-tree bytes are `BLOB` columns on `welcomes`; the server keeps them
 opaque and only enforces protocol bounds before mutation.
+Account-level KeyPackage fanout is a bounded query over indexed schema state,
+not a JSON scan: it claims one available package per device and leaves extra
+packages for later group invites or retry flows.
 
 ## Production Schema Direction
 

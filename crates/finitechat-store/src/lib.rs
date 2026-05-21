@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,7 @@ use finitechat_proto::{
     StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
     validate_room_id, validate_string_bytes,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -183,38 +183,29 @@ impl SqliteDeliveryStore {
         let key_package_id = key_package_id.to_string();
         self.with_transaction(|tx| {
             let package = load_key_package_required(tx, &key_package_id)?;
-            validate_bytes_non_empty("key_package_payload", package.key_package_payload.len())
-                .map_err(EngineError::from)?;
-            validate_bytes_len(
-                "key_package_payload",
-                package.key_package_payload.len(),
-                MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-            )
-            .map_err(EngineError::from)?;
-            if package.state != KeyPackageState::Available {
-                return Err(EngineError::KeyPackageUnavailable {
-                    key_package_id,
-                    state: package.state,
-                }
-                .into());
+            claim_available_key_package(tx, package)
+        })
+    }
+
+    pub fn claim_key_packages_for_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Vec<ClaimKeyPackageResult>, StoreError> {
+        validate_string_bytes(
+            "account_id",
+            account_id,
+            finitechat_proto::MAX_ACCOUNT_ID_BYTES,
+        )
+        .map_err(EngineError::from)?;
+        let account_id = account_id.to_string();
+        self.with_transaction(|tx| {
+            let packages = load_available_key_packages_for_account(tx, &account_id)?;
+            let mut claimed = Vec::with_capacity(packages.len());
+            for package in packages {
+                claimed.push(claim_available_key_package(tx, package)?);
             }
-            let lease_token = lease_token_for(&package.key_package_id, &package.owner);
-            tx.execute(
-                "UPDATE key_packages SET state = ?1, lease_token = ?2 WHERE key_package_id = ?3",
-                params![
-                    encode_key_package_state(KeyPackageState::Leased),
-                    lease_token,
-                    package.key_package_id,
-                ],
-            )?;
-            Ok(ClaimKeyPackageResult {
-                key_package_id: package.key_package_id,
-                owner: package.owner,
-                key_package_ref: package.key_package_ref,
-                key_package_hash: package.key_package_hash,
-                key_package_payload: package.key_package_payload,
-                lease_token,
-            })
+            debug_assert!(claimed.len() <= MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize);
+            Ok(claimed)
         })
     }
 
@@ -749,6 +740,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           lease_token TEXT
         );
 
+        CREATE INDEX IF NOT EXISTS idx_key_packages_owner_state_device
+        ON key_packages (owner_account_id, state, owner_device_id, key_package_id);
+
         CREATE TABLE IF NOT EXISTS welcomes (
           welcome_id TEXT PRIMARY KEY,
           room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
@@ -855,6 +849,62 @@ fn release_key_package_lease(
         )?;
         Ok(())
     })
+}
+
+fn claim_available_key_package(
+    tx: &Transaction<'_>,
+    package: KeyPackageRecord,
+) -> Result<ClaimKeyPackageResult, StoreError> {
+    if package.state != KeyPackageState::Available {
+        return Err(EngineError::KeyPackageUnavailable {
+            key_package_id: package.key_package_id,
+            state: package.state,
+        }
+        .into());
+    }
+    validate_key_package_payload(&package.key_package_payload)?;
+
+    let lease_token = lease_token_for(&package.key_package_id, &package.owner);
+    let updated = tx.execute(
+        "UPDATE key_packages SET state = ?1, lease_token = ?2 WHERE key_package_id = ?3",
+        params![
+            encode_key_package_state(KeyPackageState::Leased),
+            lease_token.as_str(),
+            package.key_package_id.as_str(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::CorruptState(format!(
+            "KeyPackage {} vanished during claim",
+            package.key_package_id
+        )));
+    }
+    Ok(claimed_key_package_result(package, lease_token))
+}
+
+fn validate_key_package_payload(payload: &[u8]) -> Result<(), StoreError> {
+    validate_bytes_non_empty("key_package_payload", payload.len()).map_err(EngineError::from)?;
+    validate_bytes_len(
+        "key_package_payload",
+        payload.len(),
+        MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    )
+    .map_err(EngineError::from)?;
+    Ok(())
+}
+
+fn claimed_key_package_result(
+    package: KeyPackageRecord,
+    lease_token: LeaseToken,
+) -> ClaimKeyPackageResult {
+    ClaimKeyPackageResult {
+        key_package_id: package.key_package_id,
+        owner: package.owner,
+        key_package_ref: package.key_package_ref,
+        key_package_hash: package.key_package_hash,
+        key_package_payload: package.key_package_payload,
+        lease_token,
+    }
 }
 
 fn append_event_inner(
@@ -1652,7 +1702,54 @@ fn load_key_package(
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    Ok(Some(KeyPackageRecord {
+    Ok(Some(row_to_key_package(row)?))
+}
+
+fn load_available_key_packages_for_account(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Vec<KeyPackageRecord>, StoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT key_package_id, owner_account_id, owner_device_id,
+               key_package_ref, key_package_hash, key_package_payload, state, lease_token
+        FROM key_packages
+        WHERE owner_account_id = ?1
+          AND state = ?2
+        ORDER BY owner_device_id, key_package_id
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        account_id,
+        encode_key_package_state(KeyPackageState::Available),
+    ])?;
+    let mut packages = Vec::new();
+    let mut seen_devices = BTreeSet::<String>::new();
+    while let Some(row) = rows.next()? {
+        if packages.len() >= MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize {
+            break;
+        }
+        let package = row_to_key_package(row)?;
+        if !seen_devices.insert(package.owner.device_id.clone()) {
+            continue;
+        }
+        validate_key_package_payload(&package.key_package_payload)?;
+        packages.push(package);
+    }
+    debug_assert_eq!(packages.len(), seen_devices.len());
+    Ok(packages)
+}
+
+fn load_key_package_required(
+    conn: &Connection,
+    key_package_id: &str,
+) -> Result<KeyPackageRecord, StoreError> {
+    load_key_package(conn, key_package_id)?
+        .ok_or_else(|| EngineError::KeyPackageNotFound(key_package_id.to_string()).into())
+}
+
+fn row_to_key_package(row: &Row<'_>) -> Result<KeyPackageRecord, StoreError> {
+    Ok(KeyPackageRecord {
         key_package_id: row.get(0)?,
         owner: DeviceRef {
             account_id: row.get(1)?,
@@ -1663,15 +1760,7 @@ fn load_key_package(
         key_package_payload: row.get(5)?,
         state: decode_key_package_state(row.get::<_, String>(6)?.as_str())?,
         lease_token: row.get(7)?,
-    }))
-}
-
-fn load_key_package_required(
-    conn: &Connection,
-    key_package_id: &str,
-) -> Result<KeyPackageRecord, StoreError> {
-    load_key_package(conn, key_package_id)?
-        .ok_or_else(|| EngineError::KeyPackageNotFound(key_package_id.to_string()).into())
+    })
 }
 
 fn load_welcome(conn: &Connection, welcome_id: &str) -> Result<Option<WelcomeRecord>, StoreError> {

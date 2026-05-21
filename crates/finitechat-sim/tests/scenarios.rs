@@ -3,10 +3,10 @@ use finitechat_engine::{
     SubmitCommitRequest, UploadKeyPackageRequest, device, envelope,
 };
 use finitechat_proto::{
-    KeyPackageState, LogEntryKind, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1,
-    MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
-    WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES,
+    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
+    ProtocolLimitError, RoomStatus, WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -24,6 +24,22 @@ fn provision_bob(world: &mut SimWorld) {
         )
         .unwrap();
     world.activate_device("welcome_bob_1", bob()).unwrap();
+}
+
+fn upload_available_key_package(
+    server: &mut DeliveryService,
+    owner: DeviceRef,
+    key_package_id: &str,
+) {
+    server
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: key_package_id.to_string(),
+            owner,
+            key_package_ref: format!("ref_{key_package_id}"),
+            key_package_hash: format!("hash_{key_package_id}"),
+            key_package_payload: fake_key_package_payload(key_package_id),
+        })
+        .unwrap();
 }
 
 #[test]
@@ -68,6 +84,249 @@ fn key_package_claim_returns_opaque_payload() {
         claimed.key_package_payload,
         fake_key_package_payload("kp_bob_1")
     );
+}
+
+#[test]
+fn account_key_package_claim_returns_one_available_package_per_device() {
+    let mut server = DeliveryService::new();
+    let bob_phone = device("bob_npub", "bob_phone");
+    let bob_laptop = device("bob_npub", "bob_laptop");
+
+    upload_available_key_package(&mut server, bob_phone.clone(), "kp_bob_phone_1");
+    upload_available_key_package(&mut server, bob_phone.clone(), "kp_bob_phone_2");
+    upload_available_key_package(&mut server, bob_laptop.clone(), "kp_bob_laptop_1");
+    upload_available_key_package(&mut server, charlie(), "kp_charlie_1");
+
+    let claimed = server.claim_key_packages_for_account("bob_npub").unwrap();
+
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(claimed[0].owner, bob_laptop);
+    assert_eq!(claimed[0].key_package_id, "kp_bob_laptop_1");
+    assert_eq!(claimed[1].owner, bob_phone);
+    assert_eq!(claimed[1].key_package_id, "kp_bob_phone_1");
+    assert_eq!(
+        server.key_package("kp_bob_laptop_1").unwrap().state,
+        KeyPackageState::Leased
+    );
+    assert_eq!(
+        server.key_package("kp_bob_phone_1").unwrap().state,
+        KeyPackageState::Leased
+    );
+    assert_eq!(
+        server.key_package("kp_bob_phone_2").unwrap().state,
+        KeyPackageState::Available
+    );
+    assert_eq!(
+        server.key_package("kp_charlie_1").unwrap().state,
+        KeyPackageState::Available
+    );
+}
+
+#[test]
+fn multi_device_pending_invite_action_order_fuzz_keeps_server_roles_separate() {
+    for seed in 1..=512 {
+        run_multi_device_pending_invite_ordering(seed);
+    }
+}
+
+fn run_multi_device_pending_invite_ordering(seed: u64) {
+    const ROOM_ID: &str = "room_multi_device_fuzz";
+    const GROUP_ID: &str = "mls_multi_device_fuzz";
+    const STEPS: usize = 64;
+
+    let mut server = DeliveryService::new();
+    let bob_device = device("bob_npub", "bob_runtime");
+    let alice_devices = [
+        device("alice_npub", "alice_browser"),
+        device("alice_npub", "alice_phone"),
+        device("alice_npub", "alice_tablet"),
+    ];
+    server
+        .create_or_get_direct_room(CreateDirectRoomRequest {
+            room_id: ROOM_ID.to_string(),
+            mls_group_id: GROUP_ID.to_string(),
+            creator: bob_device.clone(),
+            other_account_id: "alice_npub".to_string(),
+        })
+        .unwrap();
+    for device in &alice_devices {
+        upload_available_key_package(
+            &mut server,
+            device.clone(),
+            &format!("kp_{}", device.device_id),
+        );
+    }
+    let claimed_key_packages = server.claim_key_packages_for_account("alice_npub").unwrap();
+    assert_eq!(claimed_key_packages.len(), alice_devices.len());
+
+    let commit = envelope(
+        ROOM_ID.to_string(),
+        GROUP_ID.to_string(),
+        bob_device.clone(),
+        0,
+        LogEntryKind::Commit,
+        format!("multi_device_invite:{seed}").into_bytes(),
+    );
+    let commit_message_id = commit.message_id().unwrap();
+    let accepted = server
+        .submit_commit(SubmitCommitRequest {
+            room_id: ROOM_ID.to_string(),
+            sender: bob_device.clone(),
+            expected_epoch: 0,
+            envelope: commit,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: 0,
+                post_commit_epoch: 1,
+                commit_message_id,
+                adds: claimed_key_packages
+                    .iter()
+                    .map(|claim| MembershipAddV1 {
+                        device: claim.owner.clone(),
+                        key_package_id: claim.key_package_id.clone(),
+                        key_package_ref: claim.key_package_ref.clone(),
+                        key_package_hash: claim.key_package_hash.clone(),
+                        welcome_id: format!("welcome_{}", claim.owner.device_id),
+                    })
+                    .collect(),
+                removes: vec![],
+            },
+            staged_welcomes: claimed_key_packages
+                .iter()
+                .map(|claim| staged_welcome(&format!("welcome_{}", claim.owner.device_id)))
+                .collect(),
+            idempotency_key: format!("invite_all_alice_devices_{seed}"),
+        })
+        .unwrap();
+    assert_eq!(accepted.seq, 1);
+
+    let mut rng = Lcg::new(seed);
+    let mut acked = [false; 3];
+    let mut cursors = [accepted.seq; 3];
+    for step in 0..STEPS {
+        let device_index = rng.next_usize(alice_devices.len());
+        let device = alice_devices[device_index].clone();
+        match rng.next_usize(4) {
+            0 => {
+                if acked[device_index] {
+                    continue;
+                }
+                let welcome_id = format!("welcome_{}", device.device_id);
+                let welcomes = server.claim_welcomes(&device);
+                assert_eq!(welcomes.len(), 1);
+                assert_eq!(welcomes[0].welcome_id, welcome_id);
+                server.ack_welcome(&welcome_id, true).unwrap();
+                acked[device_index] = true;
+                assert!(server.room(ROOM_ID).unwrap().device_active_at_head(&device));
+            }
+            1 => {
+                let request = sim_application_request(
+                    ROOM_ID,
+                    GROUP_ID,
+                    bob_device.clone(),
+                    format!("bob_msg_{seed}_{step}").as_bytes(),
+                    &format!("bob_msg_{seed}_{step}"),
+                );
+                server.append_event(request).unwrap();
+            }
+            2 => {
+                let before_seq = server.room(ROOM_ID).unwrap().last_seq;
+                let request = sim_application_request(
+                    ROOM_ID,
+                    GROUP_ID,
+                    device.clone(),
+                    format!("alice_msg_{seed}_{step}_{device_index}").as_bytes(),
+                    &format!("alice_msg_{seed}_{step}_{device_index}"),
+                );
+                let result = server.append_event(request);
+                if acked[device_index] {
+                    assert!(result.is_ok());
+                } else {
+                    assert_eq!(result.unwrap_err(), EngineError::SenderNotActive(device));
+                    assert_eq!(server.room(ROOM_ID).unwrap().last_seq, before_seq);
+                }
+            }
+            _ => {
+                let page = server
+                    .sync_events(ROOM_ID, &device, cursors[device_index])
+                    .unwrap();
+                assert!(page.entries.len() <= MAX_SYNC_PAGE_ENTRIES as usize);
+                for entry in &page.entries {
+                    assert!(entry.seq > cursors[device_index]);
+                    assert_eq!(entry.kind, LogEntryKind::Application);
+                }
+                if let Some(last_entry) = page.entries.last() {
+                    cursors[device_index] = last_entry.seq;
+                }
+            }
+        }
+    }
+
+    let room = server.room(ROOM_ID).unwrap();
+    let expected_visible_entries = (room.last_seq - accepted.seq) as usize;
+    assert!(expected_visible_entries <= MAX_SYNC_PAGE_ENTRIES as usize);
+    for (index, device) in alice_devices.iter().enumerate() {
+        let page = server.sync_events(ROOM_ID, device, accepted.seq).unwrap();
+        assert_eq!(page.entries.len(), expected_visible_entries);
+        assert!(!page.has_more);
+        if !acked[index] {
+            let request = sim_application_request(
+                ROOM_ID,
+                GROUP_ID,
+                device.clone(),
+                b"still pending",
+                &format!("pending_final_{seed}_{index}"),
+            );
+            assert_eq!(
+                server.append_event(request).unwrap_err(),
+                EngineError::SenderNotActive(device.clone())
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Lcg {
+    state: u64,
+}
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        assert!(seed > 0);
+        Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn next_usize(&mut self, bound: usize) -> usize {
+        assert!(bound > 0);
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.state as usize) % bound
+    }
+}
+
+fn sim_application_request(
+    room_id: &str,
+    group_id: &str,
+    sender: DeviceRef,
+    body: &[u8],
+    idempotency_key: &str,
+) -> AppendEventRequest {
+    AppendEventRequest {
+        room_id: room_id.to_string(),
+        sender: sender.clone(),
+        envelope: envelope(
+            room_id.to_string(),
+            group_id.to_string(),
+            sender,
+            1,
+            LogEntryKind::Application,
+            body.to_vec(),
+        ),
+        idempotency_key: idempotency_key.to_string(),
+    }
 }
 
 #[test]

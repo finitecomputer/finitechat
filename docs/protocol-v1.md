@@ -82,7 +82,9 @@ These are protocol constants, not tuning hints:
 - envelope payload: `256 KiB`;
 - sync page: `100` entries and `4 MiB` of envelope payload bytes;
 - direct room devices per account: `8`;
-- KeyPackages claimed per request: `1`;
+- explicit KeyPackage claims per request: `1`;
+- account fanout KeyPackage claims per request: `8`, one available package per
+  device;
 - KeyPackage payload: `64 KiB`;
 - Welcomes claimed per request: `32`;
 - staged Welcomes per Commit: `32`;
@@ -109,12 +111,19 @@ KeyPackages:
 
 - `POST /v1/key-packages`
 - `POST /v1/key-packages/claim`
+- `POST /v1/accounts/{account_id}/key-packages/claim`
 - `POST /v1/key-packages/release`
 
 Uploaded KeyPackages include opaque serialized MLS KeyPackage bytes plus the
 metadata the server uses for routing/cache checks. Claiming a KeyPackage returns
 those exact bytes to the adding client; clients parse and verify MLS credential
 identity locally.
+
+Account fanout claim returns at most one available KeyPackage per registered
+device for the target account, ordered deterministically by device id and
+KeyPackage id. This is the invite primitive for multi-device users: the server
+routes packages to devices, but the adding client still verifies every
+Nostr-rooted MLS credential before constructing the Commit.
 
 Rooms:
 
@@ -235,3 +244,10 @@ The room server stores staged Welcome and ratchet-tree bytes as opaque payloads
 linked to the accepted Commit. It validates ids, sizes, and one-to-one matching
 with membership adds; it does not parse or trust the MLS contents. Claiming a
 Welcome returns these exact bytes to the recipient device.
+
+For multi-device invites, one MLS Commit may add several devices from the same
+account. Each added device receives its own Welcome record, but the opaque MLS
+Welcome bytes may be the same batch Welcome containing secrets for all added
+leaves. A device becomes a member interval at the accepted Commit seq even
+before it acks the Welcome, so it can sync messages after that seq; it cannot
+send until its own Welcome is claimed, activated, and acked.

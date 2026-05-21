@@ -1,7 +1,7 @@
 # Scenario Coverage
 
-Status: fake-MLS reducer scenarios, SQLite restart scenarios, and the first
-OpenMLS credential spike passing.
+Status: fake-MLS reducer scenarios, SQLite restart scenarios, OpenMLS
+credential proof, and the reusable OpenMLS client proof passing.
 
 Run:
 
@@ -19,6 +19,7 @@ Each item below has a named test in
 
 - `create_dm_room_and_release_welcome_after_commit`
 - `key_package_claim_returns_opaque_payload`
+- `account_key_package_claim_returns_one_available_package_per_device`
 - `welcome_activation_makes_new_device_active`
 - `add_commit_requires_staged_welcome_bytes_before_mutation`
 - `duplicate_commit_retry_returns_same_result_after_side_effects`
@@ -57,6 +58,7 @@ Each item below has a named test in
 - `duplicate_message_id_with_new_idempotency_key_is_rejected`
 - `idempotency_capacity_rejects_new_mutations_but_allows_replay`
 - `direct_room_rejects_too_many_devices_for_one_account`
+- `multi_device_pending_invite_action_order_fuzz_keeps_server_roles_separate`
 
 ## Meaning Of Fake-MLS
 
@@ -101,7 +103,9 @@ The production-shaped client tests live in
 Proven client scenarios:
 
 - `client_state_machine_adds_device_and_decrypts_application_message`
+- `multi_device_invite_late_joiner_catches_up_to_new_messages`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
+- `client_rejects_invalid_invite_request_before_local_pending_commit`
 - `client_rejects_tampered_ratchet_tree_before_ack`
 
 This proves the identity refinement from the protocol docs: OpenMLS carries the
@@ -139,6 +143,12 @@ Checkpoint test signal:
   storage, Welcome bytes are claimed from server storage, Alice refuses app
   sends while a local Commit is pending, and Bob decrypts a finitecomputer-style
   JSON command after acking the Welcome.
+- The multi-device checkpoint confirmed the earlier interval model was the
+  right one: devices added by an accepted Commit can sync entries after that
+  Commit even before they ack their Welcome, while the server still rejects
+  sends until each device's Welcome is acked. The real OpenMLS test then proved
+  a late Alice device can activate its batch Welcome and decrypt messages sent
+  before it joined locally.
 
 ## SQLite Follow-Up
 
@@ -149,6 +159,7 @@ Proven SQLite restart scenarios:
 
 - `sqlite_create_dm_room_and_release_welcome_after_commit`
 - `sqlite_key_package_payload_survives_reopen_and_claim`
+- `sqlite_account_key_package_claim_survives_reopen`
 - `sqlite_claimed_welcome_payload_survives_reopen`
 - `sqlite_add_commit_requires_staged_welcome_bytes_before_mutation`
 - `sqlite_duplicate_commit_retry_after_reopen_returns_same_result`

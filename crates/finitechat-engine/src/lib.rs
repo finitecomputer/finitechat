@@ -406,17 +406,64 @@ impl DeliveryService {
                 state: package.state,
             });
         }
+        validate_key_package_payload(&package.key_package_payload)?;
         let lease_token = lease_token_for(key_package_id, &package.owner);
         package.state = KeyPackageState::Leased;
         package.lease_token = Some(lease_token.clone());
-        Ok(ClaimKeyPackageResult {
-            key_package_id: package.key_package_id.clone(),
-            owner: package.owner.clone(),
-            key_package_ref: package.key_package_ref.clone(),
-            key_package_hash: package.key_package_hash.clone(),
-            key_package_payload: package.key_package_payload.clone(),
-            lease_token,
-        })
+        Ok(claimed_key_package_result(package, lease_token))
+    }
+
+    pub fn claim_key_packages_for_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Vec<ClaimKeyPackageResult>, EngineError> {
+        validate_string_bytes(
+            "account_id",
+            account_id,
+            finitechat_proto::MAX_ACCOUNT_ID_BYTES,
+        )?;
+
+        let mut available_packages = self
+            .key_packages
+            .iter()
+            .filter(|(_, package)| {
+                package.owner.account_id == account_id
+                    && package.state == KeyPackageState::Available
+            })
+            .collect::<Vec<_>>();
+        available_packages.sort_by(|(left_id, left), (right_id, right)| {
+            left.owner
+                .device_id
+                .cmp(&right.owner.device_id)
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut key_package_ids = Vec::new();
+        let mut seen_devices = BTreeSet::<DeviceId>::new();
+        for (key_package_id, package) in available_packages {
+            if key_package_ids.len() >= MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize {
+                break;
+            }
+            if !seen_devices.insert(package.owner.device_id.clone()) {
+                continue;
+            }
+            validate_key_package_payload(&package.key_package_payload)?;
+            key_package_ids.push(key_package_id.clone());
+        }
+
+        let mut claimed = Vec::with_capacity(key_package_ids.len());
+        for key_package_id in key_package_ids {
+            let package = self
+                .key_packages
+                .get_mut(&key_package_id)
+                .expect("available KeyPackage was selected before mutation");
+            let lease_token = lease_token_for(&package.key_package_id, &package.owner);
+            package.state = KeyPackageState::Leased;
+            package.lease_token = Some(lease_token.clone());
+            claimed.push(claimed_key_package_result(package, lease_token));
+        }
+        debug_assert!(claimed.len() <= MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize);
+        Ok(claimed)
     }
 
     pub fn release_key_package_lease(&mut self, key_package_id: &str) -> Result<(), EngineError> {
@@ -1154,6 +1201,30 @@ fn validate_room_open(room: &RoomRecord) -> Result<(), EngineError> {
         return Err(EngineError::RoomNotOpen);
     }
     Ok(())
+}
+
+fn validate_key_package_payload(payload: &[u8]) -> Result<(), EngineError> {
+    validate_bytes_non_empty("key_package_payload", payload.len())?;
+    validate_bytes_len(
+        "key_package_payload",
+        payload.len(),
+        MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    )?;
+    Ok(())
+}
+
+fn claimed_key_package_result(
+    package: &KeyPackageRecord,
+    lease_token: LeaseToken,
+) -> ClaimKeyPackageResult {
+    ClaimKeyPackageResult {
+        key_package_id: package.key_package_id.clone(),
+        owner: package.owner.clone(),
+        key_package_ref: package.key_package_ref.clone(),
+        key_package_hash: package.key_package_hash.clone(),
+        key_package_payload: package.key_package_payload.clone(),
+        lease_token,
+    }
 }
 
 pub fn staged_welcomes_by_id<'a>(
