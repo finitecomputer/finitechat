@@ -5,8 +5,9 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, ProtocolLimitError, RoomStatus, WelcomeState,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
+    WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
 use tempfile::TempDir;
@@ -675,5 +676,76 @@ fn sqlite_link_payload_limit_is_rejected() {
         link_session(&world.server, "link_big")
             .encrypted_payload
             .is_none()
+    );
+}
+
+#[test]
+fn sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay() {
+    let mut world = SqliteWorld::direct_room();
+    let first = finitechat_engine::AppendEventRequest {
+        room_id: world.room_id.clone(),
+        sender: alice(),
+        envelope: envelope(
+            world.room_id.clone(),
+            world.group_id.clone(),
+            alice(),
+            0,
+            LogEntryKind::Application,
+            b"body_0".to_vec(),
+        ),
+        idempotency_key: "msg_0".to_string(),
+    };
+    let first_result = world.server.append_event(first.clone()).unwrap();
+
+    for index in 1..MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE {
+        world
+            .server
+            .append_event(finitechat_engine::AppendEventRequest {
+                room_id: world.room_id.clone(),
+                sender: alice(),
+                envelope: envelope(
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    alice(),
+                    0,
+                    LogEntryKind::Application,
+                    format!("body_{index}").into_bytes(),
+                ),
+                idempotency_key: format!("msg_{index}"),
+            })
+            .unwrap();
+    }
+
+    let replayed = world.server.append_event(first).unwrap();
+    let err = store_engine_error(
+        world
+            .server
+            .append_event(finitechat_engine::AppendEventRequest {
+                room_id: world.room_id.clone(),
+                sender: alice(),
+                envelope: envelope(
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    alice(),
+                    0,
+                    LogEntryKind::Application,
+                    b"body_overflow".to_vec(),
+                ),
+                idempotency_key: format!("msg_{MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE}"),
+            })
+            .unwrap_err(),
+    );
+
+    assert_eq!(replayed, first_result);
+    assert!(matches!(
+        err,
+        EngineError::IdempotencyCapacityExceeded { room_id, sender, max_records }
+            if room_id == world.room_id
+                && sender == alice()
+                && max_records == MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE
+    ));
+    assert_eq!(
+        room(&world.reopen(), &world.room_id).log.len(),
+        MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE as usize
     );
 }

@@ -37,6 +37,7 @@ authoritative state layout is no longer a JSON snapshot.
 It proves:
 
 - accepted and rejected idempotency responses survive reopen;
+- idempotency capacity rejects new mutations without breaking existing replay;
 - Commit side effects are persisted together;
 - KeyPackage leases and consumption survive reopen;
 - Welcome release, claim, ack, failure, and resume states survive reopen;

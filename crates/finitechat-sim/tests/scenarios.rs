@@ -4,8 +4,9 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     KeyPackageState, LogEntryKind, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaError, MembershipDeltaV1,
-    MembershipRemoveV1, ProtocolLimitError, RoomStatus, WelcomeState,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1,
+    MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
+    WelcomeState,
 };
 use finitechat_sim::{SimWorld, alice, bob, charlie, dana};
 
@@ -1113,6 +1114,47 @@ fn duplicate_message_id_with_new_idempotency_key_is_rejected() {
 
     assert_eq!(err, EngineError::DuplicateMessageId(message_id));
     assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 1);
+}
+
+#[test]
+fn idempotency_capacity_rejects_new_mutations_but_allows_replay() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let first = world.app_message_request(alice(), 0, "body_0", "msg_0");
+    let first_result = world.server.append_event(first.clone()).unwrap();
+
+    for index in 1..MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE {
+        world
+            .server
+            .append_event(world.app_message_request(
+                alice(),
+                0,
+                &format!("body_{index}"),
+                &format!("msg_{index}"),
+            ))
+            .unwrap();
+    }
+
+    let replayed = world.server.append_event(first).unwrap();
+    let overflow = world.app_message_request(
+        alice(),
+        0,
+        "body_overflow",
+        &format!("msg_{MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE}"),
+    );
+    let err = world.server.append_event(overflow).unwrap_err();
+
+    assert_eq!(replayed, first_result);
+    assert!(matches!(
+        err,
+        EngineError::IdempotencyCapacityExceeded { room_id, sender, max_records }
+            if room_id == world.room_id
+                && sender == alice()
+                && max_records == MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE
+    ));
+    assert_eq!(
+        world.server.room(&world.room_id).unwrap().log.len(),
+        MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE as usize
+    );
 }
 
 #[test]

@@ -50,6 +50,7 @@ Each item below has a named test in
 - `oversized_application_payload_is_rejected_without_log_entry`
 - `sync_events_returns_bounded_page`
 - `duplicate_message_id_with_new_idempotency_key_is_rejected`
+- `idempotency_capacity_rejects_new_mutations_but_allows_replay`
 - `direct_room_rejects_too_many_devices_for_one_account`
 
 ## Meaning Of Fake-MLS
@@ -92,6 +93,7 @@ Proven SQLite restart scenarios:
 - `sqlite_sync_events_returns_bounded_page_after_reopen`
 - `sqlite_duplicate_message_id_is_typed_engine_error`
 - `sqlite_link_payload_limit_is_rejected`
+- `sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay`
 
 The remaining SQLite-only expansion is a crash matrix that injects failure
 after each logical side effect and verifies recovery converges to one log entry,

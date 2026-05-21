@@ -11,9 +11,10 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq,
-    WelcomeState, validate_bytes_len, validate_room_id, validate_string_bytes,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
+    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState, validate_bytes_len,
+    validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -238,10 +239,14 @@ impl SqliteDeliveryStore {
                 return response.response.into_event_result();
             }
 
+            ensure_idempotency_capacity(tx, &request.room_id, &request.sender)?;
             let result = append_event_inner(tx, &request)?;
             insert_idempotency(
                 tx,
                 &scope_key,
+                &request.room_id,
+                &request.sender,
+                "append_event",
                 &request_hash,
                 &PersistedIdempotencyResponse::Event(result.clone()),
             )?;
@@ -269,10 +274,14 @@ impl SqliteDeliveryStore {
                 return response.response.into_commit_result();
             }
 
+            ensure_idempotency_capacity(tx, &request.room_id, &request.sender)?;
             let result = submit_commit_inner(tx, &request)?;
             insert_idempotency(
                 tx,
                 &scope_key,
+                &request.room_id,
+                &request.sender,
+                "submit_commit",
                 &request_hash,
                 &PersistedIdempotencyResponse::Commit(result.clone()),
             )?;
@@ -741,6 +750,10 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 
         CREATE TABLE IF NOT EXISTS idempotency_records (
           scope_key TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          sender_account_id TEXT NOT NULL,
+          sender_device_id TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK (operation IN ('append_event', 'submit_commit')),
           request_hash TEXT NOT NULL,
           response_kind TEXT NOT NULL CHECK (response_kind IN ('event', 'commit')),
           response_json TEXT NOT NULL
@@ -1198,6 +1211,9 @@ fn update_link_payload(
 fn insert_idempotency(
     tx: &Transaction<'_>,
     scope_key: &str,
+    room_id: &str,
+    sender: &DeviceRef,
+    operation: &str,
     request_hash: &str,
     response: &PersistedIdempotencyResponse,
 ) -> Result<(), StoreError> {
@@ -1205,17 +1221,50 @@ fn insert_idempotency(
     tx.execute(
         r#"
         INSERT INTO idempotency_records (
-          scope_key, request_hash, response_kind, response_json
-        ) VALUES (?1, ?2, ?3, ?4)
+          scope_key, room_id, sender_account_id, sender_device_id, operation,
+          request_hash, response_kind, response_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
         params![
             scope_key,
+            room_id,
+            sender.account_id,
+            sender.device_id,
+            operation,
             request_hash,
             response.response_kind(),
             response_json,
         ],
     )?;
     Ok(())
+}
+
+fn ensure_idempotency_capacity(
+    conn: &Connection,
+    room_id: &str,
+    sender: &DeviceRef,
+) -> Result<(), StoreError> {
+    let count = conn.query_row(
+        r#"
+            SELECT COUNT(*)
+            FROM idempotency_records
+            WHERE room_id = ?1
+              AND sender_account_id = ?2
+              AND sender_device_id = ?3
+            "#,
+        params![room_id, sender.account_id, sender.device_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if count < i64::from(MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE) {
+        Ok(())
+    } else {
+        Err(EngineError::IdempotencyCapacityExceeded {
+            room_id: room_id.to_string(),
+            sender: sender.clone(),
+            max_records: MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+        }
+        .into())
+    }
 }
 
 fn room_exists(conn: &Connection, room_id: &str) -> Result<bool, StoreError> {

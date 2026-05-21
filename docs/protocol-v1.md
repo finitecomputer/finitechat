@@ -45,6 +45,7 @@ These are protocol constants, not tuning hints:
 - direct room devices per account: `8`;
 - KeyPackages claimed per request: `1`;
 - Welcomes claimed per request: `32`;
+- idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
 - idempotency key: `128` bytes;
 - account id, device id, room id, MLS group id, object ids: `128` bytes each.
@@ -125,6 +126,16 @@ entries.
 
 `has_more` means the server stopped because a page bound was reached. It does
 not mean the room is quiescent forever.
+
+## Idempotency Capacity
+
+Idempotency records are durable retry state. The room server must replay an
+existing record even when the room/device ledger is full.
+
+When a room/device already has `4096` idempotency records, a new mutation with a
+new idempotency key is rejected with `IdempotencyCapacityExceeded` before side
+effects. The server must not silently delete old records to make room, because
+that would turn a lost response retry into a possible duplicate mutation.
 
 ## Application/RPC Payloads
 

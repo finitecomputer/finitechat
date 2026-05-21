@@ -1,11 +1,12 @@
 use finitechat_proto::{
     AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
     KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST,
-    MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
-    RoomLogEntry, RoomStatus, Seq, WelcomeId, WelcomeState, validate_bytes_len,
-    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_SYNC_PAGE_BYTES,
+    MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1,
+    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeId,
+    WelcomeState, validate_bytes_len, validate_idempotency_key, validate_mls_group_id,
+    validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -236,6 +237,9 @@ enum IdempotencyResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IdempotencyRecord {
+    room_id: RoomId,
+    sender: DeviceRef,
+    operation: String,
     request_hash: String,
     response: IdempotencyResponse,
 }
@@ -435,10 +439,16 @@ impl DeliveryService {
             };
         }
 
+        self.ensure_idempotency_capacity(&request.room_id, &request.sender)?;
+        let room_id = request.room_id.clone();
+        let sender = request.sender.clone();
         let result = self.append_event_inner(request);
         self.idempotency.insert(
             scope,
             IdempotencyRecord {
+                room_id,
+                sender,
+                operation: "append_event".to_string(),
                 request_hash,
                 response: IdempotencyResponse::Event(result.clone()),
             },
@@ -468,10 +478,16 @@ impl DeliveryService {
             };
         }
 
+        self.ensure_idempotency_capacity(&request.room_id, &request.sender)?;
+        let room_id = request.room_id.clone();
+        let sender = request.sender.clone();
         let result = self.submit_commit_inner(request);
         self.idempotency.insert(
             scope,
             IdempotencyRecord {
+                room_id,
+                sender,
+                operation: "submit_commit".to_string(),
                 request_hash,
                 response: IdempotencyResponse::Commit(result.clone()),
             },
@@ -907,6 +923,28 @@ impl DeliveryService {
         }
         Ok(())
     }
+
+    fn ensure_idempotency_capacity(
+        &self,
+        room_id: &str,
+        sender: &DeviceRef,
+    ) -> Result<(), EngineError> {
+        let records = self
+            .idempotency
+            .values()
+            .filter(|record| record.room_id == room_id)
+            .filter(|record| record.sender == *sender)
+            .count();
+        if records < MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE as usize {
+            Ok(())
+        } else {
+            Err(EngineError::IdempotencyCapacityExceeded {
+                room_id: room_id.to_string(),
+                sender: sender.clone(),
+                max_records: MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+            })
+        }
+    }
 }
 
 impl RoomRecord {
@@ -1020,6 +1058,14 @@ pub enum EngineError {
     ReporterNotInInterval(DeviceRef),
     #[error("conflicting idempotency key")]
     ConflictingIdempotencyKey,
+    #[error(
+        "idempotency capacity exceeded for room {room_id} and sender {sender:?}: max {max_records}"
+    )]
+    IdempotencyCapacityExceeded {
+        room_id: RoomId,
+        sender: DeviceRef,
+        max_records: u32,
+    },
     #[error("link session already exists: {0}")]
     LinkSessionAlreadyExists(LinkSessionId),
     #[error("link session not found: {0}")]
