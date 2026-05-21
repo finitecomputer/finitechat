@@ -182,6 +182,9 @@ Current OpenMLS scope:
 - ordered-log application API that validates log entry shape, merges an
   observed local pending Commit, or processes a remote OpenMLS staged Commit
   before accepting epoch-advanced application messages.
+- later device linking proof where a new device joins two pre-existing rooms
+  using distinct per-room KeyPackages, activates both Welcomes, and decrypts
+  post-link messages in both rooms.
 
 Current known gap:
 
@@ -190,6 +193,9 @@ Current known gap:
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection. Same-epoch loser retry still needs a real
   OpenMLS scenario proof.
+- Later device linking is proven at the client protocol level, but production
+  still needs a durable room-discovery/fanout job that enumerates all rooms for
+  an account and retries failed room adds without duplicating successful ones.
 
 Good tests:
 
@@ -212,6 +218,8 @@ Good tests:
 - remote remove Commit advances remaining and removed devices through the
   removal Commit before post-remove messages are gated away from the removed
   device.
+- later linked device needs one KeyPackage per existing room, receives a
+  distinct Welcome per room, and can decrypt new messages after each add Commit.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration

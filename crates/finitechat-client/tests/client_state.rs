@@ -10,6 +10,7 @@ use finitechat_proto::LogEntryKind;
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
 const CHARLIE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [23; NOSTR_SECRET_KEY_BYTES];
+const DANA_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [29; NOSTR_SECRET_KEY_BYTES];
 const ROOM_ID: &str = "room_client_direct";
 const MLS_GROUP_ID: &str = "mls_client_direct";
 const BOB_KEY_PACKAGE_ID: &str = "kp_bob_client_1";
@@ -620,6 +621,153 @@ fn client_processes_remote_remove_commit_before_post_remove_messages() {
 }
 
 #[test]
+fn client_links_new_device_into_existing_rooms_with_distinct_key_packages() {
+    let mut server = DeliveryService::new();
+    let mut alice_browser = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
+    let mut alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_late");
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_runtime");
+    let room_a = "room_late_link_a";
+    let group_a = "mls_late_link_a";
+    let room_b = "room_late_link_b";
+    let group_b = "mls_late_link_b";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id: room_a,
+            mls_group_id: group_a,
+            key_package_id: "kp_bob_late_link_a",
+            welcome_id: "welcome_bob_late_link_a",
+            idempotency_key: "add_bob_late_link_a",
+        },
+    );
+    let dana_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut dana,
+        GroupMemberSetup {
+            room_id: room_b,
+            mls_group_id: group_b,
+            key_package_id: "kp_dana_late_link_b",
+            welcome_id: "welcome_dana_late_link_b",
+            idempotency_key: "add_dana_late_link_b",
+        },
+    );
+
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_alice_phone_late_a")
+                .unwrap(),
+        )
+        .unwrap();
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_alice_phone_late_b")
+                .unwrap(),
+        )
+        .unwrap();
+
+    let phone_claim_a = server.claim_key_package("kp_alice_phone_late_a").unwrap();
+    let prepared_a = alice_browser
+        .prepare_add_member_commit(
+            room_a,
+            &phone_claim_a,
+            "welcome_alice_phone_late_a",
+            "link_alice_phone_room_a",
+        )
+        .unwrap();
+    let accepted_a = server.submit_commit(prepared_a.request).unwrap();
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_a, &mut alice_browser, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_a, &mut bob, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    let phone_join_a = claim_and_activate_room(
+        &mut server,
+        &mut alice_phone,
+        room_a,
+        "welcome_alice_phone_late_a",
+    );
+    assert_eq!(phone_join_a, accepted_a.seq);
+
+    let phone_claim_b = server.claim_key_package("kp_alice_phone_late_b").unwrap();
+    let prepared_b = alice_browser
+        .prepare_add_member_commit(
+            room_b,
+            &phone_claim_b,
+            "welcome_alice_phone_late_b",
+            "link_alice_phone_room_b",
+        )
+        .unwrap();
+    let accepted_b = server.submit_commit(prepared_b.request).unwrap();
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_b, &mut alice_browser, dana_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_b, &mut dana, dana_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    let phone_join_b = claim_and_activate_room(
+        &mut server,
+        &mut alice_phone,
+        room_b,
+        "welcome_alice_phone_late_b",
+    );
+    assert_eq!(phone_join_b, accepted_b.seq);
+    assert_eq!(alice_phone.group_epoch(room_a).unwrap(), 2);
+    assert_eq!(alice_phone.group_epoch(room_b).unwrap(), 2);
+
+    let room_a_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"room a after link"}}"#;
+    let room_a_request = bob
+        .create_application_request(room_a, room_a_plaintext, "bob_after_late_link")
+        .unwrap();
+    server.append_event(room_a_request).unwrap();
+    assert_device_decrypts_after_for_room(
+        &server,
+        room_a,
+        &mut alice_phone,
+        accepted_a.seq,
+        room_a_plaintext,
+    );
+
+    let room_b_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"room b after link"}}"#;
+    let room_b_request = dana
+        .create_application_request(room_b, room_b_plaintext, "dana_after_late_link")
+        .unwrap();
+    server.append_event(room_b_request).unwrap();
+    assert_device_decrypts_after_for_room(
+        &server,
+        room_b,
+        &mut alice_phone,
+        accepted_b.seq,
+        room_b_plaintext,
+    );
+}
+
+#[test]
 fn multi_device_real_mls_ordering_matrix_validates_late_catch_up() {
     let activation_orders = [
         ["alice_browser", "alice_phone", "alice_tablet"],
@@ -798,6 +946,15 @@ fn claim_and_activate(
     device: &mut FiniteChatDevice,
     welcome_id: &str,
 ) -> u64 {
+    claim_and_activate_room(server, device, ROOM_ID, welcome_id)
+}
+
+fn claim_and_activate_room(
+    server: &mut DeliveryService,
+    device: &mut FiniteChatDevice,
+    room_id: &str,
+    welcome_id: &str,
+) -> u64 {
     let claimed_welcomes = server.claim_welcomes(device.device_ref());
     let welcome = claimed_welcomes
         .into_iter()
@@ -805,7 +962,7 @@ fn claim_and_activate(
         .unwrap();
     device
         .activate_welcome(
-            ROOM_ID,
+            room_id,
             &welcome.welcome_payload,
             &welcome.ratchet_tree_payload,
         )
@@ -849,6 +1006,60 @@ fn active_alice_bob_room() -> (DeliveryService, FiniteChatDevice, FiniteChatDevi
     assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
     assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
     (server, alice, bob, bob_join_seq)
+}
+
+struct GroupMemberSetup<'a> {
+    room_id: &'a str,
+    mls_group_id: &'a str,
+    key_package_id: &'a str,
+    welcome_id: &'a str,
+    idempotency_key: &'a str,
+}
+
+fn create_group_room_with_member(
+    server: &mut DeliveryService,
+    alice: &mut FiniteChatDevice,
+    member: &mut FiniteChatDevice,
+    setup: GroupMemberSetup<'_>,
+) -> u64 {
+    server
+        .create_room(CreateRoomRequest {
+            room_id: setup.room_id.to_string(),
+            mls_group_id: setup.mls_group_id.to_string(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+    alice
+        .create_group_state(setup.room_id, setup.mls_group_id)
+        .unwrap();
+    server
+        .upload_key_package(
+            member
+                .upload_key_package_request(setup.key_package_id)
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package(setup.key_package_id).unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            setup.room_id,
+            &claimed_key_package,
+            setup.welcome_id,
+            setup.idempotency_key,
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let alice_page = server
+        .sync_events(setup.room_id, alice.device_ref(), 0)
+        .unwrap();
+    alice
+        .merge_pending_commit_from_log(setup.room_id, &alice_page.entries, &prepared.message_id)
+        .unwrap();
+    let join_seq = claim_and_activate_room(server, member, setup.room_id, setup.welcome_id);
+    assert_eq!(join_seq, accepted.seq);
+    assert_eq!(alice.group_epoch(setup.room_id).unwrap(), 1);
+    assert_eq!(member.group_epoch(setup.room_id).unwrap(), 1);
+    join_seq
 }
 
 struct ActiveThreeMemberRoom {
@@ -915,12 +1126,21 @@ fn apply_one_commit(
     device: &mut FiniteChatDevice,
     after_seq: u64,
 ) -> AppliedLogEntry {
+    apply_one_commit_for_room(server, ROOM_ID, device, after_seq)
+}
+
+fn apply_one_commit_for_room(
+    server: &DeliveryService,
+    room_id: &str,
+    device: &mut FiniteChatDevice,
+    after_seq: u64,
+) -> AppliedLogEntry {
     let page = server
-        .sync_events(ROOM_ID, device.device_ref(), after_seq)
+        .sync_events(room_id, device.device_ref(), after_seq)
         .unwrap();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].kind, LogEntryKind::Commit);
-    device.apply_log_entry(ROOM_ID, &page.entries[0]).unwrap()
+    device.apply_log_entry(room_id, &page.entries[0]).unwrap()
 }
 
 fn assert_device_decrypts_after(
@@ -929,13 +1149,23 @@ fn assert_device_decrypts_after(
     after_seq: u64,
     plaintext: &[u8],
 ) {
+    assert_device_decrypts_after_for_room(server, ROOM_ID, device, after_seq, plaintext);
+}
+
+fn assert_device_decrypts_after_for_room(
+    server: &DeliveryService,
+    room_id: &str,
+    device: &mut FiniteChatDevice,
+    after_seq: u64,
+    plaintext: &[u8],
+) {
     let page = server
-        .sync_events(ROOM_ID, device.device_ref(), after_seq)
+        .sync_events(room_id, device.device_ref(), after_seq)
         .unwrap();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(
         device
-            .decrypt_application_entry(ROOM_ID, &page.entries[0])
+            .decrypt_application_entry(room_id, &page.entries[0])
             .unwrap(),
         plaintext
     );

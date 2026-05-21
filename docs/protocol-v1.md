@@ -149,6 +149,11 @@ Device linking:
 - `POST /v1/link-sessions/{id}/claim`
 - `POST /v1/link-sessions/{id}/ack`
 
+A newly linked device joins existing rooms through normal add-device Commits.
+Because MLS KeyPackages are single-use, the device must replenish enough
+KeyPackages for the rooms it is being linked into; each accepted room add
+releases a distinct Welcome for that room.
+
 ## Message Ids
 
 `seq` is a room-local cursor. It is not a stable message id.
