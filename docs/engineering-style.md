@@ -22,6 +22,40 @@ Reference: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE
   idempotency key are part of durable server state.
 - Keep fake-MLS tests honest: if a behavior will later depend on OpenMLS, mark
   the fake gate and keep the server-side invariant separate from crypto truth.
+- Do not use recursion in protocol, storage, sync, or client state-machine
+  code. Finite Chat state machines should be iterative and visibly bounded.
+- Put explicit limits on loops, batches, payloads, fanout, sync windows, and
+  retry work. If a loop is intentionally unbounded because it consumes a bounded
+  iterator from SQLite or MLS, say why near the loop.
+- Prefer explicitly sized domain types at boundaries. Use `u32` or `u64` for
+  protocol numbers, sequence numbers, counters, and WASM-facing values; avoid
+  exposing `usize` outside local indexing.
+- Declare variables at the smallest useful scope.
+- State invariants positively. Prefer `if value_is_valid { ... } else { ... }`
+  over negated forms for safety checks.
+- Centralize control flow and state mutation. Parent functions should decide
+  what happens; helpers should either validate, compute, or persist one clear
+  change.
+- Keep compiler warnings at the strictest practical setting for this repo:
+  `cargo clippy --all-targets -- -D warnings`.
+- Do not do irreversible work directly in reaction to external events. Inbound
+  HTTP, relay, push, or gateway events should be validated, persisted, and then
+  interpreted from Finite Chat's own ordered state.
+- Always explain why for surprising constraints, explicit limits, schema
+  choices, and security-relevant branches.
+- Pass important options explicitly at call sites instead of relying on library
+  defaults.
+- Distinguish the control plane from the data plane. Room creation,
+  KeyPackages, Welcomes, link sessions, repair, and idempotency are control
+  plane; encrypted application messages and sync are data plane.
+- Keep hot loops standalone with primitive arguments when they become visible
+  in profiles or performance sketches.
+- Treat cache invalidation as a protocol decision. Any derived cache must name
+  its source of truth, invalidation trigger, and stale-read behavior.
+- Audit every dependency addition before adding it. Prefer the standard library,
+  existing workspace dependencies, or a small Rust crate over shell/Python
+  tooling. New scripts should be Rust binaries or tests unless a non-Rust tool
+  is clearly the better fit.
 
 ## Assert Boundary
 
@@ -40,6 +74,70 @@ Use assertions or corruption errors for internal contradictions:
 - a Welcome ack has no corresponding inactive membership interval;
 - persisted idempotency response kind disagrees with its operation.
 
-The goal is not to maximize asserts mechanically. The goal is to keep invalid
-states from becoming ordinary states.
+Assertion policy:
 
+- Target an average of two invariant checks per nontrivial function: one near
+  ingress for the assumptions being consumed, and one near egress for the state
+  or value being produced.
+- For public APIs and mutation functions, entry checks should validate caller
+  input, current state, or both. Exit checks should validate the committed state
+  or returned value.
+- Pair important assertions. Check data before writing it and again after
+  reading it back from storage.
+- Split compound assertions or corruption checks so failures identify the exact
+  broken invariant.
+- Pure decode/encode helpers and tiny type constructors may rely on type
+  exhaustiveness instead of mechanical assertion count, but they should still
+  reject impossible external values explicitly.
+- Use handled errors for expected bad input. Use `debug_assert!`, `assert!`, or
+  `StoreError::CorruptState` for internal contradictions where continuing would
+  make state less trustworthy.
+
+The goal is not to maximize asserts mechanically. The goal is to keep invalid
+states from becoming ordinary states and to make the expected state space easy
+to review.
+
+## Test Shape
+
+- Every state-machine transition gets valid and invalid tests.
+- Every idempotent mutation gets success replay, rejected replay, and
+  conflicting-body tests.
+- Every storage invariant gets a restart test.
+- Add fuzz/property tests before OpenMLS or Postgres canary work changes parser,
+  membership, idempotency, or sync cursor logic.
+
+## Allocation Shape
+
+Rust will allocate; the rule is to make allocations visible and bounded.
+
+- Allocate request/session scratch buffers near the cycle boundary, not deep in
+  inner validation helpers.
+- Keep sync result limits explicit so vectors do not grow with room history.
+- Prefer borrowing slices in hot helpers.
+- For WASM-facing client code, treat allocations as part of the API budget and
+  document where they occur.
+
+## Performance Sketch
+
+Finite Chat should be network- and disk-bound before it is CPU-bound.
+
+Initial sniff-test target for one room-server process:
+
+- direct room Commit: one SQLite/Postgres transaction, one log row, a small
+  membership delta, zero plaintext inspection;
+- application message append: one transaction touching room head, log entry,
+  idempotency record, and push outbox;
+- sync: bounded page read by `(room_id, seq)` with opaque payload bytes.
+
+If a local SQLite dev server cannot handle hundreds of small appends per second
+on a laptop, or if a Postgres canary design cannot plausibly handle thousands
+of appends per second before network/push fanout dominates, assume the design
+has accidental complexity until proven otherwise.
+
+Optimize in this order:
+
+1. network: batch sync, cap payload sizes, keep push opaque;
+2. disk: single transaction per mutation, indexed cursor reads, no full-room
+   rewrites;
+3. memory: bounded pages and explicit fanout limits;
+4. CPU: standalone hot loops only after the first three are sound.
