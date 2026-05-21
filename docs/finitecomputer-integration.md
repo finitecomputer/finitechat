@@ -141,6 +141,26 @@ status object. When a command mutates state, its result should include or be
 followed by the corresponding snapshot so every client converges without an
 extra read command.
 
+## Daemon Survival Requirement
+
+Finite Chat is the fallback control surface when the agent stack is unhealthy.
+Hermes can be absent, hung, misconfigured, or unable to reach inference.
+Finite Chat still needs to sync rooms, publish runtime state, and accept
+allowlisted recovery commands while the host and daemon are online.
+
+The daemon must not depend on Hermes or inference for:
+
+- room sync and projection;
+- `runtime.gateway` or `runtime.inference` state snapshots;
+- recording `runtime.command.request` in the local command ledger;
+- restarting the Hermes gateway;
+- reporting terminal failure when an assistant reply cannot be produced.
+
+The integration canary should include the survival gate in
+`docs/daemon-survival-testing.md`: Hermes down at startup, inference down,
+gateway restart while Hermes is down, daemon restart during the command, and
+SSE loss repaired by pull sync.
+
 ## Topics And New Chat
 
 Finitecomputer should ship first-class topics as the product surface for Finite

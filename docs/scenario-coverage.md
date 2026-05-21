@@ -452,6 +452,32 @@ application payload behavior:
 - `dashboard_does_not_require_inbound_agent_http`
 - `chat_payloads_do_not_travel_over_generic_management_queue`
 
+## Planned Daemon Survival Scenarios
+
+Finite Chat should remain the runtime control surface when Hermes, inference, or
+bridge adapters are unhealthy:
+
+- `daemon_starts_when_hermes_is_absent`
+- `daemon_syncs_room_events_while_gateway_is_down`
+- `daemon_publishes_gateway_down_snapshot_without_hermes`
+- `daemon_publishes_inference_degraded_snapshot_without_agent_reply`
+- `dashboard_reads_stale_snapshot_while_heartbeat_is_fresh`
+- `gateway_restart_command_records_request_before_execution`
+- `gateway_restart_command_executes_when_gateway_is_down`
+- `gateway_restart_success_publishes_result_and_snapshot`
+- `gateway_restart_failure_publishes_terminal_result_without_retry_storm`
+- `hermes_hang_times_out_without_blocking_room_sync`
+- `hermes_invalid_output_marks_gateway_degraded_without_projection_corruption`
+- `inference_timeout_preserves_user_message_and_clears_activity`
+- `command_ledger_survives_restart_after_request_before_execution`
+- `command_ledger_survives_restart_after_execution_before_result`
+- `runtime_state_snapshot_after_command_result_retries_idempotently`
+- `sse_hint_during_hermes_down_only_triggers_pull_sync`
+- `daemon_restart_while_gateway_down_preserves_mls_and_cursors`
+- `broken_gateway_poll_does_not_block_keypackage_replenishment`
+- `broken_gateway_poll_does_not_block_welcome_ack`
+- `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
+
 ## Planned Transport Scenarios
 
 V1 transport should prove streams are hints and pull sync is authoritative:

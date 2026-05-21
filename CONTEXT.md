@@ -29,6 +29,10 @@ _Avoid_: Message, notification
 Structured current condition published by an agent runtime.
 _Avoid_: Command, message, activity
 
+**Finite Chat Daemon**:
+The local or runtime-resident control surface that owns a Finite Chat device.
+_Avoid_: Hermes, agent, inference provider
+
 ## Relationships
 
 - A **Room** contains zero or more **Conversations**.
@@ -37,6 +41,8 @@ _Avoid_: Command, message, activity
 - A **Segment** belongs to exactly one **Conversation**.
 - **Activity** may be scoped to a **Room** or to one **Conversation**.
 - **Runtime State** belongs to one agent runtime device and is projected by key.
+- A **Finite Chat Daemon** owns one or more **Devices** and may observe an
+  agent runtime, but it is not the agent or its inference provider.
 
 ## Example Dialogue
 
@@ -45,6 +51,9 @@ _Avoid_: Command, message, activity
 
 > **Dev:** "Do we send a command whenever the dashboard needs status?"
 > **Domain expert:** "No. The runtime publishes Runtime State, and the dashboard reads the latest projection."
+
+> **Dev:** "If Hermes is broken, is chat broken?"
+> **Domain expert:** "No. The Finite Chat Daemon still owns sync, Runtime State, and recovery commands while the host is online."
 
 ## Flagged Ambiguities
 

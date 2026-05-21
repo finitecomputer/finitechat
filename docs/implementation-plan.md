@@ -32,6 +32,9 @@ The first production-ready slice is done when:
 - finitec publishes non-notifying `runtime.state.snapshot` events for dashboard
   status surfaces, so dashboard page load reads projected state instead of
   sending a status command.
+- Finite Chat remains usable as the runtime control surface when Hermes or
+  inference is down: room sync, state snapshots, and recovery commands still
+  work while the host and daemon are online.
 
 ## Constraints
 
@@ -63,6 +66,8 @@ Must-nots:
 - Do not attempt federation, server migration, encrypted backups, push previews,
   or Signal-style metadata protection in v1.
 - Do not make dashboard call a runtime-local chat HTTP server.
+- Do not make Finite Chat daemon liveness, room sync, runtime state snapshots,
+  or gateway restart depend on Hermes or inference being healthy.
 - Do not silently migrate existing Pika rooms or finitecomputer plaintext
   threads into encrypted rooms.
 
@@ -73,6 +78,7 @@ Preferences:
 - Add OpenMLS only after fake-MLS invariants are tested.
 - Keep DTOs small enough that finitecomputer can vend/import them directly.
 - Prefer daemon-published state snapshots over request/response status polling.
+- Treat daemon survival tests as a canary gate, not as post-launch hardening.
 
 Escalate:
 
@@ -370,6 +376,8 @@ Good tests:
 - SSE drop/duplicate/reorder only triggers sync and never directly executes
   command work;
 - runtime restart preserves local MLS and pending gateway events.
+- Hermes down, inference down, and gateway restart survival cases pass without
+  blocking room sync or status projection.
 
 ### Phase 4: Canary Rollout
 

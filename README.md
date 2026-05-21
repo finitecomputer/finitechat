@@ -40,6 +40,8 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 - `docs/engineering-style.md`: local rules for debt, asserts, and invariants.
 - `docs/technical-debt-ledger.md`: observed finitecomputer integration debt,
   risks, proofs, and delete conditions.
+- `docs/daemon-survival-testing.md`: strategy for proving chat/status/recovery
+  still work when Hermes, inference, or bridge adapters are down.
 
 ## First Checks
 
