@@ -410,3 +410,9 @@ coverage before the room server owns push fanout:
 - `reserved_activity_kinds_render_generically`
 - `unknown_namespaced_activity_kind_is_preserved`
 - `app_specific_activity_kind_does_not_trigger_generic_ui`
+- `present_without_conversation_id_is_room_scoped`
+- `present_with_conversation_id_is_conversation_scoped`
+- `activity_default_expiry_guidance_stays_within_v1_cap`
+- `server_activity_cache_keeps_kind_and_activity_id_opaque`
+- `server_activity_cache_preserves_multiple_opaque_events_per_route`
+- `server_activity_cache_enforces_per_route_limit_without_seq_gap`

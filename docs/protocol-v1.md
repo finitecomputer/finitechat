@@ -138,6 +138,10 @@ must use a namespaced value such as `finitecomputer.indexing` or
 - Generic activity kinds are reserved Finite Chat values. Unknown namespaced
   activity kinds must be preserved in projection state and ignored by generic
   UI unless an application-specific renderer understands them.
+- `present` is a v1 ephemeral activity kind, not a separate global presence
+  system. Without `conversation_id`, `present` means the device is live in the
+  room; with `conversation_id`, it means the device is live in that app-level
+  conversation.
 
 ## V1 Limits
 
@@ -161,6 +165,7 @@ These are protocol constants, not tuning hints:
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
 - ephemeral activity expiry: `30 minutes` from server receipt;
+- ephemeral activity cache entries per room/conversation/device route: `64`;
 - idempotency key: `128` bytes;
 - account id, device id, room id, MLS group id, object ids: `128` bytes each.
 
@@ -330,7 +335,7 @@ events before decryption:
 - `durable`: ordered room-log data, push-eligible according to room and client
   policy;
 - `ephemeral`: best-effort activity state, always `push_policy = never`, with a
-  short explicit expiry.
+  bounded explicit expiry.
 
 Both envelope classes may carry an optional cleartext `conversation_id`.
 Clients use it to place messages and live activity in the right app-level
@@ -370,6 +375,13 @@ chat: `typing`, `thinking`, `working`, `uploading`, `recording`, and `present`.
 Application-specific activity uses namespaced kinds and must not change generic
 Finite Chat behavior unless the client opts into that namespace.
 
+Default expiry guidance is kind-specific and remains bounded by the v1 maximum:
+`typing` should normally expire within `30 seconds`; `present`, `uploading`,
+and `recording` should normally expire within `2 minutes`; `thinking` and
+`working` should normally use a `5 minute` lease, with longer leases up to the
+`30 minute` maximum only for known long-running agent work. Senders refresh
+before expiry while the state remains true.
+
 Durable terminal events may also carry encrypted activity-clear declarations,
 such as `(activity_kind, activity_id)`. Clients apply these clears to the
 durable event sender's device-scoped activity in the same room and optional
@@ -383,6 +395,13 @@ membership cache before forwarding or caching it. This check is not identity
 proof; clients still verify Nostr-rooted MLS credentials locally. It only keeps
 non-members, pending devices, and removed or revoked devices from creating live
 room activity.
+
+The server TTL cache stores bounded opaque activity events by room, optional
+conversation id, and sender device route. Because `activity_kind` and
+`activity_id` are encrypted, the server must not coalesce by those fields. It
+expires entries by server receipt time, enforces the per-route cache-entry
+limit, and may drop old activity without affecting durable sync. Clients replay
+cached activity after decryption and coalesce by the full projection key.
 
 After decryption, clients project activity by `(room_id, conversation_id,
 account_id, device_id, activity_kind, normalized_activity_id)`. Normal UI may
