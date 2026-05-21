@@ -1,6 +1,7 @@
 use finitechat_engine::{
     AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, EngineError,
-    ListAccountRoomsPage, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, envelope,
+    KeyPackageInventory, ListAccountRoomsPage, SubmitCommitRequest, UploadKeyPackageRequest,
+    WelcomeRecord, envelope,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -10,12 +11,13 @@ use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
     MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS, MAX_DEVICE_ID_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_MLS_GROUP_ID_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
-    WelcomeId, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
-    validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_MLS_GROUP_ID_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES,
+    MAX_STAGED_WELCOMES_PER_COMMIT, MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId,
+    RoomLogEntry, StagedWelcomeV1, WelcomeId, validate_bytes_len, validate_bytes_non_empty,
+    validate_idempotency_key, validate_item_count, validate_mls_group_id, validate_room_id,
+    validate_string_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
@@ -160,6 +162,13 @@ pub struct OpenMlsStorageRecord {
 pub enum AppliedLogEntry {
     Application(Vec<u8>),
     Commit { sender: DeviceRef, epoch: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageReplenishmentPlan {
+    pub inventory: KeyPackageInventory,
+    pub target_available: u32,
+    pub upload_requests: Vec<UploadKeyPackageRequest>,
 }
 
 pub struct FiniteChatDevice {
@@ -442,6 +451,87 @@ impl FiniteChatDevice {
         };
         request.validate_limits()?;
         Ok(request)
+    }
+
+    pub fn key_package_replenishment_plan(
+        &self,
+        inventory: KeyPackageInventory,
+        target_available: u32,
+        id_prefix: &str,
+        first_index: u32,
+    ) -> Result<KeyPackageReplenishmentPlan, ClientError> {
+        inventory.owner.validate_limits()?;
+        if inventory.owner != self.device_ref {
+            return Err(ClientError::KeyPackageInventoryOwnerMismatch {
+                expected: self.device_ref.clone(),
+                actual: inventory.owner,
+            });
+        }
+        validate_item_count(
+            "key_package_replenishment.target_available",
+            target_available as usize,
+            MAX_KEY_PACKAGES_PER_DEVICE,
+        )?;
+        validate_item_count(
+            "key_package_replenishment.available",
+            inventory.available as usize,
+            MAX_KEY_PACKAGES_PER_DEVICE,
+        )?;
+        validate_item_count(
+            "key_package_replenishment.leased",
+            inventory.leased as usize,
+            MAX_KEY_PACKAGES_PER_DEVICE,
+        )?;
+        if inventory.unconsumed() > u64::from(MAX_KEY_PACKAGES_PER_DEVICE) {
+            return Err(ClientError::KeyPackageInventoryOverCap {
+                available: inventory.available,
+                leased: inventory.leased,
+                max: MAX_KEY_PACKAGES_PER_DEVICE,
+            });
+        }
+        validate_bytes_non_empty("key_package_replenishment.id_prefix", id_prefix.len())?;
+        validate_string_bytes(
+            "key_package_replenishment.id_prefix",
+            id_prefix,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+
+        let missing_available = target_available.saturating_sub(inventory.available);
+        let remaining_cap = u32::try_from(
+            u64::from(MAX_KEY_PACKAGES_PER_DEVICE)
+                .checked_sub(inventory.unconsumed())
+                .ok_or(ClientError::KeyPackageInventoryOverCap {
+                    available: inventory.available,
+                    leased: inventory.leased,
+                    max: MAX_KEY_PACKAGES_PER_DEVICE,
+                })?,
+        )
+        .map_err(|_| ClientError::KeyPackageInventoryOverCap {
+            available: inventory.available,
+            leased: inventory.leased,
+            max: MAX_KEY_PACKAGES_PER_DEVICE,
+        })?;
+        let upload_count = missing_available.min(remaining_cap);
+        let mut upload_requests = Vec::with_capacity(upload_count as usize);
+        for offset in 0..upload_count {
+            let index = first_index
+                .checked_add(offset)
+                .ok_or(ClientError::KeyPackageReplenishmentIndexOverflow)?;
+            let key_package_id = format!("{id_prefix}_{index}");
+            upload_requests.push(self.upload_key_package_request(key_package_id)?);
+        }
+
+        debug_assert!(upload_requests.len() <= MAX_KEY_PACKAGES_PER_DEVICE as usize);
+        debug_assert!(
+            upload_requests
+                .iter()
+                .all(|request| request.owner == self.device_ref)
+        );
+        Ok(KeyPackageReplenishmentPlan {
+            inventory,
+            target_available,
+            upload_requests,
+        })
     }
 
     pub fn prepare_add_member_commit(
@@ -1887,6 +1977,21 @@ pub enum ClientError {
     KeyPackageRefMismatch,
     #[error("claimed KeyPackage hash does not match payload")]
     KeyPackageHashMismatch,
+    #[error("KeyPackage inventory owner mismatch: expected {expected:?}, actual {actual:?}")]
+    KeyPackageInventoryOwnerMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
+    #[error(
+        "KeyPackage inventory exceeds cap: {available} available and {leased} leased, max {max}"
+    )]
+    KeyPackageInventoryOverCap {
+        available: u32,
+        leased: u32,
+        max: u32,
+    },
+    #[error("KeyPackage replenishment id index overflow")]
+    KeyPackageReplenishmentIndexOverflow,
     #[error("failed to hash OpenMLS KeyPackage ref")]
     HashKeyPackageRef,
     #[error("failed to add OpenMLS member")]

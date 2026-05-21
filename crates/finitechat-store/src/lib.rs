@@ -5,19 +5,20 @@ use std::path::{Path, PathBuf};
 use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult,
     CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceMembership, DeviceRecord,
-    DeviceStatus, EngineError, EventAccepted, KeyPackageRecord, LinkSessionId, LinkSessionRecord,
-    LinkSessionState, ListAccountRoomsPage, ListAccountRoomsRequest, MembershipInterval,
-    RoomRecord, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord,
-    direct_room_key, direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
-    staged_welcomes_by_id, sync_events_page_for_room,
+    DeviceStatus, EngineError, EventAccepted, KeyPackageInventory, KeyPackageRecord, LinkSessionId,
+    LinkSessionRecord, LinkSessionState, ListAccountRoomsPage, ListAccountRoomsRequest,
+    MembershipInterval, RoomRecord, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest,
+    WelcomeRecord, direct_room_key, direct_room_key_string, idempotency_scope_key, lease_token_for,
+    request_hash, staged_welcomes_by_id, sync_events_page_for_room,
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
     MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
-    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState,
-    validate_bytes_len, validate_bytes_non_empty, validate_room_id, validate_string_bytes,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
+    RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
+    validate_bytes_non_empty, validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,15 @@ impl SqliteDeliveryStore {
     ) -> Result<Option<KeyPackageRecord>, StoreError> {
         let conn = self.connect()?;
         load_key_package(&conn, key_package_id)
+    }
+
+    pub fn key_package_inventory(
+        &self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, StoreError> {
+        owner.validate_limits().map_err(EngineError::from)?;
+        let conn = self.connect()?;
+        load_key_package_inventory(&conn, owner)
     }
 
     pub fn device(&self, device: &DeviceRef) -> Result<Option<DeviceRecord>, StoreError> {
@@ -187,6 +197,16 @@ impl SqliteDeliveryStore {
             observe_active_device(tx, &request.owner)?;
             if load_key_package(tx, &request.key_package_id)?.is_some() {
                 return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id).into());
+            }
+            let inventory = load_key_package_inventory(tx, &request.owner)?;
+            if inventory.unconsumed() >= u64::from(MAX_KEY_PACKAGES_PER_DEVICE) {
+                return Err(EngineError::KeyPackageInventoryFull {
+                    owner: request.owner,
+                    available: inventory.available,
+                    leased: inventory.leased,
+                    max: MAX_KEY_PACKAGES_PER_DEVICE,
+                }
+                .into());
             }
             tx.execute(
                 r#"
@@ -1958,6 +1978,46 @@ fn load_key_package(
     Ok(Some(row_to_key_package(row)?))
 }
 
+fn load_key_package_inventory(
+    conn: &Connection,
+    owner: &DeviceRef,
+) -> Result<KeyPackageInventory, StoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT state, COUNT(*)
+        FROM key_packages
+        WHERE owner_account_id = ?1
+          AND owner_device_id = ?2
+          AND state IN (?3, ?4)
+        GROUP BY state
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        owner.account_id.as_str(),
+        owner.device_id.as_str(),
+        encode_key_package_state(KeyPackageState::Available),
+        encode_key_package_state(KeyPackageState::Leased),
+    ])?;
+    let mut available = 0u32;
+    let mut leased = 0u32;
+    while let Some(row) = rows.next()? {
+        let state = decode_key_package_state(row.get::<_, String>(0)?.as_str())?;
+        let count = sqlite_count_to_u32("key_package_inventory.count", row.get(1)?)?;
+        match state {
+            KeyPackageState::Available => available = count,
+            KeyPackageState::Leased => leased = count,
+            KeyPackageState::Consumed | KeyPackageState::Released | KeyPackageState::Expired => {}
+        }
+    }
+    let inventory = KeyPackageInventory {
+        owner: owner.clone(),
+        available,
+        leased,
+    };
+    debug_assert_eq!(inventory.owner, *owner);
+    Ok(inventory)
+}
+
 fn load_available_key_packages_for_account(
     conn: &Connection,
     account_id: &str,
@@ -2299,6 +2359,22 @@ fn decode_link_session_state(value: &str) -> Result<LinkSessionState, StoreError
 
 fn to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::NumberOutOfRange { field, value })
+}
+
+fn sqlite_count_to_u32(field: &str, value: i64) -> Result<u32, StoreError> {
+    if value < 0 {
+        return Err(StoreError::CorruptState(format!(
+            "{field} count is negative: {value}"
+        )));
+    }
+    u32::try_from(value).map_err(|_| {
+        EngineError::ProtocolLimit(ProtocolLimitError::TooManyItems {
+            field: field.to_string(),
+            max_items: u64::from(u32::MAX),
+            actual_items: value as u64,
+        })
+        .into()
+    })
 }
 
 fn optional_i64(field: &'static str, value: Option<u64>) -> Result<Option<i64>, StoreError> {

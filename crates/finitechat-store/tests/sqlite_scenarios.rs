@@ -9,9 +9,9 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES,
-    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
-    StagedWelcomeV1, WelcomeState,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, ProtocolLimitError, RoomStatus, StagedWelcomeV1, WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
 use rusqlite::{Connection, ErrorCode, params};
@@ -503,6 +503,10 @@ impl DualDeliveryWorld {
             assert_eq!(
                 self.memory.device(device),
                 self.sqlite.device(device).unwrap().as_ref()
+            );
+            assert_eq!(
+                self.memory.key_package_inventory(device),
+                sqlite_result(self.sqlite.key_package_inventory(device))
             );
         }
     }
@@ -1010,6 +1014,85 @@ fn sqlite_account_key_package_claim_survives_reopen() {
     assert_eq!(
         key_package(&reopened, "kp_charlie_1").state,
         KeyPackageState::Available
+    );
+}
+
+#[test]
+fn sqlite_key_package_inventory_cap_survives_reopen_and_consumed_frees_space() {
+    let mut world = SqliteWorld::direct_room();
+    for index in 0..MAX_KEY_PACKAGES_PER_DEVICE {
+        upload_available_key_package(
+            &mut world.server,
+            bob(),
+            &format!("kp_sqlite_inventory_{index}"),
+        );
+    }
+
+    let mut reopened = world.reopen();
+    let inventory = reopened.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE);
+    assert_eq!(inventory.leased, 0);
+    assert_eq!(
+        store_engine_error(
+            reopened
+                .upload_key_package(UploadKeyPackageRequest {
+                    key_package_id: "kp_sqlite_inventory_overflow".to_string(),
+                    owner: bob(),
+                    key_package_ref: "ref_kp_sqlite_inventory_overflow".to_string(),
+                    key_package_hash: "hash_kp_sqlite_inventory_overflow".to_string(),
+                    key_package_payload: fake_key_package_payload("kp_sqlite_inventory_overflow"),
+                })
+                .unwrap_err()
+        ),
+        EngineError::KeyPackageInventoryFull {
+            owner: bob(),
+            available: MAX_KEY_PACKAGES_PER_DEVICE,
+            leased: 0,
+            max: MAX_KEY_PACKAGES_PER_DEVICE,
+        }
+    );
+
+    reopened.claim_key_package("kp_sqlite_inventory_0").unwrap();
+    let inventory = reopened.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.leased, 1);
+    assert_eq!(
+        store_engine_error(
+            reopened
+                .upload_key_package(UploadKeyPackageRequest {
+                    key_package_id: "kp_sqlite_inventory_still_full".to_string(),
+                    owner: bob(),
+                    key_package_ref: "ref_kp_sqlite_inventory_still_full".to_string(),
+                    key_package_hash: "hash_kp_sqlite_inventory_still_full".to_string(),
+                    key_package_payload: fake_key_package_payload("kp_sqlite_inventory_still_full"),
+                })
+                .unwrap_err()
+        ),
+        EngineError::KeyPackageInventoryFull {
+            owner: bob(),
+            available: MAX_KEY_PACKAGES_PER_DEVICE - 1,
+            leased: 1,
+            max: MAX_KEY_PACKAGES_PER_DEVICE,
+        }
+    );
+
+    let request = world.add_device_request(
+        alice(),
+        bob(),
+        "kp_sqlite_inventory_0",
+        "welcome_sqlite_inventory",
+        0,
+        "add_sqlite_inventory",
+    );
+    reopened.submit_commit(request).unwrap();
+    let mut reopened = world.reopen();
+    let inventory = reopened.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.leased, 0);
+    upload_available_key_package(&mut reopened, bob(), "kp_sqlite_inventory_replacement");
+    assert_eq!(
+        reopened.key_package_inventory(&bob()).unwrap().available,
+        MAX_KEY_PACKAGES_PER_DEVICE
     );
 }
 

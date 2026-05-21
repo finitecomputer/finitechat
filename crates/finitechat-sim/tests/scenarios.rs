@@ -6,9 +6,9 @@ use finitechat_engine::{
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1,
-    MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
-    WelcomeState,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE, MAX_SYNC_PAGE_ENTRIES,
+    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
+    ProtocolLimitError, RoomStatus, WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -161,6 +161,94 @@ fn revoked_device_cannot_replenish_or_claim_key_packages() {
     assert_eq!(
         server.register_device(bob()).unwrap_err(),
         EngineError::DeviceRevoked(bob())
+    );
+}
+
+#[test]
+fn key_package_inventory_is_bounded_and_consumed_packages_free_space() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for index in 0..MAX_KEY_PACKAGES_PER_DEVICE {
+        upload_available_key_package(
+            &mut world.server,
+            bob(),
+            &format!("kp_bob_inventory_{index}"),
+        );
+    }
+
+    let inventory = world.server.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE);
+    assert_eq!(inventory.leased, 0);
+    assert_eq!(
+        inventory.unconsumed(),
+        u64::from(MAX_KEY_PACKAGES_PER_DEVICE)
+    );
+    assert_eq!(
+        world
+            .server
+            .upload_key_package(UploadKeyPackageRequest {
+                key_package_id: "kp_bob_inventory_overflow".to_string(),
+                owner: bob(),
+                key_package_ref: "ref_kp_bob_inventory_overflow".to_string(),
+                key_package_hash: "hash_kp_bob_inventory_overflow".to_string(),
+                key_package_payload: fake_key_package_payload("kp_bob_inventory_overflow"),
+            })
+            .unwrap_err(),
+        EngineError::KeyPackageInventoryFull {
+            owner: bob(),
+            available: MAX_KEY_PACKAGES_PER_DEVICE,
+            leased: 0,
+            max: MAX_KEY_PACKAGES_PER_DEVICE,
+        }
+    );
+
+    world
+        .server
+        .claim_key_package("kp_bob_inventory_0")
+        .unwrap();
+    let inventory = world.server.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.leased, 1);
+    assert_eq!(
+        world
+            .server
+            .upload_key_package(UploadKeyPackageRequest {
+                key_package_id: "kp_bob_inventory_still_full".to_string(),
+                owner: bob(),
+                key_package_ref: "ref_kp_bob_inventory_still_full".to_string(),
+                key_package_hash: "hash_kp_bob_inventory_still_full".to_string(),
+                key_package_payload: fake_key_package_payload("kp_bob_inventory_still_full"),
+            })
+            .unwrap_err(),
+        EngineError::KeyPackageInventoryFull {
+            owner: bob(),
+            available: MAX_KEY_PACKAGES_PER_DEVICE - 1,
+            leased: 1,
+            max: MAX_KEY_PACKAGES_PER_DEVICE,
+        }
+    );
+
+    let request = world
+        .add_device_request(
+            alice(),
+            bob(),
+            "kp_bob_inventory_0",
+            "welcome_bob_inventory",
+            0,
+            "add_bob_inventory",
+        )
+        .unwrap();
+    world.server.submit_commit(request).unwrap();
+    let inventory = world.server.key_package_inventory(&bob()).unwrap();
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.leased, 0);
+    upload_available_key_package(&mut world.server, bob(), "kp_bob_inventory_replacement");
+    assert_eq!(
+        world
+            .server
+            .key_package_inventory(&bob())
+            .unwrap()
+            .available,
+        MAX_KEY_PACKAGES_PER_DEVICE
     );
 }
 

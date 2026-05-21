@@ -3,12 +3,12 @@ use finitechat_proto::{
     KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
-    ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
-    WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
-    validate_mls_group_id, validate_room_id, validate_string_bytes,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES,
+    MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1,
+    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq,
+    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
+    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,6 +81,19 @@ pub struct KeyPackageRecord {
     pub key_package_payload: Vec<u8>,
     pub state: KeyPackageState,
     pub lease_token: Option<LeaseToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageInventory {
+    pub owner: DeviceRef,
+    pub available: u32,
+    pub leased: u32,
+}
+
+impl KeyPackageInventory {
+    pub fn unconsumed(&self) -> u64 {
+        u64::from(self.available) + u64::from(self.leased)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +402,16 @@ impl DeliveryService {
         self.key_packages.get(key_package_id)
     }
 
+    pub fn key_package_inventory(
+        &self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, EngineError> {
+        owner.validate_limits()?;
+        let inventory = key_package_inventory_for(owner, self.key_packages.values())?;
+        debug_assert_eq!(inventory.owner, *owner);
+        Ok(inventory)
+    }
+
     pub fn device(&self, device: &DeviceRef) -> Option<&DeviceRecord> {
         self.devices.get(&device_registry_key(device))
     }
@@ -522,6 +545,15 @@ impl DeliveryService {
         self.observe_active_device(&request.owner)?;
         if self.key_packages.contains_key(&request.key_package_id) {
             return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id));
+        }
+        let inventory = self.key_package_inventory(&request.owner)?;
+        if inventory.unconsumed() >= u64::from(MAX_KEY_PACKAGES_PER_DEVICE) {
+            return Err(EngineError::KeyPackageInventoryFull {
+                owner: request.owner,
+                available: inventory.available,
+                leased: inventory.leased,
+                max: MAX_KEY_PACKAGES_PER_DEVICE,
+            });
         }
         self.key_packages.insert(
             request.key_package_id.clone(),
@@ -1393,6 +1425,15 @@ pub enum EngineError {
         key_package_id: KeyPackageId,
         state: KeyPackageState,
     },
+    #[error(
+        "key package inventory is full for {owner:?}: {available} available and {leased} leased, max {max}"
+    )]
+    KeyPackageInventoryFull {
+        owner: DeviceRef,
+        available: u32,
+        leased: u32,
+        max: u32,
+    },
     #[error("key package owner mismatch: {0}")]
     KeyPackageOwnerMismatch(KeyPackageId),
     #[error("key package ref or hash mismatch: {0}")]
@@ -1574,6 +1615,43 @@ fn device_membership_key(device: &DeviceRef) -> String {
 
 fn device_registry_key(device: &DeviceRef) -> String {
     device_membership_key(device)
+}
+
+fn key_package_inventory_for<'a>(
+    owner: &DeviceRef,
+    packages: impl Iterator<Item = &'a KeyPackageRecord>,
+) -> Result<KeyPackageInventory, EngineError> {
+    let mut available = 0usize;
+    let mut leased = 0usize;
+    for package in packages {
+        if package.owner != *owner {
+            continue;
+        }
+        match package.state {
+            KeyPackageState::Available => available += 1,
+            KeyPackageState::Leased => leased += 1,
+            KeyPackageState::Consumed | KeyPackageState::Released | KeyPackageState::Expired => {}
+        }
+    }
+
+    let inventory = KeyPackageInventory {
+        owner: owner.clone(),
+        available: inventory_count_to_u32("key_package_inventory.available", available)?,
+        leased: inventory_count_to_u32("key_package_inventory.leased", leased)?,
+    };
+    debug_assert_eq!(inventory.owner, *owner);
+    Ok(inventory)
+}
+
+fn inventory_count_to_u32(field: &str, value: usize) -> Result<u32, EngineError> {
+    u32::try_from(value).map_err(|_| {
+        ProtocolLimitError::TooManyItems {
+            field: field.to_string(),
+            max_items: u64::from(u32::MAX),
+            actual_items: u64::try_from(value).unwrap_or(u64::MAX),
+        }
+        .into()
+    })
 }
 
 fn device_is_revoked(devices: &BTreeMap<String, DeviceRecord>, device: &DeviceRef) -> bool {

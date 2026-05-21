@@ -88,6 +88,8 @@ These are protocol constants, not tuning hints:
 - explicit KeyPackage claims per request: `1`;
 - account fanout KeyPackage claims per request: `8`, one available package per
   device;
+- KeyPackage inventory per device: `64` unconsumed packages, counting
+  available and leased packages;
 - KeyPackage payload: `64 KiB`;
 - Welcomes claimed per request: `32`;
 - staged Welcomes per Commit: `32`;
@@ -125,6 +127,7 @@ material while room removals fan out.
 KeyPackages:
 
 - `POST /v1/key-packages`
+- `GET /v1/devices/{account_id}/{device_id}/key-packages/inventory`
 - `POST /v1/key-packages/claim`
 - `POST /v1/accounts/{account_id}/key-packages/claim`
 - `POST /v1/key-packages/release`
@@ -133,6 +136,12 @@ Uploaded KeyPackages include opaque serialized MLS KeyPackage bytes plus the
 metadata the server uses for routing/cache checks. Claiming a KeyPackage returns
 those exact bytes to the adding client; clients parse and verify MLS credential
 identity locally.
+
+Each device has a bounded KeyPackage inventory. The cap counts available
+packages plus leased packages because both are unconsumed server-held material;
+accepted add Commits consume leased packages and free inventory space. Clients
+use the inventory view to keep a small target number of available packages
+without pushing an unbounded upload pile into the Delivery Service.
 
 Account fanout claim returns at most one available KeyPackage per registered
 device for the target account, ordered deterministically by device id and
@@ -168,7 +177,9 @@ Device linking:
 A newly linked device joins existing rooms through normal add-device Commits.
 Because MLS KeyPackages are single-use, the device must replenish enough
 KeyPackages for the rooms it is being linked into; each accepted room add
-releases a distinct Welcome for that room.
+releases a distinct Welcome for that room. The replenishment loop should query
+inventory, upload at most the missing packages needed to reach the device's
+target available count, and stay under the unconsumed inventory cap.
 The account-room discovery endpoint is a control-plane helper for that worker:
 it pages over current/pending membership rows for an account and returns room
 head metadata plus the account's current devices. It is not an authorization

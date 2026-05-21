@@ -212,6 +212,10 @@ Current OpenMLS scope:
 - KeyPackage replenishment edge proof with real OpenMLS package bytes covering
   duplicate upload rejection, account-claim exhaustion, fresh-package
   replenishment, and lease expiry/reclaim.
+- bounded KeyPackage inventory policy: server and SQLite cap each device at
+  `64` unconsumed packages, expose available/leased counts, clients plan
+  target-available replenishment without UI involvement, consumed packages free
+  space, and the SQLite/reducer fuzzer compares inventory after every step.
 - explicit v1 history policy proof: a newly added device can sync from its
   accepted add Commit forward, but does not receive pre-membership room log
   history by default.
@@ -247,9 +251,10 @@ Current known gap:
   parity now has randomized operation-order coverage; a larger real-MLS fuzzer
   can still broaden client cryptographic-state confidence, but the core
   pending-Commit recovery branch is no longer add-only.
-- KeyPackage edge behavior is covered across real-client, sim, and SQLite
-  suites. Production still needs background policy for how many packages each
-  device keeps available per account and room fanout budget.
+- KeyPackage replenishment policy is explicit and covered across real-client,
+  sim, and SQLite suites. Production still needs the finitecomputer runtime
+  scheduler that calls the client planner at startup, after account fanout
+  claims, and after accepted add Commits.
 - V1 history recovery is intentionally narrow: new devices get messages from
   their accepted add Commit forward. Pre-invite history requires a future
   encrypted backup or explicit member-to-member history-share protocol.
@@ -310,8 +315,9 @@ Good tests:
   state, retry from the new epoch when still members, and stop sending when the
   winning Commit removed them.
 - real KeyPackage bytes cover duplicate upload, exhausted account claim,
-  replenishment by fresh upload, and lease expiry/reclaim; sim/SQLite cover
-  consumed-package reuse rejection and max-device caps.
+  replenishment by fresh upload, and lease expiry/reclaim; client/sim/SQLite
+  cover bounded inventory planning, cap enforcement, consumed-package space
+  recovery, and max-device caps.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

@@ -7,7 +7,9 @@ use finitechat_engine::{
     ListAccountRoomsRequest, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{KeyPackageState, LogEntryKind};
+use finitechat_proto::{
+    KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
+};
 use rusqlite::{Connection, params};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
@@ -1612,6 +1614,63 @@ fn client_key_package_replenishment_edges_use_real_packages() {
         server.key_package("kp_replenish_1").unwrap().state,
         KeyPackageState::Leased
     );
+}
+
+#[test]
+fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
+    let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_policy");
+    let mut server = DeliveryService::new();
+
+    let initial_inventory = server
+        .key_package_inventory(alice_phone.device_ref())
+        .unwrap();
+    let plan = alice_phone
+        .key_package_replenishment_plan(initial_inventory.clone(), 3, "kp_policy", 0)
+        .unwrap();
+    assert_eq!(plan.inventory, initial_inventory);
+    assert_eq!(plan.target_available, 3);
+    assert_eq!(plan.upload_requests.len(), 3);
+    for request in plan.upload_requests {
+        server.upload_key_package(request).unwrap();
+    }
+    let inventory = server
+        .key_package_inventory(alice_phone.device_ref())
+        .unwrap();
+    assert_eq!(inventory.available, 3);
+    assert_eq!(inventory.leased, 0);
+
+    let claimed = server
+        .claim_key_packages_for_account(&alice_phone.device_ref().account_id)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let inventory = server
+        .key_package_inventory(alice_phone.device_ref())
+        .unwrap();
+    assert_eq!(inventory.available, 2);
+    assert_eq!(inventory.leased, 1);
+
+    let plan = alice_phone
+        .key_package_replenishment_plan(inventory, 3, "kp_policy", 3)
+        .unwrap();
+    assert_eq!(plan.upload_requests.len(), 1);
+    assert_eq!(plan.upload_requests[0].key_package_id, "kp_policy_3");
+    server
+        .upload_key_package(plan.upload_requests[0].clone())
+        .unwrap();
+    let inventory = server
+        .key_package_inventory(alice_phone.device_ref())
+        .unwrap();
+    assert_eq!(inventory.available, 3);
+    assert_eq!(inventory.leased, 1);
+
+    let err = alice_phone
+        .key_package_replenishment_plan(inventory, MAX_KEY_PACKAGES_PER_DEVICE + 1, "kp_policy", 4)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ClientError::ProtocolLimit(ProtocolLimitError::TooManyItems { field, .. })
+            if field == "key_package_replenishment.target_available"
+    ));
 }
 
 #[test]

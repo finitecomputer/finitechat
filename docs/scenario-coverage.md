@@ -21,6 +21,7 @@ Each item below has a named test in
 - `key_package_claim_returns_opaque_payload`
 - `account_key_package_claim_returns_one_available_package_per_device`
 - `revoked_device_cannot_replenish_or_claim_key_packages`
+- `key_package_inventory_is_bounded_and_consumed_packages_free_space`
 - `revoked_device_cannot_claim_or_activate_pending_welcome`
 - `revoked_active_device_cannot_send_or_commit`
 - `welcome_activation_makes_new_device_active`
@@ -125,6 +126,7 @@ Proven client scenarios:
 - `client_recovers_losing_same_epoch_remove_commit_and_retries`
 - `client_drops_losing_pending_commit_when_winning_race_removes_it`
 - `client_key_package_replenishment_edges_use_real_packages`
+- `client_key_package_replenishment_plan_maintains_bounded_inventory`
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
@@ -259,10 +261,11 @@ Checkpoint test signal:
 - The KeyPackage replenishment checkpoint uses real OpenMLS package bytes for
   the client boundary: duplicate upload is rejected, account claim exhaustion
   returns no packages, uploading a fresh package replenishes availability, and
-  lease expiry makes the original package reclaimable. SQLite now also proves a
-  duplicate KeyPackage id remains rejected after reopen. Existing sim/SQLite
-  tests continue to cover consumed-package reuse rejection and direct-room
-  max-device caps.
+  lease expiry makes the original package reclaimable. The client planner now
+  takes server inventory, generates only the missing upload requests needed to
+  reach a target, and refuses over-cap targets. Sim and SQLite prove the server
+  cap counts available plus leased packages, accepted add Commits free consumed
+  package space, and cap behavior survives reopen.
 - The history-policy checkpoint makes the v1 product decision executable:
   Alice's newly linked phone syncs from cursor zero, but the server only returns
   entries from the accepted add Commit forward. The phone decrypts the
@@ -284,6 +287,7 @@ Proven SQLite restart scenarios:
 - `sqlite_key_package_payload_survives_reopen_and_claim`
 - `sqlite_duplicate_key_package_upload_is_rejected_after_reopen`
 - `sqlite_account_key_package_claim_survives_reopen`
+- `sqlite_key_package_inventory_cap_survives_reopen_and_consumed_frees_space`
 - `sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages`
 - `sqlite_claimed_welcome_payload_survives_reopen`
 - `sqlite_revoked_device_blocks_welcome_activation_and_sends_after_reopen`
@@ -320,13 +324,13 @@ epoch advance, correct membership intervals, consumed KeyPackages, released
 Welcomes, and a replayable idempotency result.
 
 The SQLite operation fuzzer applies the same deterministic sequence to the
-in-memory reducer and SQLite store, then compares room, device, KeyPackage, and
-Welcome state after every operation. It mixes register/revoke, upload/claim,
-account claim, lease expiry, Welcome claim/ack, app events, add/remove Commits,
-stale epochs, and exact idempotent retries. The first version caught a real
-reducer/store drift: explicit claim of a leased KeyPackage owned by a revoked
-device returned `KeyPackageUnavailable` in memory but `DeviceRevoked` in
-SQLite. The store now matches the reducer ordering.
+in-memory reducer and SQLite store, then compares room, device, KeyPackage,
+KeyPackage inventory, and Welcome state after every operation. It mixes
+register/revoke, upload/claim, account claim, lease expiry, Welcome claim/ack,
+app events, add/remove Commits, stale epochs, and exact idempotent retries. The
+first version caught a real reducer/store drift: explicit claim of a leased
+KeyPackage owned by a revoked device returned `KeyPackageUnavailable` in memory
+but `DeviceRevoked` in SQLite. The store now matches the reducer ordering.
 
 Push outbox rows are not implemented yet; when they land, this matrix should add
 a failure point after outbox enqueue and assert exactly one durable wake record.
