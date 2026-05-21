@@ -106,6 +106,8 @@ Proven client scenarios:
 - `multi_device_invite_late_joiner_catches_up_to_new_messages`
 - `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
 - `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
+- `client_processes_remote_add_commit_before_epoch_two_messages`
+- `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
 - `client_rejects_invalid_invite_request_before_local_pending_commit`
 - `client_rejects_tampered_ratchet_tree_before_ack`
@@ -159,6 +161,17 @@ Checkpoint test signal:
   device profile, and room mappings. It reloads Bob before sending, reloads
   Alice browser after activation, and reloads a late Alice phone before it
   decrypts messages sent while it was pending.
+- The first remote Commit checkpoint adds a real ordered-log client API:
+  application entries decrypt, own Commit entries merge only with pending local
+  state, and remote Commit entries validate the log envelope before processing
+  the OpenMLS staged Commit. The valid test advances Bob from epoch 1 to epoch
+  2 after Alice adds Charlie, and the invalid test rejects tampered Commit bytes
+  without advancing Bob's epoch.
+- Existing server tests mattered again here: the first version of the remote
+  add proof accidentally used a direct room for a third-account add, and
+  `DirectRoomThirdAccount` failed the scenario before it could become false
+  confidence. The proof now uses a group room while direct-room limits remain
+  covered separately.
 
 ## SQLite Follow-Up
 

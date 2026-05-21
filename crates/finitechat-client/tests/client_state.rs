@@ -1,12 +1,15 @@
-use finitechat_client::{ClientError, FiniteChatDevice, FiniteChatDeviceConfig, SqliteClientStore};
+use finitechat_client::{
+    AppliedLogEntry, ClientError, FiniteChatDevice, FiniteChatDeviceConfig, SqliteClientStore,
+};
 use finitechat_engine::{
-    AppendEventRequest, DeliveryService, EngineError, EventAccepted, envelope,
+    AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::LogEntryKind;
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
+const CHARLIE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [23; NOSTR_SECRET_KEY_BYTES];
 const ROOM_ID: &str = "room_client_direct";
 const MLS_GROUP_ID: &str = "mls_client_direct";
 const BOB_KEY_PACKAGE_ID: &str = "kp_bob_client_1";
@@ -390,6 +393,122 @@ fn sqlite_client_state_survives_restart_for_late_multi_device_catch_up() {
 }
 
 #[test]
+fn client_processes_remote_add_commit_before_epoch_two_messages() {
+    let (mut server, mut alice, mut bob, bob_join_seq) = active_alice_bob_room();
+    let mut charlie = test_device(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_phone");
+
+    server
+        .upload_key_package(
+            charlie
+                .upload_key_package_request("kp_remote_charlie_1")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package("kp_remote_charlie_1").unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_remote_charlie_1",
+            "alice_remote_add_charlie",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let bob_page = server
+        .sync_events(ROOM_ID, bob.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(bob_page.entries[0].kind, LogEntryKind::Commit);
+    assert_eq!(
+        bob.apply_log_entry(ROOM_ID, &bob_page.entries[0]).unwrap(),
+        AppliedLogEntry::Commit {
+            sender: alice.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 2);
+
+    let alice_page = server
+        .sync_events(ROOM_ID, alice.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(
+        alice
+            .apply_log_entry(ROOM_ID, &alice_page.entries[0])
+            .unwrap(),
+        AppliedLogEntry::Commit {
+            sender: alice.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 2);
+
+    let charlie_join_seq =
+        claim_and_activate(&mut server, &mut charlie, "welcome_remote_charlie_1");
+    assert_eq!(charlie_join_seq, accepted.seq);
+    assert_eq!(charlie.group_epoch(ROOM_ID).unwrap(), 2);
+
+    let plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"remote add ok"}}"#;
+    let request = bob
+        .create_application_request(ROOM_ID, plaintext, "bob_after_remote_add")
+        .unwrap();
+    let app = server.append_event(request).unwrap();
+    assert_eq!(app.seq, accepted.seq + 1);
+    let alice_page = server
+        .sync_events(ROOM_ID, alice.device_ref(), accepted.seq)
+        .unwrap();
+    let charlie_page = server
+        .sync_events(ROOM_ID, charlie.device_ref(), accepted.seq)
+        .unwrap();
+    assert_eq!(
+        alice
+            .decrypt_application_entry(ROOM_ID, &alice_page.entries[0])
+            .unwrap(),
+        plaintext
+    );
+    assert_eq!(
+        charlie
+            .decrypt_application_entry(ROOM_ID, &charlie_page.entries[0])
+            .unwrap(),
+        plaintext
+    );
+}
+
+#[test]
+fn client_rejects_tampered_remote_commit_without_epoch_advance() {
+    let (mut server, mut alice, mut bob, bob_join_seq) = active_alice_bob_room();
+    let charlie = test_device(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_phone");
+
+    server
+        .upload_key_package(
+            charlie
+                .upload_key_package_request("kp_tampered_charlie_1")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package("kp_tampered_charlie_1").unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_tampered_charlie_1",
+            "alice_tampered_add_charlie",
+        )
+        .unwrap();
+    server.submit_commit(prepared.request).unwrap();
+    let bob_page = server
+        .sync_events(ROOM_ID, bob.device_ref(), bob_join_seq)
+        .unwrap();
+    let mut tampered = bob_page.entries[0].clone();
+    tampered.envelope.payload[0] ^= 0x01;
+
+    let err = bob.apply_commit_entry(ROOM_ID, &tampered).unwrap_err();
+
+    assert!(matches!(err, ClientError::LogEntryMessageIdMismatch { .. }));
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
+    assert!(!bob.has_pending_commit(ROOM_ID).unwrap());
+}
+
+#[test]
 fn multi_device_real_mls_ordering_matrix_validates_late_catch_up() {
     let activation_orders = [
         ["alice_browser", "alice_phone", "alice_tablet"],
@@ -582,6 +701,43 @@ fn claim_and_activate(
         .unwrap();
     server.ack_welcome(welcome_id, true).unwrap();
     welcome.commit_seq
+}
+
+fn active_alice_bob_room() -> (DeliveryService, FiniteChatDevice, FiniteChatDevice, u64) {
+    let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
+    let mut server = DeliveryService::new();
+
+    server
+        .create_room(CreateRoomRequest {
+            room_id: ROOM_ID.to_string(),
+            mls_group_id: MLS_GROUP_ID.to_string(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+    alice.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    server
+        .upload_key_package(bob.upload_key_package_request(BOB_KEY_PACKAGE_ID).unwrap())
+        .unwrap();
+    let claimed_key_package = server.claim_key_package(BOB_KEY_PACKAGE_ID).unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            BOB_WELCOME_ID,
+            "activate_bob_helper",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let alice_page = server.sync_events(ROOM_ID, alice.device_ref(), 0).unwrap();
+    alice
+        .merge_pending_commit_from_log(ROOM_ID, &alice_page.entries, &prepared.message_id)
+        .unwrap();
+    let bob_join_seq = claim_and_activate(&mut server, &mut bob, BOB_WELCOME_ID);
+    assert_eq!(bob_join_seq, accepted.seq);
+    assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
+    (server, alice, bob, bob_join_seq)
 }
 
 fn fake_application_request(

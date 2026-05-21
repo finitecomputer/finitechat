@@ -17,8 +17,8 @@ use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
     Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
     MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
-    ProcessedMessageContent, ProtocolMessage, ProtocolVersion, RatchetTreeIn, StagedWelcome,
-    Welcome,
+    ProcessedMessageContent, ProtocolMessage, ProtocolVersion, RatchetTreeIn, StagedCommit,
+    StagedWelcome, Welcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -69,6 +69,12 @@ pub struct PersistedRoomState {
 pub struct OpenMlsStorageRecord {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliedLogEntry {
+    Application(Vec<u8>),
+    Commit { sender: DeviceRef, epoch: u64 },
 }
 
 pub struct FiniteChatDevice {
@@ -524,6 +530,101 @@ impl FiniteChatDevice {
         Ok(())
     }
 
+    pub fn apply_log_entry(
+        &mut self,
+        room_id: &str,
+        entry: &RoomLogEntry,
+    ) -> Result<AppliedLogEntry, ClientError> {
+        match entry.kind {
+            LogEntryKind::Application => {
+                let plaintext = self.decrypt_application_entry(room_id, entry)?;
+                Ok(AppliedLogEntry::Application(plaintext))
+            }
+            LogEntryKind::Commit => {
+                self.apply_commit_entry(room_id, entry)?;
+                Ok(AppliedLogEntry::Commit {
+                    sender: entry.sender.clone(),
+                    epoch: post_commit_epoch(entry.epoch)?,
+                })
+            }
+            LogEntryKind::Proposal => Err(ClientError::UnsupportedLogEntryKind(entry.kind)),
+        }
+    }
+
+    pub fn apply_commit_entry(
+        &mut self,
+        room_id: &str,
+        entry: &RoomLogEntry,
+    ) -> Result<(), ClientError> {
+        validate_log_entry_shape(room_id, entry, LogEntryKind::Commit)?;
+        let post_commit_epoch = post_commit_epoch(entry.epoch)?;
+        let own_device_ref = self.device_ref.clone();
+        let now_unix_seconds = self.now_unix_seconds;
+        let provider = &self.provider;
+        let group = self
+            .groups
+            .get_mut(room_id)
+            .ok_or_else(|| ClientError::GroupNotFound(room_id.to_string()))?;
+        let current_epoch = group.epoch().as_u64();
+        if current_epoch != entry.epoch {
+            return Err(ClientError::UnexpectedCommitEpoch {
+                room_id: room_id.to_string(),
+                current_epoch,
+                entry_epoch: entry.epoch,
+            });
+        }
+
+        if entry.sender == own_device_ref {
+            if group.pending_commit().is_none() {
+                return Err(ClientError::OwnCommitWithoutPendingState(
+                    entry.message_id.clone(),
+                ));
+            }
+            group
+                .merge_pending_commit(provider)
+                .map_err(|_| ClientError::MergePendingCommit)?;
+            if group.epoch().as_u64() != post_commit_epoch {
+                return Err(ClientError::UnexpectedPostCommitEpoch {
+                    room_id: room_id.to_string(),
+                    expected_epoch: post_commit_epoch,
+                    actual_epoch: group.epoch().as_u64(),
+                });
+            }
+            debug_assert!(group.pending_commit().is_none());
+            return Ok(());
+        }
+
+        if group.pending_commit().is_some() {
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(|_| ClientError::ClearPendingCommit)?;
+        }
+
+        let processed = group
+            .process_message(
+                provider,
+                protocol_message_from_bytes(&entry.envelope.payload)?,
+            )
+            .map_err(|_| ClientError::ProcessMessage)?;
+        let ProcessedMessageContent::StagedCommitMessage(staged_commit) = processed.into_content()
+        else {
+            return Err(ClientError::UnexpectedMessage);
+        };
+        verify_staged_commit_credentials(now_unix_seconds, &staged_commit)?;
+        group
+            .merge_staged_commit(provider, *staged_commit)
+            .map_err(|_| ClientError::MergeStagedCommit)?;
+        if group.epoch().as_u64() != post_commit_epoch {
+            return Err(ClientError::UnexpectedPostCommitEpoch {
+                room_id: room_id.to_string(),
+                expected_epoch: post_commit_epoch,
+                actual_epoch: group.epoch().as_u64(),
+            });
+        }
+        debug_assert!(group.pending_commit().is_none());
+        Ok(())
+    }
+
     pub fn activate_welcome(
         &mut self,
         room_id: impl Into<RoomId>,
@@ -592,9 +693,7 @@ impl FiniteChatDevice {
         room_id: &str,
         entry: &RoomLogEntry,
     ) -> Result<Vec<u8>, ClientError> {
-        if entry.kind != LogEntryKind::Application {
-            return Err(ClientError::UnexpectedMessage);
-        }
+        validate_log_entry_shape(room_id, entry, LogEntryKind::Application)?;
         let provider = &self.provider;
         let group = self
             .groups
@@ -859,6 +958,10 @@ pub enum ClientError {
     ActivateWelcome,
     #[error("failed to merge pending commit")]
     MergePendingCommit,
+    #[error("failed to clear losing pending commit")]
+    ClearPendingCommit,
+    #[error("failed to merge staged remote commit")]
+    MergeStagedCommit,
     #[error("failed to create application message")]
     CreateApplicationMessage,
     #[error("failed to parse protocol message")]
@@ -916,6 +1019,57 @@ pub enum ClientError {
     LoadGroupState(RoomId),
     #[error("persisted MLS group state is missing: {0}")]
     MissingGroupState(RoomId),
+    #[error("log entry room mismatch: expected {expected}, actual {actual}")]
+    LogEntryRoomMismatch { expected: RoomId, actual: RoomId },
+    #[error("log entry envelope room mismatch: entry {entry_room}, envelope {envelope_room}")]
+    LogEntryEnvelopeRoomMismatch {
+        entry_room: RoomId,
+        envelope_room: RoomId,
+    },
+    #[error("log entry kind mismatch: expected {expected:?}, actual {actual:?}")]
+    LogEntryKindMismatch {
+        expected: LogEntryKind,
+        actual: LogEntryKind,
+    },
+    #[error("log entry envelope kind mismatch: entry {entry_kind:?}, envelope {envelope_kind:?}")]
+    LogEntryEnvelopeKindMismatch {
+        entry_kind: LogEntryKind,
+        envelope_kind: LogEntryKind,
+    },
+    #[error(
+        "log entry message id does not match envelope: entry {entry_message_id}, envelope {envelope_message_id}"
+    )]
+    LogEntryMessageIdMismatch {
+        entry_message_id: String,
+        envelope_message_id: String,
+    },
+    #[error("log entry sender does not match envelope")]
+    LogEntrySenderMismatch,
+    #[error("log entry epoch {entry_epoch} does not match envelope epoch {envelope_epoch}")]
+    LogEntryEpochMismatch {
+        entry_epoch: u64,
+        envelope_epoch: u64,
+    },
+    #[error("unsupported log entry kind: {0:?}")]
+    UnsupportedLogEntryKind(LogEntryKind),
+    #[error("commit epoch mismatch for {room_id}: local {current_epoch}, entry {entry_epoch}")]
+    UnexpectedCommitEpoch {
+        room_id: RoomId,
+        current_epoch: u64,
+        entry_epoch: u64,
+    },
+    #[error("post-commit epoch overflow")]
+    EpochOverflow,
+    #[error(
+        "post-commit epoch mismatch for {room_id}: expected {expected_epoch}, actual {actual_epoch}"
+    )]
+    UnexpectedPostCommitEpoch {
+        room_id: RoomId,
+        expected_epoch: u64,
+        actual_epoch: u64,
+    },
+    #[error("own commit has no pending local state: {0}")]
+    OwnCommitWithoutPendingState(String),
     #[error("account id is not a 32-byte lowercase hex Nostr public key: {0}")]
     MalformedAccountId(String),
     #[error("MLS group id is not valid UTF-8")]
@@ -956,6 +1110,22 @@ fn verified_key_package_from_claim(
     Ok(key_package)
 }
 
+fn verify_staged_commit_credentials(
+    now_unix_seconds: u64,
+    staged_commit: &StagedCommit,
+) -> Result<(), ClientError> {
+    for credential in staged_commit.credentials_to_verify() {
+        let credential = FiniteDeviceCredentialV1::from_credential(credential.clone())?;
+        credential.verify_expected(ExpectedDeviceCredential {
+            account_public_key: credential.account_public_key(),
+            device_id: credential.device_id(),
+            mls_leaf_signing_public_key: credential.mls_leaf_signing_public_key(),
+            now_unix_seconds,
+        })?;
+    }
+    Ok(())
+}
+
 fn openmls_group_config() -> MlsGroupCreateConfig {
     MlsGroupCreateConfig::builder()
         .ciphersuite(FINITECHAT_CIPHERSUITE)
@@ -982,6 +1152,64 @@ fn protocol_message_from_bytes(bytes: &[u8]) -> Result<ProtocolMessage, ClientEr
     mls_message_in_from_bytes(bytes)?
         .try_into_protocol_message()
         .map_err(|_| ClientError::ParseProtocolMessage)
+}
+
+fn validate_log_entry_shape(
+    room_id: &str,
+    entry: &RoomLogEntry,
+    expected_kind: LogEntryKind,
+) -> Result<(), ClientError> {
+    validate_room_id(room_id)?;
+    if entry.room_id != room_id {
+        return Err(ClientError::LogEntryRoomMismatch {
+            expected: room_id.to_string(),
+            actual: entry.room_id.clone(),
+        });
+    }
+    if entry.envelope.room_id != entry.room_id {
+        return Err(ClientError::LogEntryEnvelopeRoomMismatch {
+            entry_room: entry.room_id.clone(),
+            envelope_room: entry.envelope.room_id.clone(),
+        });
+    }
+    if entry.kind != expected_kind {
+        return Err(ClientError::LogEntryKindMismatch {
+            expected: expected_kind,
+            actual: entry.kind,
+        });
+    }
+    if entry.envelope.kind != entry.kind {
+        return Err(ClientError::LogEntryEnvelopeKindMismatch {
+            entry_kind: entry.kind,
+            envelope_kind: entry.envelope.kind,
+        });
+    }
+    let envelope_message_id = entry
+        .envelope
+        .message_id()
+        .map_err(ClientError::EnvelopeMessageId)?;
+    if entry.message_id != envelope_message_id {
+        return Err(ClientError::LogEntryMessageIdMismatch {
+            entry_message_id: entry.message_id.clone(),
+            envelope_message_id,
+        });
+    }
+    if entry.sender != entry.envelope.sender {
+        return Err(ClientError::LogEntrySenderMismatch);
+    }
+    if entry.epoch != entry.envelope.epoch {
+        return Err(ClientError::LogEntryEpochMismatch {
+            entry_epoch: entry.epoch,
+            envelope_epoch: entry.envelope.epoch,
+        });
+    }
+    debug_assert_eq!(entry.room_id, room_id);
+    debug_assert_eq!(entry.kind, expected_kind);
+    Ok(())
+}
+
+fn post_commit_epoch(epoch: u64) -> Result<u64, ClientError> {
+    epoch.checked_add(1).ok_or(ClientError::EpochOverflow)
 }
 
 fn mls_message_out_bytes(message: MlsMessageOut) -> Result<Vec<u8>, ClientError> {

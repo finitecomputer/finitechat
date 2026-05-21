@@ -224,7 +224,9 @@ this JSON.
 ## Membership Delta
 
 Commit requests carry cleartext `MembershipDeltaV1` beside the opaque Commit.
-The server uses it for cache and routing. Clients validate actual MLS effects.
+The server uses it for cache and routing. Clients validate actual MLS effects
+by processing ordered Commit log entries with OpenMLS before sending or
+decrypting messages in the next epoch.
 
 Required structural checks:
 

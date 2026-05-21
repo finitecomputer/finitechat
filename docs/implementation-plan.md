@@ -137,7 +137,8 @@ Production server store:
 ### Phase 2: OpenMLS Spike
 
 Status in this repo: reusable OpenMLS client state machine, multi-device invite
-proof, and first client SQLite restart proof passing.
+proof, first client SQLite restart proof, and first remote Commit processing
+proof passing.
 
 Deliverables:
 
@@ -178,11 +179,17 @@ Current OpenMLS scope:
   devices, with varied message timing before and between activations.
 - `SqliteClientStore` for persisted client profile, room mapping, and OpenMLS
   storage rows, with a restart test covering late multi-device catch-up.
+- ordered-log application API that validates log entry shape, merges an
+  observed local pending Commit, or processes a remote OpenMLS staged Commit
+  before accepting epoch-advanced application messages.
 
 Current known gap:
 
 - Client SQLite persistence is not encrypted at rest yet. Do not ship device
   secrets on disk until this store is wrapped with audited encryption.
+- Remote Commit processing is proven for add Commits and tampered log-entry
+  rejection. Remove, update/rekey, and same-epoch loser retry still need real
+  OpenMLS scenario proofs.
 
 Good tests:
 
@@ -198,6 +205,9 @@ Good tests:
   OpenMLS application-message ratchet orderings.
 - client restart tests prove Bob can send after reload and a late Alice device
   can activate, persist, reload, and decrypt the backlog.
+- remote add Commit advances an existing device from epoch 1 to epoch 2 before
+  it sends/decrypts post-add messages.
+- tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration
 
