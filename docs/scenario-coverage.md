@@ -109,6 +109,7 @@ Proven client scenarios:
 - `client_processes_remote_add_commit_before_epoch_two_messages`
 - `client_processes_remote_update_commit_before_epoch_three_messages`
 - `client_processes_remote_remove_commit_before_post_remove_messages`
+- `stale_removed_device_can_process_removal_but_not_future_ciphertext`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -183,6 +184,11 @@ Checkpoint test signal:
   phone with separate accepted Commits, and the phone activates both Welcomes
   before decrypting post-link messages in both rooms. This keeps KeyPackage
   single-use behavior visible instead of hiding it behind UI orchestration.
+- The revocation checkpoint clones Charlie's client state before removal to
+  model a stale/lost device. After Bob removes Charlie, that stale client can
+  fetch and process the removal Commit, but the server rejects its old-epoch
+  send, rejects a forged new-epoch send as inactive, withholds post-remove log
+  entries, and OpenMLS rejects a leaked post-remove ciphertext.
 - Existing server tests mattered again here: the first version of the remote
   add proof accidentally used a direct room for a third-account add, and
   `DirectRoomThirdAccount` failed the scenario before it could become false

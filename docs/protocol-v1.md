@@ -67,6 +67,8 @@ membership intervals, repair reports, and push wake outbox records.
 - Removed devices can fetch through their removal Commit.
 - Removed devices cannot send new events or Commits after the removal Commit is
   the room head.
+- Removed devices must not be able to decrypt post-removal application
+  ciphertext, even if they obtain those bytes outside normal sync.
 - `NeedsRepair` blocks normal sends.
 - Protocol limits are enforced before state mutation. Limit failures must not
   create log entries, consume KeyPackages, release Welcomes, or write

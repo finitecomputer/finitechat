@@ -185,6 +185,9 @@ Current OpenMLS scope:
 - later device linking proof where a new device joins two pre-existing rooms
   using distinct per-room KeyPackages, activates both Welcomes, and decrypts
   post-link messages in both rooms.
+- stale removed-device proof where a device using pre-removal MLS state can
+  fetch and process its removal Commit, but cannot send or decrypt post-removal
+  ciphertext.
 
 Current known gap:
 
@@ -196,6 +199,9 @@ Current known gap:
 - Later device linking is proven at the client protocol level, but production
   still needs a durable room-discovery/fanout job that enumerates all rooms for
   an account and retries failed room adds without duplicating successful ones.
+- Removal/revocation is proven for stale local MLS state and server delivery
+  gating. Production still needs policy and UX for who may revoke which device,
+  plus durable device-status records.
 
 Good tests:
 
@@ -220,6 +226,9 @@ Good tests:
   device.
 - later linked device needs one KeyPackage per existing room, receives a
   distinct Welcome per room, and can decrypt new messages after each add Commit.
+- stale removed device can sync through the removal Commit, is rejected by the
+  server at old and faked-new epochs, transitions local MLS state to removed,
+  and cannot decrypt leaked post-remove ciphertext.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration

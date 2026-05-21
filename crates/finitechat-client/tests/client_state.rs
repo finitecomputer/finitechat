@@ -621,6 +621,89 @@ fn client_processes_remote_remove_commit_before_post_remove_messages() {
 }
 
 #[test]
+fn stale_removed_device_can_process_removal_but_not_future_ciphertext() {
+    let mut world = active_alice_bob_charlie_room();
+    let charlie_ref = world.charlie.device_ref().clone();
+    let charlie_config = test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_phone");
+    let stale_charlie_state = world.charlie.export_state().unwrap();
+    let mut stale_charlie =
+        FiniteChatDevice::from_state(charlie_config, stale_charlie_state).unwrap();
+
+    let prepared = world
+        .bob
+        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "bob_remove_stale_charlie")
+        .unwrap();
+    let accepted = world.server.submit_commit(prepared.request).unwrap();
+    apply_one_commit(&world.server, &mut world.bob, world.last_seq);
+    apply_one_commit(&world.server, &mut world.alice, world.last_seq);
+
+    let stale_page = world
+        .server
+        .sync_events(ROOM_ID, stale_charlie.device_ref(), world.last_seq)
+        .unwrap();
+    assert_eq!(stale_page.entries.len(), 1);
+    assert_eq!(stale_page.entries[0].seq, accepted.seq);
+    let stale_send = stale_charlie
+        .create_application_request(ROOM_ID, b"stale", "stale_charlie_old_epoch")
+        .unwrap();
+    assert!(matches!(
+        world.server.append_event(stale_send).unwrap_err(),
+        EngineError::WrongEpoch { .. }
+    ));
+    assert_eq!(
+        world
+            .server
+            .append_event(fake_application_request(
+                charlie_ref.clone(),
+                3,
+                "stale_charlie_fake_new_epoch"
+            ))
+            .unwrap_err(),
+        EngineError::SenderNotActive(charlie_ref.clone())
+    );
+    assert_eq!(
+        stale_charlie
+            .apply_log_entry(ROOM_ID, &stale_page.entries[0])
+            .unwrap(),
+        AppliedLogEntry::Commit {
+            sender: world.bob.device_ref().clone(),
+            epoch: 3,
+        }
+    );
+    assert!(matches!(
+        stale_charlie.create_application_request(ROOM_ID, b"removed", "stale_charlie_removed"),
+        Err(ClientError::CreateApplicationMessage)
+    ));
+
+    let plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"not for removed"}}"#;
+    let request = world
+        .bob
+        .create_application_request(ROOM_ID, plaintext, "bob_after_stale_remove")
+        .unwrap();
+    world.server.append_event(request).unwrap();
+    let alice_page = world
+        .server
+        .sync_events(ROOM_ID, world.alice.device_ref(), accepted.seq)
+        .unwrap();
+    assert_eq!(
+        world
+            .alice
+            .decrypt_application_entry(ROOM_ID, &alice_page.entries[0])
+            .unwrap(),
+        plaintext
+    );
+    assert!(matches!(
+        stale_charlie.decrypt_application_entry(ROOM_ID, &alice_page.entries[0]),
+        Err(ClientError::ProcessMessage)
+    ));
+    let stale_future_page = world
+        .server
+        .sync_events(ROOM_ID, stale_charlie.device_ref(), accepted.seq)
+        .unwrap();
+    assert!(stale_future_page.entries.is_empty());
+}
+
+#[test]
 fn client_links_new_device_into_existing_rooms_with_distinct_key_packages() {
     let mut server = DeliveryService::new();
     let mut alice_browser = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
