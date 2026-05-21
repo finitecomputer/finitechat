@@ -17,6 +17,10 @@ finitecomputer login may authorize product access, but cryptographic chat
 identity is proof that the user controls the Nostr private key for the account
 public key in the room.
 
+The room server is authoritative for room ordering only. It is not authoritative
+for who an account or device is. Identity claims are accepted by clients only
+when the Nostr-rooted credential and MLS state validate locally.
+
 Persistent Finite Chat device secrets must be rooted in that Nostr private key,
 using explicit domain separation for Finite Chat, version, account, and device
 purpose. MLS is still allowed to create ephemeral or per-epoch secrets internally;
@@ -55,6 +59,7 @@ membership intervals, repair reports, and push wake outbox records.
 - At most one Commit is accepted per room epoch.
 - Clients process entries in sequence order.
 - Clients validate cryptography and application policy.
+- The server is authoritative for ordering, not identity.
 - The server validates only routing envelopes and structural metadata in v1.
 - A Welcome is released only after the linked Commit row is durable.
 - Mutations are idempotent by account, device, method, path, and key.

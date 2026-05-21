@@ -14,7 +14,9 @@ runtime chat. That makes a server-ordered Delivery Service a natural fit.
 
 ## Decision
 
-Finite Chat v1 uses one authoritative room server per room.
+Finite Chat v1 uses one ordering-authoritative room server per room. The server
+is not authoritative for identity. Clients verify account and device identity
+from Nostr-rooted MLS credentials.
 
 The server:
 
@@ -28,6 +30,7 @@ Clients:
 
 - own MLS cryptographic state;
 - validate device credentials and application policy;
+- reject identity claims that are not proven by the Nostr account key;
 - advance local MLS state only after observing accepted log entries;
 - enter `NeedsRepair` if an accepted Commit is invalid or disagrees with the
   submitted membership delta.
@@ -47,4 +50,3 @@ Negative:
 - requires durable server storage;
 - federation and server migration become explicit future workflows;
 - total device loss still needs re-add or a separate encrypted backup system.
-
