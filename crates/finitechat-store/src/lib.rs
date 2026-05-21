@@ -3,20 +3,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateDirectRoomRequest,
-    CreateRoomRequest, DeviceMembership, EngineError, EventAccepted, KeyPackageRecord,
-    LinkSessionId, LinkSessionRecord, LinkSessionState, MembershipInterval, RoomRecord,
+    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult,
+    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceMembership, EngineError,
+    EventAccepted, KeyPackageRecord, LinkSessionId, LinkSessionRecord, LinkSessionState,
+    ListAccountRoomsPage, ListAccountRoomsRequest, MembershipInterval, RoomRecord,
     SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, direct_room_key,
     direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
     staged_welcomes_by_id, sync_events_page_for_room,
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq,
-    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
-    validate_room_id, validate_string_bytes,
+    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
+    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState,
+    validate_bytes_len, validate_bytes_non_empty, validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -417,6 +418,17 @@ impl SqliteDeliveryStore {
         Ok(sync_events_page_for_room(&room, requester, after_seq))
     }
 
+    pub fn list_account_rooms(
+        &self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
+        let conn = self.connect()?;
+        let page = load_account_rooms_page(&conn, &request)?;
+        page.validate_limits().map_err(EngineError::from)?;
+        Ok(page)
+    }
+
     pub fn create_link_session(
         &mut self,
         link_session_id: impl Into<LinkSessionId>,
@@ -728,6 +740,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           active INTEGER NOT NULL CHECK (active IN (0, 1)),
           PRIMARY KEY (room_id, account_id, device_id, start_seq)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_room_membership_account_current_room
+        ON room_membership_intervals (account_id, end_seq, room_id, device_id);
 
         CREATE TABLE IF NOT EXISTS key_packages (
           key_package_id TEXT PRIMARY KEY,
@@ -1104,8 +1119,7 @@ fn validate_commit_key_packages(
     request: &SubmitCommitRequest,
 ) -> Result<(), EngineError> {
     let mut seen_packages = std::collections::BTreeSet::new();
-    let mut added_direct_room_devices_by_account =
-        std::collections::BTreeMap::<AccountId, usize>::new();
+    let mut added_devices_by_account = std::collections::BTreeMap::<AccountId, usize>::new();
     for add in &request.membership_delta.adds {
         if let Some((left, right)) = &room.direct_accounts
             && add.device.account_id != *left
@@ -1115,18 +1129,26 @@ fn validate_commit_key_packages(
                 add.device.account_id.clone(),
             ));
         }
+        let current_devices =
+            room.current_or_pending_device_count_for_account(&add.device.account_id);
+        let added_devices = added_devices_by_account
+            .entry(add.device.account_id.clone())
+            .or_insert(0);
+        *added_devices += 1;
+        finitechat_proto::validate_item_count(
+            "room.devices_per_account",
+            current_devices + *added_devices,
+            MAX_ACCOUNT_DEVICES_PER_ROOM,
+        )?;
         if room.direct_accounts.is_some() {
-            let current_devices =
-                room.current_or_pending_device_count_for_account(&add.device.account_id);
-            let added_devices = added_direct_room_devices_by_account
-                .entry(add.device.account_id.clone())
-                .or_insert(0);
-            *added_devices += 1;
             finitechat_proto::validate_item_count(
                 "direct_room.devices_per_account",
                 current_devices + *added_devices,
                 MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
             )?;
+        }
+        if room.device_current_or_pending_at_head(&add.device) {
+            return Err(EngineError::DeviceAlreadyInRoom(add.device.clone()));
         }
         if !seen_packages.insert(add.key_package_id.clone()) {
             return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()));
@@ -1646,6 +1668,110 @@ fn load_room_membership(
             });
     }
     Ok(membership)
+}
+
+fn load_account_rooms_page(
+    conn: &Connection,
+    request: &ListAccountRoomsRequest,
+) -> Result<ListAccountRoomsPage, StoreError> {
+    let sql_limit = i64::from(request.limit) + 1;
+    let mut statement = conn.prepare(
+        r#"
+        SELECT DISTINCT r.room_id, r.mls_group_id, r.current_epoch, r.last_seq, r.status
+        FROM rooms r
+        INNER JOIN room_membership_intervals m ON m.room_id = r.room_id
+        WHERE m.account_id = ?1
+          AND m.end_seq IS NULL
+          AND (?2 IS NULL OR r.room_id > ?2)
+        ORDER BY r.room_id
+        LIMIT ?3
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        request.account_id,
+        request.after_room_id,
+        sql_limit,
+    ])?;
+    let mut rooms = Vec::with_capacity(request.limit as usize);
+    while let Some(row) = rows.next()? {
+        if rooms.len() == request.limit as usize {
+            let next_after_room_id = rooms
+                .last()
+                .map(|room: &AccountRoomRecord| room.room_id.clone());
+            let page = ListAccountRoomsPage {
+                rooms,
+                next_after_room_id,
+                has_more: true,
+            };
+            page.validate_limits().map_err(EngineError::from)?;
+            return Ok(page);
+        }
+
+        let room_id = row.get::<_, String>(0)?;
+        let devices = load_current_account_room_devices(conn, &room_id, &request.account_id)?;
+        if devices.is_empty() {
+            return Err(StoreError::CorruptState(format!(
+                "room {room_id} discovered without current account devices"
+            )));
+        }
+        rooms.push(AccountRoomRecord {
+            room_id,
+            mls_group_id: row.get(1)?,
+            current_epoch: from_i64("current_epoch", row.get(2)?)?,
+            last_seq: from_i64("last_seq", row.get(3)?)?,
+            status: decode_room_status(row.get::<_, String>(4)?.as_str())?,
+            devices,
+        });
+    }
+    let next_after_room_id = rooms.last().map(|room| room.room_id.clone());
+    let page = ListAccountRoomsPage {
+        rooms,
+        next_after_room_id,
+        has_more: false,
+    };
+    page.validate_limits().map_err(EngineError::from)?;
+    Ok(page)
+}
+
+fn load_current_account_room_devices(
+    conn: &Connection,
+    room_id: &str,
+    account_id: &str,
+) -> Result<Vec<AccountRoomDevice>, StoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT device_id, MAX(active)
+        FROM room_membership_intervals
+        WHERE room_id = ?1
+          AND account_id = ?2
+          AND end_seq IS NULL
+        GROUP BY device_id
+        ORDER BY device_id
+        LIMIT ?3
+        "#,
+    )?;
+    let mut rows = statement.query(params![
+        room_id,
+        account_id,
+        i64::from(MAX_ACCOUNT_DEVICES_PER_ROOM) + 1,
+    ])?;
+    let mut devices = Vec::new();
+    while let Some(row) = rows.next()? {
+        if devices.len() >= MAX_ACCOUNT_DEVICES_PER_ROOM as usize {
+            return Err(StoreError::CorruptState(format!(
+                "room {room_id} has too many current devices for account {account_id}"
+            )));
+        }
+        devices.push(AccountRoomDevice {
+            device: DeviceRef {
+                account_id: account_id.to_string(),
+                device_id: row.get(0)?,
+            },
+            active: bool_from_i64("active", row.get(1)?)?,
+        });
+    }
+    debug_assert!(devices.len() <= MAX_ACCOUNT_DEVICES_PER_ROOM as usize);
+    Ok(devices)
 }
 
 fn validate_room_shape(room: &RoomRecord) -> Result<(), StoreError> {

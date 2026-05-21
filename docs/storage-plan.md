@@ -98,6 +98,12 @@ opaque and only enforces protocol bounds before mutation.
 Account-level KeyPackage fanout is a bounded query over indexed schema state,
 not a JSON scan: it claims one available package per device and leaves extra
 packages for later group invites or retry flows.
+Account-room discovery follows the same rule. The server pages over indexed
+current membership rows for an account, returns room head metadata plus the
+account's current/pending devices, and rejects duplicate current/pending device
+adds before consuming another KeyPackage or releasing another Welcome. The
+general devices-per-account-per-room cap keeps group-room fanout bounded, while
+direct rooms keep the tighter direct-room cap.
 
 ## Production Schema Direction
 

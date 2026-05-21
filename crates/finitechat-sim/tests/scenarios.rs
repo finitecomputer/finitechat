@@ -1,12 +1,14 @@
 use finitechat_engine::{
-    AppendEventRequest, CreateDirectRoomRequest, DeliveryService, EngineError, LinkSessionState,
-    SubmitCommitRequest, UploadKeyPackageRequest, device, envelope,
+    AppendEventRequest, CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, EngineError,
+    LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest, UploadKeyPackageRequest,
+    device, envelope,
 };
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES,
-    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
-    ProtocolLimitError, RoomStatus, WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1,
+    MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
+    WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -537,7 +539,14 @@ fn consumed_key_package_cannot_be_reused() {
     world.server.submit_commit(first).unwrap();
 
     let second = world
-        .add_device_request(alice(), bob(), "kp_bob_1", "welcome_bob_2", 1, "second")
+        .add_device_request(
+            alice(),
+            charlie(),
+            "kp_bob_1",
+            "welcome_charlie_reuse",
+            1,
+            "second",
+        )
         .unwrap();
     let err = world.server.submit_commit(second).unwrap_err();
 
@@ -548,7 +557,7 @@ fn consumed_key_package_cannot_be_reused() {
             state: KeyPackageState::Consumed
         }
     );
-    assert!(world.server.welcome("welcome_bob_2").is_none());
+    assert!(world.server.welcome("welcome_charlie_reuse").is_none());
 }
 
 #[test]
@@ -1368,6 +1377,94 @@ fn link_fanout_existing_device_stale_isolated_to_failed_room() {
 }
 
 #[test]
+fn account_room_discovery_pages_current_devices_for_link_fanout() {
+    let mut server = DeliveryService::new();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_account_a".to_string(),
+            mls_group_id: "mls_account_a".to_string(),
+            creator: alice(),
+        })
+        .unwrap();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_account_b".to_string(),
+            mls_group_id: "mls_account_b".to_string(),
+            creator: alice(),
+        })
+        .unwrap();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_other_account".to_string(),
+            mls_group_id: "mls_other_account".to_string(),
+            creator: bob(),
+        })
+        .unwrap();
+
+    let first_page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice().account_id,
+            after_room_id: None,
+            limit: 1,
+        })
+        .unwrap();
+    assert_eq!(first_page.rooms.len(), 1);
+    assert_eq!(first_page.rooms[0].room_id, "room_account_a");
+    assert_eq!(first_page.rooms[0].devices.len(), 1);
+    assert_eq!(first_page.rooms[0].devices[0].device, alice());
+    assert!(first_page.rooms[0].devices[0].active);
+    assert!(first_page.has_more);
+    assert_eq!(
+        first_page.next_after_room_id.as_deref(),
+        Some("room_account_a")
+    );
+
+    let second_page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice().account_id,
+            after_room_id: first_page.next_after_room_id,
+            limit: 8,
+        })
+        .unwrap();
+    assert_eq!(second_page.rooms.len(), 1);
+    assert_eq!(second_page.rooms[0].room_id, "room_account_b");
+    assert!(!second_page.has_more);
+    assert_eq!(
+        second_page.next_after_room_id.as_deref(),
+        Some("room_account_b")
+    );
+}
+
+#[test]
+fn duplicate_current_or_pending_device_add_is_rejected_before_side_effects() {
+    let mut world = SimWorld::direct_room().unwrap();
+    world
+        .add_device_commit(alice(), bob(), "kp_bob_1", "welcome_bob_1", 0, "add_bob")
+        .unwrap();
+    world.upload_and_claim(bob(), "kp_bob_retry").unwrap();
+
+    let duplicate = world
+        .add_device_request(
+            alice(),
+            bob(),
+            "kp_bob_retry",
+            "welcome_bob_retry",
+            1,
+            "add_bob_retry",
+        )
+        .unwrap();
+    assert!(matches!(
+        world.server.submit_commit(duplicate).unwrap_err(),
+        EngineError::DeviceAlreadyInRoom(device) if device == bob()
+    ));
+    assert_eq!(
+        world.server.key_package("kp_bob_retry").unwrap().state,
+        KeyPackageState::Leased
+    );
+    assert!(world.server.welcome("welcome_bob_retry").is_none());
+}
+
+#[test]
 fn oversized_application_payload_is_rejected_without_log_entry() {
     let mut world = SimWorld::direct_room().unwrap();
     let request = AppendEventRequest {
@@ -1587,4 +1684,56 @@ fn direct_room_rejects_too_many_devices_for_one_account() {
         EngineError::ProtocolLimit(ProtocolLimitError::TooManyItems { field, .. })
             if field == "direct_room.devices_per_account"
     ));
+}
+
+#[test]
+fn group_room_rejects_too_many_devices_for_one_account() {
+    let mut world = SimWorld::direct_room().unwrap();
+
+    for index in 0..(MAX_ACCOUNT_DEVICES_PER_ROOM - 1) {
+        let target = device("alice_npub", format!("alice_extra_{index}"));
+        let key_package_id = format!("kp_alice_extra_{index}");
+        world
+            .upload_and_claim(target.clone(), &key_package_id)
+            .unwrap();
+        let request = world
+            .add_device_request(
+                alice(),
+                target,
+                &key_package_id,
+                &format!("welcome_alice_extra_{index}"),
+                u64::from(index),
+                &format!("add_alice_extra_{index}"),
+            )
+            .unwrap();
+        world.server.submit_commit(request).unwrap();
+    }
+
+    let overflow = device("alice_npub", "alice_extra_overflow");
+    world
+        .upload_and_claim(overflow.clone(), "kp_alice_extra_overflow")
+        .unwrap();
+    let request = world
+        .add_device_request(
+            alice(),
+            overflow,
+            "kp_alice_extra_overflow",
+            "welcome_alice_extra_overflow",
+            u64::from(MAX_ACCOUNT_DEVICES_PER_ROOM - 1),
+            "add_alice_extra_overflow",
+        )
+        .unwrap();
+    let err = world.server.submit_commit(request).unwrap_err();
+
+    assert!(matches!(
+        err,
+        EngineError::ProtocolLimit(ProtocolLimitError::TooManyItems { field, .. })
+            if field == "room.devices_per_account"
+    ));
+    assert!(
+        world
+            .server
+            .welcome("welcome_alice_extra_overflow")
+            .is_none()
+    );
 }

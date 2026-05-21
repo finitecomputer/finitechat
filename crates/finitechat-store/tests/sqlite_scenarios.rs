@@ -2,8 +2,8 @@ use std::path::Path;
 
 use finitechat_engine::{
     CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, EngineError, KeyPackageRecord,
-    LinkSessionRecord, LinkSessionState, RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest,
-    WelcomeRecord, device, envelope, idempotency_scope_key,
+    LinkSessionRecord, LinkSessionState, ListAccountRoomsRequest, RoomRecord, SubmitCommitRequest,
+    UploadKeyPackageRequest, WelcomeRecord, device, envelope, idempotency_scope_key,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
@@ -864,7 +864,14 @@ fn sqlite_consumed_key_package_cannot_be_reused() {
     world.upload_and_claim(bob(), "kp_bob_1");
     let first = world.add_device_request(alice(), bob(), "kp_bob_1", "welcome_bob_1", 0, "first");
     world.server.submit_commit(first).unwrap();
-    let second = world.add_device_request(alice(), bob(), "kp_bob_1", "welcome_bob_2", 1, "second");
+    let second = world.add_device_request(
+        alice(),
+        charlie(),
+        "kp_bob_1",
+        "welcome_charlie_reuse",
+        1,
+        "second",
+    );
 
     let err = store_engine_error(world.server.submit_commit(second).unwrap_err());
 
@@ -875,7 +882,7 @@ fn sqlite_consumed_key_package_cannot_be_reused() {
             state: KeyPackageState::Consumed
         }
     );
-    assert!(maybe_welcome(&world.server, "welcome_bob_2").is_none());
+    assert!(maybe_welcome(&world.server, "welcome_charlie_reuse").is_none());
 }
 
 #[test]
@@ -1039,6 +1046,90 @@ fn sqlite_link_session_state_machine_survives_reopen() {
         link_session(&reopened, "link_1").state,
         LinkSessionState::Delivered
     );
+}
+
+#[test]
+fn sqlite_account_room_discovery_pages_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("finitechat.sqlite3");
+    let mut server = SqliteDeliveryStore::open(&path).unwrap();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_account_a".to_string(),
+            mls_group_id: "mls_account_a".to_string(),
+            creator: alice(),
+        })
+        .unwrap();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_account_b".to_string(),
+            mls_group_id: "mls_account_b".to_string(),
+            creator: alice(),
+        })
+        .unwrap();
+    server
+        .create_room(CreateRoomRequest {
+            room_id: "room_other_account".to_string(),
+            mls_group_id: "mls_other_account".to_string(),
+            creator: bob(),
+        })
+        .unwrap();
+    let server = SqliteDeliveryStore::open(&path).unwrap();
+
+    let first_page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice().account_id,
+            after_room_id: None,
+            limit: 1,
+        })
+        .unwrap();
+    assert_eq!(first_page.rooms.len(), 1);
+    assert_eq!(first_page.rooms[0].room_id, "room_account_a");
+    assert_eq!(first_page.rooms[0].devices.len(), 1);
+    assert_eq!(first_page.rooms[0].devices[0].device, alice());
+    assert!(first_page.rooms[0].devices[0].active);
+    assert!(first_page.has_more);
+
+    let second_page = server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: alice().account_id,
+            after_room_id: first_page.next_after_room_id,
+            limit: 8,
+        })
+        .unwrap();
+    assert_eq!(second_page.rooms.len(), 1);
+    assert_eq!(second_page.rooms[0].room_id, "room_account_b");
+    assert!(!second_page.has_more);
+    assert_eq!(
+        second_page.next_after_room_id.as_deref(),
+        Some("room_account_b")
+    );
+}
+
+#[test]
+fn sqlite_duplicate_pending_device_add_is_rejected_before_side_effects() {
+    let mut world = SqliteWorld::direct_room();
+    world.upload_and_claim(bob(), "kp_bob_1");
+    let add_bob =
+        world.add_device_request(alice(), bob(), "kp_bob_1", "welcome_bob_1", 0, "add_bob");
+    world.server.submit_commit(add_bob).unwrap();
+    world.upload_and_claim(bob(), "kp_bob_retry");
+
+    let duplicate = world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_retry",
+        "welcome_bob_retry",
+        1,
+        "add_bob_retry",
+    );
+    let err = store_engine_error(world.server.submit_commit(duplicate).unwrap_err());
+    assert_eq!(err, EngineError::DeviceAlreadyInRoom(bob()));
+    assert_eq!(
+        key_package(&world.server, "kp_bob_retry").state,
+        KeyPackageState::Leased
+    );
+    assert!(world.server.welcome("welcome_bob_retry").unwrap().is_none());
 }
 
 #[test]

@@ -213,6 +213,13 @@ Checkpoint test signal:
   phone with separate accepted Commits, and the phone activates both Welcomes
   before decrypting post-link messages in both rooms. This keeps KeyPackage
   single-use behavior visible instead of hiding it behind UI orchestration.
+- The fanout-discovery checkpoint adds the server-side shape that a durable
+  link worker needs next: account-room discovery is paged, includes
+  current/pending devices for the account, survives SQLite reopen, and duplicate
+  current/pending device adds are rejected before a retry can consume a leased
+  KeyPackage or release another Welcome. The same checkpoint also makes the
+  group-room devices-per-account cap executable, while direct rooms keep their
+  tighter cap.
 - The revocation checkpoint clones Charlie's client state before removal to
   model a stale/lost device. After Bob removes Charlie, that stale client can
   fetch and process the removal Commit, but the server rejects its old-epoch
@@ -266,6 +273,8 @@ Proven SQLite restart scenarios:
 - `sqlite_delayed_welcome_syncs_forward_from_commit_seq`
 - `sqlite_terminal_welcome_failure_keeps_interval_inactive`
 - `sqlite_link_session_state_machine_survives_reopen`
+- `sqlite_account_room_discovery_pages_after_reopen`
+- `sqlite_duplicate_pending_device_add_is_rejected_before_side_effects`
 - `sqlite_direct_room_create_or_get_and_third_account_rejection`
 - `sqlite_oversized_application_payload_is_rejected_without_persisting_log`
 - `sqlite_sync_events_returns_bounded_page_after_reopen`

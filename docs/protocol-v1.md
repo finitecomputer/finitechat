@@ -83,6 +83,7 @@ These are protocol constants, not tuning hints:
 
 - envelope payload: `256 KiB`;
 - sync page: `100` entries and `4 MiB` of envelope payload bytes;
+- devices per account per room: `32`;
 - direct room devices per account: `8`;
 - explicit KeyPackage claims per request: `1`;
 - account fanout KeyPackage claims per request: `8`, one available package per
@@ -90,6 +91,7 @@ These are protocol constants, not tuning hints:
 - KeyPackage payload: `64 KiB`;
 - Welcomes claimed per request: `32`;
 - staged Welcomes per Commit: `32`;
+- account room discovery page: `256` rooms;
 - Welcome payload: `1 MiB`;
 - ratchet-tree payload: `1 MiB`;
 - idempotency records per room/device: `4096`;
@@ -130,6 +132,7 @@ Nostr-rooted MLS credential before constructing the Commit.
 Rooms:
 
 - `POST /v1/rooms`
+- `GET /v1/accounts/{account_id}/rooms?after_room_id=...&limit=N`
 - `GET /v1/rooms/{room_id}/events?after_seq=N`
 - `POST /v1/rooms/{room_id}/events`
 - `POST /v1/rooms/{room_id}/commits`
@@ -155,6 +158,11 @@ A newly linked device joins existing rooms through normal add-device Commits.
 Because MLS KeyPackages are single-use, the device must replenish enough
 KeyPackages for the rooms it is being linked into; each accepted room add
 releases a distinct Welcome for that room.
+The account-room discovery endpoint is a control-plane helper for that worker:
+it pages over current/pending membership rows for an account and returns room
+head metadata plus the account's current devices. It is not an authorization
+oracle for identity; clients still verify Nostr-rooted MLS credentials and the
+server only orders the resulting Commits.
 
 ## History Policy
 

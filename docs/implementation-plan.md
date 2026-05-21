@@ -186,6 +186,11 @@ Current OpenMLS scope:
 - later device linking proof where a new device joins two pre-existing rooms
   using distinct per-room KeyPackages, activates both Welcomes, and decrypts
   post-link messages in both rooms.
+- bounded account-room discovery for later-device fanout, with SQLite-backed
+  pagination over current/pending account membership and duplicate device-add
+  rejection before KeyPackage consumption or Welcome release. Group rooms have
+  an explicit devices-per-account cap; direct rooms keep the tighter direct-room
+  cap.
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
@@ -216,9 +221,10 @@ Current known gap:
   policy.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
-- Later device linking is proven at the client protocol level, but production
-  still needs a durable room-discovery/fanout job that enumerates all rooms for
-  an account and retries failed room adds without duplicating successful ones.
+- Later device linking is proven at the client protocol level, and the server
+  now exposes bounded account-room discovery plus duplicate current/pending
+  device-add rejection. Production still needs the client-side durable worker
+  that drives one add Commit per discovered room and records retry progress.
 - Removal/revocation is proven for stale local MLS state and server delivery
   gating. Production still needs policy and UX for who may revoke which device,
   plus durable device-status records.
@@ -268,6 +274,10 @@ Good tests:
   device.
 - later linked device needs one KeyPackage per existing room, receives a
   distinct Welcome per room, and can decrypt new messages after each add Commit.
+- account-room discovery tests prove the fanout worker can page through rooms
+  where an account already has current membership, and duplicate-add tests prove
+  a retried fanout cannot add the same current/pending device twice or consume
+  a fresh KeyPackage before rejection.
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.

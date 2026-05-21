@@ -1,6 +1,7 @@
 use finitechat_proto::{
     AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
     KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
+    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
     MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
     MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES,
@@ -177,6 +178,36 @@ pub struct SyncEventsPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListAccountRoomsRequest {
+    pub account_id: AccountId,
+    pub after_room_id: Option<RoomId>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRoomDevice {
+    pub device: DeviceRef,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRoomRecord {
+    pub room_id: RoomId,
+    pub mls_group_id: MlsGroupId,
+    pub current_epoch: Epoch,
+    pub last_seq: Seq,
+    pub status: RoomStatus,
+    pub devices: Vec<AccountRoomDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListAccountRoomsPage {
+    pub rooms: Vec<AccountRoomRecord>,
+    pub next_after_room_id: Option<RoomId>,
+    pub has_more: bool,
+}
+
 impl CreateRoomRequest {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
         validate_room_id(&self.room_id)?;
@@ -196,6 +227,67 @@ impl CreateDirectRoomRequest {
             &self.other_account_id,
             finitechat_proto::MAX_ACCOUNT_ID_BYTES,
         )?;
+        Ok(())
+    }
+}
+
+impl ListAccountRoomsRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_string_bytes(
+            "account_id",
+            &self.account_id,
+            finitechat_proto::MAX_ACCOUNT_ID_BYTES,
+        )?;
+        if let Some(after_room_id) = &self.after_room_id {
+            validate_room_id(after_room_id)?;
+        }
+        finitechat_proto::validate_item_count(
+            "account_room_discovery.limit",
+            self.limit as usize,
+            MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
+        )?;
+        validate_bytes_non_empty("account_room_discovery.limit", self.limit as usize)?;
+        Ok(())
+    }
+}
+
+impl AccountRoomDevice {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        self.device.validate_limits()?;
+        Ok(())
+    }
+}
+
+impl AccountRoomRecord {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        finitechat_proto::validate_item_count(
+            "account_room.devices",
+            self.devices.len(),
+            MAX_ACCOUNT_DEVICES_PER_ROOM,
+        )?;
+        validate_bytes_non_empty("account_room.devices", self.devices.len())?;
+        for device in &self.devices {
+            device.validate_limits()?;
+        }
+        Ok(())
+    }
+}
+
+impl ListAccountRoomsPage {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        finitechat_proto::validate_item_count(
+            "account_room_discovery.rooms",
+            self.rooms.len(),
+            MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
+        )?;
+        for room in &self.rooms {
+            room.validate_limits()?;
+        }
+        if let Some(next_after_room_id) = &self.next_after_room_id {
+            validate_room_id(next_after_room_id)?;
+        }
         Ok(())
     }
 }
@@ -818,6 +910,54 @@ impl DeliveryService {
         Ok(sync_events_page_for_room(room, requester, after_seq))
     }
 
+    pub fn list_account_rooms(
+        &self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, EngineError> {
+        request.validate_limits()?;
+        let mut rooms = Vec::new();
+        let limit = request.limit as usize;
+        for room in self.rooms.values() {
+            if let Some(after_room_id) = &request.after_room_id
+                && room.room_id <= *after_room_id
+            {
+                continue;
+            }
+            let devices = room.current_devices_for_account(&request.account_id);
+            if devices.is_empty() {
+                continue;
+            }
+            if rooms.len() == limit {
+                let next_after_room_id = rooms
+                    .last()
+                    .map(|room: &AccountRoomRecord| room.room_id.clone());
+                let page = ListAccountRoomsPage {
+                    rooms,
+                    next_after_room_id,
+                    has_more: true,
+                };
+                page.validate_limits()?;
+                return Ok(page);
+            }
+            rooms.push(AccountRoomRecord {
+                room_id: room.room_id.clone(),
+                mls_group_id: room.mls_group_id.clone(),
+                current_epoch: room.current_epoch,
+                last_seq: room.last_seq,
+                status: room.status,
+                devices,
+            });
+        }
+        let next_after_room_id = rooms.last().map(|room| room.room_id.clone());
+        let page = ListAccountRoomsPage {
+            rooms,
+            next_after_room_id,
+            has_more: false,
+        };
+        page.validate_limits()?;
+        Ok(page)
+    }
+
     pub fn create_link_session(
         &mut self,
         link_session_id: impl Into<LinkSessionId>,
@@ -957,7 +1097,7 @@ impl DeliveryService {
         delta: &MembershipDeltaV1,
     ) -> Result<(), EngineError> {
         let mut seen_packages = BTreeSet::new();
-        let mut added_direct_room_devices_by_account = BTreeMap::<AccountId, usize>::new();
+        let mut added_devices_by_account = BTreeMap::<AccountId, usize>::new();
         for add in &delta.adds {
             if let Some((left, right)) = &room.direct_accounts
                 && add.device.account_id != *left
@@ -967,18 +1107,26 @@ impl DeliveryService {
                     add.device.account_id.clone(),
                 ));
             }
+            let current_devices =
+                room.current_or_pending_device_count_for_account(&add.device.account_id);
+            let added_devices = added_devices_by_account
+                .entry(add.device.account_id.clone())
+                .or_insert(0);
+            *added_devices += 1;
+            finitechat_proto::validate_item_count(
+                "room.devices_per_account",
+                current_devices + *added_devices,
+                MAX_ACCOUNT_DEVICES_PER_ROOM,
+            )?;
             if room.direct_accounts.is_some() {
-                let current_devices =
-                    room.current_or_pending_device_count_for_account(&add.device.account_id);
-                let added_devices = added_direct_room_devices_by_account
-                    .entry(add.device.account_id.clone())
-                    .or_insert(0);
-                *added_devices += 1;
                 finitechat_proto::validate_item_count(
                     "direct_room.devices_per_account",
                     current_devices + *added_devices,
                     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
                 )?;
+            }
+            if room.device_current_or_pending_at_head(&add.device) {
+                return Err(EngineError::DeviceAlreadyInRoom(add.device.clone()));
             }
             if !seen_packages.insert(add.key_package_id.clone()) {
                 return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()));
@@ -1079,6 +1227,46 @@ impl RoomRecord {
             .count()
     }
 
+    pub fn device_current_or_pending_at_head(&self, device: &DeviceRef) -> bool {
+        self.membership
+            .get(&device_membership_key(device))
+            .map(|membership| {
+                membership
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.end_seq.is_none())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn current_devices_for_account(&self, account_id: &str) -> Vec<AccountRoomDevice> {
+        let mut devices = self
+            .membership
+            .values()
+            .filter(|membership| membership.device.account_id == account_id)
+            .filter_map(|membership| {
+                let mut is_current = false;
+                let mut is_active = false;
+                for interval in &membership.intervals {
+                    if interval.end_seq.is_none() {
+                        is_current = true;
+                        is_active = is_active || interval.active;
+                    }
+                }
+                if is_current {
+                    Some(AccountRoomDevice {
+                        device: membership.device.clone(),
+                        active: is_active,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| left.device.device_id.cmp(&right.device.device_id));
+        devices
+    }
+
     fn close_active_interval(&mut self, device: &DeviceRef, seq: Seq) {
         if let Some(membership) = self.membership.get_mut(&device_membership_key(device))
             && let Some(interval) = membership
@@ -1127,6 +1315,8 @@ pub enum EngineError {
     KeyPackageRefMismatch(KeyPackageId),
     #[error("duplicate key package in commit: {0}")]
     DuplicateKeyPackage(KeyPackageId),
+    #[error("device is already current or pending in room: {0:?}")]
+    DeviceAlreadyInRoom(DeviceRef),
     #[error("duplicate message id in room log: {0}")]
     DuplicateMessageId(MessageId),
     #[error("welcome not found: {0}")]
