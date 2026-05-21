@@ -105,6 +105,7 @@ Proven client scenarios:
 - `client_state_machine_adds_device_and_decrypts_application_message`
 - `multi_device_invite_late_joiner_catches_up_to_new_messages`
 - `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
+- `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
 - `client_rejects_invalid_invite_request_before_local_pending_commit`
 - `client_rejects_tampered_ratchet_tree_before_ack`
@@ -154,6 +155,10 @@ Checkpoint test signal:
   orders for three Alice devices and several Bob-message timing patterns. It
   stays in the normal test suite because it runs quickly enough to catch MLS
   ordering regressions before they reach integration work.
+- The first client SQLite restart proof persists OpenMLS storage rows, the
+  device profile, and room mappings. It reloads Bob before sending, reloads
+  Alice browser after activation, and reloads a late Alice phone before it
+  decrypts messages sent while it was pending.
 
 ## SQLite Follow-Up
 

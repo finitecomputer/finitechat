@@ -19,6 +19,19 @@ jobs, migrations, backups, observability, and canary rollback.
 
 ## Current SQLite Scope
 
+`finitechat-client` has the first local client SQLite store:
+
+- `client_profiles`
+- `client_rooms`
+- `client_openmls_storage`
+
+It persists the Nostr-rooted device profile metadata needed to reload, the
+Finite Chat room id to MLS group id mapping, and the OpenMLS storage key/value
+rows for signer, group, and message-secret state. This is intentionally schema
+state rather than a whole-device JSON dump. The current checkpoint proves
+restart behavior, not encryption-at-rest; the local store must be wrapped in
+audited encryption before real device secrets are shipped on disk.
+
 `finitechat-store` now uses normalized SQLite tables that mirror the intended
 Postgres shape:
 

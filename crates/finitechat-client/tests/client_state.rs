@@ -1,4 +1,4 @@
-use finitechat_client::{ClientError, FiniteChatDevice, FiniteChatDeviceConfig};
+use finitechat_client::{ClientError, FiniteChatDevice, FiniteChatDeviceConfig, SqliteClientStore};
 use finitechat_engine::{
     AppendEventRequest, DeliveryService, EngineError, EventAccepted, envelope,
 };
@@ -254,6 +254,142 @@ fn multi_device_invite_late_joiner_catches_up_to_new_messages() {
 }
 
 #[test]
+fn sqlite_client_state_survives_restart_for_late_multi_device_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
+    let browser_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone");
+    let mut bob_store = SqliteClientStore::open(dir.path().join("bob.sqlite3")).unwrap();
+    let mut browser_store =
+        SqliteClientStore::open(dir.path().join("alice_browser.sqlite3")).unwrap();
+    let mut phone_store = SqliteClientStore::open(dir.path().join("alice_phone.sqlite3")).unwrap();
+    let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
+    let mut alice_browser = FiniteChatDevice::new(browser_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut server = DeliveryService::new();
+
+    server
+        .create_or_get_direct_room(bob.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            alice_browser.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    bob.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    server
+        .upload_key_package(
+            alice_browser
+                .upload_key_package_request("kp_restart_browser_1")
+                .unwrap(),
+        )
+        .unwrap();
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_restart_phone_1")
+                .unwrap(),
+        )
+        .unwrap();
+
+    let claimed_key_packages = server
+        .claim_key_packages_for_account(&alice_browser.device_ref().account_id)
+        .unwrap();
+    assert_eq!(claimed_key_packages.len(), 2);
+    let welcome_ids = claimed_key_packages
+        .iter()
+        .map(|claim| format!("welcome_restart_{}", claim.owner.device_id))
+        .collect::<Vec<_>>();
+    let browser_welcome_id = welcome_id_for(&claimed_key_packages, &welcome_ids, "alice_browser");
+    let phone_welcome_id = welcome_id_for(&claimed_key_packages, &welcome_ids, "alice_phone");
+    let prepared = bob
+        .prepare_add_members_commit(
+            ROOM_ID,
+            &claimed_key_packages,
+            &welcome_ids,
+            "restart_invite_all_alice_devices",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let bob_page = server.sync_events(ROOM_ID, bob.device_ref(), 0).unwrap();
+    bob.merge_pending_commit_from_log(ROOM_ID, &bob_page.entries, &prepared.message_id)
+        .unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
+
+    claim_and_activate(&mut server, &mut alice_browser, &browser_welcome_id);
+    browser_store.save_device_state(&alice_browser).unwrap();
+    let mut alice_browser = browser_store.load_device(browser_config).unwrap();
+
+    let first_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"after bob restart"}}"#;
+    let first = bob
+        .create_application_request(ROOM_ID, first_plaintext, "restart_bob_first")
+        .unwrap();
+    let first_accepted = server.append_event(first).unwrap();
+    let browser_page = server
+        .sync_events(ROOM_ID, alice_browser.device_ref(), accepted.seq)
+        .unwrap();
+    assert_eq!(
+        alice_browser
+            .decrypt_application_entry(ROOM_ID, &browser_page.entries[0])
+            .unwrap(),
+        first_plaintext
+    );
+
+    let pending_phone_page = server
+        .sync_events(ROOM_ID, alice_phone.device_ref(), accepted.seq)
+        .unwrap();
+    assert_eq!(pending_phone_page.entries.len(), 1);
+    assert_eq!(
+        server
+            .append_event(fake_application_request(
+                alice_phone.device_ref().clone(),
+                1,
+                "restart_phone_before_ack",
+            ))
+            .unwrap_err(),
+        EngineError::SenderNotActive(alice_phone.device_ref().clone())
+    );
+
+    claim_and_activate(&mut server, &mut alice_phone, &phone_welcome_id);
+    phone_store.save_device_state(&alice_phone).unwrap();
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    assert_eq!(
+        alice_phone
+            .decrypt_application_entry(ROOM_ID, &pending_phone_page.entries[0])
+            .unwrap(),
+        first_plaintext
+    );
+
+    let second_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"after phone restart"}}"#;
+    let second = bob
+        .create_application_request(ROOM_ID, second_plaintext, "restart_bob_second")
+        .unwrap();
+    server.append_event(second).unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    let mut bob = bob_store.load_device(bob_config).unwrap();
+    let phone_page = server
+        .sync_events(ROOM_ID, alice_phone.device_ref(), first_accepted.seq)
+        .unwrap();
+    assert_eq!(
+        alice_phone
+            .decrypt_application_entry(ROOM_ID, &phone_page.entries[0])
+            .unwrap(),
+        second_plaintext
+    );
+    let bob_third = bob
+        .create_application_request(
+            ROOM_ID,
+            br#"{"type":"finitecomputer.command.v1","body":{"text":"after second bob restart"}}"#,
+            "restart_bob_third",
+        )
+        .unwrap();
+    server.append_event(bob_third).unwrap();
+}
+
+#[test]
 fn multi_device_real_mls_ordering_matrix_validates_late_catch_up() {
     let activation_orders = [
         ["alice_browser", "alice_phone", "alice_tablet"],
@@ -398,14 +534,33 @@ fn test_device(
     account_secret_bytes: [u8; NOSTR_SECRET_KEY_BYTES],
     device_id: &str,
 ) -> FiniteChatDevice {
-    FiniteChatDevice::new(FiniteChatDeviceConfig {
+    FiniteChatDevice::new(test_config(account_secret_bytes, device_id)).unwrap()
+}
+
+fn test_config(
+    account_secret_bytes: [u8; NOSTR_SECRET_KEY_BYTES],
+    device_id: &str,
+) -> FiniteChatDeviceConfig {
+    FiniteChatDeviceConfig {
         account_secret_key: NostrSecretKey::from_bytes(account_secret_bytes).unwrap(),
         device_id: device_id.to_string(),
         now_unix_seconds: NOW,
         credential_not_before_unix_seconds: NOW - 60,
         credential_not_after_unix_seconds: NOW + 60,
-    })
-    .unwrap()
+    }
+}
+
+fn welcome_id_for(
+    claims: &[finitechat_engine::ClaimKeyPackageResult],
+    welcome_ids: &[String],
+    device_id: &str,
+) -> String {
+    welcome_ids
+        .iter()
+        .zip(claims)
+        .find(|(_, claim)| claim.owner.device_id == device_id)
+        .map(|(welcome_id, _)| welcome_id.clone())
+        .unwrap()
 }
 
 fn claim_and_activate(

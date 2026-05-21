@@ -136,8 +136,8 @@ Production server store:
 
 ### Phase 2: OpenMLS Spike
 
-Status in this repo: reusable OpenMLS client state machine and multi-device
-invite proof passing.
+Status in this repo: reusable OpenMLS client state machine, multi-device invite
+proof, and first client SQLite restart proof passing.
 
 Deliverables:
 
@@ -176,6 +176,13 @@ Current OpenMLS scope:
   accepted Commit seq, and decrypt messages sent before it acked.
 - bounded real-MLS ordering matrix for all activation orders across three
   devices, with varied message timing before and between activations.
+- `SqliteClientStore` for persisted client profile, room mapping, and OpenMLS
+  storage rows, with a restart test covering late multi-device catch-up.
+
+Current known gap:
+
+- Client SQLite persistence is not encrypted at rest yet. Do not ship device
+  secrets on disk until this store is wrapped with audited encryption.
 
 Good tests:
 
@@ -189,6 +196,8 @@ Good tests:
   active send interleavings for several devices in one account.
 - real-MLS matrix tests keep the same multi-device invariant under several
   OpenMLS application-message ratchet orderings.
+- client restart tests prove Bob can send after reload and a late Alice device
+  can activate, persist, reload, and decrypt the backlog.
 
 ### Phase 3: Finitecomputer Local Integration
 

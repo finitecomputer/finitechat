@@ -9,8 +9,9 @@ use finitechat_mls::{
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MembershipAddV1, MembershipDeltaV1, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
-    WelcomeId, validate_idempotency_key, validate_room_id, validate_string_bytes,
+    MembershipAddV1, MembershipDeltaV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry,
+    StagedWelcomeV1, WelcomeId, validate_bytes_non_empty, validate_idempotency_key,
+    validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
@@ -21,7 +22,10 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
@@ -46,10 +50,32 @@ pub struct PreparedCommit {
     pub message_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiniteChatDeviceState {
+    pub device_ref: DeviceRef,
+    pub signer_public_key: Vec<u8>,
+    pub credential_identity: Vec<u8>,
+    pub rooms: Vec<PersistedRoomState>,
+    pub openmls_storage_records: Vec<OpenMlsStorageRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedRoomState {
+    pub room_id: RoomId,
+    pub mls_group_id: MlsGroupId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMlsStorageRecord {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 pub struct FiniteChatDevice {
     provider: OpenMlsRustCrypto,
     device_ref: DeviceRef,
     now_unix_seconds: u64,
+    credential: FiniteDeviceCredentialV1,
     credential_with_key: CredentialWithKey,
     signer: SignatureKeyPair,
     groups: BTreeMap<RoomId, MlsGroup>,
@@ -90,6 +116,7 @@ impl FiniteChatDevice {
             provider,
             device_ref,
             now_unix_seconds: config.now_unix_seconds,
+            credential,
             credential_with_key,
             signer,
             groups: BTreeMap::new(),
@@ -99,6 +126,128 @@ impl FiniteChatDevice {
             device.signer.public()
         );
         Ok(device)
+    }
+
+    pub fn from_state(
+        config: FiniteChatDeviceConfig,
+        state: FiniteChatDeviceState,
+    ) -> Result<Self, ClientError> {
+        state.validate_limits()?;
+
+        let provider = OpenMlsRustCrypto::default();
+        {
+            let mut values = provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| ClientError::OpenMlsStorageLock)?;
+            values.clear();
+            for record in &state.openmls_storage_records {
+                values.insert(record.key.clone(), record.value.clone());
+            }
+        }
+
+        let credential = FiniteDeviceCredentialV1::from_identity_bytes(&state.credential_identity)?;
+        let account_public_key = config.account_secret_key.public_key();
+        if credential.account_public_key() != account_public_key {
+            return Err(ClientError::PersistedAccountMismatch);
+        }
+        if credential.device_id() != config.device_id {
+            return Err(ClientError::PersistedDeviceMismatch);
+        }
+        credential.verify_expected(ExpectedDeviceCredential {
+            account_public_key,
+            device_id: &config.device_id,
+            mls_leaf_signing_public_key: &state.signer_public_key,
+            now_unix_seconds: config.now_unix_seconds,
+        })?;
+
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            &state.signer_public_key,
+            FINITECHAT_CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or(ClientError::MissingStoredSigner)?;
+        if signer.public() != state.signer_public_key {
+            return Err(ClientError::StoredSignerMismatch);
+        }
+
+        let credential_with_key = credential.to_openmls_credential_with_key();
+        let device_ref = DeviceRef {
+            account_id: hex_lower(account_public_key.as_bytes()),
+            device_id: config.device_id,
+        };
+        if device_ref != state.device_ref {
+            return Err(ClientError::PersistedDeviceMismatch);
+        }
+
+        let mut groups = BTreeMap::new();
+        for room in &state.rooms {
+            let group_id = GroupId::from_slice(room.mls_group_id.as_bytes());
+            let group = MlsGroup::load(provider.storage(), &group_id)
+                .map_err(|_| ClientError::LoadGroupState(room.room_id.clone()))?
+                .ok_or_else(|| ClientError::MissingGroupState(room.room_id.clone()))?;
+            if mls_group_id_string(group.group_id())? != room.mls_group_id {
+                return Err(ClientError::PersistedGroupIdMismatch(room.room_id.clone()));
+            }
+            if groups.insert(room.room_id.clone(), group).is_some() {
+                return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
+            }
+        }
+
+        let device = Self {
+            provider,
+            device_ref,
+            now_unix_seconds: config.now_unix_seconds,
+            credential,
+            credential_with_key,
+            signer,
+            groups,
+        };
+        debug_assert_eq!(
+            device.credential_with_key.signature_key.as_slice(),
+            device.signer.public()
+        );
+        Ok(device)
+    }
+
+    pub fn export_state(&self) -> Result<FiniteChatDeviceState, ClientError> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| ClientError::OpenMlsStorageLock)?;
+        let mut openmls_storage_records = values
+            .iter()
+            .map(|(key, value)| OpenMlsStorageRecord {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        openmls_storage_records.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let mut rooms = self
+            .groups
+            .iter()
+            .map(|(room_id, group)| {
+                Ok(PersistedRoomState {
+                    room_id: room_id.clone(),
+                    mls_group_id: mls_group_id_string(group.group_id())?,
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
+
+        let state = FiniteChatDeviceState {
+            device_ref: self.device_ref.clone(),
+            signer_public_key: self.signer.public().to_vec(),
+            credential_identity: self.credential.identity_bytes(),
+            rooms,
+            openmls_storage_records,
+        };
+        state.validate_limits()?;
+        Ok(state)
     }
 
     pub fn device_ref(&self) -> &DeviceRef {
@@ -527,6 +676,143 @@ impl FiniteChatDevice {
     }
 }
 
+impl FiniteChatDeviceState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        self.device_ref.validate_limits()?;
+        validate_bytes_non_empty("signer_public_key", self.signer_public_key.len())?;
+        validate_bytes_non_empty("credential_identity", self.credential_identity.len())?;
+        for room in &self.rooms {
+            room.validate_limits()?;
+        }
+        if self.openmls_storage_records.is_empty() {
+            return Err(ClientError::MissingOpenMlsStorage);
+        }
+        let mut seen_storage_keys = BTreeSet::<Vec<u8>>::new();
+        let mut seen_rooms = BTreeSet::<RoomId>::new();
+        for room in &self.rooms {
+            if !seen_rooms.insert(room.room_id.clone()) {
+                return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
+            }
+        }
+        for record in &self.openmls_storage_records {
+            record.validate_limits()?;
+            if !seen_storage_keys.insert(record.key.clone()) {
+                return Err(ClientError::DuplicateOpenMlsStorageKey);
+            }
+        }
+        debug_assert!(!self.signer_public_key.is_empty());
+        debug_assert!(!self.credential_identity.is_empty());
+        Ok(())
+    }
+}
+
+impl PersistedRoomState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        Ok(())
+    }
+}
+
+impl OpenMlsStorageRecord {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_bytes_non_empty("openmls_storage.key", self.key.len())?;
+        validate_bytes_non_empty("openmls_storage.value", self.value.len())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteClientStore {
+    db_path: PathBuf,
+}
+
+impl SqliteClientStore {
+    pub fn open(db_path: impl AsRef<Path>) -> Result<Self, ClientStoreError> {
+        let db_path = db_path.as_ref().to_path_buf();
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ClientStoreError::CreateDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let store = Self { db_path };
+        let conn = store.connect()?;
+        migrate_client_store(&conn)?;
+        Ok(store)
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn save_device_state(&mut self, device: &FiniteChatDevice) -> Result<(), ClientStoreError> {
+        let state = device.export_state()?;
+        self.with_transaction(|tx| save_device_state_tx(tx, &state))
+    }
+
+    pub fn load_device(
+        &self,
+        config: FiniteChatDeviceConfig,
+    ) -> Result<FiniteChatDevice, ClientStoreError> {
+        let account_id = hex_lower(config.account_secret_key.public_key().as_bytes());
+        let device_id = config.device_id.clone();
+        let conn = self.connect()?;
+        let state = load_device_state(&conn, &account_id, &device_id)?.ok_or(
+            ClientStoreError::DeviceStateNotFound {
+                account_id,
+                device_id,
+            },
+        )?;
+        Ok(FiniteChatDevice::from_state(config, state)?)
+    }
+
+    fn connect(&self) -> Result<Connection, ClientStoreError> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = FULL;
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            "#,
+        )?;
+        Ok(conn)
+    }
+
+    fn with_transaction<T>(
+        &mut self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, ClientStoreError>,
+    ) -> Result<T, ClientStoreError> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientStoreError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("corrupt finitechat client state: {0}")]
+    CorruptState(String),
+    #[error("failed to create sqlite client store directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("client state not found for {account_id}/{device_id}")]
+    DeviceStateNotFound {
+        account_id: String,
+        device_id: String,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error(transparent)]
@@ -608,6 +894,28 @@ pub enum ClientError {
     DuplicateInviteWelcome(WelcomeId),
     #[error("member credential missing or duplicated: {0:?}")]
     MemberCredentialMissing(DeviceRef),
+    #[error("persisted client state account does not match config")]
+    PersistedAccountMismatch,
+    #[error("persisted client state device does not match config")]
+    PersistedDeviceMismatch,
+    #[error("persisted room has duplicate room id: {0}")]
+    DuplicatePersistedRoom(RoomId),
+    #[error("persisted room {0} has mismatched MLS group id")]
+    PersistedGroupIdMismatch(RoomId),
+    #[error("persisted OpenMLS storage is empty")]
+    MissingOpenMlsStorage,
+    #[error("persisted OpenMLS storage has duplicate key")]
+    DuplicateOpenMlsStorageKey,
+    #[error("failed to lock OpenMLS storage")]
+    OpenMlsStorageLock,
+    #[error("persisted signer is missing")]
+    MissingStoredSigner,
+    #[error("persisted signer does not match credential leaf key")]
+    StoredSignerMismatch,
+    #[error("failed to load persisted MLS group state: {0}")]
+    LoadGroupState(RoomId),
+    #[error("persisted MLS group state is missing: {0}")]
+    MissingGroupState(RoomId),
     #[error("account id is not a 32-byte lowercase hex Nostr public key: {0}")]
     MalformedAccountId(String),
     #[error("MLS group id is not valid UTF-8")]
@@ -731,4 +1039,203 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(TABLE[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn migrate_client_store(conn: &Connection) -> Result<(), ClientStoreError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS client_profiles (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          signer_public_key BLOB NOT NULL,
+          credential_identity BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS client_rooms (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          mls_group_id TEXT NOT NULL,
+          PRIMARY KEY (account_id, device_id, room_id),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_profiles(account_id, device_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS client_openmls_storage (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          storage_key BLOB NOT NULL,
+          storage_value BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id, storage_key),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_profiles(account_id, device_id)
+            ON DELETE CASCADE
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn save_device_state_tx(
+    tx: &Transaction<'_>,
+    state: &FiniteChatDeviceState,
+) -> Result<(), ClientStoreError> {
+    state.validate_limits()?;
+    tx.execute(
+        r#"
+        INSERT INTO client_profiles (
+          account_id, device_id, signer_public_key, credential_identity
+        ) VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(account_id, device_id) DO UPDATE SET
+          signer_public_key = excluded.signer_public_key,
+          credential_identity = excluded.credential_identity
+        "#,
+        params![
+            state.device_ref.account_id,
+            state.device_ref.device_id,
+            state.signer_public_key,
+            state.credential_identity,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM client_rooms WHERE account_id = ?1 AND device_id = ?2",
+        params![state.device_ref.account_id, state.device_ref.device_id],
+    )?;
+    tx.execute(
+        "DELETE FROM client_openmls_storage WHERE account_id = ?1 AND device_id = ?2",
+        params![state.device_ref.account_id, state.device_ref.device_id],
+    )?;
+    for room in &state.rooms {
+        tx.execute(
+            r#"
+            INSERT INTO client_rooms (account_id, device_id, room_id, mls_group_id)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                state.device_ref.account_id,
+                state.device_ref.device_id,
+                room.room_id,
+                room.mls_group_id,
+            ],
+        )?;
+    }
+    for record in &state.openmls_storage_records {
+        tx.execute(
+            r#"
+            INSERT INTO client_openmls_storage (
+              account_id, device_id, storage_key, storage_value
+            ) VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![
+                state.device_ref.account_id,
+                state.device_ref.device_id,
+                record.key,
+                record.value,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_device_state(
+    conn: &Connection,
+    account_id: &str,
+    device_id: &str,
+) -> Result<Option<FiniteChatDeviceState>, ClientStoreError> {
+    validate_string_bytes(
+        "account_id",
+        account_id,
+        finitechat_proto::MAX_ACCOUNT_ID_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    validate_string_bytes(
+        "device_id",
+        device_id,
+        finitechat_proto::MAX_DEVICE_ID_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let profile = conn
+        .query_row(
+            r#"
+            SELECT signer_public_key, credential_identity
+            FROM client_profiles
+            WHERE account_id = ?1 AND device_id = ?2
+            "#,
+            params![account_id, device_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    let Some((signer_public_key, credential_identity)) = profile else {
+        return Ok(None);
+    };
+
+    let rooms = load_persisted_rooms(conn, account_id, device_id)?;
+    let openmls_storage_records = load_openmls_storage_records(conn, account_id, device_id)?;
+    let state = FiniteChatDeviceState {
+        device_ref: DeviceRef {
+            account_id: account_id.to_string(),
+            device_id: device_id.to_string(),
+        },
+        signer_public_key,
+        credential_identity,
+        rooms,
+        openmls_storage_records,
+    };
+    state.validate_limits()?;
+    Ok(Some(state))
+}
+
+fn load_persisted_rooms(
+    conn: &Connection,
+    account_id: &str,
+    device_id: &str,
+) -> Result<Vec<PersistedRoomState>, ClientStoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT room_id, mls_group_id
+        FROM client_rooms
+        WHERE account_id = ?1 AND device_id = ?2
+        ORDER BY room_id
+        "#,
+    )?;
+    let mut rows = statement.query(params![account_id, device_id])?;
+    let mut rooms = Vec::new();
+    while let Some(row) = rows.next()? {
+        rooms.push(PersistedRoomState {
+            room_id: row.get(0)?,
+            mls_group_id: row.get(1)?,
+        });
+    }
+    Ok(rooms)
+}
+
+fn load_openmls_storage_records(
+    conn: &Connection,
+    account_id: &str,
+    device_id: &str,
+) -> Result<Vec<OpenMlsStorageRecord>, ClientStoreError> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT storage_key, storage_value
+        FROM client_openmls_storage
+        WHERE account_id = ?1 AND device_id = ?2
+        ORDER BY storage_key
+        "#,
+    )?;
+    let mut rows = statement.query(params![account_id, device_id])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        records.push(OpenMlsStorageRecord {
+            key: row.get(0)?,
+            value: row.get(1)?,
+        });
+    }
+    if records.is_empty() {
+        return Err(ClientStoreError::CorruptState(format!(
+            "device {account_id}/{device_id} has no OpenMLS storage rows"
+        )));
+    }
+    Ok(records)
 }

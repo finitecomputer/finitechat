@@ -13,5 +13,9 @@ finitechat-proto = { path = "../finitechat-proto" }
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
