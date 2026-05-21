@@ -65,6 +65,8 @@ An encrypted, TTL-bound room event for intermediate state such as typing,
 thinking, working, uploading, or presence refreshes. The room server may route
 and cache it briefly, but it does not consume the canonical room sequence, is
 not durable history, and never creates unread state or push notifications.
+Ephemeral activity uses the same active-member authorization boundary as
+durable sends.
 
 ## Invariants
 
@@ -98,6 +100,9 @@ not durable history, and never creates unread state or push notifications.
 - The canonical room sequence advances only for MLS Commits and durable
   application events. Ephemeral activity events must not occupy `seq`, create
   cursor gaps, or block durable sync.
+- Ephemeral activity events must be rejected unless the sending device is
+  active, non-revoked, and currently a member at the room head. Pending invited
+  devices and removed devices cannot send activity.
 
 ## V1 Limits
 
@@ -299,6 +304,12 @@ Ephemeral activity may be delivered over a live stream or short TTL cache, but
 it is not returned by durable room-log sync and cannot be used as a replay
 cursor. Clients must tolerate dropped, duplicated, reordered, or expired
 activity events.
+
+The server authorizes ephemeral activity against its current device ledger and
+membership cache before forwarding or caching it. This check is not identity
+proof; clients still verify Nostr-rooted MLS credentials locally. It only keeps
+non-members, pending devices, and removed or revoked devices from creating live
+room activity.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned

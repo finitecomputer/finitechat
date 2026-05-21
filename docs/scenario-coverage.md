@@ -384,3 +384,6 @@ coverage before the room server owns push fanout:
 - `ephemeral_activity_does_not_create_command_inbox_work`
 - `ephemeral_activity_does_not_advance_room_sequence`
 - `durable_sync_cursor_ignores_ephemeral_activity`
+- `ephemeral_activity_rejects_non_member_device`
+- `ephemeral_activity_rejects_pending_unacked_device`
+- `ephemeral_activity_rejects_removed_or_revoked_device`
