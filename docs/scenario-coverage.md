@@ -111,6 +111,7 @@ Proven client scenarios:
 - `client_processes_remote_remove_commit_before_post_remove_messages`
 - `stale_removed_device_can_process_removal_but_not_future_ciphertext`
 - `client_recovers_losing_same_epoch_add_commit_and_retries`
+- `client_key_package_replenishment_edges_use_real_packages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -196,6 +197,13 @@ Checkpoint test signal:
   clears the loser, processes the winner, and lets Bob retry at epoch 2. The
   retry reuses the still-leased Dana KeyPackage because the rejected Commit did
   not consume it or release a Welcome.
+- The KeyPackage replenishment checkpoint uses real OpenMLS package bytes for
+  the client boundary: duplicate upload is rejected, account claim exhaustion
+  returns no packages, uploading a fresh package replenishes availability, and
+  lease expiry makes the original package reclaimable. SQLite now also proves a
+  duplicate KeyPackage id remains rejected after reopen. Existing sim/SQLite
+  tests continue to cover consumed-package reuse rejection and direct-room
+  max-device caps.
 - Existing server tests mattered again here: the first version of the remote
   add proof accidentally used a direct room for a third-account add, and
   `DirectRoomThirdAccount` failed the scenario before it could become false
@@ -211,6 +219,7 @@ Proven SQLite restart scenarios:
 
 - `sqlite_create_dm_room_and_release_welcome_after_commit`
 - `sqlite_key_package_payload_survives_reopen_and_claim`
+- `sqlite_duplicate_key_package_upload_is_rejected_after_reopen`
 - `sqlite_account_key_package_claim_survives_reopen`
 - `sqlite_claimed_welcome_payload_survives_reopen`
 - `sqlite_add_commit_requires_staged_welcome_bytes_before_mutation`

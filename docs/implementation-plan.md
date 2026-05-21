@@ -190,6 +190,9 @@ Current OpenMLS scope:
   ciphertext.
 - same-epoch loser recovery proof where a losing client clears its pending
   Commit after observing the winner, rolls forward, retries, and gets accepted.
+- KeyPackage replenishment edge proof with real OpenMLS package bytes covering
+  duplicate upload rejection, account-claim exhaustion, fresh-package
+  replenishment, and lease expiry/reclaim.
 
 Current known gap:
 
@@ -207,6 +210,9 @@ Current known gap:
 - Same-epoch loser recovery is proven for add Commits. Broader race matrices
   across remove/update combinations can be added, but the key recovery shape is
   now exercised with real OpenMLS state.
+- KeyPackage edge behavior is covered across real-client, sim, and SQLite
+  suites. Production still needs background policy for how many packages each
+  device keeps available per account and room fanout budget.
 
 Good tests:
 
@@ -237,6 +243,9 @@ Good tests:
 - same-epoch add loser observes the accepted winner, clears its pending Commit,
   retries from the new epoch with the still-leased KeyPackage, and then sends
   decryptable post-retry messages.
+- real KeyPackage bytes cover duplicate upload, exhausted account claim,
+  replenishment by fresh upload, and lease expiry/reclaim; sim/SQLite cover
+  consumed-package reuse rejection and max-device caps.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration

@@ -5,7 +5,7 @@ use finitechat_engine::{
     AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::LogEntryKind;
+use finitechat_proto::{KeyPackageState, LogEntryKind};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -806,6 +806,74 @@ fn client_recovers_losing_same_epoch_add_commit_and_retries() {
     assert_device_decrypts_after(&server, &mut alice, dana_accepted.seq, plaintext);
     assert_device_decrypts_after(&server, &mut charlie, dana_accepted.seq, plaintext);
     assert_device_decrypts_after(&server, &mut dana, dana_accepted.seq, plaintext);
+}
+
+#[test]
+fn client_key_package_replenishment_edges_use_real_packages() {
+    let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_replenish");
+    let mut server = DeliveryService::new();
+
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_replenish_1")
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        server
+            .upload_key_package(
+                alice_phone
+                    .upload_key_package_request("kp_replenish_1")
+                    .unwrap(),
+            )
+            .unwrap_err(),
+        EngineError::KeyPackageAlreadyExists("kp_replenish_1".to_string())
+    );
+    let first_claim = server
+        .claim_key_packages_for_account(&alice_phone.device_ref().account_id)
+        .unwrap();
+    assert_eq!(first_claim.len(), 1);
+    assert_eq!(first_claim[0].key_package_id, "kp_replenish_1");
+    assert_eq!(
+        server.key_package("kp_replenish_1").unwrap().state,
+        KeyPackageState::Leased
+    );
+    assert!(
+        server
+            .claim_key_packages_for_account(&alice_phone.device_ref().account_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_replenish_2")
+                .unwrap(),
+        )
+        .unwrap();
+    let replenished_claim = server
+        .claim_key_packages_for_account(&alice_phone.device_ref().account_id)
+        .unwrap();
+    assert_eq!(replenished_claim.len(), 1);
+    assert_eq!(replenished_claim[0].key_package_id, "kp_replenish_2");
+    assert_eq!(
+        server.key_package("kp_replenish_2").unwrap().state,
+        KeyPackageState::Leased
+    );
+
+    server.expire_key_package_lease("kp_replenish_1").unwrap();
+    assert_eq!(
+        server.key_package("kp_replenish_1").unwrap().state,
+        KeyPackageState::Available
+    );
+    let reclaimed = server.claim_key_package("kp_replenish_1").unwrap();
+    assert_eq!(reclaimed.key_package_id, "kp_replenish_1");
+    assert_eq!(
+        server.key_package("kp_replenish_1").unwrap().state,
+        KeyPackageState::Leased
+    );
 }
 
 #[test]
