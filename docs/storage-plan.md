@@ -81,5 +81,9 @@ The critical transaction remains the same:
 9. persist idempotency response;
 10. enqueue opaque push wakes.
 
+The mutation path must not reconstruct the full room log. Full log validation is
+for read/replay paths; append and Commit validation use the indexed room head,
+membership intervals, and idempotency rows needed for that single mutation.
+
 Rejected mutations admitted under an idempotency key must also persist their
 typed rejection result so client retries receive the same answer after restart.

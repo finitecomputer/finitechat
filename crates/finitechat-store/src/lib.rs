@@ -758,6 +758,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           response_kind TEXT NOT NULL CHECK (response_kind IN ('event', 'commit')),
           response_json TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_idempotency_room_sender
+        ON idempotency_records (room_id, sender_account_id, sender_device_id);
         "#,
     )?;
     Ok(())
@@ -794,7 +797,7 @@ fn append_event_inner(
     tx: &Transaction<'_>,
     request: &AppendEventRequest,
 ) -> Result<Result<EventAccepted, EngineError>, StoreError> {
-    let room = match load_room(tx, &request.room_id)? {
+    let room = match load_room_state(tx, &request.room_id)? {
         Some(room) => room,
         None => return Ok(Err(EngineError::RoomNotFound(request.room_id.clone()))),
     };
@@ -830,7 +833,7 @@ fn submit_commit_inner(
         return Ok(Err(error.into()));
     }
 
-    let room = match load_room(tx, &request.room_id)? {
+    let room = match load_room_state(tx, &request.room_id)? {
         Some(room) => room,
         None => return Ok(Err(EngineError::RoomNotFound(request.room_id.clone()))),
     };
@@ -1327,6 +1330,26 @@ fn load_room(conn: &Connection, room_id: &str) -> Result<Option<RoomRecord>, Sto
     Ok(Some(room))
 }
 
+fn load_room_state(conn: &Connection, room_id: &str) -> Result<Option<RoomRecord>, StoreError> {
+    let Some(header) = load_room_header(conn, room_id)? else {
+        return Ok(None);
+    };
+    let membership = load_room_membership(conn, room_id)?;
+    let room = RoomRecord {
+        room_id: header.room_id,
+        mls_group_id: header.mls_group_id,
+        current_epoch: header.current_epoch,
+        last_seq: header.last_seq,
+        status: header.status,
+        created_by: header.created_by,
+        log: Vec::new(),
+        membership,
+        direct_accounts: header.direct_accounts,
+    };
+    validate_membership_shape(&room)?;
+    Ok(Some(room))
+}
+
 fn load_room_header(conn: &Connection, room_id: &str) -> Result<Option<RoomHeader>, StoreError> {
     let mut statement = conn.prepare(
         r#"
@@ -1474,6 +1497,10 @@ fn validate_room_shape(room: &RoomRecord) -> Result<(), StoreError> {
             room.room_id
         )));
     }
+    validate_membership_shape(room)
+}
+
+fn validate_membership_shape(room: &RoomRecord) -> Result<(), StoreError> {
     for (key, membership) in &room.membership {
         if *key != DeviceMembership::key(&membership.device) {
             return Err(StoreError::CorruptState(format!(
