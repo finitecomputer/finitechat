@@ -387,3 +387,5 @@ coverage before the room server owns push fanout:
 - `ephemeral_activity_rejects_non_member_device`
 - `ephemeral_activity_rejects_pending_unacked_device`
 - `ephemeral_activity_rejects_removed_or_revoked_device`
+- `ephemeral_activity_payload_is_opaque_to_server`
+- `ephemeral_activity_epoch_mismatch_drops_without_repair`

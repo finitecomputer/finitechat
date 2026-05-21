@@ -94,6 +94,9 @@ durable sends.
 - Durable application events and ephemeral activity events are distinct
   envelope classes. The server can see the class and push policy, but not the
   encrypted activity kind.
+- Ephemeral activity payloads use MLS protection under the sender's current
+  room epoch. They must not use plaintext activity kinds or a second
+  application-message encryption layer.
 - Ephemeral activity events must carry `push_policy = never` and an explicit
   expiry. They must not create push outbox records, unread counts, durable
   transcript entries, or command inbox work.
@@ -298,12 +301,15 @@ events before decryption:
 
 The encrypted activity payload owns the semantic kind. The server does not need
 to know whether an ephemeral event means typing, thinking, working, uploading,
-or another generic chat activity.
+or another generic chat activity. The server-visible envelope carries only the
+fields needed to route and discard it: room id, sender device, delivery class,
+push policy, expiry, and bounded opaque MLS-protected bytes.
 
 Ephemeral activity may be delivered over a live stream or short TTL cache, but
 it is not returned by durable room-log sync and cannot be used as a replay
 cursor. Clients must tolerate dropped, duplicated, reordered, or expired
-activity events.
+activity events. If an activity event arrives for an old epoch, a future epoch,
+or otherwise fails MLS processing, the client drops it without repair.
 
 The server authorizes ephemeral activity against its current device ledger and
 membership cache before forwarding or caching it. This check is not identity
