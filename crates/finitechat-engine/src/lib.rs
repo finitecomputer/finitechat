@@ -952,8 +952,10 @@ impl DeliveryService {
             .welcomes
             .get_mut(welcome_id)
             .ok_or_else(|| EngineError::WelcomeNotFound(welcome_id.to_string()))?;
-        if welcome.state != WelcomeState::Claimed {
-            return Err(EngineError::WelcomeNotClaimed(welcome_id.to_string()));
+        match (welcome.state, activated) {
+            (WelcomeState::Acked, true) | (WelcomeState::Failed, false) => return Ok(()),
+            (WelcomeState::Claimed, _) => {}
+            _ => return Err(EngineError::WelcomeNotClaimed(welcome_id.to_string())),
         }
         welcome.state = if activated {
             WelcomeState::Acked

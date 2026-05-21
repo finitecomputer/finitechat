@@ -1,7 +1,7 @@
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, EngineError,
-    KeyPackageInventory, ListAccountRoomsPage, SubmitCommitRequest, UploadKeyPackageRequest,
-    WelcomeRecord, envelope,
+    AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, DeliveryService,
+    EngineError, KeyPackageInventory, ListAccountRoomsPage, SubmitCommitRequest, SyncEventsPage,
+    UploadKeyPackageRequest, WelcomeRecord, envelope,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -39,7 +39,7 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 4;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 5;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
@@ -47,6 +47,7 @@ const MAX_PERSISTED_ROOMS: u32 = 1024;
 const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
 const MAX_LINK_FANOUTS: u32 = 16;
 const MAX_LINK_FANOUT_ROOMS: u32 = MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS;
+const MAX_RUNTIME_SYNC_PAGES_PER_ROOM: u32 = 64;
 const MAX_OPENMLS_STORAGE_RECORDS: u32 = 8192;
 const MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
 const MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES: u32 = 1024;
@@ -74,6 +75,7 @@ const _: () = {
     assert!(MAX_PENDING_CLIENT_WELCOMES > 0);
     assert!(MAX_LINK_FANOUTS > 0);
     assert!(MAX_LINK_FANOUT_ROOMS > 0);
+    assert!(MAX_RUNTIME_SYNC_PAGES_PER_ROOM > 0);
     assert!(MAX_OPENMLS_STORAGE_RECORDS > 0);
     assert!(MAX_OPENMLS_STORAGE_KEY_BYTES > 0);
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
@@ -102,6 +104,7 @@ pub struct FiniteChatDeviceState {
     pub credential_identity: Vec<u8>,
     pub rooms: Vec<PersistedRoomState>,
     pub pending_welcomes: Vec<PendingWelcomeState>,
+    pub pending_welcome_acks: Vec<PendingWelcomeAckState>,
     pub link_fanouts: Vec<LinkFanoutState>,
     pub openmls_storage_records: Vec<OpenMlsStorageRecord>,
 }
@@ -120,6 +123,13 @@ pub struct PendingWelcomeState {
     pub commit_seq: u64,
     pub welcome_payload: Vec<u8>,
     pub ratchet_tree_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWelcomeAckState {
+    pub welcome_id: WelcomeId,
+    pub room_id: RoomId,
+    pub commit_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +181,89 @@ pub struct KeyPackageReplenishmentPlan {
     pub upload_requests: Vec<UploadKeyPackageRequest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSyncOptions {
+    pub key_package_target_available: u32,
+    pub max_sync_pages_per_room: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeSyncReport {
+    pub uploaded_key_packages: u32,
+    pub claimed_welcomes: u32,
+    pub activated_welcome_acks_sent: u32,
+    pub sync_pages: u32,
+    pub applied_entries: Vec<RuntimeAppliedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAppliedEntry {
+    pub room_id: RoomId,
+    pub seq: u64,
+    pub entry: AppliedLogEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomSyncCursor {
+    pub room_id: RoomId,
+    pub after_seq: u64,
+}
+
+impl RuntimeSyncOptions {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_item_count(
+            "runtime.key_package_target_available",
+            self.key_package_target_available as usize,
+            MAX_KEY_PACKAGES_PER_DEVICE,
+        )?;
+        validate_bytes_non_empty(
+            "runtime.max_sync_pages_per_room",
+            self.max_sync_pages_per_room as usize,
+        )?;
+        validate_item_count(
+            "runtime.max_sync_pages_per_room",
+            self.max_sync_pages_per_room as usize,
+            MAX_RUNTIME_SYNC_PAGES_PER_ROOM,
+        )?;
+        Ok(())
+    }
+}
+
+impl RuntimeSyncReport {
+    fn record_uploaded_key_package(&mut self) -> Result<(), ClientError> {
+        self.uploaded_key_packages = self
+            .uploaded_key_packages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_claimed_welcomes(&mut self, count: usize) -> Result<(), ClientError> {
+        let count = u32::try_from(count).map_err(|_| ClientError::RuntimeCounterOverflow)?;
+        self.claimed_welcomes = self
+            .claimed_welcomes
+            .checked_add(count)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_welcome_ack(&mut self) -> Result<(), ClientError> {
+        self.activated_welcome_acks_sent = self
+            .activated_welcome_acks_sent
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+
+    fn record_sync_page(&mut self) -> Result<(), ClientError> {
+        self.sync_pages = self
+            .sync_pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        Ok(())
+    }
+}
+
 pub struct FiniteChatDevice {
     provider: OpenMlsRustCrypto,
     device_ref: DeviceRef,
@@ -181,6 +274,7 @@ pub struct FiniteChatDevice {
     groups: BTreeMap<RoomId, MlsGroup>,
     room_cursors: BTreeMap<RoomId, u64>,
     pending_welcomes: BTreeMap<WelcomeId, PendingWelcomeState>,
+    pending_welcome_acks: BTreeMap<WelcomeId, PendingWelcomeAckState>,
     link_fanouts: BTreeMap<String, LinkFanoutState>,
 }
 
@@ -225,6 +319,7 @@ impl FiniteChatDevice {
             groups: BTreeMap::new(),
             room_cursors: BTreeMap::new(),
             pending_welcomes: BTreeMap::new(),
+            pending_welcome_acks: BTreeMap::new(),
             link_fanouts: BTreeMap::new(),
         };
         debug_assert_eq!(
@@ -310,6 +405,11 @@ impl FiniteChatDevice {
             .iter()
             .map(|welcome| (welcome.welcome_id.clone(), welcome.clone()))
             .collect::<BTreeMap<_, _>>();
+        let pending_welcome_acks = state
+            .pending_welcome_acks
+            .iter()
+            .map(|ack| (ack.welcome_id.clone(), ack.clone()))
+            .collect::<BTreeMap<_, _>>();
         let link_fanouts = state
             .link_fanouts
             .iter()
@@ -326,6 +426,7 @@ impl FiniteChatDevice {
             groups,
             room_cursors,
             pending_welcomes,
+            pending_welcome_acks,
             link_fanouts,
         };
         debug_assert_eq!(
@@ -364,6 +465,11 @@ impl FiniteChatDevice {
             .collect::<Result<Vec<_>, ClientError>>()?;
         rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
         let pending_welcomes = self.pending_welcomes.values().cloned().collect::<Vec<_>>();
+        let pending_welcome_acks = self
+            .pending_welcome_acks
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let link_fanouts = self.link_fanouts.values().cloned().collect::<Vec<_>>();
 
         let state = FiniteChatDeviceState {
@@ -372,6 +478,7 @@ impl FiniteChatDevice {
             credential_identity: self.credential.identity_bytes(),
             rooms,
             pending_welcomes,
+            pending_welcome_acks,
             link_fanouts,
             openmls_storage_records,
         };
@@ -424,7 +531,19 @@ impl FiniteChatDevice {
         &self,
         key_package_id: impl Into<String>,
     ) -> Result<UploadKeyPackageRequest, ClientError> {
-        let key_package_id = key_package_id.into();
+        self.build_upload_key_package_request(Some(key_package_id.into()))
+    }
+
+    pub fn upload_key_package_auto_id_request(
+        &self,
+    ) -> Result<UploadKeyPackageRequest, ClientError> {
+        self.build_upload_key_package_request(None)
+    }
+
+    fn build_upload_key_package_request(
+        &self,
+        key_package_id: Option<String>,
+    ) -> Result<UploadKeyPackageRequest, ClientError> {
         let key_package = KeyPackage::builder()
             .build(
                 FINITECHAT_CIPHERSUITE,
@@ -441,12 +560,14 @@ impl FiniteChatDevice {
             .key_package()
             .hash_ref(self.provider.crypto())
             .map_err(|_| ClientError::HashKeyPackageRef)?;
+        let key_package_hash = message_id_for_bytes(&payload);
+        let key_package_id = key_package_id.unwrap_or_else(|| format!("kp_{key_package_hash}"));
 
         let request = UploadKeyPackageRequest {
             key_package_id,
             owner: self.device_ref.clone(),
             key_package_ref: hex_lower(key_package_ref.as_slice()),
-            key_package_hash: message_id_for_bytes(&payload),
+            key_package_hash,
             key_package_payload: payload,
         };
         request.validate_limits()?;
@@ -457,8 +578,6 @@ impl FiniteChatDevice {
         &self,
         inventory: KeyPackageInventory,
         target_available: u32,
-        id_prefix: &str,
-        first_index: u32,
     ) -> Result<KeyPackageReplenishmentPlan, ClientError> {
         inventory.owner.validate_limits()?;
         if inventory.owner != self.device_ref {
@@ -489,12 +608,6 @@ impl FiniteChatDevice {
                 max: MAX_KEY_PACKAGES_PER_DEVICE,
             });
         }
-        validate_bytes_non_empty("key_package_replenishment.id_prefix", id_prefix.len())?;
-        validate_string_bytes(
-            "key_package_replenishment.id_prefix",
-            id_prefix,
-            MAX_OBJECT_ID_BYTES,
-        )?;
 
         let missing_available = target_available.saturating_sub(inventory.available);
         let remaining_cap = u32::try_from(
@@ -513,12 +626,8 @@ impl FiniteChatDevice {
         })?;
         let upload_count = missing_available.min(remaining_cap);
         let mut upload_requests = Vec::with_capacity(upload_count as usize);
-        for offset in 0..upload_count {
-            let index = first_index
-                .checked_add(offset)
-                .ok_or(ClientError::KeyPackageReplenishmentIndexOverflow)?;
-            let key_package_id = format!("{id_prefix}_{index}");
-            upload_requests.push(self.upload_key_package_request(key_package_id)?);
+        for _ in 0..upload_count {
+            upload_requests.push(self.upload_key_package_auto_id_request()?);
         }
 
         debug_assert!(upload_requests.len() <= MAX_KEY_PACKAGES_PER_DEVICE as usize);
@@ -999,8 +1108,22 @@ impl FiniteChatDevice {
         Ok(*self.room_cursors.get(room_id).unwrap_or(&0))
     }
 
+    pub fn room_sync_cursors(&self) -> Vec<RoomSyncCursor> {
+        self.groups
+            .keys()
+            .map(|room_id| RoomSyncCursor {
+                room_id: room_id.clone(),
+                after_seq: *self.room_cursors.get(room_id).unwrap_or(&0),
+            })
+            .collect()
+    }
+
     pub fn pending_welcome_count(&self) -> usize {
         self.pending_welcomes.len()
+    }
+
+    pub fn pending_welcome_ack_count(&self) -> usize {
+        self.pending_welcome_acks.len()
     }
 
     fn store_pending_welcome(&mut self, welcome: &WelcomeRecord) -> Result<(), ClientError> {
@@ -1017,6 +1140,10 @@ impl FiniteChatDevice {
         Ok(())
     }
 
+    fn pending_welcome_ids(&self) -> Vec<WelcomeId> {
+        self.pending_welcomes.keys().cloned().collect()
+    }
+
     fn pending_welcome(&self, welcome_id: &str) -> Result<PendingWelcomeState, ClientError> {
         validate_string_bytes("welcome_id", welcome_id, MAX_OBJECT_ID_BYTES)?;
         self.pending_welcomes
@@ -1031,6 +1158,59 @@ impl FiniteChatDevice {
             return Err(ClientError::PendingWelcomeNotFound(welcome_id.to_string()));
         }
         debug_assert!(!self.pending_welcomes.contains_key(welcome_id));
+        Ok(())
+    }
+
+    fn activate_pending_welcome(
+        &mut self,
+        welcome_id: &str,
+    ) -> Result<PendingWelcomeAckState, ClientError> {
+        let pending = self.pending_welcome(welcome_id)?;
+        self.activate_welcome(
+            pending.room_id.clone(),
+            &pending.welcome_payload,
+            &pending.ratchet_tree_payload,
+        )?;
+        self.set_last_applied_seq(&pending.room_id, pending.commit_seq)?;
+        self.clear_pending_welcome(welcome_id)?;
+        let ack = PendingWelcomeAckState::from_pending_welcome(&pending)?;
+        self.store_pending_welcome_ack(ack.clone())?;
+        debug_assert!(!self.pending_welcomes.contains_key(welcome_id));
+        debug_assert!(self.pending_welcome_acks.contains_key(welcome_id));
+        Ok(ack)
+    }
+
+    fn store_pending_welcome_ack(
+        &mut self,
+        ack: PendingWelcomeAckState,
+    ) -> Result<(), ClientError> {
+        ack.validate_limits()?;
+        if self.pending_welcomes.contains_key(&ack.welcome_id) {
+            return Err(ClientError::PendingWelcomeAlsoNeedsAck(ack.welcome_id));
+        }
+        if self
+            .pending_welcome_acks
+            .insert(ack.welcome_id.clone(), ack.clone())
+            .is_some()
+        {
+            return Err(ClientError::DuplicatePendingWelcomeAck(ack.welcome_id));
+        }
+        debug_assert!(self.pending_welcome_acks.contains_key(&ack.welcome_id));
+        Ok(())
+    }
+
+    fn pending_welcome_acks(&self) -> Vec<PendingWelcomeAckState> {
+        self.pending_welcome_acks.values().cloned().collect()
+    }
+
+    fn clear_pending_welcome_ack(&mut self, welcome_id: &str) -> Result<(), ClientError> {
+        validate_string_bytes("welcome_ack.welcome_id", welcome_id, MAX_OBJECT_ID_BYTES)?;
+        if self.pending_welcome_acks.remove(welcome_id).is_none() {
+            return Err(ClientError::PendingWelcomeAckNotFound(
+                welcome_id.to_string(),
+            ));
+        }
+        debug_assert!(!self.pending_welcome_acks.contains_key(welcome_id));
         Ok(())
     }
 
@@ -1435,6 +1615,11 @@ impl FiniteChatDeviceState {
             MAX_PENDING_CLIENT_WELCOMES,
         )?;
         validate_item_count(
+            "client_state.pending_welcome_acks",
+            self.pending_welcome_acks.len(),
+            MAX_PENDING_CLIENT_WELCOMES,
+        )?;
+        validate_item_count(
             "client_state.link_fanouts",
             self.link_fanouts.len(),
             MAX_LINK_FANOUTS,
@@ -1453,6 +1638,7 @@ impl FiniteChatDeviceState {
         let mut seen_storage_keys = BTreeSet::<Vec<u8>>::new();
         let mut seen_rooms = BTreeSet::<RoomId>::new();
         let mut seen_pending_welcomes = BTreeSet::<WelcomeId>::new();
+        let mut seen_pending_welcome_acks = BTreeSet::<WelcomeId>::new();
         let mut seen_link_fanouts = BTreeSet::<String>::new();
         for room in &self.rooms {
             if !seen_rooms.insert(room.room_id.clone()) {
@@ -1464,6 +1650,24 @@ impl FiniteChatDeviceState {
             if !seen_pending_welcomes.insert(welcome.welcome_id.clone()) {
                 return Err(ClientError::DuplicatePendingWelcome(
                     welcome.welcome_id.clone(),
+                ));
+            }
+        }
+        for ack in &self.pending_welcome_acks {
+            ack.validate_limits()?;
+            if !seen_pending_welcome_acks.insert(ack.welcome_id.clone()) {
+                return Err(ClientError::DuplicatePendingWelcomeAck(
+                    ack.welcome_id.clone(),
+                ));
+            }
+            if seen_pending_welcomes.contains(&ack.welcome_id) {
+                return Err(ClientError::PendingWelcomeAlsoNeedsAck(
+                    ack.welcome_id.clone(),
+                ));
+            }
+            if !seen_rooms.contains(&ack.room_id) {
+                return Err(ClientError::PendingWelcomeAckRoomMissing(
+                    ack.room_id.clone(),
                 ));
             }
         }
@@ -1536,6 +1740,28 @@ impl PendingWelcomeState {
             self.ratchet_tree_payload.len(),
             MAX_RATCHET_TREE_PAYLOAD_BYTES,
         )?;
+        Ok(())
+    }
+}
+
+impl PendingWelcomeAckState {
+    fn from_pending_welcome(pending: &PendingWelcomeState) -> Result<Self, ClientError> {
+        let ack = Self {
+            welcome_id: pending.welcome_id.clone(),
+            room_id: pending.room_id.clone(),
+            commit_seq: pending.commit_seq,
+        };
+        ack.validate_limits()?;
+        Ok(ack)
+    }
+
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_string_bytes(
+            "welcome_ack.welcome_id",
+            &self.welcome_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_room_id(&self.room_id)?;
         Ok(())
     }
 }
@@ -1770,14 +1996,21 @@ impl SqliteClientStore {
     pub fn activate_welcome_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
+        welcome_id: impl Into<WelcomeId>,
         room_id: impl Into<RoomId>,
         welcome_payload: &[u8],
         ratchet_tree_payload: &[u8],
         commit_seq: u64,
     ) -> Result<(), ClientStoreError> {
+        let welcome_id = welcome_id.into();
         let room_id = room_id.into();
         device.activate_welcome(room_id.clone(), welcome_payload, ratchet_tree_payload)?;
         device.set_last_applied_seq(&room_id, commit_seq)?;
+        device.store_pending_welcome_ack(PendingWelcomeAckState {
+            welcome_id,
+            room_id,
+            commit_seq,
+        })?;
         self.save_device_state(device)
     }
 
@@ -1795,16 +2028,18 @@ impl SqliteClientStore {
         device: &mut FiniteChatDevice,
         welcome_id: &str,
     ) -> Result<u64, ClientStoreError> {
-        let pending = device.pending_welcome(welcome_id)?;
-        device.activate_welcome(
-            pending.room_id.clone(),
-            &pending.welcome_payload,
-            &pending.ratchet_tree_payload,
-        )?;
-        device.set_last_applied_seq(&pending.room_id, pending.commit_seq)?;
-        device.clear_pending_welcome(welcome_id)?;
+        let ack = device.activate_pending_welcome(welcome_id)?;
         self.save_device_state(device)?;
-        Ok(pending.commit_seq)
+        Ok(ack.commit_seq)
+    }
+
+    pub fn clear_pending_welcome_ack_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        welcome_id: &str,
+    ) -> Result<(), ClientStoreError> {
+        device.clear_pending_welcome_ack(welcome_id)?;
+        self.save_device_state(device)
     }
 
     pub fn start_link_fanout_and_save(
@@ -1880,6 +2115,16 @@ impl SqliteClientStore {
         Ok(Some(applied))
     }
 
+    pub fn advance_room_cursor_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        room_id: &str,
+        seq: u64,
+    ) -> Result<(), ClientStoreError> {
+        device.set_last_applied_seq(room_id, seq)?;
+        self.save_device_state(device)
+    }
+
     fn connect(&self) -> Result<Connection, ClientStoreError> {
         let conn = Connection::open(&self.db_path)?;
         conn.execute_batch(
@@ -1902,6 +2147,214 @@ impl SqliteClientStore {
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+}
+
+pub trait RuntimeDelivery {
+    type Error;
+
+    fn key_package_inventory(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, Self::Error>;
+
+    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error>;
+
+    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error>;
+
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error>;
+
+    fn sync_events(
+        &mut self,
+        room_id: &str,
+        requester: &DeviceRef,
+        after_seq: u64,
+    ) -> Result<SyncEventsPage, Self::Error>;
+}
+
+impl RuntimeDelivery for DeliveryService {
+    type Error = EngineError;
+
+    fn key_package_inventory(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, Self::Error> {
+        DeliveryService::key_package_inventory(self, owner)
+    }
+
+    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
+        DeliveryService::upload_key_package(self, request)
+    }
+
+    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
+        DeliveryService::claim_welcomes(self, device)
+    }
+
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
+        DeliveryService::ack_welcome(self, welcome_id, activated)
+    }
+
+    fn sync_events(
+        &mut self,
+        room_id: &str,
+        requester: &DeviceRef,
+        after_seq: u64,
+    ) -> Result<SyncEventsPage, Self::Error> {
+        DeliveryService::sync_events(self, room_id, requester, after_seq)
+    }
+}
+
+pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    options: &RuntimeSyncOptions,
+) -> Result<RuntimeSyncReport, RuntimeWorkerError<D::Error>> {
+    options.validate_limits()?;
+    let mut report = RuntimeSyncReport::default();
+
+    let inventory = delivery
+        .key_package_inventory(device.device_ref())
+        .map_err(RuntimeWorkerError::Delivery)?;
+    let replenishment =
+        device.key_package_replenishment_plan(inventory, options.key_package_target_available)?;
+    let upload_requests = replenishment.upload_requests;
+    if !upload_requests.is_empty() {
+        store.save_device_state(device)?;
+    }
+    for request in upload_requests {
+        delivery
+            .upload_key_package(request)
+            .map_err(RuntimeWorkerError::Delivery)?;
+        report.record_uploaded_key_package()?;
+    }
+
+    let claimed_welcomes = delivery
+        .claim_welcomes(device.device_ref())
+        .map_err(RuntimeWorkerError::Delivery)?;
+    report.record_claimed_welcomes(claimed_welcomes.len())?;
+    for welcome in claimed_welcomes {
+        store.store_pending_welcome_and_save(device, &welcome)?;
+    }
+
+    for welcome_id in device.pending_welcome_ids() {
+        store.activate_pending_welcome_and_save(device, &welcome_id)?;
+    }
+
+    for ack in device.pending_welcome_acks() {
+        delivery
+            .ack_welcome(&ack.welcome_id, true)
+            .map_err(RuntimeWorkerError::Delivery)?;
+        store.clear_pending_welcome_ack_and_save(device, &ack.welcome_id)?;
+        report.record_welcome_ack()?;
+    }
+
+    for cursor in device.room_sync_cursors() {
+        sync_room_pages(
+            store,
+            device,
+            delivery,
+            options,
+            cursor.room_id,
+            cursor.after_seq,
+            &mut report,
+        )?;
+    }
+
+    Ok(report)
+}
+
+fn sync_room_pages<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    options: &RuntimeSyncOptions,
+    room_id: RoomId,
+    mut after_seq: u64,
+    report: &mut RuntimeSyncReport,
+) -> Result<(), RuntimeWorkerError<D::Error>> {
+    let mut pages = 0u32;
+    while pages < options.max_sync_pages_per_room {
+        let page = delivery
+            .sync_events(&room_id, device.device_ref(), after_seq)
+            .map_err(RuntimeWorkerError::Delivery)?;
+        report.record_sync_page()?;
+        pages = pages
+            .checked_add(1)
+            .ok_or(ClientError::RuntimeCounterOverflow)?;
+        if page.next_after_seq < after_seq {
+            return Err(ClientError::RuntimeSyncCursorRegression {
+                room_id,
+                current_seq: after_seq,
+                next_after_seq: page.next_after_seq,
+            }
+            .into());
+        }
+
+        for entry in page.entries {
+            let seq = entry.seq;
+            if let Some(applied) = store.apply_log_entry_and_save(device, &room_id, &entry)? {
+                report.applied_entries.push(RuntimeAppliedEntry {
+                    room_id: room_id.clone(),
+                    seq,
+                    entry: applied,
+                });
+            }
+        }
+
+        if page.next_after_seq > device.last_applied_seq(&room_id)? {
+            store.advance_room_cursor_and_save(device, &room_id, page.next_after_seq)?;
+        }
+
+        if !page.has_more {
+            break;
+        }
+        if page.next_after_seq == after_seq {
+            return Err(ClientError::RuntimeSyncStalled { room_id, after_seq }.into());
+        }
+        after_seq = page.next_after_seq;
+    }
+
+    debug_assert!(pages <= options.max_sync_pages_per_room);
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum RuntimeWorkerError<E> {
+    Delivery(E),
+    Client(ClientError),
+    ClientStore(ClientStoreError),
+}
+
+impl<E> From<ClientError> for RuntimeWorkerError<E> {
+    fn from(error: ClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
+impl<E> From<ClientStoreError> for RuntimeWorkerError<E> {
+    fn from(error: ClientStoreError) -> Self {
+        Self::ClientStore(error)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for RuntimeWorkerError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Delivery(error) => write!(formatter, "delivery operation failed: {error}"),
+            Self::Client(error) => write!(formatter, "{error}"),
+            Self::ClientStore(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for RuntimeWorkerError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Delivery(error) => Some(error),
+            Self::Client(error) => Some(error),
+            Self::ClientStore(error) => Some(error),
+        }
     }
 }
 
@@ -1990,8 +2443,6 @@ pub enum ClientError {
         leased: u32,
         max: u32,
     },
-    #[error("KeyPackage replenishment id index overflow")]
-    KeyPackageReplenishmentIndexOverflow,
     #[error("failed to hash OpenMLS KeyPackage ref")]
     HashKeyPackageRef,
     #[error("failed to add OpenMLS member")]
@@ -2059,8 +2510,16 @@ pub enum ClientError {
     DuplicateInviteWelcome(WelcomeId),
     #[error("pending Welcome already exists: {0}")]
     DuplicatePendingWelcome(WelcomeId),
+    #[error("pending Welcome ack already exists: {0}")]
+    DuplicatePendingWelcomeAck(WelcomeId),
+    #[error("pending Welcome cannot also need ack: {0}")]
+    PendingWelcomeAlsoNeedsAck(WelcomeId),
+    #[error("pending Welcome ack room is missing: {0}")]
+    PendingWelcomeAckRoomMissing(RoomId),
     #[error("pending Welcome not found: {0}")]
     PendingWelcomeNotFound(WelcomeId),
+    #[error("pending Welcome ack not found: {0}")]
+    PendingWelcomeAckNotFound(WelcomeId),
     #[error("pending Welcome recipient does not match this device")]
     PendingWelcomeRecipientMismatch,
     #[error("prepared commit message id does not match request")]
@@ -2123,6 +2582,16 @@ pub enum ClientError {
     LoadGroupState(RoomId),
     #[error("persisted MLS group state is missing: {0}")]
     MissingGroupState(RoomId),
+    #[error("runtime worker counter overflow")]
+    RuntimeCounterOverflow,
+    #[error("runtime sync cursor regressed for {room_id}: {current_seq} -> {next_after_seq}")]
+    RuntimeSyncCursorRegression {
+        room_id: RoomId,
+        current_seq: u64,
+        next_after_seq: u64,
+    },
+    #[error("runtime sync stalled for {room_id} after seq {after_seq}")]
+    RuntimeSyncStalled { room_id: RoomId, after_seq: u64 },
     #[error("log entry room mismatch: expected {expected}, actual {actual}")]
     LogEntryRoomMismatch { expected: RoomId, actual: RoomId },
     #[error("log entry envelope room mismatch: entry {entry_room}, envelope {envelope_room}")]
@@ -2728,6 +3197,28 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
     }
     append_count(
         &mut out,
+        "client_state.pending_welcome_acks",
+        state.pending_welcome_acks.len(),
+        MAX_PENDING_CLIENT_WELCOMES,
+    )?;
+    for ack in &state.pending_welcome_acks {
+        ack.validate_limits()?;
+        append_string_field(
+            &mut out,
+            "welcome_ack.welcome_id",
+            &ack.welcome_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        append_string_field(
+            &mut out,
+            "welcome_ack.room_id",
+            &ack.room_id,
+            finitechat_proto::MAX_ROOM_ID_BYTES,
+        )?;
+        out.extend_from_slice(&ack.commit_seq.to_be_bytes());
+    }
+    append_count(
+        &mut out,
         "client_state.link_fanouts",
         state.link_fanouts.len(),
         MAX_LINK_FANOUTS,
@@ -2818,6 +3309,20 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         });
     }
 
+    let pending_welcome_ack_count = cursor.take_count(
+        "client_state.pending_welcome_acks",
+        MAX_PENDING_CLIENT_WELCOMES,
+    )?;
+    let mut pending_welcome_acks = Vec::with_capacity(pending_welcome_ack_count);
+    for _ in 0..pending_welcome_ack_count {
+        pending_welcome_acks.push(PendingWelcomeAckState {
+            welcome_id: cursor.take_string("welcome_ack.welcome_id", MAX_OBJECT_ID_BYTES)?,
+            room_id: cursor
+                .take_string("welcome_ack.room_id", finitechat_proto::MAX_ROOM_ID_BYTES)?,
+            commit_seq: cursor.take_u64()?,
+        });
+    }
+
     let link_fanout_count = cursor.take_count("client_state.link_fanouts", MAX_LINK_FANOUTS)?;
     let mut link_fanouts = Vec::with_capacity(link_fanout_count);
     for _ in 0..link_fanout_count {
@@ -2846,6 +3351,7 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         credential_identity,
         rooms,
         pending_welcomes,
+        pending_welcome_acks,
         link_fanouts,
         openmls_storage_records,
     };
@@ -2872,6 +3378,12 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         len = checked_len_add(len, U64_BYTES)?;
         len = checked_len_add(len, U32_BYTES + welcome.welcome_payload.len())?;
         len = checked_len_add(len, U32_BYTES + welcome.ratchet_tree_payload.len())?;
+    }
+    len = checked_len_add(len, U32_BYTES)?;
+    for ack in &state.pending_welcome_acks {
+        len = checked_len_add(len, U32_BYTES + ack.welcome_id.len())?;
+        len = checked_len_add(len, U32_BYTES + ack.room_id.len())?;
+        len = checked_len_add(len, U64_BYTES)?;
     }
     len = checked_len_add(len, U32_BYTES)?;
     for fanout in &state.link_fanouts {

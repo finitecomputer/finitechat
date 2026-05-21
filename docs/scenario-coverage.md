@@ -127,6 +127,7 @@ Proven client scenarios:
 - `client_drops_losing_pending_commit_when_winning_race_removes_it`
 - `client_key_package_replenishment_edges_use_real_packages`
 - `client_key_package_replenishment_plan_maintains_bounded_inventory`
+- `runtime_sync_tick_replenishes_welcomes_acks_and_syncs_after_restart`
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
@@ -201,9 +202,11 @@ Checkpoint test signal:
   window: after Bob claims a Welcome, the server no longer returns it from
   `claim_welcomes`; Bob persists the Welcome payload and ratchet tree in the
   encrypted client snapshot, restarts, activates from local state, clears the
-  pending inbox entry, and only then acks the server. A companion failure test
-  corrupts the stored ratchet tree and proves OpenMLS rejection does not drop
-  the only local pending-Welcome copy.
+  pending inbox entry, and then acks the server. Activated Welcomes now leave
+  durable pending-ack state until the server ack succeeds; server ack is
+  idempotent, so a crash after ack but before clearing local ack state can retry.
+  A companion failure test corrupts the stored ratchet tree and proves OpenMLS
+  rejection does not drop the only local pending-Welcome copy.
 - The first remote Commit checkpoint adds a real ordered-log client API:
   application entries decrypt, own Commit entries merge only with pending local
   state, and remote Commit entries validate the log envelope before processing
@@ -263,9 +266,17 @@ Checkpoint test signal:
   returns no packages, uploading a fresh package replenishes availability, and
   lease expiry makes the original package reclaimable. The client planner now
   takes server inventory, generates only the missing upload requests needed to
-  reach a target, and refuses over-cap targets. Sim and SQLite prove the server
-  cap counts available plus leased packages, accepted add Commits free consumed
-  package space, and cap behavior survives reopen.
+  reach a target, auto-ids packages from their MLS payload hash, and refuses
+  over-cap targets. The runtime tick saves local OpenMLS state before upload so
+  a server-visible KeyPackage is not missing its local private state after
+  restart. Sim and SQLite prove the server cap counts available plus leased
+  packages, accepted add Commits free consumed package space, and cap behavior
+  survives reopen.
+- The runtime sync checkpoint exposed a gap in the earlier crash proof: we had
+  durable activation before server ack, but no durable marker telling the
+  automated runtime loop to send that ack after restart. The fix adds
+  `pending_welcome_acks` to encrypted client state and makes server ack retry
+  safe.
 - The history-policy checkpoint makes the v1 product decision executable:
   Alice's newly linked phone syncs from cursor zero, but the server only returns
   entries from the accepted add Commit forward. The phone decrypts the

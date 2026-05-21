@@ -376,8 +376,10 @@ impl SqliteDeliveryStore {
         let welcome_id = welcome_id.to_string();
         self.with_transaction(|tx| {
             let welcome = load_welcome_required(tx, &welcome_id)?;
-            if welcome.state != WelcomeState::Claimed {
-                return Err(EngineError::WelcomeNotClaimed(welcome_id).into());
+            match (welcome.state, activated) {
+                (WelcomeState::Acked, true) | (WelcomeState::Failed, false) => return Ok(()),
+                (WelcomeState::Claimed, _) => {}
+                _ => return Err(EngineError::WelcomeNotClaimed(welcome_id).into()),
             }
 
             let next_state = if activated {

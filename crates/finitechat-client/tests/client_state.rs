@@ -1,6 +1,7 @@
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    LinkFanoutRoomPlan, LinkFanoutRoomStatus, SqliteClientStore, SqliteClientStoreOptions,
+    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeSyncOptions, SqliteClientStore,
+    SqliteClientStoreOptions, run_runtime_sync_tick,
 };
 use finitechat_engine::{
     AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
@@ -8,7 +9,7 @@ use finitechat_engine::{
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
+    KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError, WelcomeState,
 };
 use rusqlite::{Connection, params};
 
@@ -543,6 +544,7 @@ fn sqlite_client_welcome_activation_is_durable_before_server_ack() {
     bob_store
         .activate_welcome_and_save(
             &mut bob,
+            "welcome_resume_bob",
             ROOM_ID,
             &welcome.welcome_payload,
             &welcome.ratchet_tree_payload,
@@ -554,6 +556,13 @@ fn sqlite_client_welcome_activation_is_durable_before_server_ack() {
     let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
     assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
     assert_eq!(bob.last_applied_seq(ROOM_ID).unwrap(), accepted.seq);
+    assert_eq!(bob.pending_welcome_ack_count(), 1);
+    server.ack_welcome("welcome_resume_bob", true).unwrap();
+    bob_store
+        .clear_pending_welcome_ack_and_save(&mut bob, "welcome_resume_bob")
+        .unwrap();
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
+    assert_eq!(bob.pending_welcome_ack_count(), 0);
     server.ack_welcome("welcome_resume_bob", true).unwrap();
 
     let plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"after ack resume"}}"#;
@@ -770,6 +779,7 @@ fn sqlite_client_apply_log_entry_persists_cursor_and_skips_replay_after_restart(
     bob_store
         .activate_welcome_and_save(
             &mut bob,
+            "welcome_sync_bob",
             ROOM_ID,
             &welcome.welcome_payload,
             &welcome.ratchet_tree_payload,
@@ -1625,7 +1635,7 @@ fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
         .key_package_inventory(alice_phone.device_ref())
         .unwrap();
     let plan = alice_phone
-        .key_package_replenishment_plan(initial_inventory.clone(), 3, "kp_policy", 0)
+        .key_package_replenishment_plan(initial_inventory.clone(), 3)
         .unwrap();
     assert_eq!(plan.inventory, initial_inventory);
     assert_eq!(plan.target_available, 3);
@@ -1650,10 +1660,10 @@ fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
     assert_eq!(inventory.leased, 1);
 
     let plan = alice_phone
-        .key_package_replenishment_plan(inventory, 3, "kp_policy", 3)
+        .key_package_replenishment_plan(inventory, 3)
         .unwrap();
     assert_eq!(plan.upload_requests.len(), 1);
-    assert_eq!(plan.upload_requests[0].key_package_id, "kp_policy_3");
+    assert!(plan.upload_requests[0].key_package_id.starts_with("kp_"));
     server
         .upload_key_package(plan.upload_requests[0].clone())
         .unwrap();
@@ -1664,13 +1674,113 @@ fn client_key_package_replenishment_plan_maintains_bounded_inventory() {
     assert_eq!(inventory.leased, 1);
 
     let err = alice_phone
-        .key_package_replenishment_plan(inventory, MAX_KEY_PACKAGES_PER_DEVICE + 1, "kp_policy", 4)
+        .key_package_replenishment_plan(inventory, MAX_KEY_PACKAGES_PER_DEVICE + 1)
         .unwrap_err();
     assert!(matches!(
         err,
         ClientError::ProtocolLimit(ProtocolLimitError::TooManyItems { field, .. })
             if field == "key_package_replenishment.target_available"
     ));
+}
+
+#[test]
+fn runtime_sync_tick_replenishes_welcomes_acks_and_syncs_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_worker");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime_worker");
+    let mut server = DeliveryService::new();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 2,
+        max_sync_pages_per_room: 4,
+    };
+    alice_store.save_device_state(&alice).unwrap();
+
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &options).unwrap();
+    assert_eq!(report.uploaded_key_packages, 2);
+    assert_eq!(report.claimed_welcomes, 0);
+    assert_eq!(report.activated_welcome_acks_sent, 0);
+    assert_eq!(
+        server
+            .key_package_inventory(alice.device_ref())
+            .unwrap()
+            .available,
+        2
+    );
+
+    let mut alice = alice_store.load_device(alice_config.clone()).unwrap();
+    server
+        .create_or_get_direct_room(bob.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            alice.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    bob.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    let claimed_key_packages = server
+        .claim_key_packages_for_account(&alice.device_ref().account_id)
+        .unwrap();
+    assert_eq!(claimed_key_packages.len(), 1);
+    let prepared = bob
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_packages[0],
+            "welcome_runtime_alice",
+            "runtime_add_alice",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let bob_page = server.sync_events(ROOM_ID, bob.device_ref(), 0).unwrap();
+    bob.merge_pending_commit_from_log(ROOM_ID, &bob_page.entries, &prepared.message_id)
+        .unwrap();
+
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &options).unwrap();
+    assert_eq!(report.uploaded_key_packages, 1);
+    assert_eq!(report.claimed_welcomes, 1);
+    assert_eq!(report.activated_welcome_acks_sent, 1);
+    assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
+    assert_eq!(alice.last_applied_seq(ROOM_ID).unwrap(), accepted.seq);
+    assert_eq!(alice.pending_welcome_count(), 0);
+    assert_eq!(alice.pending_welcome_ack_count(), 0);
+    assert_eq!(
+        server.welcome("welcome_runtime_alice").unwrap().state,
+        WelcomeState::Acked
+    );
+
+    let mut alice = alice_store.load_device(alice_config.clone()).unwrap();
+    assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
+    assert_eq!(alice.last_applied_seq(ROOM_ID).unwrap(), accepted.seq);
+
+    let plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"runtime sync"}}"#;
+    let message = bob
+        .create_application_request(ROOM_ID, plaintext, "runtime_sync_message")
+        .unwrap();
+    let message_accepted = server.append_event(message).unwrap();
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &options).unwrap();
+    assert_eq!(report.applied_entries.len(), 1);
+    assert_eq!(report.applied_entries[0].room_id, ROOM_ID);
+    assert_eq!(report.applied_entries[0].seq, message_accepted.seq);
+    assert_eq!(
+        report.applied_entries[0].entry,
+        AppliedLogEntry::Application(plaintext.to_vec())
+    );
+    assert_eq!(
+        alice.last_applied_seq(ROOM_ID).unwrap(),
+        message_accepted.seq
+    );
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    assert_eq!(
+        alice.last_applied_seq(ROOM_ID).unwrap(),
+        message_accepted.seq
+    );
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &options).unwrap();
+    assert!(replay.applied_entries.is_empty());
 }
 
 #[test]

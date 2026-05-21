@@ -216,6 +216,10 @@ Current OpenMLS scope:
   `64` unconsumed packages, expose available/leased counts, clients plan
   target-available replenishment without UI involvement, consumed packages free
   space, and the SQLite/reducer fuzzer compares inventory after every step.
+- synchronous runtime sync tick for finitecomputer integration: replenish
+  KeyPackages, save local OpenMLS private state before upload, claim Welcomes,
+  durably activate Welcomes, send idempotent Welcome acks, sync ordered room
+  pages with bounded loops, and persist cursors with applied MLS state.
 - explicit v1 history policy proof: a newly added device can sync from its
   accepted add Commit forward, but does not receive pre-membership room log
   history by default.
@@ -241,8 +245,9 @@ Current known gap:
 - Later device linking is proven at the client protocol level. The server
   exposes bounded account-room discovery plus duplicate current/pending
   device-add rejection, and the client persists fanout progress plus prepared
-  Commit retry state. Production still needs the finitecomputer runtime command
-  loop that drives this worker against real server APIs.
+  Commit retry state. The runtime sync tick now covers the common device loop;
+  production still needs finitecomputer CLI/API wiring that drives the fanout
+  worker against real server APIs.
 - Removal/revocation is proven for stale local MLS state, server delivery
   gating, and durable server-side device status. Production still needs policy
   and UX for who may revoke which device.
@@ -252,9 +257,9 @@ Current known gap:
   can still broaden client cryptographic-state confidence, but the core
   pending-Commit recovery branch is no longer add-only.
 - KeyPackage replenishment policy is explicit and covered across real-client,
-  sim, and SQLite suites. Production still needs the finitecomputer runtime
-  scheduler that calls the client planner at startup, after account fanout
-  claims, and after accepted add Commits.
+  sim, and SQLite suites. The runtime sync tick calls the planner at startup and
+  after server interactions; production still needs finitecomputer process
+  scheduling and room-server transport wiring.
 - V1 history recovery is intentionally narrow: new devices get messages from
   their accepted add Commit forward. Pre-invite history requires a future
   encrypted backup or explicit member-to-member history-share protocol.
@@ -318,6 +323,10 @@ Good tests:
   replenishment by fresh upload, and lease expiry/reclaim; client/sim/SQLite
   cover bounded inventory planning, cap enforcement, consumed-package space
   recovery, and max-device caps.
+- runtime sync tick covers the canary runtime loop: local KeyPackage state is
+  saved before upload, claimed Welcomes survive activation-before-ack crashes as
+  pending ack state, Welcome ack is idempotent, ordered room sync persists MLS
+  state and cursor together, and replay does not reprocess applied entries.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.
