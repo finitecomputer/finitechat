@@ -19,6 +19,13 @@ Dashboard route
 Finite Chat should first replace the semantics behind "chat event" and "chat
 message", not the dashboard shell.
 
+The hosted finitecomputer web path is a trusted-server-client mode, not true
+end-to-end encryption. A server-side Rust Finite Chat client may decrypt room
+state and expose the existing dashboard DTOs so the web frontend changes as
+little as possible. Only local daemon, Electron, native mobile, or other clients
+that keep Finite Chat device secrets on the user's device should be described
+as end-to-end encrypted.
+
 ## Command/RPC Mapping
 
 Dashboard and Hermes commands ride inside Finite Chat durable application
@@ -38,20 +45,31 @@ sync; it must not directly execute work from an external event callback. Optiona
 cleartext wake hints may wake a specific runtime device, but the decrypted
 command target and local policy remain authoritative.
 
+Transport should start with HTTP mutations, cursor-based pull sync, and SSE
+hints. WebSockets are not needed for v1. SSE and relay wakes only trigger sync;
+durable ordered room state remains the source of truth.
+
 ## Proposed Landing Shape
 
-Add an encrypted mode in finitecomputer with three layers:
+Add an encrypted mode in finitecomputer with four layers:
 
 1. `finitechat-proto`: shared DTOs used by dashboard server routes, finited,
    finitec, and tests.
 2. `finitechat-engine`: reducer/store used by `finited` in local/dev and by a
    future canary room server.
-3. `finitec encrypted-chat`: runtime/client commands that manage device state,
+3. `finitechatd`: local daemon that owns device secrets, MLS state, sync,
+   projections, command ledger, and attachment download/upload.
+4. `finitec encrypted-chat`: runtime/client commands that manage device state,
    KeyPackages, Welcome claim/ack, room sync, and Hermes gateway bridge.
 
 The dashboard should keep the current `FiniteChat` component contract as long as
 possible. The server route can translate encrypted room state into the existing
 render model while the encrypted transcript becomes canonical.
+
+The standalone Finite Chat product should grow from the CLI/daemon first. The
+finitecomputer integration can consume that daemon surface initially; Electron
+and native apps can reuse the same Rust core when the local true-E2EE clients
+are ready.
 
 ## Mapping To Current Files
 
@@ -60,6 +78,10 @@ render model while the encrypted transcript becomes canonical.
 - Keep current render DTOs for the UI.
 - Add encrypted room DTOs separately. Do not overload plaintext message structs
   with MLS envelope fields.
+- Model receipts as encrypted durable `chat.receipt` events with
+  `push_policy = never`, not as user-notifying messages.
+- Replace current attachment semantics with encrypted Blossom-compatible blob
+  references in decrypted message DTOs.
 
 `crates/finite-core/src/chat_runtime.rs`
 
@@ -84,6 +106,8 @@ render model while the encrypted transcript becomes canonical.
 - Encrypted room logs need durable ordered storage, not only event files.
 - Add a room-log store with transaction semantics before production use.
 - Keep machine polling for command/result flow.
+- Add SSE as a hint channel for local/dev and hosted routes, but keep pull sync
+  as the repair path.
 
 `crates/fc/src/main.rs`
 
@@ -116,8 +140,9 @@ Start with new canary rooms only.
 
 - Do not import old Pika rooms.
 - Do not transparently convert existing finitecomputer plaintext threads.
-- For existing users, create a fresh encrypted Project chat and keep old
-  transcript access as plaintext archive until a separate migration plan exists.
+- For existing users, create a fresh encrypted Project chat and expose old
+  finitecomputer plaintext threads as read-only archived chats until a separate
+  migration plan exists.
 
 ## Runtime State
 

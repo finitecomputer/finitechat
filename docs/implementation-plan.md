@@ -353,6 +353,9 @@ Deliverables:
 - local room server mode in `finited` or a companion process;
 - dashboard route keeps current UI contract while encrypted messages shadow
   plaintext transcript records;
+- hosted web decrypts through a server-side Rust Finite Chat client and must be
+  described as trusted-server-client mode, not true E2EE;
+- standalone CLI/daemon owns the true local-device E2EE path first;
 - Hermes adapter continues to use `finitec gateway`.
 
 Good tests:
@@ -360,6 +363,8 @@ Good tests:
 - `scripts/relay_e2e.sh` equivalent for encrypted chat;
 - `just chat-local-up` encrypted mode;
 - browser E2E sends message, receives Hermes reply, reloads, and sees history;
+- SSE drop/duplicate/reorder only triggers sync and never directly executes
+  command work;
 - runtime restart preserves local MLS and pending gateway events.
 
 ### Phase 4: Canary Rollout
@@ -376,8 +381,8 @@ Good tests:
 - new Project can chat through encrypted room;
 - MicroSandbox runtime only connects outward;
 - loss/retry of relay results does not duplicate messages;
-- attachments are either encrypted application payload references or explicit
-  blob objects with encrypted keys.
+- attachments use encrypted Blossom-compatible blob references and verify both
+  ciphertext hash and plaintext hash.
 
 ### Phase 5: Hardening
 

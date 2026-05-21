@@ -151,6 +151,15 @@ must use a namespaced value such as `finitecomputer.indexing` or
 - Command targeting lives in encrypted payloads. Optional server-visible wake
   hints may reduce unnecessary device wakes, but clients must treat them as
   non-authoritative routing hints, not access control or execution policy.
+- `chat.receipt` is a durable encrypted application event for read/delivered
+  state. It must use `push_policy = never`, must not create unread state, and
+  should be optional by client or account policy.
+- V1 transport uses HTTP mutations, cursor-based pull sync, and SSE hints.
+  Streams and push wakes are never authoritative; clients repair gaps through
+  bounded sync pages.
+- Attachment blobs are encrypted before upload to a Blossom-compatible blob
+  service. Blob encryption protects bytes stored outside MLS; the room message
+  still uses MLS for the attachment reference and metadata.
 
 ## V1 Limits
 
@@ -173,6 +182,7 @@ These are protocol constants, not tuning hints:
 - ratchet-tree payload: `1 MiB`;
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
+- attachment plaintext: `32 MiB`;
 - ephemeral activity expiry: `30 minutes` from server receipt;
 - ephemeral activity cache entries per room/conversation/device route: `64`;
 - idempotency key: `128` bytes;
@@ -244,8 +254,22 @@ Rooms:
 - `POST /v1/rooms`
 - `GET /v1/accounts/{account_id}/rooms?after_room_id=...&limit=N`
 - `GET /v1/rooms/{room_id}/events?after_seq=N`
+- `GET /v1/rooms/{room_id}/stream`
 - `POST /v1/rooms/{room_id}/events`
 - `POST /v1/rooms/{room_id}/commits`
+
+V1 room transport is explicit:
+
+- durable mutations use HTTP `POST`;
+- durable recovery uses cursor-based `GET` sync pages;
+- live updates use SSE as a hint channel;
+- ephemeral activity may be sent by HTTP mutation and delivered through SSE or
+  a short TTL cache;
+- WebSockets are out of scope for v1.
+
+SSE does not carry authority. If a client misses, duplicates, or reorders SSE
+items, it repairs by polling durable sync with its last applied cursor. A stream
+callback must not directly execute application work.
 
 Welcomes:
 
@@ -351,6 +375,38 @@ Clients use it to place messages and live activity in the right app-level
 session without scanning every decrypted payload in a room. Rich conversation
 state such as title, preview text, runtime status, and activity kind remains in
 the encrypted payload.
+
+Finite Chat reserves generic durable chat kinds:
+
+- `conversation.create`: creates an app-level conversation inside a room;
+- `conversation.update`: updates encrypted conversation metadata;
+- `conversation.archive`: marks a conversation archived for the app projection;
+- `chat.message`: user-visible message;
+- `chat.edit`: user-visible message edit;
+- `chat.reaction`: reaction to a message;
+- `chat.receipt`: read, delivered, or seen state.
+
+Conversation creation should be explicit when the sender can do so. A client may
+lazily materialize a conversation when it sees the first durable event for an
+unknown `conversation_id`, but explicit `conversation.create` is preferred for
+clear ordering and projection behavior.
+
+Push policy is part of the server-visible envelope, not the encrypted semantic
+kind. V1 defaults are:
+
+- `chat.message`: push-eligible according to room and account notification
+  policy;
+- `chat.edit`, `chat.reaction`, `chat.receipt`, and conversation metadata:
+  `push_policy = never`;
+- `runtime.command.request`: may wake the encrypted target runtime device, but
+  should not create a user notification by default;
+- `runtime.command.result`: push-eligible only when the receiving app maps it to
+  user-visible output or a user-requested alert;
+- `ephemeral`: always `push_policy = never`.
+
+Receipts are encrypted application payloads. A `chat.receipt` may reveal read or
+delivery state to room members after decryption, but the room server only sees
+an opaque durable event with `push_policy = never`.
 
 The encrypted activity payload owns the semantic kind. The server does not need
 to know whether an ephemeral event means typing, thinking, working, uploading,
@@ -467,6 +523,34 @@ example to wake only a runtime device with GPU access. A wake hint must not be
 trusted by the runtime as proof that the command targets it. The decrypted
 payload and local policy decide whether the runtime records or executes the
 request.
+
+## Attachments And Blobs
+
+Attachments are encrypted blob references carried inside durable encrypted
+application payloads. The room server does not store plaintext attachment bytes
+and does not parse attachment metadata.
+
+V1 uses a Blossom-compatible blob storage shape:
+
+1. validate plaintext size before encryption;
+2. encrypt the file locally for the room attachment;
+3. upload encrypted bytes to one or more Blossom-compatible blob servers;
+4. verify the uploaded ciphertext hash;
+5. send a durable `chat.message` or app event containing the encrypted
+   attachment reference;
+6. on download, verify ciphertext hash, decrypt locally, then verify plaintext
+   hash.
+
+The encrypted attachment reference should include the blob URL, ciphertext hash,
+plaintext hash, blob encryption nonce/key material or equivalent media
+reference, scheme version, MIME type, filename, and optional dimensions. Blob
+servers may learn URL, ciphertext hash, object size, timing, and requester
+metadata; they must not receive plaintext bytes, plaintext filename, or
+plaintext MIME type unless a future product decision explicitly accepts that
+metadata leak.
+
+This blob-encryption layer is for bytes stored outside the MLS room log. It does
+not add another encryption layer to ordinary room messages.
 
 Example plaintext before MLS encryption:
 

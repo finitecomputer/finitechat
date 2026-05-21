@@ -434,3 +434,49 @@ application payload behavior:
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 - `runtime_command_result_clears_matching_activity`
+
+## Planned Transport Scenarios
+
+V1 transport should prove streams are hints and pull sync is authoritative:
+
+- `http_post_append_retries_are_idempotent`
+- `sse_hint_triggers_sync_without_advancing_cursor`
+- `sse_drop_duplicate_reorder_repairs_by_pull_sync`
+- `stream_callback_never_executes_command_directly`
+- `websocket_transport_not_required_for_v1`
+- `push_wake_and_sse_share_hint_only_semantics`
+
+## Planned Chat Payload Scenarios
+
+Generic chat payload semantics should stay small and non-notifying where
+appropriate:
+
+- `chat_receipt_is_durable_but_push_never`
+- `chat_receipt_is_encrypted_payload_semantics`
+- `chat_receipt_does_not_increment_unread`
+- `conversation_create_is_explicit_durable_event`
+- `first_message_lazily_materializes_missing_conversation`
+- `reaction_edit_and_receipt_do_not_push_by_default`
+
+## Planned Attachment Scenarios
+
+Finite Chat attachments should copy the useful Pika/Blossom shape while keeping
+metadata inside encrypted app payloads:
+
+- `attachment_encrypts_before_blob_upload`
+- `attachment_upload_verifies_ciphertext_hash`
+- `attachment_download_verifies_ciphertext_before_decrypt`
+- `attachment_download_verifies_plaintext_hash_after_decrypt`
+- `attachment_reference_metadata_is_encrypted_payload`
+- `attachment_rejects_plaintext_over_v1_size_limit`
+- `attachment_blob_server_does_not_receive_plaintext_filename_or_mime`
+
+## Planned Product Mode Scenarios
+
+Finitecomputer hosted web mode and standalone Finite Chat clients should stay
+honest about trust boundaries:
+
+- `hosted_web_mode_uses_server_side_trusted_client`
+- `hosted_web_mode_is_not_labeled_e2ee`
+- `local_daemon_mode_keeps_device_secrets_local`
+- `old_plaintext_chats_render_as_read_only_archive`
