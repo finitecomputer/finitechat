@@ -9,7 +9,7 @@ use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
     MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES,
     MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
-    WelcomeState,
+    StagedWelcomeV1, WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
 use rusqlite::{Connection, ErrorCode, params};
@@ -97,6 +97,7 @@ impl SqliteWorld {
                 removes: vec![],
             },
             idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![staged_welcome(welcome_id)],
         }
     }
 
@@ -132,6 +133,7 @@ impl SqliteWorld {
                 }],
             },
             idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![],
         }
     }
 
@@ -174,6 +176,7 @@ impl SqliteWorld {
                 }],
             },
             idempotency_key: "crash_commit".to_string(),
+            staged_welcomes: vec![staged_welcome("welcome_charlie_1")],
         }
     }
 
@@ -197,6 +200,14 @@ fn bob() -> DeviceRef {
 
 fn charlie() -> DeviceRef {
     device("charlie_npub", "charlie_phone")
+}
+
+fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
+    StagedWelcomeV1 {
+        welcome_id: welcome_id.to_string(),
+        welcome_payload: format!("welcome:{welcome_id}").into_bytes(),
+        ratchet_tree_payload: format!("tree:{welcome_id}").into_bytes(),
+    }
 }
 
 fn store_engine_error(error: StoreError) -> EngineError {
@@ -485,9 +496,67 @@ fn sqlite_create_dm_room_and_release_welcome_after_commit() {
         key_package(&reopened, "kp_bob_1").state,
         KeyPackageState::Consumed
     );
+    let stored_welcome = welcome(&reopened, "welcome_bob_1");
+    assert_eq!(stored_welcome.state, WelcomeState::Released);
+    assert_eq!(stored_welcome.welcome_payload, b"welcome:welcome_bob_1");
+    assert_eq!(stored_welcome.ratchet_tree_payload, b"tree:welcome_bob_1");
+}
+
+#[test]
+fn sqlite_claimed_welcome_payload_survives_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    world.upload_and_claim(bob(), "kp_bob_1");
+    let request = world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_1",
+        "welcome_bob_1",
+        0,
+        "idem_add_bob",
+    );
+    world.server.submit_commit(request).unwrap();
+
+    let mut reopened = world.reopen();
+    let claimed = reopened.claim_welcomes(&bob()).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].welcome_payload, b"welcome:welcome_bob_1");
+    assert_eq!(claimed[0].ratchet_tree_payload, b"tree:welcome_bob_1");
+
+    let second_reopen = world.reopen();
+    let stored_welcome = welcome(&second_reopen, "welcome_bob_1");
+    assert_eq!(stored_welcome.state, WelcomeState::Claimed);
+    assert_eq!(stored_welcome.welcome_payload, b"welcome:welcome_bob_1");
+    assert_eq!(stored_welcome.ratchet_tree_payload, b"tree:welcome_bob_1");
+}
+
+#[test]
+fn sqlite_add_commit_requires_staged_welcome_bytes_before_mutation() {
+    let mut world = SqliteWorld::direct_room();
+    world.upload_and_claim(bob(), "kp_bob_1");
+    let mut request = world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_1",
+        "welcome_bob_1",
+        0,
+        "missing_welcome",
+    );
+    request.staged_welcomes.clear();
+
+    let err = store_engine_error(world.server.submit_commit(request).unwrap_err());
+
     assert_eq!(
-        welcome(&reopened, "welcome_bob_1").state,
-        WelcomeState::Released
+        err,
+        EngineError::MissingStagedWelcome("welcome_bob_1".to_string())
+    );
+    let reopened = world.reopen();
+    let room = room(&reopened, &world.room_id);
+    assert_eq!(room.current_epoch, 0);
+    assert_eq!(room.last_seq, 0);
+    assert!(maybe_welcome(&reopened, "welcome_bob_1").is_none());
+    assert_eq!(
+        key_package(&reopened, "kp_bob_1").state,
+        KeyPackageState::Leased
     );
 }
 
@@ -917,6 +986,7 @@ fn sqlite_direct_room_create_or_get_and_third_account_rejection() {
             removes: vec![],
         },
         idempotency_key: "add_third".to_string(),
+        staged_welcomes: vec![staged_welcome("welcome_charlie")],
     };
 
     let err = store_engine_error(server.submit_commit(request).unwrap_err());

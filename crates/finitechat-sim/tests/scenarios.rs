@@ -8,7 +8,7 @@ use finitechat_proto::{
     MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
     WelcomeState,
 };
-use finitechat_sim::{SimWorld, alice, bob, charlie, dana};
+use finitechat_sim::{SimWorld, alice, bob, charlie, dana, staged_welcome};
 
 fn provision_bob(world: &mut SimWorld) {
     world
@@ -68,10 +68,44 @@ fn welcome_activation_makes_new_device_active() {
 
     let welcomes = world.server.claim_welcomes(&bob());
     assert_eq!(welcomes.len(), 1);
+    assert_eq!(welcomes[0].welcome_payload, b"welcome:welcome_bob_1");
+    assert_eq!(welcomes[0].ratchet_tree_payload, b"tree:welcome_bob_1");
     world.server.ack_welcome("welcome_bob_1", true).unwrap();
 
     let room = world.server.room(&world.room_id).unwrap();
     assert!(room.device_active_at_head(&bob()));
+}
+
+#[test]
+fn add_commit_requires_staged_welcome_bytes_before_mutation() {
+    let mut world = SimWorld::direct_room().unwrap();
+    world.upload_and_claim(bob(), "kp_bob_1").unwrap();
+    let mut request = world
+        .add_device_request(
+            alice(),
+            bob(),
+            "kp_bob_1",
+            "welcome_bob_1",
+            0,
+            "missing_welcome",
+        )
+        .unwrap();
+    request.staged_welcomes.clear();
+
+    let err = world.server.submit_commit(request).unwrap_err();
+
+    assert_eq!(
+        err,
+        EngineError::MissingStagedWelcome("welcome_bob_1".to_string())
+    );
+    let room = world.server.room(&world.room_id).unwrap();
+    assert_eq!(room.current_epoch, 0);
+    assert_eq!(room.last_seq, 0);
+    assert!(world.server.welcome("welcome_bob_1").is_none());
+    assert_eq!(
+        world.server.key_package("kp_bob_1").unwrap().state,
+        KeyPackageState::Leased
+    );
 }
 
 #[test]
@@ -1220,6 +1254,7 @@ fn direct_room_rejects_too_many_devices_for_one_account() {
                     removes: vec![],
                 },
                 idempotency_key: format!("add_bob_{index}"),
+                staged_welcomes: vec![staged_welcome(&format!("welcome_bob_{index}"))],
             })
             .unwrap();
     }
@@ -1263,6 +1298,7 @@ fn direct_room_rejects_too_many_devices_for_one_account() {
                 removes: vec![],
             },
             idempotency_key: "add_bob_overflow".to_string(),
+            staged_welcomes: vec![staged_welcome("welcome_bob_overflow")],
         })
         .unwrap_err();
 

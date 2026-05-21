@@ -47,7 +47,8 @@ It proves:
 - Commit transaction rollback after intermediate side effects converges on retry;
 - same-epoch Commit losers cannot create duplicate log rows or Welcomes;
 - KeyPackage leases and consumption survive reopen;
-- Welcome release, claim, ack, failure, and resume states survive reopen;
+- Welcome release, claim, ack, failure, resume states, and opaque payload bytes
+  survive reopen;
 - direct-room identity constraints survive reopen;
 - link-session state survives reopen.
 
@@ -59,6 +60,8 @@ The SQLite shape flushed out two production-schema requirements:
 The only JSON stored by the server store is `idempotency_records.response_json`,
 which is a bounded typed replay value. Room state, message ordering,
 membership, KeyPackages, Welcomes, and link sessions are schema rows.
+Welcome payload and ratchet-tree bytes are `BLOB` columns on `welcomes`; the
+server keeps them opaque and only enforces protocol bounds before mutation.
 
 ## Production Schema Direction
 
@@ -80,13 +83,14 @@ The critical transaction remains the same:
 1. lock room row;
 2. validate expected epoch and sender membership;
 3. validate KeyPackage leases for adds;
-4. append exactly one log entry;
-5. advance room epoch;
-6. update membership interval cache;
-7. consume KeyPackages;
-8. release Welcomes;
-9. persist idempotency response;
-10. enqueue opaque push wakes.
+4. validate staged Welcome payloads for adds;
+5. append exactly one log entry;
+6. advance room epoch;
+7. update membership interval cache;
+8. consume KeyPackages;
+9. release Welcomes with opaque Welcome and ratchet-tree bytes;
+10. persist idempotency response;
+11. enqueue opaque push wakes.
 
 The mutation path must not reconstruct the full room log. Full log validation is
 for read/replay paths; append and Commit validation use the indexed room head,

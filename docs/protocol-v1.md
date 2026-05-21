@@ -84,6 +84,9 @@ These are protocol constants, not tuning hints:
 - direct room devices per account: `8`;
 - KeyPackages claimed per request: `1`;
 - Welcomes claimed per request: `32`;
+- staged Welcomes per Commit: `32`;
+- Welcome payload: `1 MiB`;
+- ratchet-tree payload: `1 MiB`;
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
 - idempotency key: `128` bytes;
@@ -216,6 +219,13 @@ Required structural checks:
 - no duplicate remove devices;
 - no add and remove of the same device;
 - every add has a KeyPackage id/ref/hash;
-- every add has a matching staged Welcome;
+- every add has exactly one matching staged Welcome;
+- every staged Welcome has non-empty opaque Welcome bytes and non-empty
+  ratchet-tree bytes, both bounded to `1 MiB`;
 - every remove has a removed leaf index;
 - `commit_message_id` matches the submitted Commit envelope.
+
+The room server stores staged Welcome and ratchet-tree bytes as opaque payloads
+linked to the accepted Commit. It validates ids, sizes, and one-to-one matching
+with membership adds; it does not parse or trust the MLS contents. Claiming a
+Welcome returns these exact bytes to the recipient device.

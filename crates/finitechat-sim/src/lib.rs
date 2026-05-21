@@ -13,6 +13,7 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
+    StagedWelcomeV1,
 };
 
 pub type Result<T> = std::result::Result<T, SimError>;
@@ -136,6 +137,7 @@ impl SimWorld {
                 removes: vec![],
             },
             idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![staged_welcome(welcome_id)],
         })?;
         Ok(())
     }
@@ -177,6 +179,7 @@ impl SimWorld {
                 removes: vec![],
             },
             idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![staged_welcome(welcome_id)],
         })
     }
 
@@ -212,6 +215,7 @@ impl SimWorld {
                 }],
             },
             idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![],
         })
     }
 
@@ -250,6 +254,14 @@ impl SimWorld {
         }
         self.server.ack_welcome(welcome_id, true)?;
         Ok(())
+    }
+}
+
+pub fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
+    StagedWelcomeV1 {
+        welcome_id: welcome_id.to_string(),
+        welcome_payload: format!("welcome:{welcome_id}").into_bytes(),
+        ratchet_tree_payload: format!("tree:{welcome_id}").into_bytes(),
     }
 }
 

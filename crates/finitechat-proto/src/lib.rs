@@ -23,6 +23,9 @@ pub const MAX_SYNC_PAGE_ENTRIES: u32 = 100;
 pub const MAX_SYNC_PAGE_BYTES: u32 = 4 * 1024 * 1024;
 pub const MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT: u32 = 8;
 pub const MAX_WELCOME_CLAIMS_PER_REQUEST: u32 = 32;
+pub const MAX_STAGED_WELCOMES_PER_COMMIT: u32 = 32;
+pub const MAX_WELCOME_PAYLOAD_BYTES: u32 = 1024 * 1024;
+pub const MAX_RATCHET_TREE_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE: u32 = 4096;
 pub const MAX_LINK_SESSION_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: u32 = 128;
@@ -38,6 +41,10 @@ const _: () = {
     assert!(MAX_SYNC_PAGE_BYTES >= MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT > 0);
     assert!(MAX_WELCOME_CLAIMS_PER_REQUEST > 0);
+    assert!(MAX_STAGED_WELCOMES_PER_COMMIT > 0);
+    assert!(MAX_STAGED_WELCOMES_PER_COMMIT >= MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT);
+    assert!(MAX_WELCOME_PAYLOAD_BYTES > 0);
+    assert!(MAX_RATCHET_TREE_PAYLOAD_BYTES > 0);
     assert!(MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE > 0);
     assert!(MAX_LINK_SESSION_PAYLOAD_BYTES > 0);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
@@ -147,6 +154,34 @@ pub struct MembershipAddV1 {
 pub struct MembershipRemoveV1 {
     pub device: DeviceRef,
     pub removed_leaf_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedWelcomeV1 {
+    pub welcome_id: WelcomeId,
+    #[serde(with = "bytes_as_vec")]
+    pub welcome_payload: Vec<u8>,
+    #[serde(with = "bytes_as_vec")]
+    pub ratchet_tree_payload: Vec<u8>,
+}
+
+impl StagedWelcomeV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_string_bytes("welcome_id", &self.welcome_id, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_non_empty("welcome_payload", self.welcome_payload.len())?;
+        validate_bytes_len(
+            "welcome_payload",
+            self.welcome_payload.len(),
+            MAX_WELCOME_PAYLOAD_BYTES,
+        )?;
+        validate_bytes_non_empty("ratchet_tree_payload", self.ratchet_tree_payload.len())?;
+        validate_bytes_len(
+            "ratchet_tree_payload",
+            self.ratchet_tree_payload.len(),
+            MAX_RATCHET_TREE_PAYLOAD_BYTES,
+        )?;
+        Ok(())
+    }
 }
 
 impl MembershipDeltaV1 {
@@ -276,6 +311,8 @@ pub struct RoomLogEntry {
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ProtocolLimitError {
+    #[error("{field} is empty")]
+    BytesEmpty { field: String },
     #[error("{field} has {actual_bytes} bytes, max {max_bytes}")]
     BytesTooLong {
         field: String,
@@ -322,6 +359,19 @@ pub fn validate_bytes_len(
             field: field.to_string(),
             max_bytes: u64::from(max_bytes),
             actual_bytes: actual_bytes as u64,
+        })
+    }
+}
+
+pub fn validate_bytes_non_empty(
+    field: &str,
+    actual_bytes: usize,
+) -> Result<(), ProtocolLimitError> {
+    if actual_bytes > 0 {
+        Ok(())
+    } else {
+        Err(ProtocolLimitError::BytesEmpty {
+            field: field.to_string(),
         })
     }
 }

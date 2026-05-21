@@ -6,13 +6,14 @@ use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, NOSTR_SECRET_KEY_BYTES, NostrSecretKey,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, WelcomeState, message_id_for_bytes,
+    DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1, WelcomeState,
+    message_id_for_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
     Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageBundle, MlsGroup,
     MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
-    ProcessedMessageContent, ProtocolMessage, StagedWelcome, Welcome,
+    ProcessedMessageContent, ProtocolMessage, RatchetTreeIn, StagedWelcome, Welcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -75,6 +76,16 @@ fn real_openmls_bytes_flow_through_engine_ordering() {
         .unwrap();
     let commit_payload = mls_message_out_bytes(commit_message);
     let welcome_payload = mls_message_out_bytes(welcome_message);
+    let ratchet_tree: RatchetTreeIn = alice_group
+        .pending_commit()
+        .expect("add_members should stage a pending commit")
+        .export_ratchet_tree(alice.provider.crypto(), alice_group.export_ratchet_tree())
+        .expect("pending commit should export ratchet tree")
+        .expect("member commit should have a staged ratchet tree")
+        .into();
+    let ratchet_tree_payload = ratchet_tree
+        .tls_serialize_detached()
+        .expect("ratchet tree should serialize");
 
     assert_eq!(alice_group.epoch().as_u64(), 0);
     assert_eq!(alice_group.members().count(), 1);
@@ -109,6 +120,11 @@ fn real_openmls_bytes_flow_through_engine_ordering() {
                 removes: vec![],
             },
             idempotency_key: "real_mls_add_bob".to_string(),
+            staged_welcomes: vec![StagedWelcomeV1 {
+                welcome_id: BOB_WELCOME_ID.to_string(),
+                welcome_payload: welcome_payload.clone(),
+                ratchet_tree_payload: ratchet_tree_payload.clone(),
+            }],
         })
         .unwrap();
 
@@ -131,17 +147,31 @@ fn real_openmls_bytes_flow_through_engine_ordering() {
     alice_group.merge_pending_commit(&alice.provider).unwrap();
     assert_eq!(alice_group.epoch().as_u64(), 1);
     assert_eq!(alice_group.members().count(), 2);
-    let ratchet_tree = alice_group.export_ratchet_tree().into();
+    assert_eq!(
+        server.welcome(BOB_WELCOME_ID).unwrap().welcome_payload,
+        welcome_payload
+    );
+    assert_eq!(
+        server.welcome(BOB_WELCOME_ID).unwrap().ratchet_tree_payload,
+        ratchet_tree_payload
+    );
 
     let claimed_welcomes = server.claim_welcomes(&bob.device_ref);
     assert_eq!(claimed_welcomes.len(), 1);
     assert_eq!(claimed_welcomes[0].welcome_id, BOB_WELCOME_ID);
+    assert_eq!(claimed_welcomes[0].welcome_payload, welcome_payload);
+    assert_eq!(
+        claimed_welcomes[0].ratchet_tree_payload,
+        ratchet_tree_payload
+    );
 
     let mut bob_group = StagedWelcome::new_from_welcome(
         &bob.provider,
         group_config.join_config(),
-        welcome_from_bytes(&welcome_payload),
-        Some(ratchet_tree),
+        welcome_from_bytes(&claimed_welcomes[0].welcome_payload),
+        Some(ratchet_tree_from_bytes(
+            &claimed_welcomes[0].ratchet_tree_payload,
+        )),
     )
     .unwrap()
     .into_group(&bob.provider)
@@ -282,6 +312,11 @@ fn welcome_from_bytes(bytes: &[u8]) -> Welcome {
         panic!("expected a Welcome message");
     };
     welcome
+}
+
+fn ratchet_tree_from_bytes(bytes: &[u8]) -> RatchetTreeIn {
+    assert!(!bytes.is_empty());
+    RatchetTreeIn::tls_deserialize_exact(bytes).expect("serialized ratchet tree should parse")
 }
 
 fn protocol_message_from_bytes(bytes: &[u8]) -> ProtocolMessage {

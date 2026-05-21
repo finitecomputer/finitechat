@@ -2,11 +2,11 @@ use finitechat_proto::{
     AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
     KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_SYNC_PAGE_BYTES,
-    MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1,
-    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeId,
-    WelcomeState, validate_bytes_len, validate_idempotency_key, validate_mls_group_id,
-    validate_room_id, validate_string_bytes,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST,
+    MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
+    RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
+    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +76,8 @@ pub struct WelcomeRecord {
     pub join_epoch: Epoch,
     pub state: WelcomeState,
     pub lease_token: Option<LeaseToken>,
+    pub welcome_payload: Vec<u8>,
+    pub ratchet_tree_payload: Vec<u8>,
 }
 
 pub type LinkSessionId = String;
@@ -137,6 +139,8 @@ pub struct SubmitCommitRequest {
     pub expected_epoch: Epoch,
     pub envelope: FiniteEnvelope,
     pub membership_delta: MembershipDeltaV1,
+    #[serde(default)]
+    pub staged_welcomes: Vec<StagedWelcomeV1>,
     pub idempotency_key: IdempotencyKey,
 }
 
@@ -223,6 +227,14 @@ impl SubmitCommitRequest {
         self.sender.validate_limits()?;
         self.envelope.validate_limits()?;
         self.membership_delta.validate_limits()?;
+        finitechat_proto::validate_item_count(
+            "staged_welcomes",
+            self.staged_welcomes.len(),
+            MAX_STAGED_WELCOMES_PER_COMMIT,
+        )?;
+        for staged_welcome in &self.staged_welcomes {
+            staged_welcome.validate_limits()?;
+        }
         validate_idempotency_key(&self.idempotency_key)?;
         Ok(())
     }
@@ -546,6 +558,8 @@ impl DeliveryService {
         request
             .membership_delta
             .validate_structure(request.expected_epoch, &actual_commit_message_id)?;
+        let staged_welcomes =
+            staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes)?;
 
         let room = self
             .rooms
@@ -580,6 +594,7 @@ impl DeliveryService {
         }
 
         self.validate_commit_key_packages(room, &request.membership_delta)?;
+        self.validate_commit_welcomes(&request.membership_delta)?;
 
         let room = self
             .rooms
@@ -626,6 +641,9 @@ impl DeliveryService {
                 .ok_or_else(|| EngineError::KeyPackageNotFound(add.key_package_id.clone()))?;
             package.state = KeyPackageState::Consumed;
             package.lease_token = None;
+            let staged_welcome = staged_welcomes
+                .get(&add.welcome_id)
+                .expect("staged welcome was validated");
 
             self.welcomes.insert(
                 add.welcome_id.clone(),
@@ -639,6 +657,8 @@ impl DeliveryService {
                     join_epoch: room.current_epoch,
                     state: WelcomeState::Released,
                     lease_token: Some(lease_token_for(&add.welcome_id, &add.device)),
+                    welcome_payload: staged_welcome.welcome_payload.clone(),
+                    ratchet_tree_payload: staged_welcome.ratchet_tree_payload.clone(),
                 },
             );
             released_welcomes.push(add.welcome_id.clone());
@@ -924,6 +944,15 @@ impl DeliveryService {
         Ok(())
     }
 
+    fn validate_commit_welcomes(&self, delta: &MembershipDeltaV1) -> Result<(), EngineError> {
+        for add in &delta.adds {
+            if self.welcomes.contains_key(&add.welcome_id) {
+                return Err(EngineError::WelcomeAlreadyExists(add.welcome_id.clone()));
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_idempotency_capacity(
         &self,
         room_id: &str,
@@ -1037,8 +1066,16 @@ pub enum EngineError {
     DuplicateMessageId(MessageId),
     #[error("welcome not found: {0}")]
     WelcomeNotFound(WelcomeId),
+    #[error("welcome already exists: {0}")]
+    WelcomeAlreadyExists(WelcomeId),
     #[error("welcome is not claimed: {0}")]
     WelcomeNotClaimed(WelcomeId),
+    #[error("duplicate welcome id in commit: {0}")]
+    DuplicateWelcomeId(WelcomeId),
+    #[error("commit add is missing staged Welcome bytes: {0}")]
+    MissingStagedWelcome(WelcomeId),
+    #[error("staged Welcome does not match any commit add: {0}")]
+    UnexpectedStagedWelcome(WelcomeId),
     #[error("wrong epoch: expected {expected}, actual {actual}")]
     WrongEpoch { expected: Epoch, actual: Epoch },
     #[error("wrong envelope kind: expected {expected:?}, actual {actual:?}")]
@@ -1099,6 +1136,55 @@ fn validate_room_open(room: &RoomRecord) -> Result<(), EngineError> {
         return Err(EngineError::RoomNotOpen);
     }
     Ok(())
+}
+
+pub fn staged_welcomes_by_id<'a>(
+    delta: &MembershipDeltaV1,
+    staged_welcomes: &'a [StagedWelcomeV1],
+) -> Result<BTreeMap<WelcomeId, &'a StagedWelcomeV1>, EngineError> {
+    finitechat_proto::validate_item_count(
+        "staged_welcomes",
+        staged_welcomes.len(),
+        MAX_STAGED_WELCOMES_PER_COMMIT,
+    )?;
+
+    let mut by_id = BTreeMap::new();
+    for staged_welcome in staged_welcomes {
+        staged_welcome.validate_limits()?;
+        if by_id
+            .insert(staged_welcome.welcome_id.clone(), staged_welcome)
+            .is_some()
+        {
+            return Err(EngineError::DuplicateWelcomeId(
+                staged_welcome.welcome_id.clone(),
+            ));
+        }
+    }
+
+    let mut expected_ids = BTreeSet::new();
+    for add in &delta.adds {
+        if !expected_ids.insert(add.welcome_id.clone()) {
+            return Err(EngineError::DuplicateWelcomeId(add.welcome_id.clone()));
+        }
+        if !by_id.contains_key(&add.welcome_id) {
+            return Err(EngineError::MissingStagedWelcome(add.welcome_id.clone()));
+        }
+    }
+
+    for welcome_id in by_id.keys() {
+        if !expected_ids.contains(welcome_id) {
+            return Err(EngineError::UnexpectedStagedWelcome(welcome_id.clone()));
+        }
+    }
+
+    debug_assert_eq!(by_id.len(), expected_ids.len());
+    debug_assert!(
+        delta
+            .adds
+            .iter()
+            .all(|add| by_id.contains_key(&add.welcome_id))
+    );
+    Ok(by_id)
 }
 
 pub fn direct_room_key(left: &str, right: &str) -> (AccountId, AccountId) {
@@ -1255,7 +1341,7 @@ pub fn envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_proto::{MembershipAddV1, MembershipRemoveV1};
+    use finitechat_proto::{MembershipAddV1, MembershipRemoveV1, StagedWelcomeV1};
 
     fn service_with_room() -> DeliveryService {
         let mut service = DeliveryService::new();
@@ -1279,6 +1365,14 @@ mod tests {
             })
             .unwrap();
         service.claim_key_package("kp_bob").unwrap();
+    }
+
+    fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
+        StagedWelcomeV1 {
+            welcome_id: welcome_id.to_string(),
+            welcome_payload: format!("welcome:{welcome_id}").into_bytes(),
+            ratchet_tree_payload: format!("tree:{welcome_id}").into_bytes(),
+        }
     }
 
     fn add_bob_commit(service: &mut DeliveryService, idempotency_key: &str) -> CommitAccepted {
@@ -1312,6 +1406,7 @@ mod tests {
                     removes: vec![],
                 },
                 idempotency_key: idempotency_key.to_string(),
+                staged_welcomes: vec![staged_welcome("welcome_bob")],
             })
             .unwrap()
     }
@@ -1350,6 +1445,7 @@ mod tests {
                     removes: vec![],
                 },
                 idempotency_key: "idem_1".to_string(),
+                staged_welcomes: vec![staged_welcome("welcome_bob")],
             })
             .unwrap();
 
@@ -1400,6 +1496,7 @@ mod tests {
                     removes: vec![],
                 },
                 idempotency_key: "idem_2".to_string(),
+                staged_welcomes: vec![staged_welcome("welcome_charlie")],
             })
             .unwrap_err();
 
@@ -1451,6 +1548,7 @@ mod tests {
                     }],
                 },
                 idempotency_key: "remove_bob".to_string(),
+                staged_welcomes: vec![],
             })
             .unwrap();
 

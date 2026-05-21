@@ -160,6 +160,8 @@ Current OpenMLS scope:
   server-ordered Commit is observed.
 - real OpenMLS Commit and application message bytes passing through
   `DeliveryService` as opaque `FiniteEnvelope.payload` bytes.
+- `DeliveryService` and SQLite commit paths storing opaque Welcome and
+  ratchet-tree bytes, then returning those exact bytes on Welcome claim.
 
 Good tests:
 

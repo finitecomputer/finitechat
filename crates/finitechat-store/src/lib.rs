@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,14 +8,14 @@ use finitechat_engine::{
     LinkSessionId, LinkSessionRecord, LinkSessionState, MembershipInterval, RoomRecord,
     SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, direct_room_key,
     direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
-    sync_events_page_for_room,
+    staged_welcomes_by_id, sync_events_page_for_room,
 };
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
-    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState, validate_bytes_len,
-    validate_room_id, validate_string_bytes,
+    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState,
+    validate_bytes_len, validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -744,7 +745,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           key_package_id TEXT NOT NULL,
           join_epoch INTEGER NOT NULL CHECK (join_epoch >= 0),
           state TEXT NOT NULL CHECK (state IN ('staged', 'released', 'claimed', 'acked', 'failed', 'expired', 'cancelled')),
-          lease_token TEXT
+          lease_token TEXT,
+          welcome_payload BLOB NOT NULL DEFAULT X'',
+          ratchet_tree_payload BLOB NOT NULL DEFAULT X''
         );
 
         CREATE TABLE IF NOT EXISTS link_sessions (
@@ -770,6 +773,39 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         ON idempotency_records (room_id, sender_account_id, sender_device_id);
         "#,
     )?;
+    ensure_column(
+        conn,
+        "welcomes",
+        "welcome_payload",
+        "BLOB NOT NULL DEFAULT X''",
+    )?;
+    ensure_column(
+        conn,
+        "welcomes",
+        "ratchet_tree_payload",
+        "BLOB NOT NULL DEFAULT X''",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+    definition: &'static str,
+) -> Result<(), StoreError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = conn.prepare(&pragma)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing_column: String = row.get(1)?;
+        if existing_column == column {
+            return Ok(());
+        }
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    conn.execute(&alter, [])?;
     Ok(())
 }
 
@@ -846,6 +882,11 @@ fn submit_commit_inner(
     {
         return Ok(Err(error.into()));
     }
+    let staged_welcomes =
+        match staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes) {
+            Ok(staged_welcomes) => staged_welcomes,
+            Err(error) => return Ok(Err(error)),
+        };
 
     let room = match load_room_state(tx, &request.room_id)? {
         Some(room) => room,
@@ -855,6 +896,9 @@ fn submit_commit_inner(
         return Ok(Err(error));
     }
     if let Err(error) = validate_commit_key_packages(tx, &room, request) {
+        return Ok(Err(error));
+    }
+    if let Err(error) = validate_commit_welcomes(tx, &request.membership_delta)? {
         return Ok(Err(error));
     }
     if message_id_exists(tx, &request.room_id, &actual_commit_message_id)? {
@@ -880,7 +924,14 @@ fn submit_commit_inner(
         next_epoch,
         seq,
     )?;
-    apply_membership_delta(tx, &request.room_id, seq, next_epoch, request)?;
+    apply_membership_delta(
+        tx,
+        &request.room_id,
+        seq,
+        next_epoch,
+        request,
+        &staged_welcomes,
+    )?;
 
     let released_welcomes = request
         .membership_delta
@@ -1034,12 +1085,27 @@ fn validate_commit_key_packages(
     Ok(())
 }
 
+fn validate_commit_welcomes(
+    tx: &Transaction<'_>,
+    delta: &finitechat_proto::MembershipDeltaV1,
+) -> Result<Result<(), EngineError>, StoreError> {
+    for add in &delta.adds {
+        if load_welcome(tx, &add.welcome_id)?.is_some() {
+            return Ok(Err(EngineError::WelcomeAlreadyExists(
+                add.welcome_id.clone(),
+            )));
+        }
+    }
+    Ok(Ok(()))
+}
+
 fn apply_membership_delta(
     tx: &Transaction<'_>,
     room_id: &str,
     seq: Seq,
     next_epoch: Epoch,
     request: &SubmitCommitRequest,
+    staged_welcomes: &BTreeMap<WelcomeId, &StagedWelcomeV1>,
 ) -> Result<(), StoreError> {
     for remove in &request.membership_delta.removes {
         tx.execute(
@@ -1071,14 +1137,18 @@ fn apply_membership_delta(
             ],
         )?;
         let lease_token = lease_token_for(&add.welcome_id, &add.device);
+        let staged_welcome = staged_welcomes
+            .get(&add.welcome_id)
+            .expect("staged welcome was validated");
         tx.execute(
             r#"
             INSERT INTO welcomes (
               welcome_id, room_id, commit_seq,
               recipient_account_id, recipient_device_id,
               sender_account_id, sender_device_id,
-              key_package_id, join_epoch, state, lease_token
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              key_package_id, join_epoch, state, lease_token,
+              welcome_payload, ratchet_tree_payload
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 add.welcome_id,
@@ -1092,6 +1162,8 @@ fn apply_membership_delta(
                 to_i64("next_epoch", next_epoch)?,
                 encode_welcome_state(WelcomeState::Released),
                 lease_token,
+                &staged_welcome.welcome_payload,
+                &staged_welcome.ratchet_tree_payload,
             ],
         )?;
     }
@@ -1586,7 +1658,8 @@ fn load_welcome(conn: &Connection, welcome_id: &str) -> Result<Option<WelcomeRec
         SELECT welcome_id, room_id, commit_seq,
                recipient_account_id, recipient_device_id,
                sender_account_id, sender_device_id,
-               key_package_id, join_epoch, state, lease_token
+               key_package_id, join_epoch, state, lease_token,
+               welcome_payload, ratchet_tree_payload
         FROM welcomes
         WHERE welcome_id = ?1
         "#,
@@ -1612,7 +1685,8 @@ fn load_released_welcomes_for_device(
         SELECT welcome_id, room_id, commit_seq,
                recipient_account_id, recipient_device_id,
                sender_account_id, sender_device_id,
-               key_package_id, join_epoch, state, lease_token
+               key_package_id, join_epoch, state, lease_token,
+               welcome_payload, ratchet_tree_payload
         FROM welcomes
         WHERE recipient_account_id = ?1
           AND recipient_device_id = ?2
@@ -1651,6 +1725,8 @@ fn row_to_welcome(row: &rusqlite::Row<'_>) -> Result<WelcomeRecord, StoreError> 
         join_epoch: from_i64("join_epoch", row.get(8)?)?,
         state: decode_welcome_state(row.get::<_, String>(9)?.as_str())?,
         lease_token: row.get(10)?,
+        welcome_payload: row.get(11)?,
+        ratchet_tree_payload: row.get(12)?,
     })
 }
 

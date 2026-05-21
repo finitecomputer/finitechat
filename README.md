@@ -44,8 +44,8 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 cargo test
 ```
 
-The tests are not proving cryptography yet. They prove the server-side ordering
-and persistence contract that Marmot-over-relays could not make reliable:
+The fake simulator tests prove the server-side ordering and persistence
+contract that Marmot-over-relays could not make reliable:
 
 - one accepted Commit per room epoch;
 - idempotent mutation retries;
@@ -55,7 +55,9 @@ and persistence contract that Marmot-over-relays could not make reliable:
 - invalid accepted Commits fail closed into `NeedsRepair`.
 
 The SQLite suite replays the highest-risk reducer scenarios across reopen
-boundaries, including accepted and rejected idempotency results.
+boundaries, including accepted and rejected idempotency results. The OpenMLS
+suite proves the first real credential, Welcome, Commit, and application-message
+bytes through the same ordering path.
 
 ## Ship Target
 

@@ -18,6 +18,7 @@ Each item below has a named test in
 
 - `create_dm_room_and_release_welcome_after_commit`
 - `welcome_activation_makes_new_device_active`
+- `add_commit_requires_staged_welcome_bytes_before_mutation`
 - `duplicate_commit_retry_returns_same_result_after_side_effects`
 - `conflicting_idempotency_key_rejects_without_side_effects`
 - `same_epoch_loser_restart_retry_replays_rejection`
@@ -113,11 +114,14 @@ Checkpoint test signal:
   OpenMLS `TreeHashMismatch`. The correct production rule is stricter than the
   fake reducer could express: publish or serve ratchet-tree material from the
   accepted post-Commit group state.
-- The current engine proof keeps Welcome bytes and ratchet-tree bytes in the
-  client test harness because `DeliveryService` currently persists only Welcome
-  release metadata. That is an intentional exposed gap, not a hidden server
-  abstraction. A later checkpoint should add an explicit opaque Welcome payload
-  store before finitecomputer integration.
+- The Welcome payload checkpoint closed the exposed server gap: `submit_commit`
+  now requires staged Welcome and ratchet-tree bytes for every add, the engine
+  and SQLite store return those exact bytes on claim, and the real OpenMLS test
+  stages Bob from server-delivered bytes instead of a test-harness side channel.
+- The real MLS proof also found the right OpenMLS API shape: Alice exports the
+  post-Commit ratchet tree from the pending commit without merging local state,
+  so the client can submit bytes to the server while still waiting for ordered
+  Commit acceptance before `merge_pending_commit`.
 
 ## SQLite Follow-Up
 
@@ -127,6 +131,8 @@ The SQLite suite lives in
 Proven SQLite restart scenarios:
 
 - `sqlite_create_dm_room_and_release_welcome_after_commit`
+- `sqlite_claimed_welcome_payload_survives_reopen`
+- `sqlite_add_commit_requires_staged_welcome_bytes_before_mutation`
 - `sqlite_duplicate_commit_retry_after_reopen_returns_same_result`
 - `sqlite_rejected_commit_is_replayable_after_reopen`
 - `sqlite_conflicting_idempotency_key_has_no_side_effects`
