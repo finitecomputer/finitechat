@@ -107,6 +107,8 @@ Proven client scenarios:
 - `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
 - `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
 - `client_processes_remote_add_commit_before_epoch_two_messages`
+- `client_processes_remote_update_commit_before_epoch_three_messages`
+- `client_processes_remote_remove_commit_before_post_remove_messages`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
 - `client_rejects_invalid_invite_request_before_local_pending_commit`
@@ -167,6 +169,13 @@ Checkpoint test signal:
   the OpenMLS staged Commit. The valid test advances Bob from epoch 1 to epoch
   2 after Alice adds Charlie, and the invalid test rejects tampered Commit bytes
   without advancing Bob's epoch.
+- The remove/update checkpoint extends that same API instead of adding a second
+  path: clients can now produce real OpenMLS self-update and remove Commits,
+  submit empty-delta update Commits or remove deltas to the server, merge their
+  own ordered Commit, and process another device's ordered Commit before
+  accepting post-epoch messages. The remove proof also checks that the removed
+  device can process its removal Commit, then cannot send locally or receive
+  post-remove server events.
 - Existing server tests mattered again here: the first version of the remote
   add proof accidentally used a direct room for a third-account add, and
   `DirectRoomThirdAccount` failed the scenario before it could become false

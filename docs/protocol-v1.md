@@ -232,6 +232,7 @@ Required structural checks:
 
 - `base_epoch == expected_epoch`;
 - `post_commit_epoch == base_epoch + 1`;
+- update/rekey Commits may have no membership delta rows;
 - no duplicate add devices;
 - no duplicate remove devices;
 - no add and remove of the same device;

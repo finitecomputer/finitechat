@@ -9,16 +9,16 @@ use finitechat_mls::{
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MembershipAddV1, MembershipDeltaV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry,
-    StagedWelcomeV1, WelcomeId, validate_bytes_non_empty, validate_idempotency_key,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId,
+    RoomLogEntry, StagedWelcomeV1, WelcomeId, validate_bytes_non_empty, validate_idempotency_key,
     validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
-    Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
-    MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, OpenMlsProvider,
-    ProcessedMessageContent, ProtocolMessage, ProtocolVersion, RatchetTreeIn, StagedCommit,
-    StagedWelcome, Welcome,
+    Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, LeafNodeIndex,
+    LeafNodeParameters, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
+    MlsMessageOut, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
+    RatchetTreeIn, StagedCommit, StagedWelcome, Welcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -497,6 +497,142 @@ impl FiniteChatDevice {
         })
     }
 
+    pub fn prepare_remove_member_commit(
+        &mut self,
+        room_id: &str,
+        removed_device: &DeviceRef,
+        idempotency_key: impl Into<String>,
+    ) -> Result<PreparedCommit, ClientError> {
+        validate_room_id(room_id)?;
+        removed_device.validate_limits()?;
+        if removed_device == &self.device_ref {
+            return Err(ClientError::CannotRemoveSelf);
+        }
+        let idempotency_key = idempotency_key.into();
+        validate_idempotency_key(&idempotency_key)?;
+
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let sender = self.device_ref.clone();
+        let now_unix_seconds = self.now_unix_seconds;
+        let group = self
+            .groups
+            .get_mut(room_id)
+            .ok_or_else(|| ClientError::GroupNotFound(room_id.to_string()))?;
+        if group.pending_commit().is_some() {
+            return Err(ClientError::PendingCommitExists(room_id.to_string()));
+        }
+        let removed_leaf_index =
+            verified_member_leaf_index(group, removed_device, now_unix_seconds)?;
+
+        let (commit_message, welcome_message, _group_info) = group
+            .remove_members(provider, signer, &[removed_leaf_index])
+            .map_err(|_| ClientError::RemoveMember)?;
+        if welcome_message.is_some() {
+            return Err(ClientError::UnexpectedWelcomeForNonAddCommit);
+        }
+        let commit_payload = mls_message_out_bytes(commit_message)?;
+        let expected_epoch = group.epoch().as_u64();
+        let mls_group_id = mls_group_id_string(group.group_id())?;
+        let commit_envelope = envelope(
+            room_id.to_string(),
+            mls_group_id,
+            sender.clone(),
+            expected_epoch,
+            LogEntryKind::Commit,
+            commit_payload,
+        );
+        let commit_message_id = commit_envelope
+            .message_id()
+            .map_err(ClientError::EnvelopeMessageId)?;
+        let request = SubmitCommitRequest {
+            room_id: room_id.to_string(),
+            sender,
+            expected_epoch,
+            envelope: commit_envelope,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: expected_epoch,
+                post_commit_epoch: post_commit_epoch(expected_epoch)?,
+                commit_message_id: commit_message_id.clone(),
+                adds: vec![],
+                removes: vec![MembershipRemoveV1 {
+                    device: removed_device.clone(),
+                    removed_leaf_index: removed_leaf_index.u32(),
+                }],
+            },
+            staged_welcomes: vec![],
+            idempotency_key,
+        };
+        request.validate_limits()?;
+        Ok(PreparedCommit {
+            request,
+            message_id: commit_message_id,
+        })
+    }
+
+    pub fn prepare_self_update_commit(
+        &mut self,
+        room_id: &str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<PreparedCommit, ClientError> {
+        validate_room_id(room_id)?;
+        let idempotency_key = idempotency_key.into();
+        validate_idempotency_key(&idempotency_key)?;
+
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let sender = self.device_ref.clone();
+        let group = self
+            .groups
+            .get_mut(room_id)
+            .ok_or_else(|| ClientError::GroupNotFound(room_id.to_string()))?;
+        if group.pending_commit().is_some() {
+            return Err(ClientError::PendingCommitExists(room_id.to_string()));
+        }
+
+        let (commit_message, welcome_message, _group_info) = group
+            .self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|_| ClientError::SelfUpdate)?
+            .into_messages();
+        if welcome_message.is_some() {
+            return Err(ClientError::UnexpectedWelcomeForNonAddCommit);
+        }
+        let commit_payload = mls_message_out_bytes(commit_message)?;
+        let expected_epoch = group.epoch().as_u64();
+        let mls_group_id = mls_group_id_string(group.group_id())?;
+        let commit_envelope = envelope(
+            room_id.to_string(),
+            mls_group_id,
+            sender.clone(),
+            expected_epoch,
+            LogEntryKind::Commit,
+            commit_payload,
+        );
+        let commit_message_id = commit_envelope
+            .message_id()
+            .map_err(ClientError::EnvelopeMessageId)?;
+        let request = SubmitCommitRequest {
+            room_id: room_id.to_string(),
+            sender,
+            expected_epoch,
+            envelope: commit_envelope,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: expected_epoch,
+                post_commit_epoch: post_commit_epoch(expected_epoch)?,
+                commit_message_id: commit_message_id.clone(),
+                adds: vec![],
+                removes: vec![],
+            },
+            staged_welcomes: vec![],
+            idempotency_key,
+        };
+        request.validate_limits()?;
+        Ok(PreparedCommit {
+            request,
+            message_id: commit_message_id,
+        })
+    }
+
     pub fn merge_pending_commit_from_log(
         &mut self,
         room_id: &str,
@@ -942,6 +1078,14 @@ pub enum ClientError {
     HashKeyPackageRef,
     #[error("failed to add OpenMLS member")]
     AddMember,
+    #[error("failed to remove OpenMLS member")]
+    RemoveMember,
+    #[error("failed to create OpenMLS self-update commit")]
+    SelfUpdate,
+    #[error("remove-member commit cannot remove the sender")]
+    CannotRemoveSelf,
+    #[error("non-add commit unexpectedly produced a Welcome")]
+    UnexpectedWelcomeForNonAddCommit,
     #[error("failed to serialize OpenMLS message")]
     SerializeMessage,
     #[error("failed to export pending ratchet tree")]
@@ -1124,6 +1268,33 @@ fn verify_staged_commit_credentials(
         })?;
     }
     Ok(())
+}
+
+fn verified_member_leaf_index(
+    group: &MlsGroup,
+    device: &DeviceRef,
+    now_unix_seconds: u64,
+) -> Result<LeafNodeIndex, ClientError> {
+    let expected_account_public_key = account_public_key_from_device_ref(device)?;
+    let mut matched_index = None;
+    for member in group.members() {
+        let credential = FiniteDeviceCredentialV1::from_credential(member.credential)?;
+        if credential.account_public_key() != expected_account_public_key
+            || credential.device_id() != device.device_id
+        {
+            continue;
+        }
+        credential.verify_expected(ExpectedDeviceCredential {
+            account_public_key: expected_account_public_key,
+            device_id: &device.device_id,
+            mls_leaf_signing_public_key: &member.signature_key,
+            now_unix_seconds,
+        })?;
+        if matched_index.replace(member.index).is_some() {
+            return Err(ClientError::MemberCredentialMissing(device.clone()));
+        }
+    }
+    matched_index.ok_or_else(|| ClientError::MemberCredentialMissing(device.clone()))
 }
 
 fn openmls_group_config() -> MlsGroupCreateConfig {

@@ -187,9 +187,9 @@ Current known gap:
 
 - Client SQLite persistence is not encrypted at rest yet. Do not ship device
   secrets on disk until this store is wrapped with audited encryption.
-- Remote Commit processing is proven for add Commits and tampered log-entry
-  rejection. Remove, update/rekey, and same-epoch loser retry still need real
-  OpenMLS scenario proofs.
+- Remote Commit processing is proven for add, update/rekey, remove, and
+  tampered log-entry rejection. Same-epoch loser retry still needs a real
+  OpenMLS scenario proof.
 
 Good tests:
 
@@ -207,6 +207,11 @@ Good tests:
   can activate, persist, reload, and decrypt the backlog.
 - remote add Commit advances an existing device from epoch 1 to epoch 2 before
   it sends/decrypts post-add messages.
+- remote update/rekey Commit advances existing devices from epoch 2 to epoch 3
+  before post-rekey messages.
+- remote remove Commit advances remaining and removed devices through the
+  removal Commit before post-remove messages are gated away from the removed
+  device.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration
