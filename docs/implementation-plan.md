@@ -158,6 +158,8 @@ Current OpenMLS scope:
 - real OpenMLS add-device Welcome flow with explicit ratchet tree material;
 - proof that the sender's local pending Commit is not merged before the
   server-ordered Commit is observed.
+- real OpenMLS Commit and application message bytes passing through
+  `DeliveryService` as opaque `FiniteEnvelope.payload` bytes.
 
 Good tests:
 

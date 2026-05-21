@@ -89,6 +89,7 @@ Proven credential scenarios:
 - `openmls_key_package_carries_nostr_rooted_device_credential`
 - `openmls_welcome_adds_device_after_server_ordered_commit_merge`
 - `openmls_welcome_without_ratchet_tree_material_rejects`
+- `real_openmls_bytes_flow_through_engine_ordering`
 
 This proves the identity refinement from the protocol docs: OpenMLS carries the
 credential bytes, but Finite Chat clients verify the Nostr-rooted account,
@@ -107,6 +108,16 @@ Checkpoint test signal:
   Welcome staging.
 - The credential tests were still relevant: no Nostr binding code changed when
   the OpenMLS provider/signer boundary was added.
+- The first engine-through-MLS test caught a ratchet-tree timing mistake:
+  exporting Alice's tree before the server-observed Commit merge produced
+  OpenMLS `TreeHashMismatch`. The correct production rule is stricter than the
+  fake reducer could express: publish or serve ratchet-tree material from the
+  accepted post-Commit group state.
+- The current engine proof keeps Welcome bytes and ratchet-tree bytes in the
+  client test harness because `DeliveryService` currently persists only Welcome
+  release metadata. That is an intentional exposed gap, not a hidden server
+  abstraction. A later checkpoint should add an explicit opaque Welcome payload
+  store before finitecomputer integration.
 
 ## SQLite Follow-Up
 

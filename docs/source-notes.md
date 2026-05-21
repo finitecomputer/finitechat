@@ -113,3 +113,9 @@ OpenMLS credential spike:
 - `secp256k1 = 0.29.1`, CC0-1.0, used for Nostr-compatible BIP340 Schnorr
   account signatures. The full `nostr-sdk` and bech32 parsing are intentionally
   not added; the protocol boundary stores raw 32-byte Nostr public keys.
+
+Internal dev-only proof dependency:
+
+- `finitechat-engine` is a dev dependency of `finitechat-mls` only for the
+  engine-through-real-MLS scenario. This does not make the server depend on MLS;
+  it proves the existing server reducer can order opaque MLS bytes.
