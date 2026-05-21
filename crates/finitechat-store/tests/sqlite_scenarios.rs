@@ -1,7 +1,9 @@
+use std::path::Path;
+
 use finitechat_engine::{
-    CreateDirectRoomRequest, CreateRoomRequest, EngineError, KeyPackageRecord, LinkSessionRecord,
-    LinkSessionState, RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    device, envelope,
+    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, EngineError, KeyPackageRecord,
+    LinkSessionRecord, LinkSessionState, RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest,
+    WelcomeRecord, device, envelope, idempotency_scope_key,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
@@ -10,6 +12,7 @@ use finitechat_proto::{
     WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 struct SqliteWorld {
@@ -132,6 +135,48 @@ impl SqliteWorld {
         }
     }
 
+    fn charlie_replaces_bob_request(&self) -> SubmitCommitRequest {
+        let sender = alice();
+        let removed = bob();
+        let added = charlie();
+        let commit = envelope(
+            self.room_id.clone(),
+            self.group_id.clone(),
+            sender.clone(),
+            1,
+            LogEntryKind::Commit,
+            format!(
+                "replace:{}:{}:{}:{}",
+                removed.account_id, removed.device_id, added.account_id, added.device_id
+            )
+            .into_bytes(),
+        );
+        let commit_message_id = commit.message_id().unwrap();
+        SubmitCommitRequest {
+            room_id: self.room_id.clone(),
+            sender,
+            expected_epoch: 1,
+            envelope: commit,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: 1,
+                post_commit_epoch: 2,
+                commit_message_id,
+                adds: vec![MembershipAddV1 {
+                    device: added,
+                    key_package_id: "kp_charlie_1".to_string(),
+                    key_package_ref: "ref_kp_charlie_1".to_string(),
+                    key_package_hash: "hash_kp_charlie_1".to_string(),
+                    welcome_id: "welcome_charlie_1".to_string(),
+                }],
+                removes: vec![MembershipRemoveV1 {
+                    device: removed,
+                    removed_leaf_index: 1,
+                }],
+            },
+            idempotency_key: "crash_commit".to_string(),
+        }
+    }
+
     fn provision_bob(&mut self) {
         self.upload_and_claim(bob(), "kp_bob_1");
         let request =
@@ -181,6 +226,233 @@ fn link_session(store: &SqliteDeliveryStore, link_session_id: &str) -> LinkSessi
     store.link_session(link_session_id).unwrap().unwrap()
 }
 
+#[derive(Copy, Clone, Debug)]
+enum CommitCrashPoint {
+    LogEntry,
+    RoomHead,
+    RemovedMembership,
+    AddedMembership,
+    ConsumedKeyPackage,
+    ReleasedWelcome,
+    IdempotencyRecord,
+}
+
+impl CommitCrashPoint {
+    const ALL: [Self; 7] = [
+        Self::LogEntry,
+        Self::RoomHead,
+        Self::RemovedMembership,
+        Self::AddedMembership,
+        Self::ConsumedKeyPackage,
+        Self::ReleasedWelcome,
+        Self::IdempotencyRecord,
+    ];
+
+    fn trigger_sql(self) -> &'static str {
+        match self {
+            Self::LogEntry => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_log_entry
+                AFTER INSERT ON room_log_entries
+                WHEN NEW.room_id = 'room_direct'
+                  AND NEW.idempotency_key = 'crash_commit'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after log entry');
+                END;
+                "#
+            }
+            Self::RoomHead => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_room_head
+                AFTER UPDATE OF current_epoch, last_seq ON rooms
+                WHEN NEW.room_id = 'room_direct'
+                  AND NEW.current_epoch = 2
+                  AND NEW.last_seq = 2
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after room head');
+                END;
+                "#
+            }
+            Self::RemovedMembership => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_removed_membership
+                AFTER UPDATE OF end_seq ON room_membership_intervals
+                WHEN NEW.room_id = 'room_direct'
+                  AND NEW.account_id = 'bob_npub'
+                  AND NEW.device_id = 'bob_runtime'
+                  AND NEW.start_seq = 1
+                  AND NEW.end_seq = 2
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after removed membership');
+                END;
+                "#
+            }
+            Self::AddedMembership => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_added_membership
+                AFTER INSERT ON room_membership_intervals
+                WHEN NEW.room_id = 'room_direct'
+                  AND NEW.account_id = 'charlie_npub'
+                  AND NEW.device_id = 'charlie_phone'
+                  AND NEW.start_seq = 2
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after added membership');
+                END;
+                "#
+            }
+            Self::ConsumedKeyPackage => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_consumed_key_package
+                AFTER UPDATE OF state ON key_packages
+                WHEN NEW.key_package_id = 'kp_charlie_1'
+                  AND NEW.state = 'consumed'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after consumed key package');
+                END;
+                "#
+            }
+            Self::ReleasedWelcome => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_released_welcome
+                AFTER INSERT ON welcomes
+                WHEN NEW.welcome_id = 'welcome_charlie_1'
+                  AND NEW.state = 'released'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after released welcome');
+                END;
+                "#
+            }
+            Self::IdempotencyRecord => {
+                r#"
+                CREATE TRIGGER finitechat_test_crash_after_idempotency_record
+                AFTER INSERT ON idempotency_records
+                WHEN NEW.room_id = 'room_direct'
+                  AND NEW.operation = 'submit_commit'
+                  AND NEW.sender_account_id = 'alice_npub'
+                  AND NEW.sender_device_id = 'alice_browser'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat test crash after idempotency record');
+                END;
+                "#
+            }
+        }
+    }
+}
+
+fn install_commit_crash_trigger(db_path: &Path, point: CommitCrashPoint) {
+    clear_commit_crash_triggers(db_path);
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(point.trigger_sql()).unwrap();
+}
+
+fn clear_commit_crash_triggers(db_path: &Path) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_log_entry;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_room_head;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_removed_membership;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_added_membership;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_consumed_key_package;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_released_welcome;
+        DROP TRIGGER IF EXISTS finitechat_test_crash_after_idempotency_record;
+        "#,
+    )
+    .unwrap();
+}
+
+fn count_rows(db_path: &Path, sql: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+fn crash_commit_idempotency_count(db_path: &Path) -> i64 {
+    let scope_key = idempotency_scope_key("room_direct", &alice(), "submit_commit", "crash_commit");
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM idempotency_records WHERE scope_key = ?1",
+        params![scope_key],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn assert_crash_commit_rolled_back(world: &SqliteWorld) {
+    let reopened = world.reopen();
+    let room = room(&reopened, &world.room_id);
+    assert_eq!(room.current_epoch, 1);
+    assert_eq!(room.last_seq, 1);
+    assert_eq!(room.log.len(), 1);
+    assert!(room.device_active_at_head(&bob()));
+    assert!(!room.device_active_at_head(&charlie()));
+    assert_eq!(
+        key_package(&reopened, "kp_charlie_1").state,
+        KeyPackageState::Leased
+    );
+    assert!(maybe_welcome(&reopened, "welcome_charlie_1").is_none());
+    assert_eq!(
+        count_rows(
+            &world.db_path,
+            "SELECT COUNT(*) FROM room_log_entries WHERE room_id = 'room_direct' AND idempotency_key = 'crash_commit'"
+        ),
+        0
+    );
+    assert_eq!(crash_commit_idempotency_count(&world.db_path), 0);
+    assert_eq!(
+        count_rows(
+            &world.db_path,
+            "SELECT COUNT(*) FROM room_membership_intervals WHERE room_id = 'room_direct' AND account_id = 'charlie_npub' AND device_id = 'charlie_phone'"
+        ),
+        0
+    );
+}
+
+fn assert_crash_commit_converged(
+    store: &SqliteDeliveryStore,
+    world: &SqliteWorld,
+    accepted: &CommitAccepted,
+) {
+    assert_eq!(accepted.seq, 2);
+    assert_eq!(accepted.released_welcomes, vec!["welcome_charlie_1"]);
+
+    let room = room(store, &world.room_id);
+    assert_eq!(room.current_epoch, 2);
+    assert_eq!(room.last_seq, 2);
+    assert_eq!(room.log.len(), 2);
+    assert!(!room.device_active_at_head(&bob()));
+    assert!(!room.device_active_at_head(&charlie()));
+    assert_eq!(
+        key_package(store, "kp_charlie_1").state,
+        KeyPackageState::Consumed
+    );
+    assert_eq!(
+        welcome(store, "welcome_charlie_1").state,
+        WelcomeState::Released
+    );
+    assert_eq!(
+        count_rows(
+            &world.db_path,
+            "SELECT COUNT(*) FROM room_log_entries WHERE room_id = 'room_direct' AND idempotency_key = 'crash_commit'"
+        ),
+        1
+    );
+    assert_eq!(crash_commit_idempotency_count(&world.db_path), 1);
+    assert_eq!(
+        count_rows(
+            &world.db_path,
+            "SELECT COUNT(*) FROM room_membership_intervals WHERE room_id = 'room_direct' AND account_id = 'bob_npub' AND device_id = 'bob_runtime' AND start_seq = 1 AND end_seq = 2 AND active = 1"
+        ),
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &world.db_path,
+            "SELECT COUNT(*) FROM room_membership_intervals WHERE room_id = 'room_direct' AND account_id = 'charlie_npub' AND device_id = 'charlie_phone' AND start_seq = 2 AND end_seq IS NULL AND active = 0"
+        ),
+        1
+    );
+}
+
 #[test]
 fn sqlite_create_dm_room_and_release_welcome_after_commit() {
     let mut world = SqliteWorld::direct_room();
@@ -208,6 +480,32 @@ fn sqlite_create_dm_room_and_release_welcome_after_commit() {
         welcome(&reopened, "welcome_bob_1").state,
         WelcomeState::Released
     );
+}
+
+#[test]
+fn sqlite_commit_crash_matrix_rolls_back_and_retry_converges() {
+    for crash_point in CommitCrashPoint::ALL {
+        let mut world = SqliteWorld::direct_room();
+        world.provision_bob();
+        world.upload_and_claim(charlie(), "kp_charlie_1");
+        let request = world.charlie_replaces_bob_request();
+
+        install_commit_crash_trigger(&world.db_path, crash_point);
+        let crash = world.server.submit_commit(request.clone()).unwrap_err();
+        assert!(
+            matches!(crash, StoreError::Sqlite(_)),
+            "expected sqlite crash at {crash_point:?}, got {crash:?}"
+        );
+        clear_commit_crash_triggers(&world.db_path);
+        assert_crash_commit_rolled_back(&world);
+
+        let mut reopened = world.reopen();
+        let accepted = reopened.submit_commit(request.clone()).unwrap();
+        let replayed = reopened.submit_commit(request).unwrap();
+
+        assert_eq!(replayed, accepted);
+        assert_crash_commit_converged(&reopened, &world, &accepted);
+    }
 }
 
 #[test]
@@ -359,6 +657,29 @@ fn sqlite_removed_device_can_sync_through_removal_after_reopen() {
     assert_eq!(bob_page.entries[0].seq, accepted.seq);
     assert_eq!(bob_page.next_after_seq, accepted.seq);
     assert!(!bob_page.has_more);
+
+    let err = store_engine_error(
+        world
+            .server
+            .append_event(finitechat_engine::AppendEventRequest {
+                room_id: world.room_id.clone(),
+                sender: bob(),
+                envelope: envelope(
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    bob(),
+                    2,
+                    LogEntryKind::Application,
+                    b"stale send".to_vec(),
+                ),
+                idempotency_key: "msg_stale_bob".to_string(),
+            })
+            .unwrap_err(),
+    );
+    assert_eq!(err, EngineError::SenderNotActive(bob()));
+    let stale_commit = world.remove_device_request(bob(), alice(), 2, "commit_stale_bob");
+    let err = store_engine_error(world.server.submit_commit(stale_commit).unwrap_err());
+    assert_eq!(err, EngineError::SenderNotActive(bob()));
 }
 
 #[test]

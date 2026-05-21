@@ -31,6 +31,8 @@ membership intervals, repair reports, and push wake outbox records.
 - Mutations are idempotent by account, device, method, path, and key.
 - Rejected mutations after idempotency admission are replayable.
 - Removed devices can fetch through their removal Commit.
+- Removed devices cannot send new events or Commits after the removal Commit is
+  the room head.
 - `NeedsRepair` blocks normal sends.
 - Protocol limits are enforced before state mutation. Limit failures must not
   create log entries, consume KeyPackages, release Welcomes, or write

@@ -94,8 +94,14 @@ Proven SQLite restart scenarios:
 - `sqlite_duplicate_message_id_is_typed_engine_error`
 - `sqlite_link_payload_limit_is_rejected`
 - `sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay`
+- `sqlite_commit_crash_matrix_rolls_back_and_retry_converges`
 
-The remaining SQLite-only expansion is a crash matrix that injects failure
-after each logical side effect and verifies recovery converges to one log entry,
-one epoch advance, one membership update, consumed KeyPackages, released
-Welcomes, replayable idempotency result, and one push outbox record.
+The SQLite crash matrix injects transaction rollbacks after log append, room
+head update, removed membership update, added membership insert, KeyPackage
+consumption, Welcome release, and idempotency record insert. It then reopens the
+store, retries the same Commit, and verifies convergence to one log entry, one
+epoch advance, correct membership intervals, consumed KeyPackages, released
+Welcomes, and a replayable idempotency result.
+
+Push outbox rows are not implemented yet; when they land, this matrix should add
+a failure point after outbox enqueue and assert exactly one durable wake record.

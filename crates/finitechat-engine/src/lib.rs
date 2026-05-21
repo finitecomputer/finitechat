@@ -955,7 +955,7 @@ impl RoomRecord {
                 membership.intervals.iter().any(|interval| {
                     interval.active
                         && interval.start_seq <= self.last_seq
-                        && interval.end_seq.is_none_or(|end| end >= self.last_seq)
+                        && interval.end_seq.is_none()
                 })
             })
             .unwrap_or(false)

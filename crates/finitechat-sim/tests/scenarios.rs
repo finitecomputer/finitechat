@@ -482,6 +482,16 @@ fn stale_push_for_removed_device_cannot_authorize_new_events() {
         .server
         .append_event(world.app_message_request(alice(), 2, "after removal", "msg_after_remove"))
         .unwrap();
+    let err = world
+        .server
+        .append_event(world.app_message_request(bob(), 2, "stale send", "msg_stale_bob"))
+        .unwrap_err();
+    assert_eq!(err, EngineError::SenderNotActive(bob()));
+    let stale_commit = world
+        .remove_device_request(bob(), alice(), 2, "commit_stale_bob")
+        .unwrap();
+    let err = world.server.submit_commit(stale_commit).unwrap_err();
+    assert_eq!(err, EngineError::SenderNotActive(bob()));
 
     let bob_page = world
         .server

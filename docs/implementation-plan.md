@@ -110,6 +110,7 @@ Current SQLite scope:
   Welcomes, link sessions, and idempotency records;
 - reopen tests for accepted Commit replay, rejected Commit replay,
   KeyPackages, Welcomes, direct-room rules, and link sessions;
+- crash-matrix tests for Commit transaction rollback and retry convergence;
 - same schema direction intended for the Postgres canary store.
 
 Good tests:

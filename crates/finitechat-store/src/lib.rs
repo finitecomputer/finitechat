@@ -586,6 +586,8 @@ impl SqliteDeliveryStore {
         let conn = Connection::open(&self.db_path)?;
         conn.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
             "#,
@@ -671,6 +673,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = FULL;
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS rooms (

@@ -33,12 +33,15 @@ Postgres shape:
 
 The store still uses SQLite for local/dev and first-server proof, but the
 authoritative state layout is no longer a JSON snapshot.
+SQLite connections set `journal_mode = WAL` and `synchronous = FULL`
+explicitly so tests do not inherit durability behavior from library defaults.
 
 It proves:
 
 - accepted and rejected idempotency responses survive reopen;
 - idempotency capacity rejects new mutations without breaking existing replay;
 - Commit side effects are persisted together;
+- Commit transaction rollback after intermediate side effects converges on retry;
 - KeyPackage leases and consumption survive reopen;
 - Welcome release, claim, ack, failure, and resume states survive reopen;
 - direct-room identity constraints survive reopen;
