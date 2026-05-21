@@ -10,6 +10,35 @@ A Nostr public key. This is user-level identity.
 
 One application install for one account. Every device is its own MLS leaf.
 
+## Identity And Secret Roots
+
+Finite Chat v1 uses the Nostr account key as the user identity root. WorkOS or
+finitecomputer login may authorize product access, but cryptographic chat
+identity is proof that the user controls the Nostr private key for the account
+public key in the room.
+
+Persistent Finite Chat device secrets must be rooted in that Nostr private key,
+using explicit domain separation for Finite Chat, version, account, and device
+purpose. MLS is still allowed to create ephemeral or per-epoch secrets internally;
+those are MLS protocol state, not a replacement account identity.
+
+`FiniteDeviceCredentialV1` is the credential payload carried in MLS credential
+identity bytes. It binds:
+
+- Nostr account public key;
+- Finite Chat device id;
+- MLS leaf signing public key or credential key material;
+- credential version and expiry/rotation metadata;
+- Nostr account signature over the binding.
+
+Clients must reject MLS credentials whose Nostr account signature, device id,
+or MLS leaf key binding does not match the expected account/device. Changed
+LeafNodes use the same binding rule.
+
+The Nostr key authenticates the device and any persistent device root. The MLS
+key material performs room encryption. These are not independent identities.
+They are one account identity with per-device MLS participation.
+
 `Room`
 
 One MLS group plus one server-ordered log. V1 has exactly one authoritative
@@ -37,6 +66,9 @@ membership intervals, repair reports, and push wake outbox records.
 - Protocol limits are enforced before state mutation. Limit failures must not
   create log entries, consume KeyPackages, release Welcomes, or write
   idempotency responses.
+- Encrypted application messages use MLS protection. Do not add an extra
+  application-message encryption layer unless a future threat model names the
+  additional boundary. Local database encryption is separate at-rest protection.
 
 ## V1 Limits
 
