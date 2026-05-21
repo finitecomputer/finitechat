@@ -178,8 +178,8 @@ Current OpenMLS scope:
 - bounded real-MLS ordering matrix for all activation orders across three
   devices, with varied message timing before and between activations.
 - `SqliteClientStore` for encrypted persisted client profile, room mapping, and
-  OpenMLS storage snapshot rows, with restart tests covering late multi-device
-  catch-up.
+  OpenMLS storage snapshot rows, with per-room applied cursors and restart
+  tests covering late multi-device catch-up.
 - ordered-log application API that validates log entry shape, merges an
   observed local pending Commit, or processes a remote OpenMLS staged Commit
   before accepting epoch-advanced application messages.
@@ -201,12 +201,17 @@ Current OpenMLS scope:
   snapshot proof: no legacy cleartext client tables, sampled raw credential and
   OpenMLS storage bytes absent from the stored ciphertext, wrong derived key
   rejection, and tamper rejection.
+- client crash-resume proof for durable Welcome activation before server ack,
+  plus store-backed ordered-log apply that persists MLS state and applied
+  cursor together and skips duplicate replay after restart.
 
 Current known gap:
 
 - Client SQLite persistence now encrypts the client-state snapshot with a
-  Nostr-derived wrapping key. Production still needs OS keychain/passphrase
-  unlock policy and crash-resume tests around mid-Welcome and mid-sync writes.
+  Nostr-derived wrapping key and stores per-room applied cursors. Production
+  still needs OS keychain/passphrase unlock policy and a persisted pending
+  Welcome inbox for crashes after server claim but before local durable
+  activation.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
 - Later device linking is proven at the client protocol level, but production
@@ -242,6 +247,10 @@ Good tests:
 - encrypted client store tests prove the local wrapping key is derived from the
   Nostr secret, legacy cleartext state tables are absent, wrong keys cannot
   decrypt, and ciphertext tampering fails closed.
+- crash-resume tests prove a device can durably activate a Welcome before
+  acking the server, then restart and ack safely; sync tests prove Commit and
+  application entries persist MLS state and cursor together, so duplicate replay
+  after restart is skipped instead of reprocessing the same MLS epoch.
 - remote add Commit advances an existing device from epoch 1 to epoch 2 before
   it sends/decrypts post-add messages.
 - remote update/rekey Commit advances existing devices from epoch 2 to epoch 3

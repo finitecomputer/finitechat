@@ -34,7 +34,7 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 1;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 2;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
@@ -49,6 +49,7 @@ const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
     MAX_CLIENT_STATE_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
+const U64_BYTES: usize = 8;
 
 const _: () = {
     assert!(NOSTR_PUBLIC_KEY_BYTES == 32);
@@ -90,6 +91,7 @@ pub struct FiniteChatDeviceState {
 pub struct PersistedRoomState {
     pub room_id: RoomId,
     pub mls_group_id: MlsGroupId,
+    pub last_applied_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +114,7 @@ pub struct FiniteChatDevice {
     credential_with_key: CredentialWithKey,
     signer: SignatureKeyPair,
     groups: BTreeMap<RoomId, MlsGroup>,
+    room_cursors: BTreeMap<RoomId, u64>,
 }
 
 impl FiniteChatDevice {
@@ -153,6 +156,7 @@ impl FiniteChatDevice {
             credential_with_key,
             signer,
             groups: BTreeMap::new(),
+            room_cursors: BTreeMap::new(),
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -227,6 +231,11 @@ impl FiniteChatDevice {
                 return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
             }
         }
+        let room_cursors = state
+            .rooms
+            .iter()
+            .map(|room| (room.room_id.clone(), room.last_applied_seq))
+            .collect::<BTreeMap<_, _>>();
 
         let device = Self {
             provider,
@@ -236,6 +245,7 @@ impl FiniteChatDevice {
             credential_with_key,
             signer,
             groups,
+            room_cursors,
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -267,6 +277,7 @@ impl FiniteChatDevice {
                 Ok(PersistedRoomState {
                     room_id: room_id.clone(),
                     mls_group_id: mls_group_id_string(group.group_id())?,
+                    last_applied_seq: *self.room_cursors.get(room_id).unwrap_or(&0),
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -319,7 +330,8 @@ impl FiniteChatDevice {
             self.credential_with_key.clone(),
         )
         .map_err(|_| ClientError::CreateGroup)?;
-        self.groups.insert(room_id, group);
+        self.groups.insert(room_id.clone(), group);
+        self.room_cursors.insert(room_id, 0);
         Ok(())
     }
 
@@ -810,8 +822,15 @@ impl FiniteChatDevice {
         .into_group(&self.provider)
         .map_err(|_| ClientError::ActivateWelcome)?;
         self.verify_member_in_group(&group, &self.device_ref)?;
-        self.groups.insert(room_id, group);
+        self.groups.insert(room_id.clone(), group);
+        self.room_cursors.insert(room_id, 0);
         Ok(())
+    }
+
+    pub fn last_applied_seq(&self, room_id: &str) -> Result<u64, ClientError> {
+        validate_room_id(room_id)?;
+        self.group(room_id)?;
+        Ok(*self.room_cursors.get(room_id).unwrap_or(&0))
     }
 
     pub fn create_application_request(
@@ -935,6 +954,22 @@ impl FiniteChatDevice {
         self.groups
             .get(room_id)
             .ok_or_else(|| ClientError::GroupNotFound(room_id.to_string()))
+    }
+
+    fn set_last_applied_seq(&mut self, room_id: &str, seq: u64) -> Result<(), ClientError> {
+        validate_room_id(room_id)?;
+        self.group(room_id)?;
+        let current_seq = self.room_cursors.get(room_id).copied().unwrap_or(0);
+        if seq < current_seq {
+            return Err(ClientError::AppliedSeqRegression {
+                room_id: room_id.to_string(),
+                current_seq,
+                attempted_seq: seq,
+            });
+        }
+        self.room_cursors.insert(room_id.to_string(), seq);
+        debug_assert!(self.room_cursors.contains_key(room_id));
+        Ok(())
     }
 }
 
@@ -1127,6 +1162,43 @@ impl SqliteClientStore {
                     device_id,
                 })?;
         Ok(FiniteChatDevice::from_state(config, state)?)
+    }
+
+    pub fn activate_welcome_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        room_id: impl Into<RoomId>,
+        welcome_payload: &[u8],
+        ratchet_tree_payload: &[u8],
+        commit_seq: u64,
+    ) -> Result<(), ClientStoreError> {
+        let room_id = room_id.into();
+        device.activate_welcome(room_id.clone(), welcome_payload, ratchet_tree_payload)?;
+        device.set_last_applied_seq(&room_id, commit_seq)?;
+        self.save_device_state(device)
+    }
+
+    pub fn apply_log_entry_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        room_id: &str,
+        entry: &RoomLogEntry,
+    ) -> Result<Option<AppliedLogEntry>, ClientStoreError> {
+        validate_room_id(room_id).map_err(ClientError::from)?;
+        if entry.room_id != room_id {
+            return Err(ClientError::LogEntryRoomMismatch {
+                expected: room_id.to_string(),
+                actual: entry.room_id.clone(),
+            }
+            .into());
+        }
+        if entry.seq <= device.last_applied_seq(room_id)? {
+            return Ok(None);
+        }
+        let applied = device.apply_log_entry(room_id, entry)?;
+        device.set_last_applied_seq(room_id, entry.seq)?;
+        self.save_device_state(device)?;
+        Ok(Some(applied))
     }
 
     fn connect(&self) -> Result<Connection, ClientStoreError> {
@@ -1368,6 +1440,14 @@ pub enum ClientError {
     MalformedAccountId(String),
     #[error("MLS group id is not valid UTF-8")]
     MlsGroupIdNotUtf8,
+    #[error(
+        "applied seq regression for {room_id}: current {current_seq}, attempted {attempted_seq}"
+    )]
+    AppliedSeqRegression {
+        room_id: RoomId,
+        current_seq: u64,
+        attempted_seq: u64,
+    },
 }
 
 fn verified_key_package_from_claim(
@@ -1872,6 +1952,7 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
             &room.mls_group_id,
             finitechat_proto::MAX_MLS_GROUP_ID_BYTES,
         )?;
+        out.extend_from_slice(&room.last_applied_seq.to_be_bytes());
     }
     append_count(
         &mut out,
@@ -1932,6 +2013,7 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
             room_id: cursor.take_string("room_id", finitechat_proto::MAX_ROOM_ID_BYTES)?,
             mls_group_id: cursor
                 .take_string("mls_group_id", finitechat_proto::MAX_MLS_GROUP_ID_BYTES)?,
+            last_applied_seq: cursor.take_u64()?,
         });
     }
 
@@ -1972,6 +2054,7 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
     for room in &state.rooms {
         len = checked_len_add(len, U32_BYTES + room.room_id.len())?;
         len = checked_len_add(len, U32_BYTES + room.mls_group_id.len())?;
+        len = checked_len_add(len, U64_BYTES)?;
     }
     len = checked_len_add(len, U32_BYTES)?;
     for record in &state.openmls_storage_records {
@@ -2064,6 +2147,15 @@ impl<'a> ClientStateCursor<'a> {
     fn take_u32(&mut self) -> Result<u32, ClientStoreError> {
         let bytes = self.take_bytes(U32_BYTES)?;
         Ok(u32::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| ClientStoreError::StateSnapshotTruncated)?,
+        ))
+    }
+
+    fn take_u64(&mut self) -> Result<u64, ClientStoreError> {
+        let bytes = self.take_bytes(U64_BYTES)?;
+        Ok(u64::from_be_bytes(
             bytes
                 .try_into()
                 .map_err(|_| ClientStoreError::StateSnapshotTruncated)?,

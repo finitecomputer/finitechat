@@ -109,6 +109,8 @@ Proven client scenarios:
 - `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
 - `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
 - `sqlite_client_store_encrypts_state_and_rejects_wrong_or_tampered_key_material`
+- `sqlite_client_welcome_activation_is_durable_before_server_ack`
+- `sqlite_client_apply_log_entry_persists_cursor_and_skips_replay_after_restart`
 - `client_processes_remote_add_commit_before_epoch_two_messages`
 - `client_processes_remote_update_commit_before_epoch_three_messages`
 - `client_processes_remote_remove_commit_before_post_remove_messages`
@@ -176,6 +178,13 @@ Checkpoint test signal:
   negative test checks that legacy cleartext tables are absent, sampled raw
   credential/OpenMLS bytes are not stored in the ciphertext, the wrong derived
   key cannot load the device, and tampering fails closed.
+- The crash-resume checkpoint moves applied room cursors into the encrypted
+  client snapshot and adds store-backed operations for Welcome activation and
+  ordered-log apply. Bob can activate and persist a Welcome before server ack,
+  restart, then ack and decrypt future messages. Bob can also process a remote
+  Commit and an application message through the store, restart with the cursor
+  already advanced, and skip replayed entries without asking OpenMLS to process
+  an already-applied epoch/message again.
 - The first remote Commit checkpoint adds a real ordered-log client API:
   application entries decrypt, own Commit entries merge only with pending local
   state, and remote Commit entries validate the log envelope before processing
