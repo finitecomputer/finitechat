@@ -63,8 +63,8 @@ application events unless their kind explicitly says otherwise.
 
 An encrypted, TTL-bound room event for intermediate state such as typing,
 thinking, working, uploading, or presence refreshes. The room server may route
-and cache it briefly, but it is not durable history and never creates unread
-state or push notifications.
+and cache it briefly, but it does not consume the canonical room sequence, is
+not durable history, and never creates unread state or push notifications.
 
 ## Invariants
 
@@ -95,6 +95,9 @@ state or push notifications.
 - Ephemeral activity events must carry `push_policy = never` and an explicit
   expiry. They must not create push outbox records, unread counts, durable
   transcript entries, or command inbox work.
+- The canonical room sequence advances only for MLS Commits and durable
+  application events. Ephemeral activity events must not occupy `seq`, create
+  cursor gaps, or block durable sync.
 
 ## V1 Limits
 
@@ -291,6 +294,11 @@ events before decryption:
 The encrypted activity payload owns the semantic kind. The server does not need
 to know whether an ephemeral event means typing, thinking, working, uploading,
 or another generic chat activity.
+
+Ephemeral activity may be delivered over a live stream or short TTL cache, but
+it is not returned by durable room-log sync and cannot be used as a replay
+cursor. Clients must tolerate dropped, duplicated, reordered, or expired
+activity events.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned

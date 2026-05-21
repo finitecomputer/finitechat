@@ -382,3 +382,5 @@ coverage before the room server owns push fanout:
 - `ephemeral_activity_never_enqueues_push`
 - `ephemeral_activity_expires_without_transcript_entry`
 - `ephemeral_activity_does_not_create_command_inbox_work`
+- `ephemeral_activity_does_not_advance_room_sequence`
+- `durable_sync_cursor_ignores_ephemeral_activity`
