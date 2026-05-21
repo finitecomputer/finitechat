@@ -19,6 +19,25 @@ Dashboard route
 Finite Chat should first replace the semantics behind "chat event" and "chat
 message", not the dashboard shell.
 
+## Command/RPC Mapping
+
+Dashboard and Hermes commands ride inside Finite Chat durable application
+events, not a separate RPC channel. The dashboard sends
+`runtime.command.request` as an encrypted durable event in the Project runtime
+room. The runtime device syncs ordered room entries, decrypts the request,
+validates sender and target policy locally, persists a request ledger entry, and
+then schedules execution.
+
+Intermediate states such as thinking, working, tool-running, upload progress,
+or runtime presence use ephemeral activity events with `push_policy = never`.
+User-visible output, durable checkpoints, terminal success, terminal failure,
+and cancellation results are durable application events.
+
+The current relay shell can still wake/poll the runtime. A wake only triggers
+sync; it must not directly execute work from an external event callback. Optional
+cleartext wake hints may wake a specific runtime device, but the decrypted
+command target and local policy remain authoritative.
+
 ## Proposed Landing Shape
 
 Add an encrypted mode in finitecomputer with three layers:

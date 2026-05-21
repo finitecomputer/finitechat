@@ -142,6 +142,15 @@ must use a namespaced value such as `finitecomputer.indexing` or
   system. Without `conversation_id`, `present` means the device is live in the
   room; with `conversation_id`, it means the device is live in that app-level
   conversation.
+- Runtime command requests, command results, and command cancellations are
+  durable application events. Ephemeral activity can describe progress, but it
+  must not create command inbox work.
+- Command execution is driven from ordered durable sync. A runtime must decrypt,
+  validate, and persist request ledger state before scheduling work; it must not
+  execute directly from a stream or push callback.
+- Command targeting lives in encrypted payloads. Optional server-visible wake
+  hints may reduce unnecessary device wakes, but clients must treat them as
+  non-authoritative routing hints, not access control or execution policy.
 
 ## V1 Limits
 
@@ -414,13 +423,62 @@ Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
 application data, not authoritative room-server state.
 
+Finite Chat reserves generic durable command kinds:
+
+- `runtime.command.request`: asks a target identity or device to do work;
+- `runtime.command.result`: terminal result for a request;
+- `runtime.command.cancel`: durable cancellation request.
+
+The encrypted command payload owns `request_id`, command name, target identity,
+optional target device, body, terminal status, result body, error details, and
+activity-clear declarations. The room server does not parse or validate those
+fields. It only orders the durable event bytes, applies envelope limits, and
+replays idempotent append results.
+
+`request_id` is an encrypted app-level correlation id, not a server mutation id.
+The server-level retry identity remains the serialized envelope `message_id`
+plus the mutation idempotency key. If a sender loses the append response for a
+command request, result, or cancel, it retries the exact same envelope bytes
+with the same idempotency key. Retrying with a new idempotency key and the same
+envelope bytes is still a duplicate message error.
+
+Command progress splits by durability:
+
+- ephemeral activity: `thinking`, `working`, progress pings, tool-running
+  state, and other intermediate status that can be dropped;
+- durable application events: user-visible output, durable logs or checkpoints,
+  terminal success, terminal failure, and terminal cancellation.
+
+A runtime processes command requests by syncing ordered durable events,
+decrypting them, validating sender and target policy locally, and recording a
+request ledger entry before scheduling execution. The request ledger should
+deduplicate replays by request id, sender, conversation, and original message
+id. Execution workers read the ledger; live streams and push wakes only cause
+sync.
+
+Cancellation is also durable. A `runtime.command.cancel` references the
+encrypted `request_id`. If cancellation wins before terminal result, the
+runtime emits a durable `runtime.command.result` with `cancelled` status. If a
+terminal result is already accepted by the client projection, a later cancel is
+ignored for that request.
+
+Optional wake hints may appear in the server-visible envelope when useful, for
+example to wake only a runtime device with GPU access. A wake hint must not be
+trusted by the runtime as proof that the command targets it. The decrypted
+payload and local policy decide whether the runtime records or executes the
+request.
+
 Example plaintext before MLS encryption:
 
 ```json
 {
-  "type": "finitecomputer.command.v1",
+  "type": "runtime.command.request",
   "request_id": "req_123",
   "command": "dashboard.send_message",
+  "target": {
+    "account_id": "agent_abc",
+    "device_id": null
+  },
   "body": {
     "project_id": "proj_abc",
     "text": "run tests"

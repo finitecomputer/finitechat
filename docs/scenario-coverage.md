@@ -416,3 +416,21 @@ coverage before the room server owns push fanout:
 - `server_activity_cache_keeps_kind_and_activity_id_opaque`
 - `server_activity_cache_preserves_multiple_opaque_events_per_route`
 - `server_activity_cache_enforces_per_route_limit_without_seq_gap`
+
+## Planned Command/RPC Scenarios
+
+Finitecomputer command transport should be proven as generic Finite Chat
+application payload behavior:
+
+- `runtime_command_request_is_durable_application_event`
+- `runtime_command_result_is_durable_terminal_event`
+- `runtime_command_cancel_is_durable_and_races_with_result`
+- `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
+- `runtime_command_request_id_is_opaque_to_server`
+- `runtime_command_retry_reuses_message_id_and_idempotency_key`
+- `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
+- `runtime_sync_persists_request_ledger_before_execution`
+- `runtime_stream_callback_only_triggers_sync`
+- `runtime_wake_hint_is_non_authoritative`
+- `runtime_target_policy_uses_decrypted_payload`
+- `runtime_command_result_clears_matching_activity`
