@@ -124,6 +124,9 @@ activity event before expiry, and end it early with an explicit clear.
   projection key replaces the previous expiry, and an explicit clear removes
   the matching device-scoped activity before expiry. Clears must not remove
   sibling devices, unrelated activity kinds, or a different activity id.
+- Decrypted durable terminal events may clear matching activity projection
+  state for the sender. This is a client-side projection update, not a server
+  mutation or room-log side effect.
 
 ## V1 Limits
 
@@ -349,6 +352,14 @@ activity such as human typing. Long-running agent activity should set
 `activity_id` to the command, request, or run id that caused the work. Refreshes
 and clears match on the normalized activity id, so a delayed clear for an old
 operation cannot erase a newer `working` indicator from the same device.
+
+Durable terminal events may also carry encrypted activity-clear declarations,
+such as `(activity_kind, activity_id)`. Clients apply these clears to the
+durable event sender's device-scoped activity in the same room and optional
+conversation. A normal chat message can clear that device's default `typing`
+activity; a `runtime.command.result`, assistant response, or terminal failure
+can clear the matching `thinking` or `working` activity for its run id. This
+gives correctness when the explicit ephemeral clear was dropped.
 
 The server authorizes ephemeral activity against its current device ledger and
 membership cache before forwarding or caching it. This check is not identity

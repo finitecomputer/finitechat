@@ -402,3 +402,8 @@ coverage before the room server owns push fanout:
 - `long_running_agent_activity_uses_command_or_run_id`
 - `long_running_agent_activity_survives_refresh_without_push`
 - `ephemeral_activity_expiry_is_bounded`
+- `durable_chat_message_clears_matching_default_typing`
+- `durable_command_result_clears_matching_working_activity`
+- `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
+- `durable_terminal_clear_is_sender_scoped`
+- `durable_terminal_clear_does_not_remove_different_activity_id`
