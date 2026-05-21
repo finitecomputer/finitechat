@@ -150,6 +150,7 @@ pub struct SubmitCommitRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageResult {
     pub key_package_id: KeyPackageId,
+    pub owner: DeviceRef,
     pub key_package_ref: KeyPackageRef,
     pub key_package_hash: KeyPackageHash,
     pub key_package_payload: Vec<u8>,
@@ -410,6 +411,7 @@ impl DeliveryService {
         package.lease_token = Some(lease_token.clone());
         Ok(ClaimKeyPackageResult {
             key_package_id: package.key_package_id.clone(),
+            owner: package.owner.clone(),
             key_package_ref: package.key_package_ref.clone(),
             key_package_hash: package.key_package_hash.clone(),
             key_package_payload: package.key_package_payload.clone(),

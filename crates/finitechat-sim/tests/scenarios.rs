@@ -61,6 +61,7 @@ fn key_package_claim_returns_opaque_payload() {
     let claimed = world.upload_and_claim(bob(), "kp_bob_1").unwrap();
 
     assert_eq!(claimed.key_package_id, "kp_bob_1");
+    assert_eq!(claimed.owner, bob());
     assert_eq!(claimed.key_package_ref, "ref_kp_bob_1");
     assert_eq!(claimed.key_package_hash, "hash_kp_bob_1");
     assert_eq!(

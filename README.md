@@ -29,6 +29,7 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
   validation helpers.
 - `crates/finitechat-engine`: deterministic in-memory Delivery Service model.
 - `crates/finitechat-store`: SQLite-backed server parity store.
+- `crates/finitechat-client`: OpenMLS/Nostr client state machine.
 - `crates/finitechat-sim`: executable scenario tests for protocol invariants.
 - `docs/implementation-plan.md`: concrete ship plan.
 - `docs/finitecomputer-integration.md`: how this lands in `../finitecomputer`.

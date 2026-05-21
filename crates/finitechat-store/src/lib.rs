@@ -209,6 +209,7 @@ impl SqliteDeliveryStore {
             )?;
             Ok(ClaimKeyPackageResult {
                 key_package_id: package.key_package_id,
+                owner: package.owner,
                 key_package_ref: package.key_package_ref,
                 key_package_hash: package.key_package_hash,
                 key_package_payload: package.key_package_payload,

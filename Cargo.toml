@@ -6,6 +6,7 @@ members = [
   "crates/finitechat-store",
   "crates/finitechat-sim",
   "crates/finitechat-mls",
+  "crates/finitechat-client",
 ]
 
 [workspace.package]

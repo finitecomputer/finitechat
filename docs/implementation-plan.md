@@ -164,6 +164,9 @@ Current OpenMLS scope:
   ratchet-tree bytes, then returning those exact bytes on Welcome claim.
 - `DeliveryService` and SQLite KeyPackage paths storing opaque serialized
   KeyPackage bytes, then returning those exact bytes on KeyPackage claim.
+- `finitechat-client` crate owning the first reusable OpenMLS device state
+  machine: KeyPackage upload, add-member Commit preparation, server-observed
+  pending Commit merge, Welcome activation, and encrypted app decrypt.
 
 Good tests:
 

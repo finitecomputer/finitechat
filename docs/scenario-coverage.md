@@ -9,6 +9,7 @@ Run:
 cargo test -p finitechat-sim --test scenarios
 cargo test -p finitechat-store --test sqlite_scenarios
 cargo test -p finitechat-mls
+cargo test -p finitechat-client
 ```
 
 ## Proven Scenarios
@@ -91,7 +92,17 @@ Proven credential scenarios:
 - `openmls_key_package_carries_nostr_rooted_device_credential`
 - `openmls_welcome_adds_device_after_server_ordered_commit_merge`
 - `openmls_welcome_without_ratchet_tree_material_rejects`
-- `real_openmls_bytes_flow_through_engine_ordering`
+
+## OpenMLS Client Proof
+
+The production-shaped client tests live in
+`crates/finitechat-client/tests/client_state.rs`.
+
+Proven client scenarios:
+
+- `client_state_machine_adds_device_and_decrypts_application_message`
+- `client_refuses_to_merge_pending_commit_before_server_observation`
+- `client_rejects_tampered_ratchet_tree_before_ack`
 
 This proves the identity refinement from the protocol docs: OpenMLS carries the
 credential bytes, but Finite Chat clients verify the Nostr-rooted account,
@@ -123,6 +134,11 @@ Checkpoint test signal:
   post-Commit ratchet tree from the pending commit without merging local state,
   so the client can submit bytes to the server while still waiting for ordered
   Commit acceptance before `merge_pending_commit`.
+- The client checkpoint removed the raw engine/OpenMLS harness and moved that
+  behavior into `finitechat-client`: KeyPackage bytes are claimed from server
+  storage, Welcome bytes are claimed from server storage, Alice refuses app
+  sends while a local Commit is pending, and Bob decrypts a finitecomputer-style
+  JSON command after acking the Welcome.
 
 ## SQLite Follow-Up
 

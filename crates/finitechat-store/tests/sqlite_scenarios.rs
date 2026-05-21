@@ -530,6 +530,7 @@ fn sqlite_key_package_payload_survives_reopen_and_claim() {
 
     let mut reopened = world.reopen();
     let claimed = reopened.claim_key_package("kp_bob_1").unwrap();
+    assert_eq!(claimed.owner, bob());
     assert_eq!(claimed.key_package_ref, "ref_kp_bob_1");
     assert_eq!(claimed.key_package_hash, "hash_kp_bob_1");
     assert_eq!(
