@@ -156,6 +156,17 @@ Because MLS KeyPackages are single-use, the device must replenish enough
 KeyPackages for the rooms it is being linked into; each accepted room add
 releases a distinct Welcome for that room.
 
+## History Policy
+
+V1 room history starts for a device at that device's accepted add Commit. A
+newly added device may sync the add Commit and later room entries, including
+messages sent before it acked its Welcome, but the room server must not replay
+pre-membership room log entries as ordinary history for that device.
+
+Pre-invite history recovery is a separate product protocol. It must be provided
+by encrypted backup or an explicit member-to-member history-share message, not
+by making the server authoritative over old plaintext or hidden key access.
+
 ## Message Ids
 
 `seq` is a room-local cursor. It is not a stable message id.

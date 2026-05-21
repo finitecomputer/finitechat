@@ -112,6 +112,7 @@ Proven client scenarios:
 - `stale_removed_device_can_process_removal_but_not_future_ciphertext`
 - `client_recovers_losing_same_epoch_add_commit_and_retries`
 - `client_key_package_replenishment_edges_use_real_packages`
+- `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -204,6 +205,10 @@ Checkpoint test signal:
   duplicate KeyPackage id remains rejected after reopen. Existing sim/SQLite
   tests continue to cover consumed-package reuse rejection and direct-room
   max-device caps.
+- The history-policy checkpoint makes the v1 product decision executable:
+  Alice's newly linked phone syncs from cursor zero, but the server only returns
+  entries from the accepted add Commit forward. The phone decrypts the
+  post-invite message and never receives Bob's pre-invite room-log message.
 - Existing server tests mattered again here: the first version of the remote
   add proof accidentally used a direct room for a third-account add, and
   `DirectRoomThirdAccount` failed the scenario before it could become false

@@ -193,14 +193,16 @@ Current OpenMLS scope:
 - KeyPackage replenishment edge proof with real OpenMLS package bytes covering
   duplicate upload rejection, account-claim exhaustion, fresh-package
   replenishment, and lease expiry/reclaim.
+- explicit v1 history policy proof: a newly added device can sync from its
+  accepted add Commit forward, but does not receive pre-membership room log
+  history by default.
 
 Current known gap:
 
 - Client SQLite persistence is not encrypted at rest yet. Do not ship device
   secrets on disk until this store is wrapped with audited encryption.
 - Remote Commit processing is proven for add, update/rekey, remove, and
-  tampered log-entry rejection. Same-epoch loser retry still needs a real
-  OpenMLS scenario proof.
+  tampered log-entry rejection.
 - Later device linking is proven at the client protocol level, but production
   still needs a durable room-discovery/fanout job that enumerates all rooms for
   an account and retries failed room adds without duplicating successful ones.
@@ -213,6 +215,9 @@ Current known gap:
 - KeyPackage edge behavior is covered across real-client, sim, and SQLite
   suites. Production still needs background policy for how many packages each
   device keeps available per account and room fanout budget.
+- V1 history recovery is intentionally narrow: new devices get messages from
+  their accepted add Commit forward. Pre-invite history requires a future
+  encrypted backup or explicit member-to-member history-share protocol.
 
 Good tests:
 
@@ -246,6 +251,9 @@ Good tests:
 - real KeyPackage bytes cover duplicate upload, exhausted account claim,
   replenishment by fresh upload, and lease expiry/reclaim; sim/SQLite cover
   consumed-package reuse rejection and max-device caps.
+- newly added devices sync from the accepted add Commit forward and cannot see
+  pre-membership room log history unless a future explicit history mechanism
+  provides it.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration

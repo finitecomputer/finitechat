@@ -877,6 +877,93 @@ fn client_key_package_replenishment_edges_use_real_packages() {
 }
 
 #[test]
+fn new_device_history_policy_starts_at_add_commit_not_prior_messages() {
+    let room_id = "room_history_policy";
+    let mls_group_id = "mls_history_policy";
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
+    let mut alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_history");
+    let mut server = DeliveryService::new();
+
+    server
+        .create_room(CreateRoomRequest {
+            room_id: room_id.to_string(),
+            mls_group_id: mls_group_id.to_string(),
+            creator: bob.device_ref().clone(),
+        })
+        .unwrap();
+    bob.create_group_state(room_id, mls_group_id).unwrap();
+    let prior_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"before invite"}}"#;
+    let prior_request = bob
+        .create_application_request(room_id, prior_plaintext, "history_before_invite")
+        .unwrap();
+    let prior = server.append_event(prior_request).unwrap();
+
+    server
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_history_alice_phone")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package("kp_history_alice_phone").unwrap();
+    let prepared = bob
+        .prepare_add_member_commit(
+            room_id,
+            &claimed_key_package,
+            "welcome_history_alice_phone",
+            "history_add_alice_phone",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    assert_eq!(
+        apply_one_commit_for_room(&server, room_id, &mut bob, prior.seq),
+        AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 1,
+        }
+    );
+    let join_seq = claim_and_activate_room(
+        &mut server,
+        &mut alice_phone,
+        room_id,
+        "welcome_history_alice_phone",
+    );
+    assert_eq!(join_seq, accepted.seq);
+
+    let post_plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"after invite"}}"#;
+    let post_request = bob
+        .create_application_request(room_id, post_plaintext, "history_after_invite")
+        .unwrap();
+    server.append_event(post_request).unwrap();
+
+    let full_page = server
+        .sync_events(room_id, alice_phone.device_ref(), 0)
+        .unwrap();
+    assert!(
+        full_page
+            .entries
+            .iter()
+            .all(|entry| entry.seq >= accepted.seq)
+    );
+    assert!(
+        !full_page
+            .entries
+            .iter()
+            .any(|entry| entry.message_id == prior.message_id)
+    );
+    assert_eq!(full_page.entries[0].kind, LogEntryKind::Commit);
+    assert_eq!(full_page.entries[0].seq, accepted.seq);
+    assert_eq!(full_page.entries[1].kind, LogEntryKind::Application);
+    assert_eq!(
+        alice_phone
+            .decrypt_application_entry(room_id, &full_page.entries[1])
+            .unwrap(),
+        post_plaintext
+    );
+}
+
+#[test]
 fn client_links_new_device_into_existing_rooms_with_distinct_key_packages() {
     let mut server = DeliveryService::new();
     let mut alice_browser = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
