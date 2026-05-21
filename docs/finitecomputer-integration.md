@@ -26,6 +26,11 @@ little as possible. Only local daemon, Electron, native mobile, or other clients
 that keep Finite Chat device secrets on the user's device should be described
 as end-to-end encrypted.
 
+Hosted dashboard product copy should call this "web chat" or "topics", not
+"encrypted chat". Finite Chat can be the internal protocol and storage upgrade;
+E2EE language starts only when users run clients that keep keys off the hosted
+server.
+
 ## Command/RPC Mapping
 
 Dashboard and Hermes commands ride inside Finite Chat durable application
@@ -40,6 +45,12 @@ or runtime presence use ephemeral activity events with `push_policy = never`.
 User-visible output, durable checkpoints, terminal success, terminal failure,
 and cancellation results are durable application events.
 
+Status reads should not become durable command spam. The runtime should publish
+encrypted latest-state snapshots when status changes, and the dashboard should
+normally read its local decrypted projection. An explicit refresh button may send
+a `runtime.command.request`, but page load should not append request/result
+events just to ask what the runtime already knows.
+
 The current relay shell can still wake/poll the runtime. A wake only triggers
 sync; it must not directly execute work from an external event callback. Optional
 cleartext wake hints may wake a specific runtime device, but the decrypted
@@ -48,6 +59,38 @@ command target and local policy remain authoritative.
 Transport should start with HTTP mutations, cursor-based pull sync, and SSE
 hints. WebSockets are not needed for v1. SSE and relay wakes only trigger sync;
 durable ordered room state remains the source of truth.
+
+## Dashboard Command Audit
+
+The current finitecomputer relay surface on `origin/finitec-inference-profiles`
+has four categories:
+
+- Projection reads: `chat.bootstrap`, `chat.list_threads`,
+  `chat.list_messages`, `chat.list_slash_commands`, and `chat.get_attachment`.
+  These should become local reads against the trusted-server Finite Chat
+  projection or encrypted blob store. They should not be modeled as runtime
+  commands.
+- Chat mutations: `chat.create_thread` and `chat.send_message`. These map to
+  durable Finite Chat events: `conversation.create` for creating a topic and
+  `chat.message` for user input. Runtime inbox work is derived only after the
+  runtime syncs and decrypts ordered room events.
+- Runtime commands: `runtime.inference.validate`, `runtime.inference.apply`,
+  `runtime.inference.rollback`, `runtime.gateway.restart`, and Matrix
+  connection commands. These should use `runtime.command.request` and
+  `runtime.command.result` with namespaced encrypted command names such as
+  `finitecomputer.runtime.inference.apply`.
+- Host control-plane operations: published-site access, repo provisioning,
+  Google OAuth handoff, Telegram env setup, Codex auth orchestration, and pod
+  restarts. These can stay on the host control-plane path until the runtime
+  itself owns those secrets and side effects. Finite Chat should not pretend to
+  replace the host control plane.
+
+Config-editing commands must be serialized per target runtime resource. For
+example, inference profile apply, rollback, and gateway restart all touch Hermes
+config or gateway lifecycle and should share a runtime-side command ledger key
+such as `hermes.config`. Command retries reuse the same encrypted envelope and
+idempotency key. Results include the post-mutation status snapshot but should
+use `push_policy = never` unless the user explicitly asked to be notified.
 
 ## Topics And New Chat
 
@@ -60,8 +103,8 @@ model/skill binding, and external bridge metadata.
 The app shell's "New chat" action should create a new topic. A `/new` command
 inside an existing topic should not create another topic; it should append
 `conversation.segment.start` inside the same `conversation_id`. The UI can render
-that event as a divider, while the runtime treats it as the start of a fresh
-prompt context for that topic.
+that event as a divider. Hermes owns the actual prompt/session reset behavior;
+Finite Chat only preserves the ordered boundary all clients can agree on.
 
 Hermes `thread_id` and Telegram `message_thread_id` map naturally to topic
 `conversation_id`. Finite Chat should store external platform identifiers and
@@ -71,7 +114,7 @@ not need to expose the external platform's raw identifier.
 
 ## Proposed Landing Shape
 
-Add an encrypted mode in finitecomputer with four layers:
+Add a Finite Chat-backed mode in finitecomputer with four layers:
 
 1. `finitechat-proto`: shared DTOs used by dashboard server routes, finited,
    finitec, and tests.

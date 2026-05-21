@@ -18,7 +18,7 @@ A first-class user-facing conversation lane inside a room.
 _Avoid_: Thread, room
 
 **Segment**:
-A bounded context window inside a conversation.
+An app-owned context boundary inside a conversation.
 _Avoid_: Topic, conversation, room
 
 **Activity**:

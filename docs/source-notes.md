@@ -123,6 +123,44 @@ session keys, and the plugin keeps a `sessionKey -> group/account` table so
 tools can route replies. It does not add a separate topic primitive, which makes
 Finite Chat's conversation/topic layer the useful missing concept.
 
+## Finitecomputer Command Audit
+
+Audited `origin/finitec-inference-profiles` in a detached worktree at commit
+`2ca7364`.
+
+The dashboard relay client posts `{ lane, kind, ttlSecs, payload }` and waits
+for a result. Chat calls are restricted to `chat.*`, while other runtime calls
+use lanes such as `runtime` and `connection`.
+
+Current relay kinds handled by `finitec relay run`:
+
+- `chat.bootstrap`
+- `chat.list_threads`
+- `chat.create_thread`
+- `chat.list_messages`
+- `chat.send_message`
+- `chat.list_slash_commands`
+- `chat.get_attachment`
+- `connection.matrix.status`
+- `connection.matrix.configure`
+- `connection.matrix.disconnect`
+- `runtime.inference.status`
+- `runtime.inference.validate`
+- `runtime.inference.apply`
+- `runtime.inference.rollback`
+- `runtime.gateway.restart`
+
+Finite Chat should split these by responsibility. Chat reads become projection
+reads, chat writes become durable chat events, runtime/config mutations become
+`runtime.command.request` payloads, and host-owned control-plane work should stay
+outside Finite Chat.
+
+The dashboard also has host-side operations that do not currently use relay:
+published-site auth updates, repo provisioning, Telegram env setup, Google
+Workspace OAuth credential handoff, Codex auth orchestration, and pod restarts.
+Those are control-plane responsibilities unless a future runtime client owns the
+secrets and side effects directly.
+
 ## Dependency Audit
 
 OpenMLS credential spike:

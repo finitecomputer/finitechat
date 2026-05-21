@@ -434,6 +434,11 @@ application payload behavior:
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 - `runtime_command_result_clears_matching_activity`
+- `dashboard_status_page_load_reads_projection_without_command`
+- `explicit_status_refresh_uses_runtime_command_without_push`
+- `runtime_config_commands_serialize_per_resource`
+- `runtime_config_command_result_includes_post_mutation_status`
+- `host_control_plane_operation_does_not_use_chat_command`
 
 ## Planned Transport Scenarios
 
@@ -464,7 +469,7 @@ appropriate:
 - `topic_skill_binding_is_encrypted_conversation_metadata`
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_start_is_durable_but_push_never`
-- `agent_prompt_context_resets_at_latest_segment_boundary`
+- `segment_boundary_is_projected_without_protocol_managed_prompt_state`
 
 ## Planned Attachment Scenarios
 

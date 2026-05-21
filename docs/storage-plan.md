@@ -6,16 +6,19 @@ Use three storage profiles:
 
 - Client/device: encrypted local SQLite for MLS client state, pending outbound
   work, inbound event cache, and device-linking state.
-- Local/dev and first server proof: SQLite.
-- Hosted production room server: Postgres.
+- Local/dev, first server proof, and self-hosted single-node production: SQLite.
+- Hosted multi-node room server: Postgres.
 
 SQLite is not "just client testing" in this repo. It is the first durable
-server proof because it forces every reducer invariant through a transaction
-and a restart boundary. That makes it useful before the HTTP API exists.
+server proof because it forces every reducer invariant through a transaction and
+a restart boundary. For self-hosted Finite Chat, the single-writer property is a
+strength: it matches the room-server sequencer model, keeps deployment small,
+and makes transaction order easy to reason about.
 
-Postgres is still the production target for hosted room servers because it has
-stronger operational fit for multi-process API nodes, queue workers, retention
-jobs, migrations, backups, observability, and canary rollback.
+Postgres is still the production target for hosted multi-node room servers
+because it has stronger operational fit for multiple API processes, queue
+workers, retention jobs, migrations, backups, observability, and canary
+rollback.
 
 ## Current SQLite Scope
 

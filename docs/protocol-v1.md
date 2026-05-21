@@ -504,6 +504,12 @@ Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
 application data, not authoritative room-server state.
 
+Read-mostly runtime status should usually be represented as encrypted
+latest-state projection data, not as a command request for every UI render.
+Commands are for work that needs runtime scheduling, authorization, mutation, or
+an explicit refresh. Polling a dashboard page must not by itself append durable
+command traffic to a room log.
+
 Finite Chat reserves generic durable command kinds:
 
 - `runtime.command.request`: asks a target identity or device to do work;
@@ -537,10 +543,10 @@ deduplicate replays by request id, sender, conversation, and original message
 id. Execution workers read the ledger; live streams and push wakes only cause
 sync.
 
-When a runtime builds prompt context for a topic, it should respect the latest
-accepted `conversation.segment.start` event in that conversation unless the
-application explicitly opts into older history. The transcript remains visible
-and durable; only the runtime's active context window resets.
+Finite Chat only records ordered segment boundaries. The app/runtime owns what a
+segment means for its prompt context or local memory. A Hermes bridge can map
+`conversation.segment.start` to Hermes' existing `/new` session reset behavior,
+while the Finite Chat transcript remains visible and durable.
 
 Cancellation is also durable. A `runtime.command.cancel` references the
 encrypted `request_id`. If cancellation wins before terminal result, the
