@@ -194,10 +194,13 @@ These are protocol constants, not tuning hints:
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
 - attachment plaintext: `32 MiB`;
+- runtime state snapshot payload: `64 KiB`;
+- runtime state keys per room/device: `128`;
 - ephemeral activity expiry: `30 minutes` from server receipt;
 - ephemeral activity cache entries per room/conversation/device route: `64`;
 - idempotency key: `128` bytes;
-- account id, device id, room id, MLS group id, object ids: `128` bytes each.
+- account id, device id, room id, MLS group id, object ids, state keys:
+  `128` bytes each.
 
 The numbers are intentionally small for v1. They keep WASM memory behavior
 predictable, bound retry/fanout work, and make accidental full-room reads show
@@ -423,6 +426,7 @@ kind. V1 defaults are:
 - `chat.edit`, `chat.reaction`, `chat.receipt`, and conversation metadata:
   `push_policy = never`;
 - `conversation.segment.start`: `push_policy = never`;
+- `runtime.state.snapshot`: `push_policy = never`;
 - `runtime.command.request`: may wake the encrypted target runtime device, but
   should not create a user notification by default;
 - `runtime.command.result`: push-eligible only when the receiving app maps it to
@@ -520,6 +524,41 @@ latest-state projection data, not as a command request for every UI render.
 Commands are for work that needs runtime scheduling, authorization, mutation, or
 an explicit refresh. Polling a dashboard page must not by itself append durable
 command traffic to a room log.
+
+Finite Chat reserves a generic durable state kind:
+
+- `runtime.state.snapshot`: publishes structured current runtime state.
+
+`runtime.state.snapshot` is the structured version of an old instant-messenger
+status message: current, user-facing enough to display, bot-readable, but not a
+chat message. It is durable so new devices and restarted dashboards can recover
+the latest state, and it must use `push_policy = never`, must not create unread
+state, and must not create command inbox work.
+
+The encrypted snapshot payload owns:
+
+- `state_key`: stable application key such as `runtime.inference`,
+  `runtime.gateway`, `runtime.connection.matrix`, `runtime.connection.telegram`,
+  `runtime.published_apps`, or `runtime.capabilities`;
+- `schema`: application schema id for the typed JSON body;
+- `revision`: monotonically increasing value for this `(room, source device,
+  state_key)`;
+- `observed_at`: when the runtime observed the state;
+- `expires_at`: when clients should mark the projection stale if no newer
+  snapshot arrives;
+- `status`: the typed JSON value for the app.
+
+Clients project runtime state by `(room_id, source_account_id,
+source_device_id, state_key)`. A newer revision replaces the prior projection
+for that key. If two snapshots race with the same revision, clients keep the one
+with the later accepted room sequence. Unknown schemas are preserved for
+specialized clients and ignored by generic UI.
+
+Runtime daemons should publish snapshots on meaningful changes and on a slow
+refresh cadence. The cadence must be bounded by product policy; it is not a
+heartbeat substitute. Liveness remains a small server-visible heartbeat, while
+`runtime.state.snapshot` carries encrypted application state. A command result
+may include or be immediately followed by a snapshot for the state it changed.
 
 Finite Chat reserves generic durable command kinds:
 

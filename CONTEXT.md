@@ -25,6 +25,10 @@ _Avoid_: Topic, conversation, room
 TTL-bound encrypted intermediate state inside a room or conversation.
 _Avoid_: Message, notification
 
+**Runtime State**:
+Structured current condition published by an agent runtime.
+_Avoid_: Command, message, activity
+
 ## Relationships
 
 - A **Room** contains zero or more **Conversations**.
@@ -32,11 +36,15 @@ _Avoid_: Message, notification
 - A **Conversation** contains one or more **Segments** when an app supports context resets.
 - A **Segment** belongs to exactly one **Conversation**.
 - **Activity** may be scoped to a **Room** or to one **Conversation**.
+- **Runtime State** belongs to one agent runtime device and is projected by key.
 
 ## Example Dialogue
 
 > **Dev:** "If the user runs `/new` in the Deploys topic, do we create a new topic?"
 > **Domain expert:** "No. Deploys stays the same Topic; `/new` starts a new Segment inside it."
+
+> **Dev:** "Do we send a command whenever the dashboard needs status?"
+> **Domain expert:** "No. The runtime publishes Runtime State, and the dashboard reads the latest projection."
 
 ## Flagged Ambiguities
 

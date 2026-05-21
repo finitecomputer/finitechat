@@ -436,6 +436,15 @@ application payload behavior:
 - `runtime_command_result_clears_matching_activity`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`
+- `runtime_state_snapshot_is_durable_but_push_never`
+- `runtime_state_snapshot_does_not_create_unread_or_inbox_work`
+- `runtime_state_projection_replaces_by_state_key_and_revision`
+- `runtime_state_projection_uses_room_sequence_to_break_revision_ties`
+- `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
+- `runtime_state_snapshot_unknown_schema_is_preserved`
+- `runtime_state_command_result_publishes_post_mutation_snapshot`
+- `runtime_state_slow_refresh_cadence_is_bounded`
+- `runtime_liveness_heartbeat_is_not_encrypted_runtime_state`
 - `runtime_config_commands_serialize_per_resource`
 - `runtime_config_command_result_includes_post_mutation_status`
 - `portable_agent_command_does_not_assume_hosted_runner`

@@ -184,6 +184,12 @@ Telegram/Matrix/Hermes config, Codex status, local skills sync, and any other
 agent-portable capability should move toward finitec-owned commands and status
 projections.
 
+Status reads should use daemon-published state rather than page-load commands.
+The Finite Chat shape is `runtime.state.snapshot`: a durable, non-notifying,
+encrypted status event keyed by runtime device and stable state key. This gives
+the dashboard the latest projected state without writing a chat message or
+sending a command every time someone opens a page.
+
 ## Dependency Audit
 
 OpenMLS credential spike:

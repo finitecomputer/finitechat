@@ -29,6 +29,9 @@ The first production-ready slice is done when:
   migration;
 - local `just chat-local-up` has an encrypted mode that exercises dashboard,
   relay, finitec, Hermes, attachments, and restart persistence.
+- finitec publishes non-notifying `runtime.state.snapshot` events for dashboard
+  status surfaces, so dashboard page load reads projected state instead of
+  sending a status command.
 
 ## Constraints
 
@@ -69,6 +72,7 @@ Preferences:
 - Add SQLite before Axum production APIs.
 - Add OpenMLS only after fake-MLS invariants are tested.
 - Keep DTOs small enough that finitecomputer can vend/import them directly.
+- Prefer daemon-published state snapshots over request/response status polling.
 
 Escalate:
 

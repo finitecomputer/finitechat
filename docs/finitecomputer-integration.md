@@ -59,10 +59,11 @@ User-visible output, durable checkpoints, terminal success, terminal failure,
 and cancellation results are durable application events.
 
 Status reads should not become durable command spam. The runtime should publish
-encrypted latest-state snapshots when status changes, and the dashboard should
-normally read its local decrypted projection. An explicit refresh button may send
-a `runtime.command.request`, but page load should not append request/result
-events just to ask what the runtime already knows.
+encrypted `runtime.state.snapshot` events when state changes and on a slow
+bounded refresh cadence. The dashboard normally reads its local decrypted latest
+projection. An explicit refresh button may send a `runtime.command.request`, but
+page load should not append request/result events just to ask what the runtime
+already knows.
 
 The current relay shell can still wake/poll the runtime. A wake only triggers
 sync; it must not directly execute work from an external event callback. Optional
@@ -108,6 +109,37 @@ config or gateway lifecycle and should share a runtime-side command ledger key
 such as `hermes.config`. Command retries reuse the same encrypted envelope and
 idempotency key. Results include the post-mutation status snapshot but should
 use `push_policy = never` unless the user explicitly asked to be notified.
+
+## Runtime State Snapshots
+
+Finitecomputer should model bot-visible status like structured AIM status
+messages: compact, current, non-notifying, and useful to both humans and agents.
+The finitec daemon publishes encrypted `runtime.state.snapshot` events keyed by
+the runtime device and a stable `state_key`. The dashboard projects the latest
+snapshot for each key instead of asking the runtime for status on every page
+load.
+
+Initial state keys:
+
+- `runtime.inference`: active model/provider/profile, backup availability, and
+  restart support;
+- `runtime.gateway`: gateway health, connected platforms, and restartability;
+- `runtime.connection.matrix`: Matrix configured/connected state;
+- `runtime.connection.telegram`: Telegram token/access/topic status and pairing
+  state;
+- `runtime.connection.google_workspace`: Google Workspace credential and tool
+  availability;
+- `runtime.connection.codex`: Codex auth and device-code state;
+- `runtime.published_apps`: runtime-owned app inventory and observed process
+  state;
+- `runtime.capabilities`: finitec/agent capabilities and schema versions.
+
+Snapshots are not presence. Runtime liveness stays in the small server-visible
+heartbeat path. Snapshots are encrypted app state with `push_policy = never`.
+They include `observed_at`, `expires_at`, `revision`, `schema`, and a typed
+status object. When a command mutates state, its result should include or be
+followed by the corresponding snapshot so every client converges without an
+extra read command.
 
 ## Topics And New Chat
 
