@@ -110,6 +110,7 @@ Proven client scenarios:
 - `client_processes_remote_update_commit_before_epoch_three_messages`
 - `client_processes_remote_remove_commit_before_post_remove_messages`
 - `stale_removed_device_can_process_removal_but_not_future_ciphertext`
+- `client_recovers_losing_same_epoch_add_commit_and_retries`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -189,6 +190,12 @@ Checkpoint test signal:
   fetch and process the removal Commit, but the server rejects its old-epoch
   send, rejects a forged new-epoch send as inactive, withholds post-remove log
   entries, and OpenMLS rejects a leaked post-remove ciphertext.
+- The same-epoch recovery checkpoint creates two real local pending Commits at
+  epoch 1. Alice's add wins, Bob's add loses with `WrongEpoch`, Bob keeps local
+  pending state until he observes Alice's ordered Commit, then `apply_log_entry`
+  clears the loser, processes the winner, and lets Bob retry at epoch 2. The
+  retry reuses the still-leased Dana KeyPackage because the rejected Commit did
+  not consume it or release a Welcome.
 - Existing server tests mattered again here: the first version of the remote
   add proof accidentally used a direct room for a third-account add, and
   `DirectRoomThirdAccount` failed the scenario before it could become false

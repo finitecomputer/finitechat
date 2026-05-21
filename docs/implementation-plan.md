@@ -188,6 +188,8 @@ Current OpenMLS scope:
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
+- same-epoch loser recovery proof where a losing client clears its pending
+  Commit after observing the winner, rolls forward, retries, and gets accepted.
 
 Current known gap:
 
@@ -202,6 +204,9 @@ Current known gap:
 - Removal/revocation is proven for stale local MLS state and server delivery
   gating. Production still needs policy and UX for who may revoke which device,
   plus durable device-status records.
+- Same-epoch loser recovery is proven for add Commits. Broader race matrices
+  across remove/update combinations can be added, but the key recovery shape is
+  now exercised with real OpenMLS state.
 
 Good tests:
 
@@ -229,6 +234,9 @@ Good tests:
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.
+- same-epoch add loser observes the accepted winner, clears its pending Commit,
+  retries from the new epoch with the still-leased KeyPackage, and then sends
+  decryptable post-retry messages.
 - tampered remote Commit bytes are rejected before epoch advance.
 
 ### Phase 3: Finitecomputer Local Integration

@@ -704,6 +704,111 @@ fn stale_removed_device_can_process_removal_but_not_future_ciphertext() {
 }
 
 #[test]
+fn client_recovers_losing_same_epoch_add_commit_and_retries() {
+    let (mut server, mut alice, mut bob, bob_join_seq) = active_alice_bob_room();
+    let mut charlie = test_device(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_phone");
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_runtime");
+
+    server
+        .upload_key_package(
+            charlie
+                .upload_key_package_request("kp_race_charlie_1")
+                .unwrap(),
+        )
+        .unwrap();
+    server
+        .upload_key_package(dana.upload_key_package_request("kp_race_dana_1").unwrap())
+        .unwrap();
+    let claimed_charlie = server.claim_key_package("kp_race_charlie_1").unwrap();
+    let claimed_dana = server.claim_key_package("kp_race_dana_1").unwrap();
+
+    let alice_winner = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_charlie,
+            "welcome_race_charlie_1",
+            "race_alice_add_charlie",
+        )
+        .unwrap();
+    let bob_loser = bob
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_dana,
+            "welcome_race_dana_1",
+            "race_bob_add_dana_loses",
+        )
+        .unwrap();
+    let alice_accepted = server.submit_commit(alice_winner.request).unwrap();
+    assert!(matches!(
+        server.submit_commit(bob_loser.request).unwrap_err(),
+        EngineError::WrongEpoch { .. }
+    ));
+    assert!(server.welcome("welcome_race_dana_1").is_none());
+    assert!(bob.has_pending_commit(ROOM_ID).unwrap());
+
+    assert_eq!(
+        apply_one_commit(&server, &mut bob, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert!(!bob.has_pending_commit(ROOM_ID).unwrap());
+    assert_eq!(
+        apply_one_commit(&server, &mut alice, bob_join_seq),
+        AppliedLogEntry::Commit {
+            sender: alice.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    let charlie_join_seq = claim_and_activate(&mut server, &mut charlie, "welcome_race_charlie_1");
+    assert_eq!(charlie_join_seq, alice_accepted.seq);
+
+    let bob_retry = bob
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_dana,
+            "welcome_race_dana_1",
+            "race_bob_add_dana_retry",
+        )
+        .unwrap();
+    let dana_accepted = server.submit_commit(bob_retry.request).unwrap();
+    assert_eq!(dana_accepted.seq, alice_accepted.seq + 1);
+    assert_eq!(
+        apply_one_commit(&server, &mut bob, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 3,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&server, &mut alice, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 3,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&server, &mut charlie, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 3,
+        }
+    );
+    let dana_join_seq = claim_and_activate(&mut server, &mut dana, "welcome_race_dana_1");
+    assert_eq!(dana_join_seq, dana_accepted.seq);
+
+    let plaintext = br#"{"type":"finitecomputer.command.v1","body":{"text":"race recovered"}}"#;
+    let request = bob
+        .create_application_request(ROOM_ID, plaintext, "bob_after_race_recovery")
+        .unwrap();
+    server.append_event(request).unwrap();
+    assert_device_decrypts_after(&server, &mut alice, dana_accepted.seq, plaintext);
+    assert_device_decrypts_after(&server, &mut charlie, dana_accepted.seq, plaintext);
+    assert_device_decrypts_after(&server, &mut dana, dana_accepted.seq, plaintext);
+}
+
+#[test]
 fn client_links_new_device_into_existing_rooms_with_distinct_key_packages() {
     let mut server = DeliveryService::new();
     let mut alice_browser = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
