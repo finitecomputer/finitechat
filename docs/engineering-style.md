@@ -14,6 +14,9 @@ Reference: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE
 - JSON is allowed for wire DTOs, encrypted application payloads, and bounded
   typed replay values such as idempotency responses.
 - Store APIs must not hide database or corruption errors behind `Option`.
+- Use typed error enums for crate boundaries. Do not use `anyhow` in protocol,
+  engine, store, or simulation code; callers should be able to match errors
+  without parsing strings.
 - Every mutation that changes room state must have a test covering the positive
   path and at least one negative/replay path.
 - Prefer explicit branch structure for validation. Avoid clever `Option` or

@@ -145,16 +145,15 @@ dependencies = [
 name = "finitechat-sim"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "finitechat-engine",
  "finitechat-proto",
+ "serde_json",
 ]
 
 [[package]]
 name = "finitechat-store"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "finitechat-engine",
  "finitechat-proto",
  "rusqlite",

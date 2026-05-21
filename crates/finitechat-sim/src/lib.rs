@@ -4,14 +4,64 @@
 //! runs the same reducer surfaces that production storage/API code must keep
 //! semantically equivalent.
 
-use anyhow::Result;
+use std::error::Error;
+use std::fmt;
+
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CreateRoomRequest, DeliveryService,
+    AppendEventRequest, ClaimKeyPackageResult, CreateRoomRequest, DeliveryService, EngineError,
     SubmitCommitRequest, UploadKeyPackageRequest, device, envelope,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
 };
+
+pub type Result<T> = std::result::Result<T, SimError>;
+
+#[derive(Debug)]
+pub enum SimError {
+    Engine(EngineError),
+    EnvelopeJson(serde_json::Error),
+    ExpectedWelcome {
+        welcome_id: String,
+        device: DeviceRef,
+    },
+}
+
+impl fmt::Display for SimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine(error) => write!(f, "{error}"),
+            Self::EnvelopeJson(error) => write!(f, "failed to derive envelope message id: {error}"),
+            Self::ExpectedWelcome { welcome_id, device } => write!(
+                f,
+                "expected welcome {welcome_id} for device {}/{}",
+                device.account_id, device.device_id
+            ),
+        }
+    }
+}
+
+impl Error for SimError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::EnvelopeJson(error) => Some(error),
+            Self::ExpectedWelcome { .. } => None,
+        }
+    }
+}
+
+impl From<EngineError> for SimError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+impl From<serde_json::Error> for SimError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::EnvelopeJson(error)
+    }
+}
 
 pub struct SimWorld {
     pub server: DeliveryService,
@@ -189,12 +239,15 @@ impl SimWorld {
 
     pub fn activate_device(&mut self, welcome_id: &str, device: DeviceRef) -> Result<()> {
         let welcomes = self.server.claim_welcomes(&device);
-        anyhow::ensure!(
-            welcomes
-                .iter()
-                .any(|welcome| welcome.welcome_id == welcome_id),
-            "expected welcome {welcome_id} for {device:?}"
-        );
+        if !welcomes
+            .iter()
+            .any(|welcome| welcome.welcome_id == welcome_id)
+        {
+            return Err(SimError::ExpectedWelcome {
+                welcome_id: welcome_id.to_string(),
+                device,
+            });
+        }
         self.server.ack_welcome(welcome_id, true)?;
         Ok(())
     }
