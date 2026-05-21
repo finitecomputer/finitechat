@@ -8,7 +8,9 @@ use finitechat_proto::{
     MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, RoomStatus,
     WelcomeState,
 };
-use finitechat_sim::{SimWorld, alice, bob, charlie, dana, staged_welcome};
+use finitechat_sim::{
+    SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
+};
 
 fn provision_bob(world: &mut SimWorld) {
     world
@@ -49,6 +51,21 @@ fn create_dm_room_and_release_welcome_after_commit() {
     assert_eq!(
         world.server.welcome("welcome_bob_1").unwrap().state,
         WelcomeState::Released
+    );
+}
+
+#[test]
+fn key_package_claim_returns_opaque_payload() {
+    let mut world = SimWorld::direct_room().unwrap();
+
+    let claimed = world.upload_and_claim(bob(), "kp_bob_1").unwrap();
+
+    assert_eq!(claimed.key_package_id, "kp_bob_1");
+    assert_eq!(claimed.key_package_ref, "ref_kp_bob_1");
+    assert_eq!(claimed.key_package_hash, "hash_kp_bob_1");
+    assert_eq!(
+        claimed.key_package_payload,
+        fake_key_package_payload("kp_bob_1")
     );
 }
 
@@ -897,6 +914,7 @@ fn direct_room_create_or_get_and_third_account_rejection() {
             owner: charlie(),
             key_package_ref: "ref_kp_charlie".to_string(),
             key_package_hash: "hash_kp_charlie".to_string(),
+            key_package_payload: fake_key_package_payload("kp_charlie"),
         })
         .unwrap();
     service.claim_key_package("kp_charlie").unwrap();
@@ -1222,6 +1240,7 @@ fn direct_room_rejects_too_many_devices_for_one_account() {
                 owner: target.clone(),
                 key_package_ref: format!("ref_{key_package_id}"),
                 key_package_hash: format!("hash_{key_package_id}"),
+                key_package_payload: fake_key_package_payload(&key_package_id),
             })
             .unwrap();
         server.claim_key_package(&key_package_id).unwrap();
@@ -1266,6 +1285,7 @@ fn direct_room_rejects_too_many_devices_for_one_account() {
             owner: overflow.clone(),
             key_package_ref: "ref_kp_bob_overflow".to_string(),
             key_package_hash: "hash_kp_bob_overflow".to_string(),
+            key_package_payload: fake_key_package_payload("kp_bob_overflow"),
         })
         .unwrap();
     server.claim_key_package("kp_bob_overflow").unwrap();

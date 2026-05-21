@@ -162,6 +162,8 @@ Current OpenMLS scope:
   `DeliveryService` as opaque `FiniteEnvelope.payload` bytes.
 - `DeliveryService` and SQLite commit paths storing opaque Welcome and
   ratchet-tree bytes, then returning those exact bytes on Welcome claim.
+- `DeliveryService` and SQLite KeyPackage paths storing opaque serialized
+  KeyPackage bytes, then returning those exact bytes on KeyPackage claim.
 
 Good tests:
 

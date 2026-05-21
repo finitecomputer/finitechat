@@ -17,6 +17,7 @@ Each item below has a named test in
 `crates/finitechat-sim/tests/scenarios.rs`.
 
 - `create_dm_room_and_release_welcome_after_commit`
+- `key_package_claim_returns_opaque_payload`
 - `welcome_activation_makes_new_device_active`
 - `add_commit_requires_staged_welcome_bytes_before_mutation`
 - `duplicate_commit_retry_returns_same_result_after_side_effects`
@@ -131,6 +132,7 @@ The SQLite suite lives in
 Proven SQLite restart scenarios:
 
 - `sqlite_create_dm_room_and_release_welcome_after_commit`
+- `sqlite_key_package_payload_survives_reopen_and_claim`
 - `sqlite_claimed_welcome_payload_survives_reopen`
 - `sqlite_add_commit_requires_staged_welcome_bytes_before_mutation`
 - `sqlite_duplicate_commit_retry_after_reopen_returns_same_result`

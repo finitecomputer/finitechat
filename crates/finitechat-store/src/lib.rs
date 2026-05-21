@@ -13,9 +13,10 @@ use finitechat_engine::{
 use finitechat_proto::{
     AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId,
-    MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState,
-    validate_bytes_len, validate_room_id, validate_string_bytes,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq,
+    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
+    validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -156,8 +157,8 @@ impl SqliteDeliveryStore {
                 r#"
                 INSERT INTO key_packages (
                   key_package_id, owner_account_id, owner_device_id,
-                  key_package_ref, key_package_hash, state, lease_token
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                  key_package_ref, key_package_hash, key_package_payload, state, lease_token
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
                 "#,
                 params![
                     request.key_package_id,
@@ -165,6 +166,7 @@ impl SqliteDeliveryStore {
                     request.owner.device_id,
                     request.key_package_ref,
                     request.key_package_hash,
+                    request.key_package_payload,
                     encode_key_package_state(KeyPackageState::Available),
                 ],
             )?;
@@ -181,6 +183,14 @@ impl SqliteDeliveryStore {
         let key_package_id = key_package_id.to_string();
         self.with_transaction(|tx| {
             let package = load_key_package_required(tx, &key_package_id)?;
+            validate_bytes_non_empty("key_package_payload", package.key_package_payload.len())
+                .map_err(EngineError::from)?;
+            validate_bytes_len(
+                "key_package_payload",
+                package.key_package_payload.len(),
+                MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+            )
+            .map_err(EngineError::from)?;
             if package.state != KeyPackageState::Available {
                 return Err(EngineError::KeyPackageUnavailable {
                     key_package_id,
@@ -199,6 +209,9 @@ impl SqliteDeliveryStore {
             )?;
             Ok(ClaimKeyPackageResult {
                 key_package_id: package.key_package_id,
+                key_package_ref: package.key_package_ref,
+                key_package_hash: package.key_package_hash,
+                key_package_payload: package.key_package_payload,
                 lease_token,
             })
         })
@@ -730,6 +743,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           owner_device_id TEXT NOT NULL,
           key_package_ref TEXT NOT NULL,
           key_package_hash TEXT NOT NULL,
+          key_package_payload BLOB NOT NULL DEFAULT X'',
           state TEXT NOT NULL CHECK (state IN ('available', 'leased', 'consumed', 'released', 'expired')),
           lease_token TEXT
         );
@@ -772,6 +786,12 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         CREATE INDEX IF NOT EXISTS idx_idempotency_room_sender
         ON idempotency_records (room_id, sender_account_id, sender_device_id);
         "#,
+    )?;
+    ensure_column(
+        conn,
+        "key_packages",
+        "key_package_payload",
+        "BLOB NOT NULL DEFAULT X''",
     )?;
     ensure_column(
         conn,
@@ -1622,7 +1642,7 @@ fn load_key_package(
     let mut statement = conn.prepare(
         r#"
         SELECT key_package_id, owner_account_id, owner_device_id,
-               key_package_ref, key_package_hash, state, lease_token
+               key_package_ref, key_package_hash, key_package_payload, state, lease_token
         FROM key_packages
         WHERE key_package_id = ?1
         "#,
@@ -1639,8 +1659,9 @@ fn load_key_package(
         },
         key_package_ref: row.get(3)?,
         key_package_hash: row.get(4)?,
-        state: decode_key_package_state(row.get::<_, String>(5)?.as_str())?,
-        lease_token: row.get(6)?,
+        key_package_payload: row.get(5)?,
+        state: decode_key_package_state(row.get::<_, String>(6)?.as_str())?,
+        lease_token: row.get(7)?,
     }))
 }
 

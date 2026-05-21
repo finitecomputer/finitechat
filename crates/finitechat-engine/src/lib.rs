@@ -2,11 +2,12 @@ use finitechat_proto::{
     AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
     KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST,
-    MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
-    RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
-    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
+    ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
+    WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
+    validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,6 +62,7 @@ pub struct KeyPackageRecord {
     pub owner: DeviceRef,
     pub key_package_ref: KeyPackageRef,
     pub key_package_hash: KeyPackageHash,
+    pub key_package_payload: Vec<u8>,
     pub state: KeyPackageState,
     pub lease_token: Option<LeaseToken>,
 }
@@ -122,6 +124,7 @@ pub struct UploadKeyPackageRequest {
     pub owner: DeviceRef,
     pub key_package_ref: KeyPackageRef,
     pub key_package_hash: KeyPackageHash,
+    pub key_package_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +150,9 @@ pub struct SubmitCommitRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageResult {
     pub key_package_id: KeyPackageId,
+    pub key_package_ref: KeyPackageRef,
+    pub key_package_hash: KeyPackageHash,
+    pub key_package_payload: Vec<u8>,
     pub lease_token: LeaseToken,
 }
 
@@ -206,6 +212,12 @@ impl UploadKeyPackageRequest {
             "key_package_hash",
             &self.key_package_hash,
             MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("key_package_payload", self.key_package_payload.len())?;
+        validate_bytes_len(
+            "key_package_payload",
+            self.key_package_payload.len(),
+            MAX_KEY_PACKAGE_PAYLOAD_BYTES,
         )?;
         Ok(())
     }
@@ -370,6 +382,7 @@ impl DeliveryService {
                 owner: request.owner,
                 key_package_ref: request.key_package_ref,
                 key_package_hash: request.key_package_hash,
+                key_package_payload: request.key_package_payload,
                 state: KeyPackageState::Available,
                 lease_token: None,
             },
@@ -396,7 +409,10 @@ impl DeliveryService {
         package.state = KeyPackageState::Leased;
         package.lease_token = Some(lease_token.clone());
         Ok(ClaimKeyPackageResult {
-            key_package_id: key_package_id.to_string(),
+            key_package_id: package.key_package_id.clone(),
+            key_package_ref: package.key_package_ref.clone(),
+            key_package_hash: package.key_package_hash.clone(),
+            key_package_payload: package.key_package_payload.clone(),
             lease_token,
         })
     }
@@ -1362,6 +1378,7 @@ mod tests {
                 owner: device("bob", "phone"),
                 key_package_ref: "ref_bob".to_string(),
                 key_package_hash: "hash_bob".to_string(),
+                key_package_payload: b"key-package:kp_bob".to_vec(),
             })
             .unwrap();
         service.claim_key_package("kp_bob").unwrap();
@@ -1464,6 +1481,7 @@ mod tests {
                 owner: device("charlie", "phone"),
                 key_package_ref: "ref_charlie".to_string(),
                 key_package_hash: "hash_charlie".to_string(),
+                key_package_payload: b"key-package:kp_charlie".to_vec(),
             })
             .unwrap();
         service.claim_key_package("kp_charlie").unwrap();

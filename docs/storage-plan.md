@@ -46,7 +46,7 @@ It proves:
 - Commit side effects are persisted together;
 - Commit transaction rollback after intermediate side effects converges on retry;
 - same-epoch Commit losers cannot create duplicate log rows or Welcomes;
-- KeyPackage leases and consumption survive reopen;
+- KeyPackage leases, consumption, and opaque payload bytes survive reopen;
 - Welcome release, claim, ack, failure, resume states, and opaque payload bytes
   survive reopen;
 - direct-room identity constraints survive reopen;
@@ -60,8 +60,9 @@ The SQLite shape flushed out two production-schema requirements:
 The only JSON stored by the server store is `idempotency_records.response_json`,
 which is a bounded typed replay value. Room state, message ordering,
 membership, KeyPackages, Welcomes, and link sessions are schema rows.
-Welcome payload and ratchet-tree bytes are `BLOB` columns on `welcomes`; the
-server keeps them opaque and only enforces protocol bounds before mutation.
+KeyPackage bytes are a `BLOB` column on `key_packages`. Welcome payload and
+ratchet-tree bytes are `BLOB` columns on `welcomes`; the server keeps them
+opaque and only enforces protocol bounds before mutation.
 
 ## Production Schema Direction
 

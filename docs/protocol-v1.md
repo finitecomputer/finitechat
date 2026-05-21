@@ -83,6 +83,7 @@ These are protocol constants, not tuning hints:
 - sync page: `100` entries and `4 MiB` of envelope payload bytes;
 - direct room devices per account: `8`;
 - KeyPackages claimed per request: `1`;
+- KeyPackage payload: `64 KiB`;
 - Welcomes claimed per request: `32`;
 - staged Welcomes per Commit: `32`;
 - Welcome payload: `1 MiB`;
@@ -109,6 +110,11 @@ KeyPackages:
 - `POST /v1/key-packages`
 - `POST /v1/key-packages/claim`
 - `POST /v1/key-packages/release`
+
+Uploaded KeyPackages include opaque serialized MLS KeyPackage bytes plus the
+metadata the server uses for routing/cache checks. Claiming a KeyPackage returns
+those exact bytes to the adding client; clients parse and verify MLS credential
+identity locally.
 
 Rooms:
 

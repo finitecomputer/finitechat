@@ -49,9 +49,14 @@ fn real_openmls_bytes_flow_through_engine_ordering() {
             owner: bob.device_ref.clone(),
             key_package_ref: bob_key_package_metadata.key_package_ref.clone(),
             key_package_hash: bob_key_package_metadata.key_package_hash.clone(),
+            key_package_payload: bob_key_package_metadata.key_package_payload.clone(),
         })
         .unwrap();
-    server.claim_key_package(BOB_KEY_PACKAGE_ID).unwrap();
+    let claimed_key_package = server.claim_key_package(BOB_KEY_PACKAGE_ID).unwrap();
+    assert_eq!(
+        claimed_key_package.key_package_payload,
+        bob_key_package_metadata.key_package_payload
+    );
 
     let group_config = MlsGroupCreateConfig::builder()
         .ciphersuite(CIPHERSUITE)
@@ -286,6 +291,7 @@ impl TestMlsDevice {
 struct KeyPackageMetadata {
     key_package_ref: String,
     key_package_hash: String,
+    key_package_payload: Vec<u8>,
 }
 
 impl KeyPackageMetadata {
@@ -302,6 +308,7 @@ impl KeyPackageMetadata {
         Self {
             key_package_ref: hex_lower(key_package_ref.as_slice()),
             key_package_hash: message_id_for_bytes(&key_package_bytes),
+            key_package_payload: key_package_bytes,
         }
     }
 }

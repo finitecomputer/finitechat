@@ -95,6 +95,7 @@ impl SimWorld {
             owner,
             key_package_ref: format!("ref_{key_package_id}"),
             key_package_hash: format!("hash_{key_package_id}"),
+            key_package_payload: fake_key_package_payload(key_package_id),
         })?;
         Ok(self.server.claim_key_package(key_package_id)?)
     }
@@ -263,6 +264,10 @@ pub fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
         welcome_payload: format!("welcome:{welcome_id}").into_bytes(),
         ratchet_tree_payload: format!("tree:{welcome_id}").into_bytes(),
     }
+}
+
+pub fn fake_key_package_payload(key_package_id: &str) -> Vec<u8> {
+    format!("key-package:{key_package_id}").into_bytes()
 }
 
 pub fn alice() -> DeviceRef {

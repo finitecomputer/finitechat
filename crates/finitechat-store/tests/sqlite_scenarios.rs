@@ -55,6 +55,7 @@ impl SqliteWorld {
                 owner,
                 key_package_ref: format!("ref_{key_package_id}"),
                 key_package_hash: format!("hash_{key_package_id}"),
+                key_package_payload: fake_key_package_payload(key_package_id),
             })
             .unwrap();
         self.server.claim_key_package(key_package_id).unwrap();
@@ -208,6 +209,10 @@ fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
         welcome_payload: format!("welcome:{welcome_id}").into_bytes(),
         ratchet_tree_payload: format!("tree:{welcome_id}").into_bytes(),
     }
+}
+
+fn fake_key_package_payload(key_package_id: &str) -> Vec<u8> {
+    format!("key-package:{key_package_id}").into_bytes()
 }
 
 fn store_engine_error(error: StoreError) -> EngineError {
@@ -500,6 +505,37 @@ fn sqlite_create_dm_room_and_release_welcome_after_commit() {
     assert_eq!(stored_welcome.state, WelcomeState::Released);
     assert_eq!(stored_welcome.welcome_payload, b"welcome:welcome_bob_1");
     assert_eq!(stored_welcome.ratchet_tree_payload, b"tree:welcome_bob_1");
+}
+
+#[test]
+fn sqlite_key_package_payload_survives_reopen_and_claim() {
+    let mut world = SqliteWorld::direct_room();
+    world
+        .server
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: "kp_bob_1".to_string(),
+            owner: bob(),
+            key_package_ref: "ref_kp_bob_1".to_string(),
+            key_package_hash: "hash_kp_bob_1".to_string(),
+            key_package_payload: fake_key_package_payload("kp_bob_1"),
+        })
+        .unwrap();
+
+    let reopened = world.reopen();
+    let stored = key_package(&reopened, "kp_bob_1");
+    assert_eq!(
+        stored.key_package_payload,
+        fake_key_package_payload("kp_bob_1")
+    );
+
+    let mut reopened = world.reopen();
+    let claimed = reopened.claim_key_package("kp_bob_1").unwrap();
+    assert_eq!(claimed.key_package_ref, "ref_kp_bob_1");
+    assert_eq!(claimed.key_package_hash, "hash_kp_bob_1");
+    assert_eq!(
+        claimed.key_package_payload,
+        fake_key_package_payload("kp_bob_1")
+    );
 }
 
 #[test]
@@ -955,6 +991,7 @@ fn sqlite_direct_room_create_or_get_and_third_account_rejection() {
             owner: charlie(),
             key_package_ref: "ref_kp_charlie".to_string(),
             key_package_hash: "hash_kp_charlie".to_string(),
+            key_package_payload: fake_key_package_payload("kp_charlie"),
         })
         .unwrap();
     server.claim_key_package("kp_charlie").unwrap();
