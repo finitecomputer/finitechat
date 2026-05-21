@@ -163,20 +163,29 @@ not need to expose the external platform's raw identifier.
 
 ## Proposed Landing Shape
 
-Add a Finite Chat-backed mode in finitecomputer with five layers:
+The first finitecomputer canary should embed Finite Chat Rust crates directly in
+`finited` and `finitec`, while keeping the API shaped so a standalone daemon can
+be extracted later. Do not require a separate `finitechatd` process for the
+first canary; that would add a deployment, auth, logging, and upgrade surface
+before the protocol boundary has proved itself in the product.
+
+Add a Finite Chat-backed mode in finitecomputer with four immediate layers:
 
 1. `finitechat-proto`: shared DTOs used by dashboard server routes, finited,
    finitec, and tests.
 2. `finitechat-engine`: reducer/store used by `finited` in local/dev and by a
    future canary room server.
-3. `finitechatd`: local user daemon that owns device secrets, MLS state, sync,
-   projections, command ledger, and attachment download/upload.
-4. `finite`/`finitec` agent daemon: the portable process installed inside any
+3. `finite`/`finitec` agent daemon: the portable process installed inside any
    agent runtime. It owns the outbound connection, runtime device state,
    management command handlers, Hermes/agent adapters, heartbeat, and local
    capability reporting.
-5. `finitec encrypted-chat`: runtime/client commands that manage device state,
+4. `finitec encrypted-chat`: runtime/client commands that manage device state,
    KeyPackages, Welcome claim/ack, room sync, and Hermes gateway bridge.
+
+Later, extract `finitechatd` as the local user daemon that owns device secrets,
+MLS state, sync, projections, command ledger, and attachment download/upload.
+That extraction should be a packaging decision over an already-tested boundary,
+not a prerequisite for the first finitecomputer canary.
 
 The dashboard should keep the current `FiniteChat` component contract as long as
 possible. The server route can translate encrypted room state into the existing
@@ -300,3 +309,11 @@ Keep it boring:
    ordering.
 
 After that, add the room server API and dashboard local-loop feature flag.
+
+## Debt Hygiene
+
+Observed integration debt is tracked in
+`docs/technical-debt-ledger.md`. Before changing finitecomputer, update that
+ledger when a shortcut is introduced, narrowed, or deleted. The ledger is
+deliberately loud: every tolerated shortcut needs a source, risk, first proof,
+and delete condition.

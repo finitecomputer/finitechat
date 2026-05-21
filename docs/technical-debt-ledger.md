@@ -1,0 +1,38 @@
+# Technical Debt Ledger
+
+Status: active ledger.
+
+This file is where tolerated integration debt goes before it becomes product
+architecture by accident. A debt item is allowed only when it has:
+
+- an observed source;
+- why the shortcut is risky;
+- the first proof that keeps it bounded;
+- a delete condition.
+
+Do not call something "temporary" without a delete condition. Do not add a new
+finitecomputer integration shortcut without adding or updating a row here.
+
+## Finitecomputer Integration Debt
+
+| Debt | Observed Source | Why It Is Risky | First Proof | Delete Condition |
+| --- | --- | --- | --- | --- |
+| Plaintext relay and mirrored chat snapshots | `finited` exposes chat snapshot and SSE stream endpoints; `finitecomputer` docs call this Half-Moved | The snapshot can quietly become canonical chat state instead of a transition bridge | Finite Chat durable room-log store can replay the same dashboard DTOs from ordered encrypted events | Dashboard reads projection from durable Finite Chat room events; snapshot mirror is removed or becomes a derived cache with named source/invalidation |
+| File-backed relay commands | `finited` relay currently stores events/results outside the Finite Chat room sequencer | Command/result delivery can drift from room ordering, idempotency, and runtime command ledger rules | Runtime command request/result DTOs are tested through the Finite Chat reducer/store before finitecomputer integration | Runtime commands that affect chat/runtime state are ordered durable room events; relay callbacks only wake sync or carry hosted-runner admin events |
+| Plaintext `ChatRuntime` as canonical transcript | `finite-core::ChatRuntime` stores threads, messages, gateway inbox, and attachments in local SQLite | New protocol semantics can get bolted onto the old transcript schema, creating two chat models | Encrypted room projection can render the existing dashboard DTO contract without mutating plaintext `messages` | Plaintext `ChatRuntime` is read-only archive/fallback or deleted for canary Projects |
+| Stringly relay lanes and kinds | Dashboard relay calls use `{ lane, kind, payload }` strings such as `chat.send_message` and `runtime.inference.apply` | Command names and payloads can spread without typed validation or idempotency semantics | `finitechat-proto` owns typed command, topic, state, and message DTOs with invalid-data tests | Dashboard/server routes translate into typed Finite Chat events before runtime scheduling; untyped relay names are not the application protocol |
+| Runtime-local attachment bytes | Current chat attachments are stored under the runtime and can travel through relay JSON/base64 paths | Attachments are not portable across clients, and storage policy is mixed into chat transport | Blossom-compatible encrypted blob refs round-trip through Finite Chat tests | Chat messages carry encrypted blob references; dashboard/runtime no longer fetch plaintext attachment bytes from runtime-specific stores |
+| Dashboard status as request/response | Existing dashboard surfaces use runtime commands/status calls for some state | Page loads can become durable command spam and make "read status" look like "ask runtime to work" | `runtime.state.snapshot` projection tests prove non-notifying latest-state reads | Dashboard status cards read projected snapshots by state key; explicit refresh is a user command |
+| Hosted-runner admin mixed with portable commands | finitecomputer still has hosted operations for routes, auth policy, runner images, and emergency pod work | Portable Finite Chat can accidentally depend on Finite Computer's hosting substrate | Integration docs classify each surface as portable finitec command, runtime state snapshot, or hosted-runner admin | A self-managed agent with only `finitec` can use chat, topics, commands, attachments, and state snapshots without hosted-runner APIs |
+| Trusted-server hosted web decryption | Hosted finitecomputer web may use a server-side Rust Finite Chat client to decrypt and render DTOs | Product copy could imply E2EE where the hosted server has device secrets | Docs and UI copy call hosted mode "web chat" or "topics", not E2EE | E2EE language is used only for clients that keep Finite Chat device secrets on the user's device |
+| Premature separate `finitechatd` process | A standalone daemon is the long-term product shape, but the first canary can embed Rust crates | A new process adds auth, deployment, logging, upgrade, and local-debug burden before protocol fit is proven | Embedded crates expose a daemon-shaped API and pass local-loop restart tests | Extract `finitechatd` only after the embedded boundary has stable DTOs, sync ticks, command ledger, and storage layout |
+
+## Review Rule
+
+Before each finitecomputer integration checkpoint, review this ledger and answer:
+
+- Did this checkpoint add a new shortcut?
+- Did an existing shortcut gain a smaller delete condition?
+- Did tests prove the shortcut is still bounded?
+- Did any user-facing copy become less honest about hosted web versus true
+  end-to-end encryption?

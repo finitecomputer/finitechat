@@ -38,6 +38,8 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 - `docs/scenario-coverage.md`: named simulator scenarios proven so far.
 - `docs/storage-plan.md`: SQLite/Postgres/client-store decision record.
 - `docs/engineering-style.md`: local rules for debt, asserts, and invariants.
+- `docs/technical-debt-ledger.md`: observed finitecomputer integration debt,
+  risks, proofs, and delete conditions.
 
 ## First Checks
 
