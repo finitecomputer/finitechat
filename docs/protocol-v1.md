@@ -48,6 +48,13 @@ They are one account identity with per-device MLS participation.
 One MLS group plus one server-ordered log. V1 has exactly one authoritative
 server per room.
 
+`Conversation`
+
+An application-level session inside a room. A Hermes or finitecomputer "new
+chat" is a conversation, not a separate MLS group. Conversations do not define
+membership, encryption, ordering authority, or delivery boundaries; the room
+does.
+
 `Room Server`
 
 Delivery Service for KeyPackages, ordered room log entries, Welcomes, sessions,
@@ -106,6 +113,9 @@ durable sends.
 - Ephemeral activity events must be rejected unless the sending device is
   active, non-revoked, and currently a member at the room head. Pending invited
   devices and removed devices cannot send activity.
+- `conversation_id` is optional server-visible routing/index metadata scoped to
+  a room. It must not grant access, define identity, replace MLS membership, or
+  carry activity semantics.
 
 ## V1 Limits
 
@@ -299,11 +309,18 @@ events before decryption:
 - `ephemeral`: best-effort activity state, always `push_policy = never`, with a
   short explicit expiry.
 
+Both envelope classes may carry an optional cleartext `conversation_id`.
+Clients use it to place messages and live activity in the right app-level
+session without scanning every decrypted payload in a room. Rich conversation
+state such as title, preview text, runtime status, and activity kind remains in
+the encrypted payload.
+
 The encrypted activity payload owns the semantic kind. The server does not need
 to know whether an ephemeral event means typing, thinking, working, uploading,
 or another generic chat activity. The server-visible envelope carries only the
-fields needed to route and discard it: room id, sender device, delivery class,
-push policy, expiry, and bounded opaque MLS-protected bytes.
+fields needed to route and discard it: room id, optional conversation id,
+sender device, delivery class, push policy, expiry, and bounded opaque
+MLS-protected bytes.
 
 Ephemeral activity may be delivered over a live stream or short TTL cache, but
 it is not returned by durable room-log sync and cannot be used as a replay
