@@ -133,6 +133,7 @@ Proven client scenarios:
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
 - `sqlite_link_fanout_worker_survives_restart_after_prepared_commit`
 - `runtime_link_fanout_tick_links_later_device_after_submit_response_loss`
+- `runtime_link_fanout_tick_reprepares_after_same_epoch_loss`
 - `client_link_fanout_rejects_wrong_claim_before_pending_commit`
 - `client_rejects_tampered_remote_commit_without_epoch_advance`
 - `client_refuses_to_merge_pending_commit_before_server_observation`
@@ -255,6 +256,13 @@ Checkpoint test signal:
   the setup: Alice had already merged the setup Commit but the encrypted cursor
   still pointed at zero, so the worker tried to process an old epoch. The test
   now explicitly persists the setup cursors before starting fanout.
+- The same-epoch runtime fanout proof closes the retry hole around prepared
+  link adds. Alice prepares a later-device add, submit fails before reaching
+  the server, Bob wins the epoch with a self-update, Alice processes Bob's
+  ordered Commit and clears her losing pending Commit, then the fanout worker
+  reuses the still-leased claimed KeyPackage from encrypted fanout state,
+  prepares a fresh add at the new epoch, submits it, completes from the ordered
+  log, and the target device activates its Welcome.
 - The revocation checkpoint clones Charlie's client state before removal to
   model a stale/lost device. After Bob removes Charlie, that stale client can
   fetch and process the removal Commit, but the server rejects its old-epoch

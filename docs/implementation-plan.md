@@ -201,8 +201,9 @@ Current OpenMLS scope:
   replenishes KeyPackages, an existing device pages account rooms with bounded
   loops, claims one target-device package per room, persists the claimed package
   with the fanout plan, prepares durable add Commits, retries submit after
-  response loss, completes from the ordered log, and lets the target device
-  claim both Welcomes through the normal runtime sync tick.
+  response loss, re-prepares after same-epoch loss using the still-leased
+  claimed KeyPackage, completes from the ordered log, and lets the target
+  device claim Welcomes through the normal runtime sync tick.
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
@@ -314,8 +315,9 @@ Good tests:
   a fresh KeyPackage before rejection.
 - durable link-fanout tests prove a prepared MLS add Commit survives restart as
   an encrypted client snapshot replay value; runtime fanout proves submit
-  response loss converges through idempotent retry; a wrong KeyPackage claim is
-  rejected before local pending Commit mutation.
+  response loss converges, same-epoch loss reuses the retained KeyPackage claim
+  after rolling forward, and a wrong KeyPackage claim is rejected before local
+  pending Commit mutation.
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.

@@ -1813,6 +1813,7 @@ fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let mut delivery = UploadFailureDelivery {
         server: DeliveryService::new(),
         fail_first_upload_after_server_accept: true,
+        fail_first_submit_before_server_accept: false,
         fail_first_submit_after_server_accept: false,
     };
     let options = RuntimeSyncOptions {
@@ -2429,6 +2430,7 @@ fn runtime_link_fanout_tick_links_later_device_after_submit_response_loss() {
     let mut delivery = UploadFailureDelivery {
         server,
         fail_first_upload_after_server_accept: false,
+        fail_first_submit_before_server_accept: false,
         fail_first_submit_after_server_accept: true,
     };
     let options = RuntimeLinkFanoutOptions {
@@ -2561,6 +2563,142 @@ fn runtime_link_fanout_tick_links_later_device_after_submit_response_loss() {
         accepted_b_seq,
         room_b_plaintext,
     );
+}
+
+#[test]
+fn runtime_link_fanout_tick_reprepares_after_same_epoch_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_link_race");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_runtime_link_race");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut server = DeliveryService::new();
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime_link_race");
+    let room_id = "room_runtime_link_race";
+    let group_id = "mls_runtime_link_race";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_bob_runtime_link_race",
+            welcome_id: "welcome_bob_runtime_link_race",
+            idempotency_key: "add_bob_runtime_link_race",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let sync_options = RuntimeSyncOptions {
+        key_package_target_available: 1,
+        max_sync_pages_per_room: 4,
+    };
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut server,
+        &sync_options,
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 1);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_runtime_race",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let options = RuntimeLinkFanoutOptions {
+        max_discovery_pages_per_tick: 2,
+        max_commit_rooms_per_tick: 1,
+        max_completion_sync_pages_per_room: 4,
+    };
+    let mut delivery = UploadFailureDelivery {
+        server,
+        fail_first_upload_after_server_accept: false,
+        fail_first_submit_before_server_accept: true,
+        fail_first_submit_after_server_accept: false,
+    };
+
+    let err = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_runtime_race",
+        &options,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeWorkerError::Delivery(TestDeliveryError::InjectedSubmitBeforeServerAccept)
+    ));
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert!(alice_browser.has_pending_commit(room_id).unwrap());
+
+    let bob_winner = bob
+        .prepare_self_update_commit(room_id, "bob_runtime_link_race_wins")
+        .unwrap();
+    let bob_accepted = delivery.server.submit_commit(bob_winner.request).unwrap();
+    let page = delivery
+        .server
+        .sync_events(room_id, alice_browser.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(
+        alice_store
+            .apply_log_entry_and_save(&mut alice_browser, room_id, &page.entries[0])
+            .unwrap(),
+        Some(AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 2,
+        })
+    );
+    assert_eq!(bob_accepted.seq, bob_join_seq + 1);
+    assert!(!alice_browser.has_pending_commit(room_id).unwrap());
+
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_runtime_race",
+        &options,
+    )
+    .unwrap();
+    assert_eq!(report.claimed_key_packages, 0);
+    assert_eq!(report.prepared_commits, 1);
+    assert_eq!(report.submitted_commits, 1);
+    assert_eq!(report.completed_rooms, 1);
+    assert!(report.complete);
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: phone_add_seq,
+    } = alice_browser
+        .link_fanout_room_status("fanout_runtime_race", room_id)
+        .unwrap()
+    else {
+        panic!("race fanout did not complete");
+    };
+    assert_eq!(phone_add_seq, bob_accepted.seq + 1);
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery.server,
+        &sync_options,
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 1);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 1);
+    assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 3);
 }
 
 #[test]
@@ -3284,12 +3422,14 @@ fn send_bob_messages(
 enum TestDeliveryError {
     Engine(EngineError),
     InjectedAfterServerAccept,
+    InjectedSubmitBeforeServerAccept,
     InjectedSubmitAfterServerAccept,
 }
 
 struct UploadFailureDelivery {
     server: DeliveryService,
     fail_first_upload_after_server_accept: bool,
+    fail_first_submit_before_server_accept: bool,
     fail_first_submit_after_server_accept: bool,
 }
 
@@ -3331,6 +3471,10 @@ impl RuntimeDelivery for UploadFailureDelivery {
         &mut self,
         request: SubmitCommitRequest,
     ) -> Result<CommitAccepted, Self::Error> {
+        if self.fail_first_submit_before_server_accept {
+            self.fail_first_submit_before_server_accept = false;
+            return Err(TestDeliveryError::InjectedSubmitBeforeServerAccept);
+        }
         if self.fail_first_submit_after_server_accept {
             self.fail_first_submit_after_server_accept = false;
             self.server

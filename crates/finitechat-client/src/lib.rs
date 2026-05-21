@@ -1642,8 +1642,10 @@ impl FiniteChatDevice {
                 .iter()
                 .find(|room| room.plan.room_id == room_id)
                 .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
-            if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
-                return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string()));
+            match &room.status {
+                LinkFanoutRoomStatus::Pending => {}
+                LinkFanoutRoomStatus::Prepared { .. } if !self.has_pending_commit(room_id)? => {}
+                _ => return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string())),
             }
             (fanout.target_device.clone(), room.plan.clone())
         };
@@ -1691,8 +1693,10 @@ impl FiniteChatDevice {
                 .iter()
                 .find(|room| room.plan.room_id == room_id)
                 .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
-            if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
-                return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string()));
+            match &room.status {
+                LinkFanoutRoomStatus::Pending => {}
+                LinkFanoutRoomStatus::Prepared { .. } if !self.has_pending_commit(room_id)? => {}
+                _ => return Err(ClientError::LinkFanoutRoomNotPending(room_id.to_string())),
             }
             (fanout.target_device.clone(), room.plan.clone())
         };
@@ -1721,7 +1725,6 @@ impl FiniteChatDevice {
             .iter_mut()
             .find(|room| room.plan.room_id == room_id)
             .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
-        room.claimed_key_package = None;
         room.status = LinkFanoutRoomStatus::Prepared {
             prepared: Box::new(prepared.clone()),
         };
@@ -1761,6 +1764,7 @@ impl FiniteChatDevice {
             .iter_mut()
             .find(|room| room.plan.room_id == room_id)
             .ok_or_else(|| ClientError::LinkFanoutRoomNotFound(room_id.to_string()))?;
+        room.claimed_key_package = None;
         room.status = LinkFanoutRoomStatus::Done {
             accepted_seq: entry.seq,
         };
@@ -2223,7 +2227,7 @@ impl LinkFanoutState {
         for room in &self.rooms {
             room.validate_limits()?;
             if let Some(claimed_key_package) = &room.claimed_key_package {
-                if !matches!(room.status, LinkFanoutRoomStatus::Pending) {
+                if matches!(room.status, LinkFanoutRoomStatus::Done { .. }) {
                     return Err(ClientError::UnexpectedLinkFanoutClaim(
                         claimed_key_package.key_package_id.clone(),
                     ));
@@ -2787,6 +2791,12 @@ pub fn run_link_fanout_tick<D: RuntimeDelivery>(
     for room_id in &room_ids.pending {
         store.prepare_claimed_link_fanout_room_commit_and_save(device, fanout_id, room_id)?;
         report.record_prepared_commit()?;
+    }
+    for room_id in &room_ids.prepared {
+        if !device.has_pending_commit(room_id)? {
+            store.prepare_claimed_link_fanout_room_commit_and_save(device, fanout_id, room_id)?;
+            report.record_prepared_commit()?;
+        }
     }
     for room_id in room_ids.all_prepared() {
         let prepared = device.prepared_link_fanout_commit(fanout_id, &room_id)?;
