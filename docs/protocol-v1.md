@@ -73,7 +73,8 @@ thinking, working, uploading, or presence refreshes. The room server may route
 and cache it briefly, but it does not consume the canonical room sequence, is
 not durable history, and never creates unread state or push notifications.
 Ephemeral activity uses the same active-member authorization boundary as
-durable sends.
+durable sends. Senders refresh long-running activity by sending a newer
+activity event before expiry, and end it early with an explicit clear.
 
 ## Invariants
 
@@ -119,6 +120,10 @@ durable sends.
 - Client activity projection state is keyed by device first, then rolled up for
   identity-level UX. A specific device can be active without every device for
   that account or agent becoming active.
+- Ephemeral activity expiry is a lease. A newer activity event for the same
+  projection key replaces the previous expiry, and an explicit clear removes
+  the matching device-scoped activity before expiry. Clears must not remove
+  sibling devices or unrelated activity kinds.
 
 ## V1 Limits
 
@@ -141,6 +146,7 @@ These are protocol constants, not tuning hints:
 - ratchet-tree payload: `1 MiB`;
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
+- ephemeral activity expiry: `30 minutes` from server receipt;
 - idempotency key: `128` bytes;
 - account id, device id, room id, MLS group id, object ids: `128` bytes each.
 
@@ -330,6 +336,12 @@ it is not returned by durable room-log sync and cannot be used as a replay
 cursor. Clients must tolerate dropped, duplicated, reordered, or expired
 activity events. If an activity event arrives for an old epoch, a future epoch,
 or otherwise fails MLS processing, the client drops it without repair.
+
+Human typing indicators should use short expiries. Agent `thinking` or
+`working` indicators may last for minutes, but remain bounded by the v1 expiry
+limit. Long-running senders should refresh the activity while work continues
+and send an explicit clear when a durable message, command result, or terminal
+failure makes the intermediate state obsolete.
 
 The server authorizes ephemeral activity against its current device ledger and
 membership cache before forwarding or caching it. This check is not identity
