@@ -203,6 +203,9 @@ Current OpenMLS scope:
 - durable device-status revocation proof where revoked devices remain revoked
   across SQLite reopen and cannot upload or claim KeyPackages, claim or
   activate Welcomes, send application events, submit Commits, or be added again.
+- deterministic server-store operation fuzzer that applies the same generated
+  register/revoke, KeyPackage, Welcome, event, Commit, and retry operations to
+  the in-memory reducer and SQLite store, then compares resulting durable state.
 - same-epoch loser recovery proof where a losing client clears its pending
   Commit after observing the winner, rolls forward, retries when still a
   member, or becomes locally unable to send when the winning Commit removed it.
@@ -240,8 +243,9 @@ Current known gap:
   gating, and durable server-side device status. Production still needs policy
   and UX for who may revoke which device.
 - Same-epoch loser recovery is proven with real OpenMLS state for add/add,
-  update/update, remove-after-update, and removed-loser races. A larger
-  randomized operation-order fuzzer can still broaden confidence, but the core
+  update/update, remove-after-update, and removed-loser races. SQLite/reducer
+  parity now has randomized operation-order coverage; a larger real-MLS fuzzer
+  can still broaden client cryptographic-state confidence, but the core
   pending-Commit recovery branch is no longer add-only.
 - KeyPackage edge behavior is covered across real-client, sim, and SQLite
   suites. Production still needs background policy for how many packages each
@@ -299,6 +303,9 @@ Good tests:
 - revoked device status survives SQLite reopen and blocks KeyPackage
   replenishment/claim, pending Welcome claim/activation, application sends,
   Commits, and future add-device Commits.
+- randomized SQLite/reducer parity covers thousands of mixed control-plane
+  operations, including stale epochs, retries, duplicate KeyPackages,
+  revocations, Welcome ack attempts, and membership Commit failures.
 - same-epoch losers observe the accepted winner, clear pending local Commit
   state, retry from the new epoch when still members, and stop sending when the
   winning Commit removed them.

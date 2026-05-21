@@ -1,10 +1,11 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use finitechat_engine::{
-    AppendEventRequest, CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceStatus,
-    EngineError, KeyPackageRecord, LinkSessionRecord, LinkSessionState, ListAccountRoomsRequest,
-    RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, device, envelope,
-    idempotency_scope_key,
+    AppendEventRequest, CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest,
+    DeliveryService, DeviceStatus, EngineError, KeyPackageRecord, LinkSessionRecord,
+    LinkSessionState, ListAccountRoomsRequest, RoomRecord, SubmitCommitRequest,
+    UploadKeyPackageRequest, WelcomeRecord, device, envelope, idempotency_scope_key,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
@@ -214,6 +215,367 @@ impl SqliteWorld {
     }
 }
 
+struct DualDeliveryWorld {
+    _dir: TempDir,
+    memory: DeliveryService,
+    sqlite: SqliteDeliveryStore,
+    room_id: String,
+    group_id: String,
+    known_key_packages: BTreeSet<String>,
+    known_welcomes: BTreeSet<String>,
+    known_devices: Vec<DeviceRef>,
+    last_commit_request: Option<SubmitCommitRequest>,
+    last_event_request: Option<AppendEventRequest>,
+}
+
+impl DualDeliveryWorld {
+    fn new(seed: u64) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("finitechat_fuzz.sqlite3");
+        let mut memory = DeliveryService::new();
+        let mut sqlite = SqliteDeliveryStore::open(&db_path).unwrap();
+        let room_id = format!("room_fuzz_{seed}");
+        let group_id = format!("mls_fuzz_{seed}");
+        let create = CreateRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: group_id.clone(),
+            creator: alice(),
+        };
+        memory.create_room(create.clone()).unwrap();
+        sqlite.create_room(create).unwrap();
+        let world = Self {
+            _dir: dir,
+            memory,
+            sqlite,
+            room_id,
+            group_id,
+            known_key_packages: BTreeSet::new(),
+            known_welcomes: BTreeSet::new(),
+            known_devices: vec![alice(), bob(), charlie(), dana()],
+            last_commit_request: None,
+            last_event_request: None,
+        };
+        world.assert_equivalent();
+        world
+    }
+
+    fn register_device(&mut self, device: DeviceRef) {
+        let memory = self.memory.register_device(device.clone());
+        let sqlite = sqlite_result(self.sqlite.register_device(device));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn revoke_device(&mut self, device: DeviceRef) {
+        let memory = self.memory.revoke_device(device.clone());
+        let sqlite = sqlite_result(self.sqlite.revoke_device(device));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn upload_key_package(&mut self, owner: DeviceRef, key_package_id: &str) {
+        let request = upload_key_package_request(owner, key_package_id);
+        self.known_key_packages
+            .insert(request.key_package_id.clone());
+        let memory = self.memory.upload_key_package(request.clone());
+        let sqlite = sqlite_result(self.sqlite.upload_key_package(request));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn claim_key_package(&mut self, key_package_id: &str) {
+        self.known_key_packages.insert(key_package_id.to_string());
+        let memory = self.memory.claim_key_package(key_package_id);
+        let sqlite = sqlite_result(self.sqlite.claim_key_package(key_package_id));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn claim_key_packages_for_account(&mut self, account_id: &str) {
+        let memory = self.memory.claim_key_packages_for_account(account_id);
+        let sqlite = sqlite_result(self.sqlite.claim_key_packages_for_account(account_id));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn expire_key_package_lease(&mut self, key_package_id: &str) {
+        self.known_key_packages.insert(key_package_id.to_string());
+        let memory = self.memory.expire_key_package_lease(key_package_id);
+        let sqlite = sqlite_result(self.sqlite.expire_key_package_lease(key_package_id));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn claim_welcomes(&mut self, device: &DeviceRef) {
+        let memory = self.memory.claim_welcomes(device);
+        let sqlite = sqlite_result(self.sqlite.claim_welcomes(device));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) {
+        self.known_welcomes.insert(welcome_id.to_string());
+        let memory = self.memory.ack_welcome(welcome_id, activated);
+        let sqlite = sqlite_result(self.sqlite.ack_welcome(welcome_id, activated));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn append_event(&mut self, request: AppendEventRequest) {
+        self.last_event_request = Some(request.clone());
+        let memory = self.memory.append_event(request.clone());
+        let sqlite = sqlite_result(self.sqlite.append_event(request));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn retry_last_event(&mut self) {
+        if let Some(request) = self.last_event_request.clone() {
+            let memory = self.memory.append_event(request.clone());
+            let sqlite = sqlite_result(self.sqlite.append_event(request));
+            assert_eq!(memory, sqlite);
+            self.assert_equivalent();
+        }
+    }
+
+    fn submit_commit(&mut self, request: SubmitCommitRequest) {
+        self.remember_commit_artifacts(&request);
+        self.last_commit_request = Some(request.clone());
+        let memory = self.memory.submit_commit(request.clone());
+        let sqlite = sqlite_result(self.sqlite.submit_commit(request));
+        assert_eq!(memory, sqlite);
+        self.assert_equivalent();
+    }
+
+    fn retry_last_commit(&mut self) {
+        if let Some(request) = self.last_commit_request.clone() {
+            let memory = self.memory.submit_commit(request.clone());
+            let sqlite = sqlite_result(self.sqlite.submit_commit(request));
+            assert_eq!(memory, sqlite);
+            self.assert_equivalent();
+        }
+    }
+
+    fn add_request(
+        &self,
+        sender: DeviceRef,
+        target: DeviceRef,
+        key_package_id: &str,
+        welcome_id: &str,
+        expected_epoch: u64,
+        idempotency_key: &str,
+    ) -> SubmitCommitRequest {
+        let commit = envelope(
+            self.room_id.clone(),
+            self.group_id.clone(),
+            sender.clone(),
+            expected_epoch,
+            LogEntryKind::Commit,
+            format!(
+                "fuzz:add:{}:{}:{}",
+                target.account_id, target.device_id, idempotency_key
+            )
+            .into_bytes(),
+        );
+        let commit_message_id = commit.message_id().unwrap();
+        SubmitCommitRequest {
+            room_id: self.room_id.clone(),
+            sender,
+            expected_epoch,
+            envelope: commit,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: expected_epoch,
+                post_commit_epoch: expected_epoch + 1,
+                commit_message_id,
+                adds: vec![MembershipAddV1 {
+                    device: target,
+                    key_package_id: key_package_id.to_string(),
+                    key_package_ref: format!("ref_{key_package_id}"),
+                    key_package_hash: format!("hash_{key_package_id}"),
+                    welcome_id: welcome_id.to_string(),
+                }],
+                removes: vec![],
+            },
+            idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![staged_welcome(welcome_id)],
+        }
+    }
+
+    fn remove_request(
+        &self,
+        sender: DeviceRef,
+        target: DeviceRef,
+        expected_epoch: u64,
+        idempotency_key: &str,
+    ) -> SubmitCommitRequest {
+        let commit = envelope(
+            self.room_id.clone(),
+            self.group_id.clone(),
+            sender.clone(),
+            expected_epoch,
+            LogEntryKind::Commit,
+            format!(
+                "fuzz:remove:{}:{}:{}",
+                target.account_id, target.device_id, idempotency_key
+            )
+            .into_bytes(),
+        );
+        let commit_message_id = commit.message_id().unwrap();
+        SubmitCommitRequest {
+            room_id: self.room_id.clone(),
+            sender,
+            expected_epoch,
+            envelope: commit,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: expected_epoch,
+                post_commit_epoch: expected_epoch + 1,
+                commit_message_id,
+                adds: vec![],
+                removes: vec![MembershipRemoveV1 {
+                    device: target,
+                    removed_leaf_index: 1,
+                }],
+            },
+            idempotency_key: idempotency_key.to_string(),
+            staged_welcomes: vec![],
+        }
+    }
+
+    fn event_request(
+        &self,
+        sender: DeviceRef,
+        epoch: u64,
+        idempotency_key: &str,
+    ) -> AppendEventRequest {
+        AppendEventRequest {
+            room_id: self.room_id.clone(),
+            sender: sender.clone(),
+            envelope: envelope(
+                self.room_id.clone(),
+                self.group_id.clone(),
+                sender,
+                epoch,
+                LogEntryKind::Application,
+                format!("fuzz:event:{idempotency_key}").into_bytes(),
+            ),
+            idempotency_key: idempotency_key.to_string(),
+        }
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.memory.room(&self.room_id).unwrap().current_epoch
+    }
+
+    fn maybe_stale_epoch(&self, stale: bool) -> u64 {
+        let current_epoch = self.current_epoch();
+        if stale && current_epoch > 0 {
+            current_epoch - 1
+        } else {
+            current_epoch
+        }
+    }
+
+    fn remember_commit_artifacts(&mut self, request: &SubmitCommitRequest) {
+        for add in &request.membership_delta.adds {
+            self.known_key_packages.insert(add.key_package_id.clone());
+            self.known_welcomes.insert(add.welcome_id.clone());
+        }
+    }
+
+    fn assert_equivalent(&self) {
+        assert_eq!(
+            self.memory.room(&self.room_id),
+            self.sqlite.room(&self.room_id).unwrap().as_ref()
+        );
+        for key_package_id in &self.known_key_packages {
+            assert_eq!(
+                self.memory.key_package(key_package_id),
+                self.sqlite.key_package(key_package_id).unwrap().as_ref()
+            );
+        }
+        for welcome_id in &self.known_welcomes {
+            assert_eq!(
+                self.memory.welcome(welcome_id),
+                self.sqlite.welcome(welcome_id).unwrap().as_ref()
+            );
+        }
+        for device in &self.known_devices {
+            assert_eq!(
+                self.memory.device(device),
+                self.sqlite.device(device).unwrap().as_ref()
+            );
+        }
+    }
+}
+
+fn sqlite_result<T>(result: Result<T, StoreError>) -> Result<T, EngineError> {
+    result.map_err(store_engine_error)
+}
+
+fn upload_key_package_request(owner: DeviceRef, key_package_id: &str) -> UploadKeyPackageRequest {
+    UploadKeyPackageRequest {
+        key_package_id: key_package_id.to_string(),
+        owner,
+        key_package_ref: format!("ref_{key_package_id}"),
+        key_package_hash: format!("hash_{key_package_id}"),
+        key_package_payload: fake_key_package_payload(key_package_id),
+    }
+}
+
+struct Lcg {
+    state: u64,
+}
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.state
+    }
+
+    fn next_usize(&mut self, modulo: usize) -> usize {
+        debug_assert!(modulo > 0);
+        (self.next_u64() % modulo as u64) as usize
+    }
+
+    fn next_bool(&mut self) -> bool {
+        self.next_usize(2) == 0
+    }
+}
+
+fn fuzz_device(index: usize) -> DeviceRef {
+    match index % 4 {
+        0 => alice(),
+        1 => bob(),
+        2 => charlie(),
+        _ => dana(),
+    }
+}
+
+fn fuzz_device_label(device: &DeviceRef) -> &'static str {
+    match device.device_id.as_str() {
+        "alice_browser" => "alice",
+        "bob_runtime" => "bob",
+        "charlie_phone" => "charlie",
+        "dana_tablet" => "dana",
+        _ => "device",
+    }
+}
+
+fn fuzz_key_package_id(device: &DeviceRef, slot: usize) -> String {
+    format!("kp_fuzz_{}_{}", fuzz_device_label(device), slot % 4)
+}
+
+fn fuzz_welcome_id(device: &DeviceRef, slot: usize) -> String {
+    format!("welcome_fuzz_{}_{}", fuzz_device_label(device), slot % 4)
+}
+
 fn alice() -> DeviceRef {
     device("alice_npub", "alice_browser")
 }
@@ -224,6 +586,10 @@ fn bob() -> DeviceRef {
 
 fn charlie() -> DeviceRef {
     device("charlie_npub", "charlie_phone")
+}
+
+fn dana() -> DeviceRef {
+    device("dana_npub", "dana_tablet")
 }
 
 fn staged_welcome(welcome_id: &str) -> StagedWelcomeV1 {
@@ -803,6 +1169,85 @@ fn sqlite_revoked_device_blocks_welcome_activation_and_sends_after_reopen() {
         EngineError::DeviceRevoked(bob())
     );
     assert!(!room(&reopened, &claimed_world.room_id).device_active_at_head(&bob()));
+}
+
+#[test]
+fn sqlite_operation_fuzz_matches_in_memory_delivery_service() {
+    for seed in 1..=32 {
+        run_sqlite_operation_fuzz(seed);
+    }
+}
+
+fn run_sqlite_operation_fuzz(seed: u64) {
+    const STEPS: usize = 64;
+
+    let mut world = DualDeliveryWorld::new(seed);
+    let bootstrap_key_package = format!("kp_fuzz_bootstrap_bob_{seed}");
+    let bootstrap_welcome = format!("welcome_fuzz_bootstrap_bob_{seed}");
+    world.upload_key_package(bob(), &bootstrap_key_package);
+    world.claim_key_package(&bootstrap_key_package);
+    let bootstrap = world.add_request(
+        alice(),
+        bob(),
+        &bootstrap_key_package,
+        &bootstrap_welcome,
+        0,
+        &format!("fuzz_bootstrap_add_bob_{seed}"),
+    );
+    world.submit_commit(bootstrap);
+    world.claim_welcomes(&bob());
+    world.ack_welcome(&bootstrap_welcome, true);
+
+    let mut rng = Lcg::new(seed);
+    for step in 0..STEPS {
+        let device = fuzz_device(rng.next_usize(4));
+        let slot = rng.next_usize(4);
+        let key_package_id = fuzz_key_package_id(&device, slot);
+        let welcome_id = fuzz_welcome_id(&device, slot);
+        let idempotency_key = format!("fuzz_{seed}_{step}");
+        match rng.next_usize(13) {
+            0 => world.register_device(device),
+            1 => world.revoke_device(device),
+            2 => world.upload_key_package(device, &key_package_id),
+            3 => world.claim_key_package(&key_package_id),
+            4 => world.claim_key_packages_for_account(&device.account_id),
+            5 => world.expire_key_package_lease(&key_package_id),
+            6 => {
+                let sender = fuzz_device(rng.next_usize(4));
+                let expected_epoch = world.maybe_stale_epoch(rng.next_usize(4) == 0);
+                let request = world.add_request(
+                    sender,
+                    device,
+                    &key_package_id,
+                    &welcome_id,
+                    expected_epoch,
+                    &format!("{idempotency_key}_add"),
+                );
+                world.submit_commit(request);
+            }
+            7 => world.claim_welcomes(&device),
+            8 => world.ack_welcome(&welcome_id, rng.next_bool()),
+            9 => {
+                let epoch = world.maybe_stale_epoch(rng.next_usize(4) == 0);
+                let request =
+                    world.event_request(device, epoch, &format!("{idempotency_key}_event"));
+                world.append_event(request);
+            }
+            10 => {
+                let sender = fuzz_device(rng.next_usize(4));
+                let expected_epoch = world.maybe_stale_epoch(rng.next_usize(4) == 0);
+                let request = world.remove_request(
+                    sender,
+                    device,
+                    expected_epoch,
+                    &format!("{idempotency_key}_remove"),
+                );
+                world.submit_commit(request);
+            }
+            11 => world.retry_last_commit(),
+            _ => world.retry_last_event(),
+        }
+    }
 }
 
 #[test]

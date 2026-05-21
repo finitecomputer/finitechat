@@ -308,6 +308,7 @@ Proven SQLite restart scenarios:
 - `sqlite_duplicate_message_id_is_typed_engine_error`
 - `sqlite_link_payload_limit_is_rejected`
 - `sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay`
+- `sqlite_operation_fuzz_matches_in_memory_delivery_service`
 - `sqlite_commit_crash_matrix_rolls_back_and_retry_converges`
 - `sqlite_commit_epoch_unique_index_blocks_second_commit_row`
 
@@ -317,6 +318,15 @@ consumption, Welcome release, and idempotency record insert. It then reopens the
 store, retries the same Commit, and verifies convergence to one log entry, one
 epoch advance, correct membership intervals, consumed KeyPackages, released
 Welcomes, and a replayable idempotency result.
+
+The SQLite operation fuzzer applies the same deterministic sequence to the
+in-memory reducer and SQLite store, then compares room, device, KeyPackage, and
+Welcome state after every operation. It mixes register/revoke, upload/claim,
+account claim, lease expiry, Welcome claim/ack, app events, add/remove Commits,
+stale epochs, and exact idempotent retries. The first version caught a real
+reducer/store drift: explicit claim of a leased KeyPackage owned by a revoked
+device returned `KeyPackageUnavailable` in memory but `DeviceRevoked` in
+SQLite. The store now matches the reducer ordering.
 
 Push outbox rows are not implemented yet; when they land, this matrix should add
 a failure point after outbox enqueue and assert exactly one durable wake record.

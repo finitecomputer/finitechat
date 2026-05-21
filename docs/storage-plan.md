@@ -80,6 +80,8 @@ It proves:
 - same-epoch Commit losers cannot create duplicate log rows or Welcomes;
 - device revocation status survives reopen and blocks new server-mediated
   device material or mutations;
+- randomized in-memory-vs-SQLite operation sequences stay state-equivalent
+  across mixed accepted/rejected mutations and exact idempotent retries;
 - KeyPackage leases, consumption, and opaque payload bytes survive reopen;
 - account-level KeyPackage fanout claims return one available package per
   device and persist the leases across reopen;

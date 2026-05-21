@@ -218,7 +218,6 @@ impl SqliteDeliveryStore {
         let key_package_id = key_package_id.to_string();
         self.with_transaction(|tx| {
             let package = load_key_package_required(tx, &key_package_id)?;
-            ensure_device_not_revoked(tx, &package.owner)?;
             claim_available_key_package(tx, package)
         })
     }
@@ -966,6 +965,7 @@ fn claim_available_key_package(
         }
         .into());
     }
+    ensure_device_not_revoked(tx, &package.owner)?;
     validate_key_package_payload(&package.key_package_payload)?;
 
     let lease_token = lease_token_for(&package.key_package_id, &package.owner);
