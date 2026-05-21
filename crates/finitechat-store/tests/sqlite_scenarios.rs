@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use finitechat_engine::{
-    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, EngineError, KeyPackageRecord,
-    LinkSessionRecord, LinkSessionState, ListAccountRoomsRequest, RoomRecord, SubmitCommitRequest,
-    UploadKeyPackageRequest, WelcomeRecord, device, envelope, idempotency_scope_key,
+    AppendEventRequest, CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceStatus,
+    EngineError, KeyPackageRecord, LinkSessionRecord, LinkSessionState, ListAccountRoomsRequest,
+    RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, device, envelope,
+    idempotency_scope_key,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
@@ -181,6 +182,28 @@ impl SqliteWorld {
         }
     }
 
+    fn app_message_request(
+        &self,
+        sender: DeviceRef,
+        epoch: u64,
+        body: &str,
+        idempotency_key: &str,
+    ) -> AppendEventRequest {
+        AppendEventRequest {
+            room_id: self.room_id.clone(),
+            sender: sender.clone(),
+            envelope: envelope(
+                self.room_id.clone(),
+                self.group_id.clone(),
+                sender,
+                epoch,
+                LogEntryKind::Application,
+                body.as_bytes().to_vec(),
+            ),
+            idempotency_key: idempotency_key.to_string(),
+        }
+    }
+
     fn provision_bob(&mut self) {
         self.upload_and_claim(bob(), "kp_bob_1");
         let request =
@@ -244,6 +267,13 @@ fn room(store: &SqliteDeliveryStore, room_id: &str) -> RoomRecord {
 
 fn key_package(store: &SqliteDeliveryStore, key_package_id: &str) -> KeyPackageRecord {
     store.key_package(key_package_id).unwrap().unwrap()
+}
+
+fn device_record(
+    store: &SqliteDeliveryStore,
+    device: &DeviceRef,
+) -> finitechat_engine::DeviceRecord {
+    store.device(device).unwrap().unwrap()
 }
 
 fn welcome(store: &SqliteDeliveryStore, welcome_id: &str) -> WelcomeRecord {
@@ -618,6 +648,52 @@ fn sqlite_account_key_package_claim_survives_reopen() {
 }
 
 #[test]
+fn sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages() {
+    let mut world = SqliteWorld::direct_room();
+    upload_available_key_package(&mut world.server, bob(), "kp_bob_revoked_1");
+    world.server.revoke_device(bob()).unwrap();
+
+    let mut reopened = world.reopen();
+
+    assert_eq!(
+        device_record(&reopened, &bob()).status,
+        DeviceStatus::Revoked
+    );
+    assert_eq!(
+        store_engine_error(
+            reopened
+                .upload_key_package(UploadKeyPackageRequest {
+                    key_package_id: "kp_bob_revoked_2".to_string(),
+                    owner: bob(),
+                    key_package_ref: "ref_kp_bob_revoked_2".to_string(),
+                    key_package_hash: "hash_kp_bob_revoked_2".to_string(),
+                    key_package_payload: fake_key_package_payload("kp_bob_revoked_2"),
+                })
+                .unwrap_err()
+        ),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert_eq!(
+        store_engine_error(reopened.claim_key_package("kp_bob_revoked_1").unwrap_err()),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert!(
+        reopened
+            .claim_key_packages_for_account(&bob().account_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        key_package(&reopened, "kp_bob_revoked_1").state,
+        KeyPackageState::Available
+    );
+    assert_eq!(
+        store_engine_error(reopened.register_device(bob()).unwrap_err()),
+        EngineError::DeviceRevoked(bob())
+    );
+}
+
+#[test]
 fn sqlite_claimed_welcome_payload_survives_reopen() {
     let mut world = SqliteWorld::direct_room();
     world.upload_and_claim(bob(), "kp_bob_1");
@@ -642,6 +718,91 @@ fn sqlite_claimed_welcome_payload_survives_reopen() {
     assert_eq!(stored_welcome.state, WelcomeState::Claimed);
     assert_eq!(stored_welcome.welcome_payload, b"welcome:welcome_bob_1");
     assert_eq!(stored_welcome.ratchet_tree_payload, b"tree:welcome_bob_1");
+}
+
+#[test]
+fn sqlite_revoked_device_blocks_welcome_activation_and_sends_after_reopen() {
+    let mut pending_world = SqliteWorld::direct_room();
+    pending_world.upload_and_claim(bob(), "kp_bob_revoked_welcome");
+    let add_pending = pending_world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_revoked_welcome",
+        "welcome_bob_revoked",
+        0,
+        "add_bob_revoked_welcome",
+    );
+    pending_world.server.submit_commit(add_pending).unwrap();
+    pending_world.server.revoke_device(bob()).unwrap();
+    let mut reopened = pending_world.reopen();
+    assert_eq!(
+        store_engine_error(reopened.claim_welcomes(&bob()).unwrap_err()),
+        EngineError::DeviceRevoked(bob())
+    );
+
+    let mut active_world = SqliteWorld::direct_room();
+    active_world.upload_and_claim(bob(), "kp_bob_active_revoked");
+    let add_active = active_world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_active_revoked",
+        "welcome_bob_active_revoked",
+        0,
+        "add_bob_active_revoked",
+    );
+    active_world.server.submit_commit(add_active).unwrap();
+    let claimed = active_world.server.claim_welcomes(&bob()).unwrap();
+    assert_eq!(claimed.len(), 1);
+    active_world
+        .server
+        .ack_welcome("welcome_bob_active_revoked", true)
+        .unwrap();
+    active_world.server.revoke_device(bob()).unwrap();
+
+    let mut reopened = active_world.reopen();
+    assert_eq!(
+        store_engine_error(
+            reopened
+                .append_event(active_world.app_message_request(
+                    bob(),
+                    1,
+                    "revoked send",
+                    "revoked_send"
+                ))
+                .unwrap_err()
+        ),
+        EngineError::DeviceRevoked(bob())
+    );
+    let remove = active_world.remove_device_request(bob(), alice(), 1, "revoked_commit");
+    assert_eq!(
+        store_engine_error(reopened.submit_commit(remove).unwrap_err()),
+        EngineError::DeviceRevoked(bob())
+    );
+
+    let mut claimed_world = SqliteWorld::direct_room();
+    claimed_world.upload_and_claim(bob(), "kp_bob_claimed_then_revoked");
+    let add_claimed = claimed_world.add_device_request(
+        alice(),
+        bob(),
+        "kp_bob_claimed_then_revoked",
+        "welcome_bob_claimed_then_revoked",
+        0,
+        "add_bob_claimed_then_revoked",
+    );
+    claimed_world.server.submit_commit(add_claimed).unwrap();
+    let claimed = claimed_world.server.claim_welcomes(&bob()).unwrap();
+    assert_eq!(claimed.len(), 1);
+    claimed_world.server.revoke_device(bob()).unwrap();
+    let mut reopened = claimed_world.reopen();
+    assert_eq!(
+        store_engine_error(
+            reopened
+                .ack_welcome("welcome_bob_claimed_then_revoked", true)
+                .unwrap_err()
+        ),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert!(!room(&reopened, &claimed_world.room_id).device_active_at_head(&bob()));
 }
 
 #[test]

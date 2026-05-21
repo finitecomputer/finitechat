@@ -64,7 +64,7 @@ fn client_state_machine_adds_device_and_decrypts_application_message() {
     assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
     assert!(!alice.has_pending_commit(ROOM_ID).unwrap());
 
-    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref()).unwrap();
     assert_eq!(claimed_welcomes.len(), 1);
     bob.activate_welcome(
         ROOM_ID,
@@ -533,7 +533,7 @@ fn sqlite_client_welcome_activation_is_durable_before_server_ack() {
         .merge_pending_commit_from_log(ROOM_ID, &alice_page.entries, &prepared.message_id)
         .unwrap();
 
-    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref()).unwrap();
     let welcome = claimed_welcomes
         .iter()
         .find(|welcome| welcome.welcome_id == "welcome_resume_bob")
@@ -616,7 +616,7 @@ fn sqlite_client_claimed_welcome_survives_restart_before_activation() {
         .merge_pending_commit_from_log(ROOM_ID, &alice_page.entries, &prepared.message_id)
         .unwrap();
 
-    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref()).unwrap();
     let welcome = claimed_welcomes
         .iter()
         .find(|welcome| welcome.welcome_id == "welcome_pending_bob")
@@ -628,7 +628,7 @@ fn sqlite_client_claimed_welcome_survives_restart_before_activation() {
 
     let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
     assert_eq!(bob.pending_welcome_count(), 1);
-    assert_eq!(server.claim_welcomes(bob.device_ref()).len(), 0);
+    assert_eq!(server.claim_welcomes(bob.device_ref()).unwrap().len(), 0);
     assert_eq!(
         bob_store
             .activate_pending_welcome_and_save(&mut bob, "welcome_pending_bob")
@@ -700,7 +700,7 @@ fn sqlite_client_failed_pending_welcome_activation_keeps_inbox_entry() {
         .unwrap();
     server.submit_commit(prepared.request).unwrap();
 
-    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref()).unwrap();
     let mut welcome = claimed_welcomes
         .iter()
         .find(|welcome| welcome.welcome_id == "welcome_pending_retry_bob")
@@ -761,6 +761,7 @@ fn sqlite_client_apply_log_entry_persists_cursor_and_skips_replay_after_restart(
         .unwrap();
     let welcome = server
         .claim_welcomes(bob.device_ref())
+        .unwrap()
         .into_iter()
         .find(|welcome| welcome.welcome_id == "welcome_sync_bob")
         .unwrap();
@@ -2046,7 +2047,7 @@ fn sqlite_link_fanout_worker_survives_restart_after_prepared_commit() {
             .unwrap()
     );
 
-    let claimed_welcomes = server.claim_welcomes(alice_phone.device_ref());
+    let claimed_welcomes = server.claim_welcomes(alice_phone.device_ref()).unwrap();
     assert_eq!(claimed_welcomes.len(), 2);
     let welcome_a = claimed_welcomes
         .iter()
@@ -2305,7 +2306,7 @@ fn client_rejects_tampered_ratchet_tree_before_ack() {
         .unwrap();
     server.submit_commit(prepared.request).unwrap();
 
-    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref()).unwrap();
     let mut tampered_tree = claimed_welcomes[0].ratchet_tree_payload.clone();
     let last = tampered_tree.len() - 1;
     tampered_tree[last] ^= 0x01;
@@ -2400,7 +2401,7 @@ fn claim_and_activate_room(
     room_id: &str,
     welcome_id: &str,
 ) -> u64 {
-    let claimed_welcomes = server.claim_welcomes(device.device_ref());
+    let claimed_welcomes = server.claim_welcomes(device.device_ref()).unwrap();
     let welcome = claimed_welcomes
         .into_iter()
         .find(|welcome| welcome.welcome_id == welcome_id)

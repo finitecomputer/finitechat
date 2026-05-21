@@ -110,6 +110,17 @@ Session:
 - `POST /v1/session/challenge`
 - `POST /v1/session/login`
 - `POST /v1/devices`
+- `POST /v1/devices/{device_id}/revoke`
+
+Device records are a server-side control-plane ledger, not identity proof.
+Clients still decide whether a device identity is valid by verifying its
+Nostr-rooted MLS credential. The server records only whether a device is
+currently usable for server mutations. Revocation is terminal in v1: a revoked
+device cannot upload or claim KeyPackages, claim or activate Welcomes, create
+rooms, send application events, submit Commits, or be added to a room again.
+MLS remove Commits are still required for the cryptographic cutoff; the device
+status ledger prevents the revoked install from acquiring new server-mediated
+material while room removals fan out.
 
 KeyPackages:
 

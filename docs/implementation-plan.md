@@ -200,6 +200,9 @@ Current OpenMLS scope:
 - stale removed-device proof where a device using pre-removal MLS state can
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
+- durable device-status revocation proof where revoked devices remain revoked
+  across SQLite reopen and cannot upload or claim KeyPackages, claim or
+  activate Welcomes, send application events, submit Commits, or be added again.
 - same-epoch loser recovery proof where a losing client clears its pending
   Commit after observing the winner, rolls forward, retries when still a
   member, or becomes locally unable to send when the winning Commit removed it.
@@ -233,9 +236,9 @@ Current known gap:
   device-add rejection, and the client persists fanout progress plus prepared
   Commit retry state. Production still needs the finitecomputer runtime command
   loop that drives this worker against real server APIs.
-- Removal/revocation is proven for stale local MLS state and server delivery
-  gating. Production still needs policy and UX for who may revoke which device,
-  plus durable device-status records.
+- Removal/revocation is proven for stale local MLS state, server delivery
+  gating, and durable server-side device status. Production still needs policy
+  and UX for who may revoke which device.
 - Same-epoch loser recovery is proven with real OpenMLS state for add/add,
   update/update, remove-after-update, and removed-loser races. A larger
   randomized operation-order fuzzer can still broaden confidence, but the core
@@ -293,6 +296,9 @@ Good tests:
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.
+- revoked device status survives SQLite reopen and blocks KeyPackage
+  replenishment/claim, pending Welcome claim/activation, application sends,
+  Commits, and future add-device Commits.
 - same-epoch losers observe the accepted winner, clear pending local Commit
   state, retry from the new epoch when still members, and stop sending when the
   winning Commit removed them.

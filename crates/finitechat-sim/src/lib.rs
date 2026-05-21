@@ -243,7 +243,7 @@ impl SimWorld {
     }
 
     pub fn activate_device(&mut self, welcome_id: &str, device: DeviceRef) -> Result<()> {
-        let welcomes = self.server.claim_welcomes(&device);
+        let welcomes = self.server.claim_welcomes(&device)?;
         if !welcomes
             .iter()
             .any(|welcome| welcome.welcome_id == welcome_id)

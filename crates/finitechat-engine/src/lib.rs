@@ -19,6 +19,8 @@ use thiserror::Error;
 pub struct DeliveryService {
     rooms: BTreeMap<RoomId, RoomRecord>,
     direct_rooms: BTreeMap<String, RoomId>,
+    #[serde(default)]
+    devices: BTreeMap<String, DeviceRecord>,
     key_packages: BTreeMap<KeyPackageId, KeyPackageRecord>,
     welcomes: BTreeMap<WelcomeId, WelcomeRecord>,
     link_sessions: BTreeMap<LinkSessionId, LinkSessionRecord>,
@@ -55,6 +57,19 @@ pub struct MembershipInterval {
     pub start_seq: Seq,
     pub end_seq: Option<Seq>,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    pub device: DeviceRef,
+    pub status: DeviceStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +389,10 @@ impl DeliveryService {
         self.key_packages.get(key_package_id)
     }
 
+    pub fn device(&self, device: &DeviceRef) -> Option<&DeviceRecord> {
+        self.devices.get(&device_registry_key(device))
+    }
+
     pub fn welcome(&self, welcome_id: &str) -> Option<&WelcomeRecord> {
         self.welcomes.get(welcome_id)
     }
@@ -384,6 +403,7 @@ impl DeliveryService {
 
     pub fn create_room(&mut self, request: CreateRoomRequest) -> Result<(), EngineError> {
         request.validate_limits()?;
+        self.observe_active_device(&request.creator)?;
         if self.rooms.contains_key(&request.room_id) {
             return Err(EngineError::RoomAlreadyExists(request.room_id));
         }
@@ -421,6 +441,7 @@ impl DeliveryService {
         request: CreateDirectRoomRequest,
     ) -> Result<RoomId, EngineError> {
         request.validate_limits()?;
+        self.observe_active_device(&request.creator)?;
         let key = direct_room_key(&request.creator.account_id, &request.other_account_id);
         let direct_key = direct_room_key_string(&key);
         if let Some(room_id) = self.direct_rooms.get(&direct_key) {
@@ -460,11 +481,45 @@ impl DeliveryService {
         Ok(request.room_id)
     }
 
+    pub fn register_device(&mut self, device: DeviceRef) -> Result<(), EngineError> {
+        device.validate_limits()?;
+        let key = device_registry_key(&device);
+        if let Some(record) = self.devices.get(&key) {
+            debug_assert_eq!(record.device, device);
+            if record.status == DeviceStatus::Revoked {
+                return Err(EngineError::DeviceRevoked(device));
+            }
+            return Ok(());
+        }
+        self.devices.insert(
+            key,
+            DeviceRecord {
+                device,
+                status: DeviceStatus::Active,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn revoke_device(&mut self, device: DeviceRef) -> Result<(), EngineError> {
+        device.validate_limits()?;
+        let key = device_registry_key(&device);
+        self.devices.insert(
+            key,
+            DeviceRecord {
+                device,
+                status: DeviceStatus::Revoked,
+            },
+        );
+        Ok(())
+    }
+
     pub fn upload_key_package(
         &mut self,
         request: UploadKeyPackageRequest,
     ) -> Result<(), EngineError> {
         request.validate_limits()?;
+        self.observe_active_device(&request.owner)?;
         if self.key_packages.contains_key(&request.key_package_id) {
             return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id));
         }
@@ -498,6 +553,7 @@ impl DeliveryService {
                 state: package.state,
             });
         }
+        ensure_device_not_revoked(&self.devices, &package.owner)?;
         validate_key_package_payload(&package.key_package_payload)?;
         let lease_token = lease_token_for(key_package_id, &package.owner);
         package.state = KeyPackageState::Leased;
@@ -521,6 +577,7 @@ impl DeliveryService {
             .filter(|(_, package)| {
                 package.owner.account_id == account_id
                     && package.state == KeyPackageState::Available
+                    && !device_is_revoked(&self.devices, &package.owner)
             })
             .collect::<Vec<_>>();
         available_packages.sort_by(|(left_id, left), (right_id, right)| {
@@ -668,6 +725,7 @@ impl DeliveryService {
         &mut self,
         request: AppendEventRequest,
     ) -> Result<EventAccepted, EngineError> {
+        ensure_device_not_revoked(&self.devices, &request.sender)?;
         let room = self
             .rooms
             .get_mut(&request.room_id)
@@ -711,6 +769,7 @@ impl DeliveryService {
         &mut self,
         request: SubmitCommitRequest,
     ) -> Result<CommitAccepted, EngineError> {
+        ensure_device_not_revoked(&self.devices, &request.sender)?;
         let actual_commit_message_id = request.envelope.message_id()?;
         request
             .membership_delta
@@ -828,7 +887,12 @@ impl DeliveryService {
         })
     }
 
-    pub fn claim_welcomes(&mut self, device: &DeviceRef) -> Vec<WelcomeRecord> {
+    pub fn claim_welcomes(
+        &mut self,
+        device: &DeviceRef,
+    ) -> Result<Vec<WelcomeRecord>, EngineError> {
+        device.validate_limits()?;
+        ensure_device_not_revoked(&self.devices, device)?;
         let mut claimed = Vec::new();
         for welcome in self.welcomes.values_mut() {
             if claimed.len() >= MAX_WELCOME_CLAIMS_PER_REQUEST as usize {
@@ -839,10 +903,19 @@ impl DeliveryService {
                 claimed.push(welcome.clone());
             }
         }
-        claimed
+        Ok(claimed)
     }
 
     pub fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), EngineError> {
+        if activated {
+            let recipient = self
+                .welcomes
+                .get(welcome_id)
+                .ok_or_else(|| EngineError::WelcomeNotFound(welcome_id.to_string()))?
+                .recipient
+                .clone();
+            ensure_device_not_revoked(&self.devices, &recipient)?;
+        }
         let welcome = self
             .welcomes
             .get_mut(welcome_id)
@@ -1099,6 +1172,7 @@ impl DeliveryService {
         let mut seen_packages = BTreeSet::new();
         let mut added_devices_by_account = BTreeMap::<AccountId, usize>::new();
         for add in &delta.adds {
+            ensure_device_not_revoked(&self.devices, &add.device)?;
             if let Some((left, right)) = &room.direct_accounts
                 && add.device.account_id != *left
                 && add.device.account_id != *right
@@ -1186,6 +1260,16 @@ impl DeliveryService {
                 max_records: MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
             })
         }
+    }
+
+    fn observe_active_device(&mut self, device: &DeviceRef) -> Result<(), EngineError> {
+        ensure_device_not_revoked(&self.devices, device)?;
+        let key = device_registry_key(device);
+        self.devices.entry(key).or_insert_with(|| DeviceRecord {
+            device: device.clone(),
+            status: DeviceStatus::Active,
+        });
+        Ok(())
     }
 }
 
@@ -1317,6 +1401,8 @@ pub enum EngineError {
     DuplicateKeyPackage(KeyPackageId),
     #[error("device is already current or pending in room: {0:?}")]
     DeviceAlreadyInRoom(DeviceRef),
+    #[error("device is revoked: {0:?}")]
+    DeviceRevoked(DeviceRef),
     #[error("duplicate message id in room log: {0}")]
     DuplicateMessageId(MessageId),
     #[error("welcome not found: {0}")]
@@ -1484,6 +1570,28 @@ fn device_membership_key(device: &DeviceRef) -> String {
         length_prefixed(&device.account_id),
         length_prefixed(&device.device_id)
     )
+}
+
+fn device_registry_key(device: &DeviceRef) -> String {
+    device_membership_key(device)
+}
+
+fn device_is_revoked(devices: &BTreeMap<String, DeviceRecord>, device: &DeviceRef) -> bool {
+    devices
+        .get(&device_registry_key(device))
+        .is_some_and(|record| record.status == DeviceStatus::Revoked)
+}
+
+fn ensure_device_not_revoked(
+    devices: &BTreeMap<String, DeviceRecord>,
+    device: &DeviceRef,
+) -> Result<(), EngineError> {
+    debug_assert!(device.validate_limits().is_ok());
+    if device_is_revoked(devices, device) {
+        Err(EngineError::DeviceRevoked(device.clone()))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn idempotency_scope_key(
@@ -1799,7 +1907,7 @@ mod tests {
     fn removed_device_can_sync_through_removal_commit() {
         let mut service = service_with_room();
         add_bob_commit(&mut service, "add_bob");
-        let claimed = service.claim_welcomes(&device("bob", "phone"));
+        let claimed = service.claim_welcomes(&device("bob", "phone")).unwrap();
         assert_eq!(claimed.len(), 1);
         service.ack_welcome("welcome_bob", true).unwrap();
 

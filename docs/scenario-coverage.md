@@ -20,6 +20,9 @@ Each item below has a named test in
 - `create_dm_room_and_release_welcome_after_commit`
 - `key_package_claim_returns_opaque_payload`
 - `account_key_package_claim_returns_one_available_package_per_device`
+- `revoked_device_cannot_replenish_or_claim_key_packages`
+- `revoked_device_cannot_claim_or_activate_pending_welcome`
+- `revoked_active_device_cannot_send_or_commit`
 - `welcome_activation_makes_new_device_active`
 - `add_commit_requires_staged_welcome_bytes_before_mutation`
 - `duplicate_commit_retry_returns_same_result_after_side_effects`
@@ -237,6 +240,11 @@ Checkpoint test signal:
   fetch and process the removal Commit, but the server rejects its old-epoch
   send, rejects a forged new-epoch send as inactive, withholds post-remove log
   entries, and OpenMLS rejects a leaked post-remove ciphertext.
+- The durable device-status checkpoint adds the server-side revocation ledger
+  that room MLS removal needs around it. Revoked devices cannot replenish or
+  claim KeyPackages, cannot claim or activate pending Welcomes, cannot send
+  application events, and cannot submit Commits. SQLite proves the status
+  survives reopen.
 - The same-epoch recovery checkpoint creates two real local pending Commits at
   epoch 1. Alice's add wins, Bob's add loses with `WrongEpoch`, Bob keeps local
   pending state until he observes Alice's ordered Commit, then `apply_log_entry`
@@ -276,7 +284,9 @@ Proven SQLite restart scenarios:
 - `sqlite_key_package_payload_survives_reopen_and_claim`
 - `sqlite_duplicate_key_package_upload_is_rejected_after_reopen`
 - `sqlite_account_key_package_claim_survives_reopen`
+- `sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages`
 - `sqlite_claimed_welcome_payload_survives_reopen`
+- `sqlite_revoked_device_blocks_welcome_activation_and_sends_after_reopen`
 - `sqlite_add_commit_requires_staged_welcome_bytes_before_mutation`
 - `sqlite_duplicate_commit_retry_after_reopen_returns_same_result`
 - `sqlite_rejected_commit_is_replayable_after_reopen`

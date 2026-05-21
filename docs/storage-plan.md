@@ -55,6 +55,7 @@ Postgres shape:
 
 - `rooms`
 - `direct_rooms`
+- `devices`
 - `room_log_entries`
 - `room_membership_intervals`
 - `key_packages`
@@ -77,6 +78,8 @@ It proves:
 - Commit side effects are persisted together;
 - Commit transaction rollback after intermediate side effects converges on retry;
 - same-epoch Commit losers cannot create duplicate log rows or Welcomes;
+- device revocation status survives reopen and blocks new server-mediated
+  device material or mutations;
 - KeyPackage leases, consumption, and opaque payload bytes survive reopen;
 - account-level KeyPackage fanout claims return one available package per
   device and persist the leases across reopen;
@@ -92,10 +95,14 @@ The SQLite shape flushed out two production-schema requirements:
 
 The only JSON stored by the server store is `idempotency_records.response_json`,
 which is a bounded typed replay value. Room state, message ordering,
-membership, KeyPackages, Welcomes, and link sessions are schema rows. The
-client store uses a bounded binary snapshot because OpenMLS storage is already
-a local opaque provider snapshot, and encrypting it as one unit avoids leaking
-OpenMLS storage-key names into SQLite indexes.
+membership, device status, KeyPackages, Welcomes, and link sessions are schema
+rows. The client store uses a bounded binary snapshot because OpenMLS storage
+is already a local opaque provider snapshot, and encrypting it as one unit
+avoids leaking OpenMLS storage-key names into SQLite indexes.
+Device status is deliberately small: active or revoked. It is not identity
+authority and does not replace client-side Nostr credential verification, but
+it gives the server a durable way to block revoked installs from new
+KeyPackages, Welcome activation, sends, Commits, and future add-device Commits.
 KeyPackage bytes are a `BLOB` column on `key_packages`. Welcome payload and
 ratchet-tree bytes are `BLOB` columns on `welcomes`; the server keeps them
 opaque and only enforces protocol bounds before mutation.
@@ -115,6 +122,7 @@ The Postgres schema should keep this same model:
 
 - `rooms`
 - `direct_rooms`
+- `devices`
 - `room_log_entries`
 - `room_membership_intervals`
 - `key_packages`

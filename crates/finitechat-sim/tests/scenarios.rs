@@ -1,7 +1,7 @@
 use finitechat_engine::{
-    AppendEventRequest, CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, EngineError,
-    LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest, UploadKeyPackageRequest,
-    device, envelope,
+    AppendEventRequest, CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, DeviceStatus,
+    EngineError, LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest,
+    UploadKeyPackageRequest, device, envelope,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
@@ -125,6 +125,120 @@ fn account_key_package_claim_returns_one_available_package_per_device() {
 }
 
 #[test]
+fn revoked_device_cannot_replenish_or_claim_key_packages() {
+    let mut server = DeliveryService::new();
+    upload_available_key_package(&mut server, bob(), "kp_bob_revoked_1");
+
+    server.revoke_device(bob()).unwrap();
+
+    assert_eq!(server.device(&bob()).unwrap().status, DeviceStatus::Revoked);
+    assert_eq!(
+        server
+            .upload_key_package(UploadKeyPackageRequest {
+                key_package_id: "kp_bob_revoked_2".to_string(),
+                owner: bob(),
+                key_package_ref: "ref_kp_bob_revoked_2".to_string(),
+                key_package_hash: "hash_kp_bob_revoked_2".to_string(),
+                key_package_payload: fake_key_package_payload("kp_bob_revoked_2"),
+            })
+            .unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert_eq!(
+        server.claim_key_package("kp_bob_revoked_1").unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert!(
+        server
+            .claim_key_packages_for_account(&bob().account_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        server.key_package("kp_bob_revoked_1").unwrap().state,
+        KeyPackageState::Available
+    );
+    assert_eq!(
+        server.register_device(bob()).unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+}
+
+#[test]
+fn revoked_device_cannot_claim_or_activate_pending_welcome() {
+    let mut world = SimWorld::direct_room().unwrap();
+    world
+        .add_device_commit(
+            alice(),
+            bob(),
+            "kp_bob_revoked_welcome",
+            "welcome_bob_revoked",
+            0,
+            "add_bob_revoked_welcome",
+        )
+        .unwrap();
+
+    world.server.revoke_device(bob()).unwrap();
+
+    assert_eq!(
+        world.server.claim_welcomes(&bob()).unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+
+    let mut claimed_world = SimWorld::direct_room().unwrap();
+    claimed_world
+        .add_device_commit(
+            alice(),
+            bob(),
+            "kp_bob_claimed_then_revoked",
+            "welcome_bob_claimed_then_revoked",
+            0,
+            "add_bob_claimed_then_revoked",
+        )
+        .unwrap();
+    let claimed = claimed_world.server.claim_welcomes(&bob()).unwrap();
+    assert_eq!(claimed.len(), 1);
+    claimed_world.server.revoke_device(bob()).unwrap();
+    assert_eq!(
+        claimed_world
+            .server
+            .ack_welcome("welcome_bob_claimed_then_revoked", true)
+            .unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+    assert!(
+        !claimed_world
+            .server
+            .room(&claimed_world.room_id)
+            .unwrap()
+            .device_active_at_head(&bob())
+    );
+}
+
+#[test]
+fn revoked_active_device_cannot_send_or_commit() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+
+    world.server.revoke_device(bob()).unwrap();
+
+    assert_eq!(
+        world
+            .server
+            .append_event(world.app_message_request(bob(), 1, "revoked send", "revoked_send"))
+            .unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+    let remove = world
+        .remove_device_request(bob(), alice(), 1, "revoked_commit")
+        .unwrap();
+    assert_eq!(
+        world.server.submit_commit(remove).unwrap_err(),
+        EngineError::DeviceRevoked(bob())
+    );
+}
+
+#[test]
 fn multi_device_pending_invite_action_order_fuzz_keeps_server_roles_separate() {
     for seed in 1..=512 {
         run_multi_device_pending_invite_ordering(seed);
@@ -213,7 +327,7 @@ fn run_multi_device_pending_invite_ordering(seed: u64) {
                     continue;
                 }
                 let welcome_id = format!("welcome_{}", device.device_id);
-                let welcomes = server.claim_welcomes(&device);
+                let welcomes = server.claim_welcomes(&device).unwrap();
                 assert_eq!(welcomes.len(), 1);
                 assert_eq!(welcomes[0].welcome_id, welcome_id);
                 server.ack_welcome(&welcome_id, true).unwrap();
@@ -345,7 +459,7 @@ fn welcome_activation_makes_new_device_active() {
         )
         .unwrap();
 
-    let welcomes = world.server.claim_welcomes(&bob());
+    let welcomes = world.server.claim_welcomes(&bob()).unwrap();
     assert_eq!(welcomes.len(), 1);
     assert_eq!(welcomes[0].welcome_payload, b"welcome:welcome_bob_1");
     assert_eq!(welcomes[0].ratchet_tree_payload, b"tree:welcome_bob_1");
@@ -864,8 +978,8 @@ fn commit_durable_before_welcome_release_restart_releases_exactly_once() {
         .unwrap();
 
     let mut restarted = world.server.clone();
-    let first_claim = restarted.claim_welcomes(&bob());
-    let duplicate_claim = restarted.claim_welcomes(&bob());
+    let first_claim = restarted.claim_welcomes(&bob()).unwrap();
+    let duplicate_claim = restarted.claim_welcomes(&bob()).unwrap();
 
     assert_eq!(first_claim.len(), 1);
     assert!(duplicate_claim.is_empty());
@@ -913,7 +1027,7 @@ fn welcome_claim_crash_before_ack_can_resume_after_restart() {
             "idem_add_bob",
         )
         .unwrap();
-    let claimed = world.server.claim_welcomes(&bob());
+    let claimed = world.server.claim_welcomes(&bob()).unwrap();
     assert_eq!(claimed.len(), 1);
 
     let mut restarted = world.server.clone();
@@ -971,7 +1085,7 @@ fn welcome_terminal_failure_keeps_membership_interval_inactive() {
             "idem_add_bob",
         )
         .unwrap();
-    world.server.claim_welcomes(&bob());
+    world.server.claim_welcomes(&bob()).unwrap();
     world.server.ack_welcome("welcome_bob_1", false).unwrap();
 
     assert_eq!(

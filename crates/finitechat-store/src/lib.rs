@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 
 use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult,
-    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceMembership, EngineError,
-    EventAccepted, KeyPackageRecord, LinkSessionId, LinkSessionRecord, LinkSessionState,
-    ListAccountRoomsPage, ListAccountRoomsRequest, MembershipInterval, RoomRecord,
-    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, direct_room_key,
-    direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
+    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceMembership, DeviceRecord,
+    DeviceStatus, EngineError, EventAccepted, KeyPackageRecord, LinkSessionId, LinkSessionRecord,
+    LinkSessionState, ListAccountRoomsPage, ListAccountRoomsRequest, MembershipInterval,
+    RoomRecord, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord,
+    direct_room_key, direct_room_key_string, idempotency_scope_key, lease_token_for, request_hash,
     staged_welcomes_by_id, sync_events_page_for_room,
 };
 use finitechat_proto::{
@@ -80,6 +80,12 @@ impl SqliteDeliveryStore {
         load_key_package(&conn, key_package_id)
     }
 
+    pub fn device(&self, device: &DeviceRef) -> Result<Option<DeviceRecord>, StoreError> {
+        device.validate_limits().map_err(EngineError::from)?;
+        let conn = self.connect()?;
+        load_device_record(&conn, device)
+    }
+
     pub fn welcome(&self, welcome_id: &str) -> Result<Option<WelcomeRecord>, StoreError> {
         let conn = self.connect()?;
         load_welcome(&conn, welcome_id)
@@ -96,6 +102,7 @@ impl SqliteDeliveryStore {
     pub fn create_room(&mut self, request: CreateRoomRequest) -> Result<(), StoreError> {
         request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
+            observe_active_device(tx, &request.creator)?;
             if room_exists(tx, &request.room_id)? {
                 return Err(EngineError::RoomAlreadyExists(request.room_id).into());
             }
@@ -118,6 +125,7 @@ impl SqliteDeliveryStore {
     ) -> Result<RoomId, StoreError> {
         request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
+            observe_active_device(tx, &request.creator)?;
             let account_pair =
                 direct_room_key(&request.creator.account_id, &request.other_account_id);
             let direct_key = direct_room_key_string(&account_pair);
@@ -145,12 +153,38 @@ impl SqliteDeliveryStore {
         })
     }
 
+    pub fn register_device(&mut self, device: DeviceRef) -> Result<(), StoreError> {
+        device.validate_limits().map_err(EngineError::from)?;
+        self.with_transaction(|tx| observe_active_device(tx, &device))
+    }
+
+    pub fn revoke_device(&mut self, device: DeviceRef) -> Result<(), StoreError> {
+        device.validate_limits().map_err(EngineError::from)?;
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO devices (account_id, device_id, status)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(account_id, device_id)
+                DO UPDATE SET status = excluded.status
+                "#,
+                params![
+                    device.account_id,
+                    device.device_id,
+                    encode_device_status(DeviceStatus::Revoked),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn upload_key_package(
         &mut self,
         request: UploadKeyPackageRequest,
     ) -> Result<(), StoreError> {
         request.validate_limits().map_err(EngineError::from)?;
         self.with_transaction(|tx| {
+            observe_active_device(tx, &request.owner)?;
             if load_key_package(tx, &request.key_package_id)?.is_some() {
                 return Err(EngineError::KeyPackageAlreadyExists(request.key_package_id).into());
             }
@@ -184,6 +218,7 @@ impl SqliteDeliveryStore {
         let key_package_id = key_package_id.to_string();
         self.with_transaction(|tx| {
             let package = load_key_package_required(tx, &key_package_id)?;
+            ensure_device_not_revoked(tx, &package.owner)?;
             claim_available_key_package(tx, package)
         })
     }
@@ -300,6 +335,7 @@ impl SqliteDeliveryStore {
         device.validate_limits().map_err(EngineError::from)?;
         let device = device.clone();
         self.with_transaction(|tx| {
+            ensure_device_not_revoked(tx, &device)?;
             let mut claimed = Vec::new();
             let mut welcomes = load_released_welcomes_for_device(tx, &device)?;
             for welcome in &mut welcomes {
@@ -326,6 +362,7 @@ impl SqliteDeliveryStore {
             }
 
             let next_state = if activated {
+                ensure_device_not_revoked(tx, &welcome.recipient)?;
                 WelcomeState::Acked
             } else {
                 WelcomeState::Failed
@@ -712,6 +749,13 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           room_id TEXT NOT NULL UNIQUE REFERENCES rooms(room_id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS devices (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+          PRIMARY KEY (account_id, device_id)
+        );
+
         CREATE TABLE IF NOT EXISTS room_log_entries (
           room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
           seq INTEGER NOT NULL CHECK (seq > 0),
@@ -839,6 +883,51 @@ fn ensure_column(
     Ok(())
 }
 
+fn observe_active_device(conn: &Connection, device: &DeviceRef) -> Result<(), StoreError> {
+    if let Some(record) = load_device_record(conn, device)? {
+        debug_assert_eq!(record.device, *device);
+        if record.status == DeviceStatus::Revoked {
+            return Err(EngineError::DeviceRevoked(device.clone()).into());
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO devices (account_id, device_id, status) VALUES (?1, ?2, ?3)",
+        params![
+            device.account_id,
+            device.device_id,
+            encode_device_status(DeviceStatus::Active),
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_device_not_revoked(conn: &Connection, device: &DeviceRef) -> Result<(), StoreError> {
+    if device_is_revoked(conn, device)? {
+        Err(EngineError::DeviceRevoked(device.clone()).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn device_revocation_error(
+    conn: &Connection,
+    device: &DeviceRef,
+) -> Result<Option<EngineError>, StoreError> {
+    if device_is_revoked(conn, device)? {
+        Ok(Some(EngineError::DeviceRevoked(device.clone())))
+    } else {
+        Ok(None)
+    }
+}
+
+fn device_is_revoked(conn: &Connection, device: &DeviceRef) -> Result<bool, StoreError> {
+    Ok(matches!(
+        load_device_status(conn, device)?,
+        Some(DeviceStatus::Revoked)
+    ))
+}
+
 fn release_key_package_lease(
     store: &mut SqliteDeliveryStore,
     key_package_id: &str,
@@ -926,6 +1015,9 @@ fn append_event_inner(
     tx: &Transaction<'_>,
     request: &AppendEventRequest,
 ) -> Result<Result<EventAccepted, EngineError>, StoreError> {
+    if let Some(error) = device_revocation_error(tx, &request.sender)? {
+        return Ok(Err(error));
+    }
     let room = match load_room_state(tx, &request.room_id)? {
         Some(room) => room,
         None => return Ok(Err(EngineError::RoomNotFound(request.room_id.clone()))),
@@ -961,6 +1053,9 @@ fn submit_commit_inner(
     tx: &Transaction<'_>,
     request: &SubmitCommitRequest,
 ) -> Result<Result<CommitAccepted, EngineError>, StoreError> {
+    if let Some(error) = device_revocation_error(tx, &request.sender)? {
+        return Ok(Err(error));
+    }
     let actual_commit_message_id = request.envelope.message_id()?;
     if let Err(error) = request
         .membership_delta
@@ -982,7 +1077,10 @@ fn submit_commit_inner(
         return Ok(Err(error));
     }
     if let Err(error) = validate_commit_key_packages(tx, &room, request) {
-        return Ok(Err(error));
+        return match error {
+            StoreError::Engine(engine) => Ok(Err(engine)),
+            other => Err(other),
+        };
     }
     if let Err(error) = validate_commit_welcomes(tx, &request.membership_delta)? {
         return Ok(Err(error));
@@ -1117,17 +1215,16 @@ fn validate_commit_key_packages(
     tx: &Transaction<'_>,
     room: &RoomRecord,
     request: &SubmitCommitRequest,
-) -> Result<(), EngineError> {
+) -> Result<(), StoreError> {
     let mut seen_packages = std::collections::BTreeSet::new();
     let mut added_devices_by_account = std::collections::BTreeMap::<AccountId, usize>::new();
     for add in &request.membership_delta.adds {
+        ensure_device_not_revoked(tx, &add.device)?;
         if let Some((left, right)) = &room.direct_accounts
             && add.device.account_id != *left
             && add.device.account_id != *right
         {
-            return Err(EngineError::DirectRoomThirdAccount(
-                add.device.account_id.clone(),
-            ));
+            return Err(EngineError::DirectRoomThirdAccount(add.device.account_id.clone()).into());
         }
         let current_devices =
             room.current_or_pending_device_count_for_account(&add.device.account_id);
@@ -1139,40 +1236,38 @@ fn validate_commit_key_packages(
             "room.devices_per_account",
             current_devices + *added_devices,
             MAX_ACCOUNT_DEVICES_PER_ROOM,
-        )?;
+        )
+        .map_err(EngineError::from)?;
         if room.direct_accounts.is_some() {
             finitechat_proto::validate_item_count(
                 "direct_room.devices_per_account",
                 current_devices + *added_devices,
                 MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-            )?;
+            )
+            .map_err(EngineError::from)?;
         }
         if room.device_current_or_pending_at_head(&add.device) {
-            return Err(EngineError::DeviceAlreadyInRoom(add.device.clone()));
+            return Err(EngineError::DeviceAlreadyInRoom(add.device.clone()).into());
         }
         if !seen_packages.insert(add.key_package_id.clone()) {
-            return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()));
+            return Err(EngineError::DuplicateKeyPackage(add.key_package_id.clone()).into());
         }
-        let package = load_key_package(tx, &add.key_package_id)
-            .map_err(|error| EngineError::Json(error.to_string()))?
+        let package = load_key_package(tx, &add.key_package_id)?
             .ok_or_else(|| EngineError::KeyPackageNotFound(add.key_package_id.clone()))?;
         if package.state != KeyPackageState::Leased {
             return Err(EngineError::KeyPackageUnavailable {
                 key_package_id: add.key_package_id.clone(),
                 state: package.state,
-            });
+            }
+            .into());
         }
         if package.owner != add.device {
-            return Err(EngineError::KeyPackageOwnerMismatch(
-                add.key_package_id.clone(),
-            ));
+            return Err(EngineError::KeyPackageOwnerMismatch(add.key_package_id.clone()).into());
         }
         if package.key_package_ref != add.key_package_ref
             || package.key_package_hash != add.key_package_hash
         {
-            return Err(EngineError::KeyPackageRefMismatch(
-                add.key_package_id.clone(),
-            ));
+            return Err(EngineError::KeyPackageRefMismatch(add.key_package_id.clone()).into());
         }
     }
     Ok(())
@@ -1812,6 +1907,38 @@ fn validate_membership_shape(room: &RoomRecord) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn load_device_record(
+    conn: &Connection,
+    device: &DeviceRef,
+) -> Result<Option<DeviceRecord>, StoreError> {
+    let status = load_device_status(conn, device)?;
+    Ok(status.map(|status| DeviceRecord {
+        device: device.clone(),
+        status,
+    }))
+}
+
+fn load_device_status(
+    conn: &Connection,
+    device: &DeviceRef,
+) -> Result<Option<DeviceStatus>, StoreError> {
+    let status = conn
+        .query_row(
+            r#"
+            SELECT status
+            FROM devices
+            WHERE account_id = ?1
+              AND device_id = ?2
+            "#,
+            params![device.account_id, device.device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    status
+        .map(|status| decode_device_status(&status))
+        .transpose()
+}
+
 fn load_key_package(
     conn: &Connection,
     key_package_id: &str,
@@ -1842,6 +1969,13 @@ fn load_available_key_packages_for_account(
         FROM key_packages
         WHERE owner_account_id = ?1
           AND state = ?2
+          AND NOT EXISTS (
+            SELECT 1
+            FROM devices
+            WHERE devices.account_id = key_packages.owner_account_id
+              AND devices.device_id = key_packages.owner_device_id
+              AND devices.status = 'revoked'
+          )
         ORDER BY owner_device_id, key_package_id
         "#,
     )?;
@@ -2033,6 +2167,23 @@ fn load_idempotency(
         request_hash,
         response,
     }))
+}
+
+fn encode_device_status(status: DeviceStatus) -> &'static str {
+    match status {
+        DeviceStatus::Active => "active",
+        DeviceStatus::Revoked => "revoked",
+    }
+}
+
+fn decode_device_status(value: &str) -> Result<DeviceStatus, StoreError> {
+    match value {
+        "active" => Ok(DeviceStatus::Active),
+        "revoked" => Ok(DeviceStatus::Revoked),
+        other => Err(StoreError::CorruptState(format!(
+            "unknown device status {other}"
+        ))),
+    }
 }
 
 fn encode_room_status(status: RoomStatus) -> &'static str {
