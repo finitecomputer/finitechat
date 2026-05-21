@@ -1,11 +1,13 @@
 use finitechat_client::{
-    AppliedLogEntry, ClientError, FiniteChatDevice, FiniteChatDeviceConfig, SqliteClientStore,
+    AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
+    SqliteClientStore, SqliteClientStoreOptions,
 };
 use finitechat_engine::{
     AppendEventRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted, envelope,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{KeyPackageState, LogEntryKind};
+use rusqlite::{Connection, params};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -263,10 +265,11 @@ fn sqlite_client_state_survives_restart_for_late_multi_device_catch_up() {
     let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_runtime");
     let browser_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_browser");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone");
-    let mut bob_store = SqliteClientStore::open(dir.path().join("bob.sqlite3")).unwrap();
+    let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
     let mut browser_store =
-        SqliteClientStore::open(dir.path().join("alice_browser.sqlite3")).unwrap();
-    let mut phone_store = SqliteClientStore::open(dir.path().join("alice_phone.sqlite3")).unwrap();
+        sqlite_client_store(dir.path().join("alice_browser.sqlite3"), &browser_config);
+    let mut phone_store =
+        sqlite_client_store(dir.path().join("alice_phone.sqlite3"), &phone_config);
     let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
     let mut alice_browser = FiniteChatDevice::new(browser_config.clone()).unwrap();
     let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
@@ -391,6 +394,104 @@ fn sqlite_client_state_survives_restart_for_late_multi_device_catch_up() {
         )
         .unwrap();
     server.append_event(bob_third).unwrap();
+}
+
+#[test]
+fn sqlite_client_store_encrypts_state_and_rejects_wrong_or_tampered_key_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encrypted.sqlite3");
+    let config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_secure_store");
+    let mut device = FiniteChatDevice::new(config.clone()).unwrap();
+    device
+        .create_group_state("room_secure_store", "mls_secure_store")
+        .unwrap();
+    let exported_state = device.export_state().unwrap();
+    let mut store = sqlite_client_store(&path, &config);
+
+    store.save_device_state(&device).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let legacy_tables: u64 = conn
+        .query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('client_profiles', 'client_rooms', 'client_openmls_storage')
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_tables, 0);
+
+    let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            r#"
+            SELECT nonce, ciphertext
+            FROM client_device_states
+            WHERE account_id = ?1 AND device_id = ?2
+            "#,
+            params![
+                hex_lower(config.account_secret_key.public_key().as_bytes()),
+                &config.device_id,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(nonce.len(), 12);
+    assert!(
+        !contains_subsequence(&ciphertext, &exported_state.credential_identity),
+        "credential identity should only appear inside encrypted state"
+    );
+    let storage_value = exported_state
+        .openmls_storage_records
+        .iter()
+        .find(|record| record.value.len() >= 16)
+        .expect("OpenMLS should persist at least one non-trivial secret row");
+    assert!(
+        !contains_subsequence(&ciphertext, &storage_value.value),
+        "OpenMLS storage values should only appear inside encrypted state"
+    );
+    drop(conn);
+
+    let wrong_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "bob_secure_store");
+    let wrong_store = SqliteClientStore::open(
+        &path,
+        SqliteClientStoreOptions::from_nostr_secret(
+            &wrong_config.account_secret_key,
+            &config.device_id,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let wrong_key_error = match wrong_store.load_device(config.clone()) {
+        Ok(_) => panic!("wrong local store key should not decrypt client state"),
+        Err(error) => error,
+    };
+    assert!(matches!(wrong_key_error, ClientStoreError::DecryptState));
+
+    let mut tampered = ciphertext;
+    tampered[0] ^= 0x01;
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        r#"
+        UPDATE client_device_states
+        SET ciphertext = ?1
+        WHERE account_id = ?2 AND device_id = ?3
+        "#,
+        params![
+            tampered,
+            hex_lower(config.account_secret_key.public_key().as_bytes()),
+            &config.device_id,
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    let tamper_error = match store.load_device(config) {
+        Ok(_) => panic!("tampered local store ciphertext should not decrypt"),
+        Err(error) => error,
+    };
+    assert!(matches!(tamper_error, ClientStoreError::DecryptState));
 }
 
 #[test]
@@ -1269,6 +1370,35 @@ fn test_config(
         credential_not_before_unix_seconds: NOW - 60,
         credential_not_after_unix_seconds: NOW + 60,
     }
+}
+
+fn sqlite_client_store(
+    path: impl AsRef<std::path::Path>,
+    config: &FiniteChatDeviceConfig,
+) -> SqliteClientStore {
+    SqliteClientStore::open(
+        path,
+        SqliteClientStoreOptions::from_nostr_secret(&config.account_secret_key, &config.device_id)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(TABLE[(byte >> 4) as usize] as char);
+        out.push(TABLE[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn welcome_id_for(

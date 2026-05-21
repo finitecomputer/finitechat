@@ -21,16 +21,21 @@ jobs, migrations, backups, observability, and canary rollback.
 
 `finitechat-client` has the first local client SQLite store:
 
-- `client_profiles`
-- `client_rooms`
-- `client_openmls_storage`
+- `client_device_states`
 
-It persists the Nostr-rooted device profile metadata needed to reload, the
-Finite Chat room id to MLS group id mapping, and the OpenMLS storage key/value
-rows for signer, group, and message-secret state. This is intentionally schema
-state rather than a whole-device JSON dump. The current checkpoint proves
-restart behavior, not encryption-at-rest; the local store must be wrapped in
-audited encryption before real device secrets are shipped on disk.
+The table stores one encrypted binary snapshot per account/device. The
+plaintext snapshot contains the Nostr-rooted device profile metadata needed to
+reload, the Finite Chat room id to MLS group id mapping, and OpenMLS storage
+records for signer, group, and message-secret state. The wrapping key is
+derived from the user's Nostr secret and device id using HKDF with Finite Chat
+domain separation, and the account/device lookup key is bound into AEAD AAD.
+
+This is application-level SQLite encryption for the client state snapshot, not
+SQLCipher. SQLite metadata, row counts, WAL behavior, and account/device lookup
+ids remain visible to the local machine. Production still needs the unlock
+policy that decides whether the Nostr key comes from OS keychain, user
+passphrase, hardware-backed storage, or an already-unlocked finitecomputer
+runtime.
 
 `finitechat-store` now uses normalized SQLite tables that mirror the intended
 Postgres shape:
@@ -74,7 +79,10 @@ The SQLite shape flushed out two production-schema requirements:
 
 The only JSON stored by the server store is `idempotency_records.response_json`,
 which is a bounded typed replay value. Room state, message ordering,
-membership, KeyPackages, Welcomes, and link sessions are schema rows.
+membership, KeyPackages, Welcomes, and link sessions are schema rows. The
+client store uses a bounded binary snapshot because OpenMLS storage is already
+a local opaque provider snapshot, and encrypting it as one unit avoids leaking
+OpenMLS storage-key names into SQLite indexes.
 KeyPackage bytes are a `BLOB` column on `key_packages`. Welcome payload and
 ratchet-tree bytes are `BLOB` columns on `welcomes`; the server keeps them
 opaque and only enforces protocol bounds before mutation.

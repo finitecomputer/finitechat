@@ -7,6 +7,7 @@
 //! Nostr account, device id, and MLS leaf signing key.
 
 use finitechat_proto::{DeviceId, MAX_DEVICE_ID_BYTES, MAX_OBJECT_ID_BYTES};
+use hkdf::Hkdf;
 use openmls::prelude::{BasicCredential, Credential, CredentialWithKey};
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,9 @@ pub const MAX_MLS_LEAF_SIGNING_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
 
 const FINITE_DEVICE_CREDENTIAL_MAGIC: &[u8] = b"finitechat.device-credential.v1";
 const DEVICE_BINDING_SIGNATURE_DOMAIN: &[u8] = b"finitechat.device-binding-signature.v1";
+const NOSTR_SECRET_DERIVATION_ROOT_DOMAIN: &[u8] = b"finitechat.nostr-secret-hkdf.v1";
+const MAX_SECRET_DERIVATION_DOMAIN_BYTES: usize = 128;
+const MAX_SECRET_DERIVATION_CONTEXT_BYTES: usize = 1024;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
 const UNSIGNED_FIXED_BYTES: usize = FINITE_DEVICE_CREDENTIAL_MAGIC.len()
@@ -37,6 +41,8 @@ const _: () = {
     assert!(NOSTR_PUBLIC_KEY_BYTES == 32);
     assert!(NOSTR_SECRET_KEY_BYTES == 32);
     assert!(NOSTR_SCHNORR_SIGNATURE_BYTES == 64);
+    assert!(MAX_SECRET_DERIVATION_DOMAIN_BYTES <= u16::MAX as usize);
+    assert!(MAX_SECRET_DERIVATION_CONTEXT_BYTES <= u16::MAX as usize);
     assert!(MAX_DEVICE_ID_BYTES <= u16::MAX as u32);
     assert!(MAX_MLS_LEAF_SIGNING_PUBLIC_KEY_BYTES <= u16::MAX as u32);
 };
@@ -62,6 +68,21 @@ impl NostrSecretKey {
         let public_key = NostrPublicKey(public_key.serialize());
         debug_assert_eq!(public_key.0.len(), NOSTR_PUBLIC_KEY_BYTES);
         public_key
+    }
+
+    pub fn derive_secret_32(
+        &self,
+        domain: &[u8],
+        context: &[u8],
+    ) -> Result<[u8; 32], MlsCredentialError> {
+        validate_secret_derivation_input(domain, context)?;
+        let salt = secret_derivation_salt(domain)?;
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), &self.0);
+        let mut output = [0u8; 32];
+        hkdf.expand(context, &mut output)
+            .map_err(|_| MlsCredentialError::SecretDerivationFailed)?;
+        debug_assert_eq!(output.len(), 32);
+        Ok(output)
     }
 
     fn keypair(&self) -> Keypair {
@@ -382,6 +403,63 @@ pub enum MlsCredentialError {
     CredentialExpired,
     #[error("OpenMLS credential is not a BasicCredential")]
     WrongOpenMlsCredentialType,
+    #[error("secret derivation domain must not be empty")]
+    EmptySecretDerivationDomain,
+    #[error("secret derivation domain has {actual_bytes} bytes, max {max_bytes}")]
+    SecretDerivationDomainTooLong { max_bytes: u32, actual_bytes: u32 },
+    #[error("secret derivation context has {actual_bytes} bytes, max {max_bytes}")]
+    SecretDerivationContextTooLong { max_bytes: u32, actual_bytes: u32 },
+    #[error("secret derivation failed")]
+    SecretDerivationFailed,
+}
+
+fn validate_secret_derivation_input(
+    domain: &[u8],
+    context: &[u8],
+) -> Result<(), MlsCredentialError> {
+    if domain.is_empty() {
+        return Err(MlsCredentialError::EmptySecretDerivationDomain);
+    }
+    if domain.len() > MAX_SECRET_DERIVATION_DOMAIN_BYTES {
+        return Err(MlsCredentialError::SecretDerivationDomainTooLong {
+            max_bytes: MAX_SECRET_DERIVATION_DOMAIN_BYTES as u32,
+            actual_bytes: len_as_u32(domain.len()),
+        });
+    }
+    if context.len() > MAX_SECRET_DERIVATION_CONTEXT_BYTES {
+        return Err(MlsCredentialError::SecretDerivationContextTooLong {
+            max_bytes: MAX_SECRET_DERIVATION_CONTEXT_BYTES as u32,
+            actual_bytes: len_as_u32(context.len()),
+        });
+    }
+    debug_assert!(!domain.is_empty());
+    debug_assert!(domain.len() <= MAX_SECRET_DERIVATION_DOMAIN_BYTES);
+    debug_assert!(context.len() <= MAX_SECRET_DERIVATION_CONTEXT_BYTES);
+    Ok(())
+}
+
+fn secret_derivation_salt(domain: &[u8]) -> Result<Vec<u8>, MlsCredentialError> {
+    validate_secret_derivation_input(domain, &[])?;
+    let domain_len = u16::try_from(domain.len()).map_err(|_| {
+        MlsCredentialError::SecretDerivationDomainTooLong {
+            max_bytes: MAX_SECRET_DERIVATION_DOMAIN_BYTES as u32,
+            actual_bytes: len_as_u32(domain.len()),
+        }
+    })?;
+    let mut salt =
+        Vec::with_capacity(NOSTR_SECRET_DERIVATION_ROOT_DOMAIN.len() + U16_BYTES + domain.len());
+    salt.extend_from_slice(NOSTR_SECRET_DERIVATION_ROOT_DOMAIN);
+    salt.extend_from_slice(&domain_len.to_be_bytes());
+    salt.extend_from_slice(domain);
+    debug_assert_eq!(
+        salt.len(),
+        NOSTR_SECRET_DERIVATION_ROOT_DOMAIN.len() + U16_BYTES + domain.len()
+    );
+    Ok(salt)
+}
+
+fn len_as_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 fn validate_binding_fields(
@@ -738,6 +816,52 @@ mod tests {
         let credential = signed_credential();
 
         credential.verify_expected(expected_credential()).unwrap();
+    }
+
+    #[test]
+    fn nostr_secret_derivation_is_stable_and_domain_separated() {
+        let secret = account_secret();
+        let first = secret
+            .derive_secret_32(b"finitechat.test.local-key.v1", b"phone")
+            .unwrap();
+        let repeated = secret
+            .derive_secret_32(b"finitechat.test.local-key.v1", b"phone")
+            .unwrap();
+        let other_domain = secret
+            .derive_secret_32(b"finitechat.test.other-key.v1", b"phone")
+            .unwrap();
+        let other_context = secret
+            .derive_secret_32(b"finitechat.test.local-key.v1", b"laptop")
+            .unwrap();
+        let other_secret = NostrSecretKey::from_bytes(OTHER_ACCOUNT_SECRET_BYTES)
+            .unwrap()
+            .derive_secret_32(b"finitechat.test.local-key.v1", b"phone")
+            .unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_domain);
+        assert_ne!(first, other_context);
+        assert_ne!(first, other_secret);
+    }
+
+    #[test]
+    fn nostr_secret_derivation_rejects_unbounded_input() {
+        let secret = account_secret();
+        assert_eq!(
+            secret.derive_secret_32(b"", b"phone").unwrap_err(),
+            MlsCredentialError::EmptySecretDerivationDomain
+        );
+        assert!(matches!(
+            secret.derive_secret_32(&[b'a'; MAX_SECRET_DERIVATION_DOMAIN_BYTES + 1], b"phone"),
+            Err(MlsCredentialError::SecretDerivationDomainTooLong { .. })
+        ));
+        assert!(matches!(
+            secret.derive_secret_32(
+                b"finitechat.test.local-key.v1",
+                &[b'a'; MAX_SECRET_DERIVATION_CONTEXT_BYTES + 1],
+            ),
+            Err(MlsCredentialError::SecretDerivationContextTooLong { .. })
+        ));
     }
 
     #[test]

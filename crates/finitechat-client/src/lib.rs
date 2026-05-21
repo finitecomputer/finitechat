@@ -8,17 +8,18 @@ use finitechat_mls::{
 };
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
-    DeviceRef, KeyPackageId, LogEntryKind, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId,
-    RoomLogEntry, StagedWelcomeV1, WelcomeId, validate_bytes_non_empty, validate_idempotency_key,
-    validate_mls_group_id, validate_room_id, validate_string_bytes,
+    DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
+    WelcomeId, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
+    validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
-    Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, LeafNodeIndex,
+    AeadType, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, LeafNodeIndex,
     LeafNodeParameters, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
-    MlsMessageOut, OpenMlsProvider, ProcessedMessageContent, ProtocolMessage, ProtocolVersion,
-    RatchetTreeIn, StagedCommit, StagedWelcome, Welcome,
+    MlsMessageOut, OpenMlsCrypto, OpenMlsProvider, OpenMlsRand, ProcessedMessageContent,
+    ProtocolMessage, ProtocolVersion, RatchetTreeIn, StagedCommit, StagedWelcome, Welcome,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -31,8 +32,34 @@ use thiserror::Error;
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
+const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 1;
+const CLIENT_STORE_KEY_BYTES: usize = 32;
+const CLIENT_STORE_NONCE_BYTES: usize = 12;
+const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
+const MAX_PERSISTED_ROOMS: u32 = 1024;
+const MAX_OPENMLS_STORAGE_RECORDS: u32 = 8192;
+const MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
+const MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES: u32 = 1024;
+const MAX_OPENMLS_STORAGE_KEY_BYTES: u32 = 4 * 1024;
+const MAX_OPENMLS_STORAGE_VALUE_BYTES: u32 = 8 * 1024 * 1024;
+const MAX_CLIENT_STATE_PLAINTEXT_BYTES: u32 = 32 * 1024 * 1024;
+const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
+    MAX_CLIENT_STATE_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
+const U16_BYTES: usize = 2;
+const U32_BYTES: usize = 4;
+
 const _: () = {
     assert!(NOSTR_PUBLIC_KEY_BYTES == 32);
+    assert!(CLIENT_STORE_KEY_BYTES == 32);
+    assert!(CLIENT_STORE_NONCE_BYTES == 12);
+    assert!(CLIENT_STORE_AEAD_TAG_BYTES == 16);
+    assert!(MAX_PERSISTED_ROOMS > 0);
+    assert!(MAX_OPENMLS_STORAGE_RECORDS > 0);
+    assert!(MAX_OPENMLS_STORAGE_KEY_BYTES > 0);
+    assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
+    assert!(MAX_CLIENT_STATE_CIPHERTEXT_BYTES > MAX_CLIENT_STATE_PLAINTEXT_BYTES);
 };
 
 #[derive(Debug, Clone)]
@@ -915,7 +942,23 @@ impl FiniteChatDeviceState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         self.device_ref.validate_limits()?;
         validate_bytes_non_empty("signer_public_key", self.signer_public_key.len())?;
+        validate_bytes_len(
+            "signer_public_key",
+            self.signer_public_key.len(),
+            MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES,
+        )?;
         validate_bytes_non_empty("credential_identity", self.credential_identity.len())?;
+        validate_bytes_len(
+            "credential_identity",
+            self.credential_identity.len(),
+            MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES,
+        )?;
+        validate_item_count("client_state.rooms", self.rooms.len(), MAX_PERSISTED_ROOMS)?;
+        validate_item_count(
+            "client_state.openmls_storage_records",
+            self.openmls_storage_records.len(),
+            MAX_OPENMLS_STORAGE_RECORDS,
+        )?;
         for room in &self.rooms {
             room.validate_limits()?;
         }
@@ -952,18 +995,100 @@ impl PersistedRoomState {
 impl OpenMlsStorageRecord {
     fn validate_limits(&self) -> Result<(), ClientError> {
         validate_bytes_non_empty("openmls_storage.key", self.key.len())?;
+        validate_bytes_len(
+            "openmls_storage.key",
+            self.key.len(),
+            MAX_OPENMLS_STORAGE_KEY_BYTES,
+        )?;
         validate_bytes_non_empty("openmls_storage.value", self.value.len())?;
+        validate_bytes_len(
+            "openmls_storage.value",
+            self.value.len(),
+            MAX_OPENMLS_STORAGE_VALUE_BYTES,
+        )?;
         Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientStoreEncryptionKey {
+    bytes: [u8; CLIENT_STORE_KEY_BYTES],
+}
+
+impl ClientStoreEncryptionKey {
+    pub fn from_nostr_secret(
+        account_secret_key: &NostrSecretKey,
+        device_id: &str,
+    ) -> Result<Self, ClientStoreError> {
+        validate_bytes_non_empty("client_store.device_id", device_id.len())
+            .map_err(ClientError::from)?;
+        validate_string_bytes("client_store.device_id", device_id, MAX_DEVICE_ID_BYTES)
+            .map_err(ClientError::from)?;
+        let bytes = account_secret_key
+            .derive_secret_32(CLIENT_STORE_KEY_DERIVATION_DOMAIN, device_id.as_bytes())
+            .map_err(ClientError::from)?;
+        debug_assert_eq!(bytes.len(), CLIENT_STORE_KEY_BYTES);
+        Ok(Self { bytes })
+    }
+
+    fn as_bytes(&self) -> &[u8; CLIENT_STORE_KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for ClientStoreEncryptionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClientStoreEncryptionKey(REDACTED)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteClientStoreOptions {
+    pub encryption_key: ClientStoreEncryptionKey,
+}
+
+impl SqliteClientStoreOptions {
+    pub fn from_nostr_secret(
+        account_secret_key: &NostrSecretKey,
+        device_id: &str,
+    ) -> Result<Self, ClientStoreError> {
+        Ok(Self {
+            encryption_key: ClientStoreEncryptionKey::from_nostr_secret(
+                account_secret_key,
+                device_id,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyClientStoreTable {
+    Profiles,
+    Rooms,
+    OpenMlsStorage,
+}
+
+impl LegacyClientStoreTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Profiles => "client_profiles",
+            Self::Rooms => "client_rooms",
+            Self::OpenMlsStorage => "client_openmls_storage",
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SqliteClientStore {
     db_path: PathBuf,
+    options: SqliteClientStoreOptions,
 }
 
 impl SqliteClientStore {
-    pub fn open(db_path: impl AsRef<Path>) -> Result<Self, ClientStoreError> {
+    pub fn open(
+        db_path: impl AsRef<Path>,
+        options: SqliteClientStoreOptions,
+    ) -> Result<Self, ClientStoreError> {
         let db_path = db_path.as_ref().to_path_buf();
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).map_err(|source| ClientStoreError::CreateDir {
@@ -972,7 +1097,7 @@ impl SqliteClientStore {
             })?;
         }
 
-        let store = Self { db_path };
+        let store = Self { db_path, options };
         let conn = store.connect()?;
         migrate_client_store(&conn)?;
         Ok(store)
@@ -984,7 +1109,8 @@ impl SqliteClientStore {
 
     pub fn save_device_state(&mut self, device: &FiniteChatDevice) -> Result<(), ClientStoreError> {
         let state = device.export_state()?;
-        self.with_transaction(|tx| save_device_state_tx(tx, &state))
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| save_device_state_tx(tx, &state, &encryption_key))
     }
 
     pub fn load_device(
@@ -994,12 +1120,12 @@ impl SqliteClientStore {
         let account_id = hex_lower(config.account_secret_key.public_key().as_bytes());
         let device_id = config.device_id.clone();
         let conn = self.connect()?;
-        let state = load_device_state(&conn, &account_id, &device_id)?.ok_or(
-            ClientStoreError::DeviceStateNotFound {
-                account_id,
-                device_id,
-            },
-        )?;
+        let state =
+            load_device_state(&conn, &self.options.encryption_key, &account_id, &device_id)?
+                .ok_or(ClientStoreError::DeviceStateNotFound {
+                    account_id,
+                    device_id,
+                })?;
         Ok(FiniteChatDevice::from_state(config, state)?)
     }
 
@@ -1034,8 +1160,6 @@ pub enum ClientStoreError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error("corrupt finitechat client state: {0}")]
-    CorruptState(String),
     #[error("failed to create sqlite client store directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -1046,6 +1170,32 @@ pub enum ClientStoreError {
         account_id: String,
         device_id: String,
     },
+    #[error(
+        "legacy unencrypted client store table {table:?} contains state; explicit migration is required"
+    )]
+    LegacyUnencryptedStatePresent { table: LegacyClientStoreTable },
+    #[error("failed to generate encrypted client store nonce")]
+    Randomness,
+    #[error("failed to encrypt client state")]
+    EncryptState,
+    #[error("failed to decrypt client state")]
+    DecryptState,
+    #[error("encrypted client state nonce has {actual_bytes} bytes")]
+    InvalidNonceLength { actual_bytes: usize },
+    #[error("encrypted client state snapshot has malformed magic")]
+    StateSnapshotMagic,
+    #[error("encrypted client state snapshot version {0} is not supported")]
+    StateSnapshotVersion(u16),
+    #[error("encrypted client state snapshot is truncated")]
+    StateSnapshotTruncated,
+    #[error("encrypted client state snapshot has trailing bytes")]
+    StateSnapshotTrailingBytes,
+    #[error("encrypted client state snapshot has invalid UTF-8")]
+    StateSnapshotUtf8,
+    #[error("encrypted client state snapshot length overflow")]
+    StateSnapshotLengthOverflow,
+    #[error("encrypted client state snapshot identity does not match lookup")]
+    StateSnapshotIdentityMismatch,
 }
 
 #[derive(Debug, Error)]
@@ -1441,141 +1591,367 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn migrate_client_store(conn: &Connection) -> Result<(), ClientStoreError> {
+    reject_or_remove_legacy_client_store_tables(conn)?;
     conn.execute_batch(
         r#"
-        CREATE TABLE IF NOT EXISTS client_profiles (
+        CREATE TABLE IF NOT EXISTS client_device_states (
           account_id TEXT NOT NULL,
           device_id TEXT NOT NULL,
-          signer_public_key BLOB NOT NULL,
-          credential_identity BLOB NOT NULL,
+          nonce BLOB NOT NULL,
+          ciphertext BLOB NOT NULL,
           PRIMARY KEY (account_id, device_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS client_rooms (
-          account_id TEXT NOT NULL,
-          device_id TEXT NOT NULL,
-          room_id TEXT NOT NULL,
-          mls_group_id TEXT NOT NULL,
-          PRIMARY KEY (account_id, device_id, room_id),
-          FOREIGN KEY (account_id, device_id)
-            REFERENCES client_profiles(account_id, device_id)
-            ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS client_openmls_storage (
-          account_id TEXT NOT NULL,
-          device_id TEXT NOT NULL,
-          storage_key BLOB NOT NULL,
-          storage_value BLOB NOT NULL,
-          PRIMARY KEY (account_id, device_id, storage_key),
-          FOREIGN KEY (account_id, device_id)
-            REFERENCES client_profiles(account_id, device_id)
-            ON DELETE CASCADE
         );
         "#,
     )?;
     Ok(())
+}
+
+fn reject_or_remove_legacy_client_store_tables(conn: &Connection) -> Result<(), ClientStoreError> {
+    let tables = [
+        LegacyClientStoreTable::OpenMlsStorage,
+        LegacyClientStoreTable::Rooms,
+        LegacyClientStoreTable::Profiles,
+    ];
+    for table in tables {
+        if !legacy_table_exists(conn, table)? {
+            continue;
+        }
+        if legacy_table_row_count(conn, table)? > 0 {
+            return Err(ClientStoreError::LegacyUnencryptedStatePresent { table });
+        }
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS client_openmls_storage;
+        DROP TABLE IF EXISTS client_rooms;
+        DROP TABLE IF EXISTS client_profiles;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn legacy_table_exists(
+    conn: &Connection,
+    table: LegacyClientStoreTable,
+) -> Result<bool, ClientStoreError> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table.name()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(exists)
+}
+
+fn legacy_table_row_count(
+    conn: &Connection,
+    table: LegacyClientStoreTable,
+) -> Result<u64, ClientStoreError> {
+    let count = match table {
+        LegacyClientStoreTable::Profiles => {
+            conn.query_row("SELECT COUNT(*) FROM client_profiles", [], |row| {
+                row.get::<_, u64>(0)
+            })?
+        }
+        LegacyClientStoreTable::Rooms => {
+            conn.query_row("SELECT COUNT(*) FROM client_rooms", [], |row| {
+                row.get::<_, u64>(0)
+            })?
+        }
+        LegacyClientStoreTable::OpenMlsStorage => {
+            conn.query_row("SELECT COUNT(*) FROM client_openmls_storage", [], |row| {
+                row.get::<_, u64>(0)
+            })?
+        }
+    };
+    Ok(count)
 }
 
 fn save_device_state_tx(
     tx: &Transaction<'_>,
     state: &FiniteChatDeviceState,
+    encryption_key: &ClientStoreEncryptionKey,
 ) -> Result<(), ClientStoreError> {
     state.validate_limits()?;
+    let sealed = encrypt_device_state(encryption_key, state)?;
     tx.execute(
         r#"
-        INSERT INTO client_profiles (
-          account_id, device_id, signer_public_key, credential_identity
+        INSERT INTO client_device_states (
+          account_id, device_id, nonce, ciphertext
         ) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(account_id, device_id) DO UPDATE SET
-          signer_public_key = excluded.signer_public_key,
-          credential_identity = excluded.credential_identity
+          nonce = excluded.nonce,
+          ciphertext = excluded.ciphertext
         "#,
         params![
             state.device_ref.account_id,
             state.device_ref.device_id,
-            state.signer_public_key,
-            state.credential_identity,
+            sealed.nonce,
+            sealed.ciphertext,
         ],
     )?;
-    tx.execute(
-        "DELETE FROM client_rooms WHERE account_id = ?1 AND device_id = ?2",
-        params![state.device_ref.account_id, state.device_ref.device_id],
-    )?;
-    tx.execute(
-        "DELETE FROM client_openmls_storage WHERE account_id = ?1 AND device_id = ?2",
-        params![state.device_ref.account_id, state.device_ref.device_id],
-    )?;
-    for room in &state.rooms {
-        tx.execute(
-            r#"
-            INSERT INTO client_rooms (account_id, device_id, room_id, mls_group_id)
-            VALUES (?1, ?2, ?3, ?4)
-            "#,
-            params![
-                state.device_ref.account_id,
-                state.device_ref.device_id,
-                room.room_id,
-                room.mls_group_id,
-            ],
-        )?;
-    }
-    for record in &state.openmls_storage_records {
-        tx.execute(
-            r#"
-            INSERT INTO client_openmls_storage (
-              account_id, device_id, storage_key, storage_value
-            ) VALUES (?1, ?2, ?3, ?4)
-            "#,
-            params![
-                state.device_ref.account_id,
-                state.device_ref.device_id,
-                record.key,
-                record.value,
-            ],
-        )?;
-    }
     Ok(())
 }
 
 fn load_device_state(
     conn: &Connection,
+    encryption_key: &ClientStoreEncryptionKey,
     account_id: &str,
     device_id: &str,
 ) -> Result<Option<FiniteChatDeviceState>, ClientStoreError> {
-    validate_string_bytes(
-        "account_id",
-        account_id,
-        finitechat_proto::MAX_ACCOUNT_ID_BYTES,
-    )
-    .map_err(ClientError::from)?;
-    validate_string_bytes(
-        "device_id",
-        device_id,
-        finitechat_proto::MAX_DEVICE_ID_BYTES,
-    )
-    .map_err(ClientError::from)?;
-    let profile = conn
+    validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)
+        .map_err(ClientError::from)?;
+    validate_string_bytes("device_id", device_id, MAX_DEVICE_ID_BYTES)
+        .map_err(ClientError::from)?;
+    let sealed = conn
         .query_row(
             r#"
-            SELECT signer_public_key, credential_identity
-            FROM client_profiles
+            SELECT nonce, ciphertext
+            FROM client_device_states
             WHERE account_id = ?1 AND device_id = ?2
             "#,
             params![account_id, device_id],
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    let Some((signer_public_key, credential_identity)) = profile else {
+    let Some((nonce, ciphertext)) = sealed else {
         return Ok(None);
     };
 
-    let rooms = load_persisted_rooms(conn, account_id, device_id)?;
-    let openmls_storage_records = load_openmls_storage_records(conn, account_id, device_id)?;
+    let state = decrypt_device_state(encryption_key, account_id, device_id, &nonce, &ciphertext)?;
+    if state.device_ref.account_id != account_id || state.device_ref.device_id != device_id {
+        return Err(ClientStoreError::StateSnapshotIdentityMismatch);
+    }
+    state.validate_limits()?;
+    Ok(Some(state))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedClientState {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+fn encrypt_device_state(
+    encryption_key: &ClientStoreEncryptionKey,
+    state: &FiniteChatDeviceState,
+) -> Result<SealedClientState, ClientStoreError> {
+    state.validate_limits()?;
+    let plaintext = encode_device_state(state)?;
+    let aad = client_store_aad(&state.device_ref.account_id, &state.device_ref.device_id)?;
+    let provider = OpenMlsRustCrypto::default();
+    let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider
+        .rand()
+        .random_array()
+        .map_err(|_| ClientStoreError::Randomness)?;
+    let ciphertext = provider
+        .crypto()
+        .aead_encrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            &plaintext,
+            &nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::EncryptState)?;
+    validate_bytes_len(
+        "client_state.ciphertext",
+        ciphertext.len(),
+        MAX_CLIENT_STATE_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    debug_assert_eq!(nonce.len(), CLIENT_STORE_NONCE_BYTES);
+    debug_assert!(!ciphertext.is_empty());
+    Ok(SealedClientState {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
+fn decrypt_device_state(
+    encryption_key: &ClientStoreEncryptionKey,
+    account_id: &str,
+    device_id: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<FiniteChatDeviceState, ClientStoreError> {
+    if nonce.len() != CLIENT_STORE_NONCE_BYTES {
+        return Err(ClientStoreError::InvalidNonceLength {
+            actual_bytes: nonce.len(),
+        });
+    }
+    validate_bytes_non_empty("client_state.ciphertext", ciphertext.len())
+        .map_err(ClientError::from)?;
+    validate_bytes_len(
+        "client_state.ciphertext",
+        ciphertext.len(),
+        MAX_CLIENT_STATE_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = client_store_aad(account_id, device_id)?;
+    let provider = OpenMlsRustCrypto::default();
+    let plaintext = provider
+        .crypto()
+        .aead_decrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            ciphertext,
+            nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::DecryptState)?;
+    decode_device_state(&plaintext)
+}
+
+fn client_store_aad(account_id: &str, device_id: &str) -> Result<Vec<u8>, ClientStoreError> {
+    validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)
+        .map_err(ClientError::from)?;
+    validate_string_bytes("device_id", device_id, MAX_DEVICE_ID_BYTES)
+        .map_err(ClientError::from)?;
+    let mut aad = Vec::with_capacity(
+        CLIENT_STATE_SNAPSHOT_MAGIC.len()
+            + U16_BYTES
+            + U32_BYTES
+            + account_id.len()
+            + U32_BYTES
+            + device_id.len(),
+    );
+    aad.extend_from_slice(CLIENT_STATE_SNAPSHOT_MAGIC);
+    aad.extend_from_slice(&CLIENT_STATE_SNAPSHOT_VERSION.to_be_bytes());
+    append_raw_len_prefixed(&mut aad, account_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, device_id.as_bytes())?;
+    debug_assert!(aad.len() >= CLIENT_STATE_SNAPSHOT_MAGIC.len() + U16_BYTES);
+    Ok(aad)
+}
+
+fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientStoreError> {
+    state.validate_limits()?;
+    let mut out = Vec::with_capacity(encoded_device_state_len(state)?);
+    out.extend_from_slice(CLIENT_STATE_SNAPSHOT_MAGIC);
+    out.extend_from_slice(&CLIENT_STATE_SNAPSHOT_VERSION.to_be_bytes());
+    append_string_field(
+        &mut out,
+        "account_id",
+        &state.device_ref.account_id,
+        MAX_ACCOUNT_ID_BYTES,
+    )?;
+    append_string_field(
+        &mut out,
+        "device_id",
+        &state.device_ref.device_id,
+        MAX_DEVICE_ID_BYTES,
+    )?;
+    append_bytes_field(
+        &mut out,
+        "signer_public_key",
+        &state.signer_public_key,
+        MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES,
+    )?;
+    append_bytes_field(
+        &mut out,
+        "credential_identity",
+        &state.credential_identity,
+        MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES,
+    )?;
+    append_count(
+        &mut out,
+        "client_state.rooms",
+        state.rooms.len(),
+        MAX_PERSISTED_ROOMS,
+    )?;
+    for room in &state.rooms {
+        room.validate_limits()?;
+        append_string_field(
+            &mut out,
+            "room_id",
+            &room.room_id,
+            finitechat_proto::MAX_ROOM_ID_BYTES,
+        )?;
+        append_string_field(
+            &mut out,
+            "mls_group_id",
+            &room.mls_group_id,
+            finitechat_proto::MAX_MLS_GROUP_ID_BYTES,
+        )?;
+    }
+    append_count(
+        &mut out,
+        "client_state.openmls_storage_records",
+        state.openmls_storage_records.len(),
+        MAX_OPENMLS_STORAGE_RECORDS,
+    )?;
+    for record in &state.openmls_storage_records {
+        record.validate_limits()?;
+        append_bytes_field(
+            &mut out,
+            "openmls_storage.key",
+            &record.key,
+            MAX_OPENMLS_STORAGE_KEY_BYTES,
+        )?;
+        append_bytes_field(
+            &mut out,
+            "openmls_storage.value",
+            &record.value,
+            MAX_OPENMLS_STORAGE_VALUE_BYTES,
+        )?;
+    }
+    validate_bytes_len(
+        "client_state.plaintext",
+        out.len(),
+        MAX_CLIENT_STATE_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    debug_assert!(!out.is_empty());
+    Ok(out)
+}
+
+fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStoreError> {
+    validate_bytes_non_empty("client_state.plaintext", bytes.len()).map_err(ClientError::from)?;
+    validate_bytes_len(
+        "client_state.plaintext",
+        bytes.len(),
+        MAX_CLIENT_STATE_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let mut cursor = ClientStateCursor::new(bytes);
+    cursor.take_magic()?;
+    let version = cursor.take_u16()?;
+    if version != CLIENT_STATE_SNAPSHOT_VERSION {
+        return Err(ClientStoreError::StateSnapshotVersion(version));
+    }
+    let account_id = cursor.take_string("account_id", MAX_ACCOUNT_ID_BYTES)?;
+    let device_id = cursor.take_string("device_id", MAX_DEVICE_ID_BYTES)?;
+    let signer_public_key =
+        cursor.take_vec("signer_public_key", MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES)?;
+    let credential_identity =
+        cursor.take_vec("credential_identity", MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES)?;
+
+    let room_count = cursor.take_count("client_state.rooms", MAX_PERSISTED_ROOMS)?;
+    let mut rooms = Vec::with_capacity(room_count);
+    for _ in 0..room_count {
+        rooms.push(PersistedRoomState {
+            room_id: cursor.take_string("room_id", finitechat_proto::MAX_ROOM_ID_BYTES)?,
+            mls_group_id: cursor
+                .take_string("mls_group_id", finitechat_proto::MAX_MLS_GROUP_ID_BYTES)?,
+        });
+    }
+
+    let storage_count = cursor.take_count(
+        "client_state.openmls_storage_records",
+        MAX_OPENMLS_STORAGE_RECORDS,
+    )?;
+    let mut openmls_storage_records = Vec::with_capacity(storage_count);
+    for _ in 0..storage_count {
+        openmls_storage_records.push(OpenMlsStorageRecord {
+            key: cursor.take_vec("openmls_storage.key", MAX_OPENMLS_STORAGE_KEY_BYTES)?,
+            value: cursor.take_vec("openmls_storage.value", MAX_OPENMLS_STORAGE_VALUE_BYTES)?,
+        });
+    }
+    cursor.finish()?;
+
     let state = FiniteChatDeviceState {
         device_ref: DeviceRef {
-            account_id: account_id.to_string(),
-            device_id: device_id.to_string(),
+            account_id,
+            device_id,
         },
         signer_public_key,
         credential_identity,
@@ -1583,58 +1959,155 @@ fn load_device_state(
         openmls_storage_records,
     };
     state.validate_limits()?;
-    Ok(Some(state))
+    Ok(state)
 }
 
-fn load_persisted_rooms(
-    conn: &Connection,
-    account_id: &str,
-    device_id: &str,
-) -> Result<Vec<PersistedRoomState>, ClientStoreError> {
-    let mut statement = conn.prepare(
-        r#"
-        SELECT room_id, mls_group_id
-        FROM client_rooms
-        WHERE account_id = ?1 AND device_id = ?2
-        ORDER BY room_id
-        "#,
-    )?;
-    let mut rows = statement.query(params![account_id, device_id])?;
-    let mut rooms = Vec::new();
-    while let Some(row) = rows.next()? {
-        rooms.push(PersistedRoomState {
-            room_id: row.get(0)?,
-            mls_group_id: row.get(1)?,
-        });
+fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, ClientStoreError> {
+    let mut len = CLIENT_STATE_SNAPSHOT_MAGIC.len() + U16_BYTES;
+    len = checked_len_add(len, U32_BYTES + state.device_ref.account_id.len())?;
+    len = checked_len_add(len, U32_BYTES + state.device_ref.device_id.len())?;
+    len = checked_len_add(len, U32_BYTES + state.signer_public_key.len())?;
+    len = checked_len_add(len, U32_BYTES + state.credential_identity.len())?;
+    len = checked_len_add(len, U32_BYTES)?;
+    for room in &state.rooms {
+        len = checked_len_add(len, U32_BYTES + room.room_id.len())?;
+        len = checked_len_add(len, U32_BYTES + room.mls_group_id.len())?;
     }
-    Ok(rooms)
+    len = checked_len_add(len, U32_BYTES)?;
+    for record in &state.openmls_storage_records {
+        len = checked_len_add(len, U32_BYTES + record.key.len())?;
+        len = checked_len_add(len, U32_BYTES + record.value.len())?;
+    }
+    validate_bytes_len(
+        "client_state.plaintext",
+        len,
+        MAX_CLIENT_STATE_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(len)
 }
 
-fn load_openmls_storage_records(
-    conn: &Connection,
-    account_id: &str,
-    device_id: &str,
-) -> Result<Vec<OpenMlsStorageRecord>, ClientStoreError> {
-    let mut statement = conn.prepare(
-        r#"
-        SELECT storage_key, storage_value
-        FROM client_openmls_storage
-        WHERE account_id = ?1 AND device_id = ?2
-        ORDER BY storage_key
-        "#,
-    )?;
-    let mut rows = statement.query(params![account_id, device_id])?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        records.push(OpenMlsStorageRecord {
-            key: row.get(0)?,
-            value: row.get(1)?,
-        });
+fn checked_len_add(left: usize, right: usize) -> Result<usize, ClientStoreError> {
+    left.checked_add(right)
+        .ok_or(ClientStoreError::StateSnapshotLengthOverflow)
+}
+
+fn append_string_field(
+    out: &mut Vec<u8>,
+    field: &str,
+    value: &str,
+    max_bytes: u32,
+) -> Result<(), ClientStoreError> {
+    validate_string_bytes(field, value, max_bytes).map_err(ClientError::from)?;
+    append_raw_len_prefixed(out, value.as_bytes())
+}
+
+fn append_bytes_field(
+    out: &mut Vec<u8>,
+    field: &str,
+    bytes: &[u8],
+    max_bytes: u32,
+) -> Result<(), ClientStoreError> {
+    validate_bytes_len(field, bytes.len(), max_bytes).map_err(ClientError::from)?;
+    append_raw_len_prefixed(out, bytes)
+}
+
+fn append_count(
+    out: &mut Vec<u8>,
+    field: &str,
+    count: usize,
+    max_items: u32,
+) -> Result<(), ClientStoreError> {
+    validate_item_count(field, count, max_items).map_err(ClientError::from)?;
+    let count = u32::try_from(count).map_err(|_| ClientStoreError::StateSnapshotLengthOverflow)?;
+    out.extend_from_slice(&count.to_be_bytes());
+    Ok(())
+}
+
+fn append_raw_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ClientStoreError> {
+    let len =
+        u32::try_from(bytes.len()).map_err(|_| ClientStoreError::StateSnapshotLengthOverflow)?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct ClientStateCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ClientStateCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        debug_assert!(!bytes.is_empty());
+        Self { bytes, offset: 0 }
     }
-    if records.is_empty() {
-        return Err(ClientStoreError::CorruptState(format!(
-            "device {account_id}/{device_id} has no OpenMLS storage rows"
-        )));
+
+    fn take_magic(&mut self) -> Result<(), ClientStoreError> {
+        let magic = self.take_bytes(CLIENT_STATE_SNAPSHOT_MAGIC.len())?;
+        if magic == CLIENT_STATE_SNAPSHOT_MAGIC {
+            Ok(())
+        } else {
+            Err(ClientStoreError::StateSnapshotMagic)
+        }
     }
-    Ok(records)
+
+    fn take_u16(&mut self) -> Result<u16, ClientStoreError> {
+        let bytes = self.take_bytes(U16_BYTES)?;
+        Ok(u16::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| ClientStoreError::StateSnapshotTruncated)?,
+        ))
+    }
+
+    fn take_u32(&mut self) -> Result<u32, ClientStoreError> {
+        let bytes = self.take_bytes(U32_BYTES)?;
+        Ok(u32::from_be_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| ClientStoreError::StateSnapshotTruncated)?,
+        ))
+    }
+
+    fn take_count(&mut self, field: &str, max_items: u32) -> Result<usize, ClientStoreError> {
+        let count = self.take_u32()? as usize;
+        validate_item_count(field, count, max_items).map_err(ClientError::from)?;
+        Ok(count)
+    }
+
+    fn take_string(&mut self, field: &str, max_bytes: u32) -> Result<String, ClientStoreError> {
+        let bytes = self.take_vec(field, max_bytes)?;
+        let value = String::from_utf8(bytes).map_err(|_| ClientStoreError::StateSnapshotUtf8)?;
+        validate_string_bytes(field, &value, max_bytes).map_err(ClientError::from)?;
+        Ok(value)
+    }
+
+    fn take_vec(&mut self, field: &str, max_bytes: u32) -> Result<Vec<u8>, ClientStoreError> {
+        let len = self.take_u32()? as usize;
+        validate_bytes_len(field, len, max_bytes).map_err(ClientError::from)?;
+        Ok(self.take_bytes(len)?.to_vec())
+    }
+
+    fn take_bytes(&mut self, len: usize) -> Result<&'a [u8], ClientStoreError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(ClientStoreError::StateSnapshotLengthOverflow)?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(ClientStoreError::StateSnapshotTruncated)?;
+        self.offset = end;
+        debug_assert!(self.offset <= self.bytes.len());
+        Ok(bytes)
+    }
+
+    fn finish(&self) -> Result<(), ClientStoreError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(ClientStoreError::StateSnapshotTrailingBytes)
+        }
+    }
 }

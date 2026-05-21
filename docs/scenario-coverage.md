@@ -83,6 +83,8 @@ The first real OpenMLS-facing tests live in `crates/finitechat-mls/src/lib.rs`.
 Proven credential scenarios:
 
 - `nostr_signed_device_credential_verifies`
+- `nostr_secret_derivation_is_stable_and_domain_separated`
+- `nostr_secret_derivation_rejects_unbounded_input`
 - `wrong_account_key_rejects`
 - `wrong_device_id_rejects`
 - `wrong_mls_leaf_key_rejects`
@@ -106,6 +108,7 @@ Proven client scenarios:
 - `multi_device_invite_late_joiner_catches_up_to_new_messages`
 - `multi_device_real_mls_ordering_matrix_validates_late_catch_up`
 - `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
+- `sqlite_client_store_encrypts_state_and_rejects_wrong_or_tampered_key_material`
 - `client_processes_remote_add_commit_before_epoch_two_messages`
 - `client_processes_remote_update_commit_before_epoch_three_messages`
 - `client_processes_remote_remove_commit_before_post_remove_messages`
@@ -168,6 +171,11 @@ Checkpoint test signal:
   device profile, and room mappings. It reloads Bob before sending, reloads
   Alice browser after activation, and reloads a late Alice phone before it
   decrypts messages sent while it was pending.
+- The encrypted client-store checkpoint replaces those raw local tables with a
+  Nostr-derived encrypted snapshot. The restart proof still passes, and the new
+  negative test checks that legacy cleartext tables are absent, sampled raw
+  credential/OpenMLS bytes are not stored in the ciphertext, the wrong derived
+  key cannot load the device, and tampering fails closed.
 - The first remote Commit checkpoint adds a real ordered-log client API:
   application entries decrypt, own Commit entries merge only with pending local
   state, and remote Commit entries validate the log envelope before processing

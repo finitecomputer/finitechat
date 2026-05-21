@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 finitechat-proto = { path = "../finitechat-proto" }
+hkdf.workspace = true
 openmls.workspace = true
 secp256k1.workspace = true
 sha2.workspace = true

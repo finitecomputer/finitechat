@@ -137,7 +137,7 @@ Production server store:
 ### Phase 2: OpenMLS Spike
 
 Status in this repo: reusable OpenMLS client state machine, multi-device invite
-proof, first client SQLite restart proof, and first remote Commit processing
+proof, encrypted client SQLite restart proof, and remote Commit processing
 proof passing.
 
 Deliverables:
@@ -177,8 +177,9 @@ Current OpenMLS scope:
   accepted Commit seq, and decrypt messages sent before it acked.
 - bounded real-MLS ordering matrix for all activation orders across three
   devices, with varied message timing before and between activations.
-- `SqliteClientStore` for persisted client profile, room mapping, and OpenMLS
-  storage rows, with a restart test covering late multi-device catch-up.
+- `SqliteClientStore` for encrypted persisted client profile, room mapping, and
+  OpenMLS storage snapshot rows, with restart tests covering late multi-device
+  catch-up.
 - ordered-log application API that validates log entry shape, merges an
   observed local pending Commit, or processes a remote OpenMLS staged Commit
   before accepting epoch-advanced application messages.
@@ -196,11 +197,16 @@ Current OpenMLS scope:
 - explicit v1 history policy proof: a newly added device can sync from its
   accepted add Commit forward, but does not receive pre-membership room log
   history by default.
+- Nostr-rooted local storage key derivation and encrypted SQLite client-state
+  snapshot proof: no legacy cleartext client tables, sampled raw credential and
+  OpenMLS storage bytes absent from the stored ciphertext, wrong derived key
+  rejection, and tamper rejection.
 
 Current known gap:
 
-- Client SQLite persistence is not encrypted at rest yet. Do not ship device
-  secrets on disk until this store is wrapped with audited encryption.
+- Client SQLite persistence now encrypts the client-state snapshot with a
+  Nostr-derived wrapping key. Production still needs OS keychain/passphrase
+  unlock policy and crash-resume tests around mid-Welcome and mid-sync writes.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
 - Later device linking is proven at the client protocol level, but production
@@ -233,6 +239,9 @@ Good tests:
   OpenMLS application-message ratchet orderings.
 - client restart tests prove Bob can send after reload and a late Alice device
   can activate, persist, reload, and decrypt the backlog.
+- encrypted client store tests prove the local wrapping key is derived from the
+  Nostr secret, legacy cleartext state tables are absent, wrong keys cannot
+  decrypt, and ciphertext tampering fails closed.
 - remote add Commit advances an existing device from epoch 1 to epoch 2 before
   it sends/decrypts post-add messages.
 - remote update/rekey Commit advances existing devices from epoch 2 to epoch 3

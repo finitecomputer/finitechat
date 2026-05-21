@@ -432,6 +432,7 @@ name = "finitechat-mls"
 version = "0.1.0"
 dependencies = [
  "finitechat-proto",
+ "hkdf",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
