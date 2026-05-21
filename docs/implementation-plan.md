@@ -178,8 +178,8 @@ Current OpenMLS scope:
 - bounded real-MLS ordering matrix for all activation orders across three
   devices, with varied message timing before and between activations.
 - `SqliteClientStore` for encrypted persisted client profile, room mapping, and
-  OpenMLS storage snapshot rows, with per-room applied cursors and restart
-  tests covering late multi-device catch-up.
+  OpenMLS storage snapshot rows, with per-room applied cursors, pending claimed
+  Welcomes, and restart tests covering late multi-device catch-up.
 - ordered-log application API that validates log entry shape, merges an
   observed local pending Commit, or processes a remote OpenMLS staged Commit
   before accepting epoch-advanced application messages.
@@ -204,14 +204,16 @@ Current OpenMLS scope:
 - client crash-resume proof for durable Welcome activation before server ack,
   plus store-backed ordered-log apply that persists MLS state and applied
   cursor together and skips duplicate replay after restart.
+- pending claimed-Welcome inbox proof: after the server marks a Welcome
+  claimed, the client persists the Welcome payload and ratchet tree locally,
+  restarts, activates from local encrypted state, and then acks the server.
 
 Current known gap:
 
 - Client SQLite persistence now encrypts the client-state snapshot with a
-  Nostr-derived wrapping key and stores per-room applied cursors. Production
-  still needs OS keychain/passphrase unlock policy and a persisted pending
-  Welcome inbox for crashes after server claim but before local durable
-  activation.
+  Nostr-derived wrapping key and stores per-room applied cursors plus pending
+  claimed Welcomes. Production still needs OS keychain/passphrase unlock
+  policy.
 - Remote Commit processing is proven for add, update/rekey, remove, and
   tampered log-entry rejection.
 - Later device linking is proven at the client protocol level, but production
@@ -251,6 +253,12 @@ Good tests:
   acking the server, then restart and ack safely; sync tests prove Commit and
   application entries persist MLS state and cursor together, so duplicate replay
   after restart is skipped instead of reprocessing the same MLS epoch.
+- pending-Welcome tests prove a device can claim a Welcome from the server,
+  persist the opaque Welcome and ratchet tree locally, restart after the server
+  will no longer return it from claim, activate from the local encrypted inbox,
+  and then ack safely. The failure-path companion keeps the pending inbox entry
+  after OpenMLS rejects activation, so local state remains retryable/diagnosable
+  instead of silently dropping the only claimed Welcome copy.
 - remote add Commit advances an existing device from epoch 1 to epoch 2 before
   it sends/decrypts post-add messages.
 - remote update/rekey Commit advances existing devices from epoch 2 to epoch 3

@@ -578,6 +578,157 @@ fn sqlite_client_welcome_activation_is_durable_before_server_ack() {
 }
 
 #[test]
+fn sqlite_client_claimed_welcome_survives_restart_before_activation() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_pending_welcome");
+    let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
+    let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_pending_welcome");
+    let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
+    let mut server = DeliveryService::new();
+
+    server
+        .create_room(CreateRoomRequest {
+            room_id: ROOM_ID.to_string(),
+            mls_group_id: MLS_GROUP_ID.to_string(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+    alice.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    server
+        .upload_key_package(
+            bob.upload_key_package_request("kp_pending_welcome_bob")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package("kp_pending_welcome_bob").unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_pending_bob",
+            "add_pending_bob",
+        )
+        .unwrap();
+    let accepted = server.submit_commit(prepared.request).unwrap();
+    let alice_page = server.sync_events(ROOM_ID, alice.device_ref(), 0).unwrap();
+    alice
+        .merge_pending_commit_from_log(ROOM_ID, &alice_page.entries, &prepared.message_id)
+        .unwrap();
+
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let welcome = claimed_welcomes
+        .iter()
+        .find(|welcome| welcome.welcome_id == "welcome_pending_bob")
+        .unwrap();
+    bob_store
+        .store_pending_welcome_and_save(&mut bob, welcome)
+        .unwrap();
+    assert_eq!(bob.pending_welcome_count(), 1);
+
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
+    assert_eq!(bob.pending_welcome_count(), 1);
+    assert_eq!(server.claim_welcomes(bob.device_ref()).len(), 0);
+    assert_eq!(
+        bob_store
+            .activate_pending_welcome_and_save(&mut bob, "welcome_pending_bob")
+            .unwrap(),
+        accepted.seq
+    );
+
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
+    assert_eq!(bob.pending_welcome_count(), 0);
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
+    assert_eq!(bob.last_applied_seq(ROOM_ID).unwrap(), accepted.seq);
+    server.ack_welcome("welcome_pending_bob", true).unwrap();
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"after pending resume"}}"#;
+    let request = alice
+        .create_application_request(ROOM_ID, plaintext, "pending_resume_after_ack")
+        .unwrap();
+    let accepted_message = server.append_event(request).unwrap();
+    let page = server
+        .sync_events(
+            ROOM_ID,
+            bob.device_ref(),
+            bob.last_applied_seq(ROOM_ID).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(
+        bob_store
+            .apply_log_entry_and_save(&mut bob, ROOM_ID, &page.entries[0])
+            .unwrap(),
+        Some(AppliedLogEntry::Application(plaintext.to_vec()))
+    );
+    let bob = bob_store.load_device(bob_config).unwrap();
+    assert_eq!(bob.last_applied_seq(ROOM_ID).unwrap(), accepted_message.seq);
+}
+
+#[test]
+fn sqlite_client_failed_pending_welcome_activation_keeps_inbox_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_pending_welcome_retry");
+    let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
+    let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_pending_welcome_retry");
+    let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
+    let mut server = DeliveryService::new();
+
+    server
+        .create_room(CreateRoomRequest {
+            room_id: ROOM_ID.to_string(),
+            mls_group_id: MLS_GROUP_ID.to_string(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+    alice.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    server
+        .upload_key_package(
+            bob.upload_key_package_request("kp_pending_retry_bob")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = server.claim_key_package("kp_pending_retry_bob").unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_pending_retry_bob",
+            "add_pending_retry_bob",
+        )
+        .unwrap();
+    server.submit_commit(prepared.request).unwrap();
+
+    let claimed_welcomes = server.claim_welcomes(bob.device_ref());
+    let mut welcome = claimed_welcomes
+        .iter()
+        .find(|welcome| welcome.welcome_id == "welcome_pending_retry_bob")
+        .unwrap()
+        .clone();
+    let last = welcome.ratchet_tree_payload.len() - 1;
+    welcome.ratchet_tree_payload[last] ^= 0x01;
+    bob_store
+        .store_pending_welcome_and_save(&mut bob, &welcome)
+        .unwrap();
+
+    let err = bob_store
+        .activate_pending_welcome_and_save(&mut bob, "welcome_pending_retry_bob")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ClientStoreError::Client(
+            ClientError::ParseRatchetTree
+                | ClientError::StageWelcome
+                | ClientError::ActivateWelcome
+        )
+    ));
+    assert_eq!(bob.pending_welcome_count(), 1);
+
+    let bob = bob_store.load_device(bob_config).unwrap();
+    assert_eq!(bob.pending_welcome_count(), 1);
+}
+
+#[test]
 fn sqlite_client_apply_log_entry_persists_cursor_and_skips_replay_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_sync_resume");

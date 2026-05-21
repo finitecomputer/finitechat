@@ -1,6 +1,6 @@
 use finitechat_engine::{
     AppendEventRequest, ClaimKeyPackageResult, CreateDirectRoomRequest, EngineError,
-    SubmitCommitRequest, UploadKeyPackageRequest, envelope,
+    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, envelope,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -9,7 +9,8 @@ use finitechat_mls::{
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, MembershipAddV1, MembershipDeltaV1,
+    MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1,
     MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, StagedWelcomeV1,
     WelcomeId, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
     validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
@@ -34,11 +35,12 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 2;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 3;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
 const MAX_PERSISTED_ROOMS: u32 = 1024;
+const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
 const MAX_OPENMLS_STORAGE_RECORDS: u32 = 8192;
 const MAX_CLIENT_SIGNER_PUBLIC_KEY_BYTES: u32 = MAX_OBJECT_ID_BYTES;
 const MAX_CLIENT_CREDENTIAL_IDENTITY_BYTES: u32 = 1024;
@@ -57,6 +59,7 @@ const _: () = {
     assert!(CLIENT_STORE_NONCE_BYTES == 12);
     assert!(CLIENT_STORE_AEAD_TAG_BYTES == 16);
     assert!(MAX_PERSISTED_ROOMS > 0);
+    assert!(MAX_PENDING_CLIENT_WELCOMES > 0);
     assert!(MAX_OPENMLS_STORAGE_RECORDS > 0);
     assert!(MAX_OPENMLS_STORAGE_KEY_BYTES > 0);
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
@@ -84,6 +87,7 @@ pub struct FiniteChatDeviceState {
     pub signer_public_key: Vec<u8>,
     pub credential_identity: Vec<u8>,
     pub rooms: Vec<PersistedRoomState>,
+    pub pending_welcomes: Vec<PendingWelcomeState>,
     pub openmls_storage_records: Vec<OpenMlsStorageRecord>,
 }
 
@@ -92,6 +96,15 @@ pub struct PersistedRoomState {
     pub room_id: RoomId,
     pub mls_group_id: MlsGroupId,
     pub last_applied_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWelcomeState {
+    pub welcome_id: WelcomeId,
+    pub room_id: RoomId,
+    pub commit_seq: u64,
+    pub welcome_payload: Vec<u8>,
+    pub ratchet_tree_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +128,7 @@ pub struct FiniteChatDevice {
     signer: SignatureKeyPair,
     groups: BTreeMap<RoomId, MlsGroup>,
     room_cursors: BTreeMap<RoomId, u64>,
+    pending_welcomes: BTreeMap<WelcomeId, PendingWelcomeState>,
 }
 
 impl FiniteChatDevice {
@@ -157,6 +171,7 @@ impl FiniteChatDevice {
             signer,
             groups: BTreeMap::new(),
             room_cursors: BTreeMap::new(),
+            pending_welcomes: BTreeMap::new(),
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -236,6 +251,11 @@ impl FiniteChatDevice {
             .iter()
             .map(|room| (room.room_id.clone(), room.last_applied_seq))
             .collect::<BTreeMap<_, _>>();
+        let pending_welcomes = state
+            .pending_welcomes
+            .iter()
+            .map(|welcome| (welcome.welcome_id.clone(), welcome.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         let device = Self {
             provider,
@@ -246,6 +266,7 @@ impl FiniteChatDevice {
             signer,
             groups,
             room_cursors,
+            pending_welcomes,
         };
         debug_assert_eq!(
             device.credential_with_key.signature_key.as_slice(),
@@ -282,12 +303,14 @@ impl FiniteChatDevice {
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
         rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
+        let pending_welcomes = self.pending_welcomes.values().cloned().collect::<Vec<_>>();
 
         let state = FiniteChatDeviceState {
             device_ref: self.device_ref.clone(),
             signer_public_key: self.signer.public().to_vec(),
             credential_identity: self.credential.identity_bytes(),
             rooms,
+            pending_welcomes,
             openmls_storage_records,
         };
         state.validate_limits()?;
@@ -833,6 +856,41 @@ impl FiniteChatDevice {
         Ok(*self.room_cursors.get(room_id).unwrap_or(&0))
     }
 
+    pub fn pending_welcome_count(&self) -> usize {
+        self.pending_welcomes.len()
+    }
+
+    fn store_pending_welcome(&mut self, welcome: &WelcomeRecord) -> Result<(), ClientError> {
+        if welcome.recipient != self.device_ref {
+            return Err(ClientError::PendingWelcomeRecipientMismatch);
+        }
+        let pending = PendingWelcomeState::from_welcome_record(welcome)?;
+        if self.pending_welcomes.contains_key(&pending.welcome_id) {
+            return Err(ClientError::DuplicatePendingWelcome(pending.welcome_id));
+        }
+        self.pending_welcomes
+            .insert(pending.welcome_id.clone(), pending);
+        debug_assert!(!self.pending_welcomes.is_empty());
+        Ok(())
+    }
+
+    fn pending_welcome(&self, welcome_id: &str) -> Result<PendingWelcomeState, ClientError> {
+        validate_string_bytes("welcome_id", welcome_id, MAX_OBJECT_ID_BYTES)?;
+        self.pending_welcomes
+            .get(welcome_id)
+            .cloned()
+            .ok_or_else(|| ClientError::PendingWelcomeNotFound(welcome_id.to_string()))
+    }
+
+    fn clear_pending_welcome(&mut self, welcome_id: &str) -> Result<(), ClientError> {
+        validate_string_bytes("welcome_id", welcome_id, MAX_OBJECT_ID_BYTES)?;
+        if self.pending_welcomes.remove(welcome_id).is_none() {
+            return Err(ClientError::PendingWelcomeNotFound(welcome_id.to_string()));
+        }
+        debug_assert!(!self.pending_welcomes.contains_key(welcome_id));
+        Ok(())
+    }
+
     pub fn create_application_request(
         &mut self,
         room_id: &str,
@@ -990,6 +1048,11 @@ impl FiniteChatDeviceState {
         )?;
         validate_item_count("client_state.rooms", self.rooms.len(), MAX_PERSISTED_ROOMS)?;
         validate_item_count(
+            "client_state.pending_welcomes",
+            self.pending_welcomes.len(),
+            MAX_PENDING_CLIENT_WELCOMES,
+        )?;
+        validate_item_count(
             "client_state.openmls_storage_records",
             self.openmls_storage_records.len(),
             MAX_OPENMLS_STORAGE_RECORDS,
@@ -1002,9 +1065,18 @@ impl FiniteChatDeviceState {
         }
         let mut seen_storage_keys = BTreeSet::<Vec<u8>>::new();
         let mut seen_rooms = BTreeSet::<RoomId>::new();
+        let mut seen_pending_welcomes = BTreeSet::<WelcomeId>::new();
         for room in &self.rooms {
             if !seen_rooms.insert(room.room_id.clone()) {
                 return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
+            }
+        }
+        for welcome in &self.pending_welcomes {
+            welcome.validate_limits()?;
+            if !seen_pending_welcomes.insert(welcome.welcome_id.clone()) {
+                return Err(ClientError::DuplicatePendingWelcome(
+                    welcome.welcome_id.clone(),
+                ));
             }
         }
         for record in &self.openmls_storage_records {
@@ -1023,6 +1095,44 @@ impl PersistedRoomState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         validate_room_id(&self.room_id)?;
         validate_mls_group_id(&self.mls_group_id)?;
+        Ok(())
+    }
+}
+
+impl PendingWelcomeState {
+    fn from_welcome_record(welcome: &WelcomeRecord) -> Result<Self, ClientError> {
+        let pending = Self {
+            welcome_id: welcome.welcome_id.clone(),
+            room_id: welcome.room_id.clone(),
+            commit_seq: welcome.commit_seq,
+            welcome_payload: welcome.welcome_payload.clone(),
+            ratchet_tree_payload: welcome.ratchet_tree_payload.clone(),
+        };
+        pending.validate_limits()?;
+        Ok(pending)
+    }
+
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_string_bytes("welcome_id", &self.welcome_id, MAX_OBJECT_ID_BYTES)?;
+        validate_room_id(&self.room_id)?;
+        validate_bytes_non_empty(
+            "pending_welcome.welcome_payload",
+            self.welcome_payload.len(),
+        )?;
+        validate_bytes_len(
+            "pending_welcome.welcome_payload",
+            self.welcome_payload.len(),
+            MAX_WELCOME_PAYLOAD_BYTES,
+        )?;
+        validate_bytes_non_empty(
+            "pending_welcome.ratchet_tree_payload",
+            self.ratchet_tree_payload.len(),
+        )?;
+        validate_bytes_len(
+            "pending_welcome.ratchet_tree_payload",
+            self.ratchet_tree_payload.len(),
+            MAX_RATCHET_TREE_PAYLOAD_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -1176,6 +1286,32 @@ impl SqliteClientStore {
         device.activate_welcome(room_id.clone(), welcome_payload, ratchet_tree_payload)?;
         device.set_last_applied_seq(&room_id, commit_seq)?;
         self.save_device_state(device)
+    }
+
+    pub fn store_pending_welcome_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        welcome: &WelcomeRecord,
+    ) -> Result<(), ClientStoreError> {
+        device.store_pending_welcome(welcome)?;
+        self.save_device_state(device)
+    }
+
+    pub fn activate_pending_welcome_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        welcome_id: &str,
+    ) -> Result<u64, ClientStoreError> {
+        let pending = device.pending_welcome(welcome_id)?;
+        device.activate_welcome(
+            pending.room_id.clone(),
+            &pending.welcome_payload,
+            &pending.ratchet_tree_payload,
+        )?;
+        device.set_last_applied_seq(&pending.room_id, pending.commit_seq)?;
+        device.clear_pending_welcome(welcome_id)?;
+        self.save_device_state(device)?;
+        Ok(pending.commit_seq)
     }
 
     pub fn apply_log_entry_and_save(
@@ -1361,6 +1497,12 @@ pub enum ClientError {
     DuplicateInviteKeyPackage(KeyPackageId),
     #[error("invite batch contains duplicate Welcome id: {0}")]
     DuplicateInviteWelcome(WelcomeId),
+    #[error("pending Welcome already exists: {0}")]
+    DuplicatePendingWelcome(WelcomeId),
+    #[error("pending Welcome not found: {0}")]
+    PendingWelcomeNotFound(WelcomeId),
+    #[error("pending Welcome recipient does not match this device")]
+    PendingWelcomeRecipientMismatch,
     #[error("member credential missing or duplicated: {0:?}")]
     MemberCredentialMissing(DeviceRef),
     #[error("persisted client state account does not match config")]
@@ -1956,6 +2098,40 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
     }
     append_count(
         &mut out,
+        "client_state.pending_welcomes",
+        state.pending_welcomes.len(),
+        MAX_PENDING_CLIENT_WELCOMES,
+    )?;
+    for welcome in &state.pending_welcomes {
+        welcome.validate_limits()?;
+        append_string_field(
+            &mut out,
+            "welcome_id",
+            &welcome.welcome_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        append_string_field(
+            &mut out,
+            "pending_welcome.room_id",
+            &welcome.room_id,
+            finitechat_proto::MAX_ROOM_ID_BYTES,
+        )?;
+        out.extend_from_slice(&welcome.commit_seq.to_be_bytes());
+        append_bytes_field(
+            &mut out,
+            "pending_welcome.welcome_payload",
+            &welcome.welcome_payload,
+            MAX_WELCOME_PAYLOAD_BYTES,
+        )?;
+        append_bytes_field(
+            &mut out,
+            "pending_welcome.ratchet_tree_payload",
+            &welcome.ratchet_tree_payload,
+            MAX_RATCHET_TREE_PAYLOAD_BYTES,
+        )?;
+    }
+    append_count(
+        &mut out,
         "client_state.openmls_storage_records",
         state.openmls_storage_records.len(),
         MAX_OPENMLS_STORAGE_RECORDS,
@@ -2017,6 +2193,26 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         });
     }
 
+    let pending_welcome_count =
+        cursor.take_count("client_state.pending_welcomes", MAX_PENDING_CLIENT_WELCOMES)?;
+    let mut pending_welcomes = Vec::with_capacity(pending_welcome_count);
+    for _ in 0..pending_welcome_count {
+        pending_welcomes.push(PendingWelcomeState {
+            welcome_id: cursor.take_string("welcome_id", MAX_OBJECT_ID_BYTES)?,
+            room_id: cursor.take_string(
+                "pending_welcome.room_id",
+                finitechat_proto::MAX_ROOM_ID_BYTES,
+            )?,
+            commit_seq: cursor.take_u64()?,
+            welcome_payload: cursor
+                .take_vec("pending_welcome.welcome_payload", MAX_WELCOME_PAYLOAD_BYTES)?,
+            ratchet_tree_payload: cursor.take_vec(
+                "pending_welcome.ratchet_tree_payload",
+                MAX_RATCHET_TREE_PAYLOAD_BYTES,
+            )?,
+        });
+    }
+
     let storage_count = cursor.take_count(
         "client_state.openmls_storage_records",
         MAX_OPENMLS_STORAGE_RECORDS,
@@ -2038,6 +2234,7 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
         signer_public_key,
         credential_identity,
         rooms,
+        pending_welcomes,
         openmls_storage_records,
     };
     state.validate_limits()?;
@@ -2055,6 +2252,14 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         len = checked_len_add(len, U32_BYTES + room.room_id.len())?;
         len = checked_len_add(len, U32_BYTES + room.mls_group_id.len())?;
         len = checked_len_add(len, U64_BYTES)?;
+    }
+    len = checked_len_add(len, U32_BYTES)?;
+    for welcome in &state.pending_welcomes {
+        len = checked_len_add(len, U32_BYTES + welcome.welcome_id.len())?;
+        len = checked_len_add(len, U32_BYTES + welcome.room_id.len())?;
+        len = checked_len_add(len, U64_BYTES)?;
+        len = checked_len_add(len, U32_BYTES + welcome.welcome_payload.len())?;
+        len = checked_len_add(len, U32_BYTES + welcome.ratchet_tree_payload.len())?;
     }
     len = checked_len_add(len, U32_BYTES)?;
     for record in &state.openmls_storage_records {

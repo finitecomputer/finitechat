@@ -110,6 +110,8 @@ Proven client scenarios:
 - `sqlite_client_state_survives_restart_for_late_multi_device_catch_up`
 - `sqlite_client_store_encrypts_state_and_rejects_wrong_or_tampered_key_material`
 - `sqlite_client_welcome_activation_is_durable_before_server_ack`
+- `sqlite_client_claimed_welcome_survives_restart_before_activation`
+- `sqlite_client_failed_pending_welcome_activation_keeps_inbox_entry`
 - `sqlite_client_apply_log_entry_persists_cursor_and_skips_replay_after_restart`
 - `client_processes_remote_add_commit_before_epoch_two_messages`
 - `client_processes_remote_update_commit_before_epoch_three_messages`
@@ -185,6 +187,13 @@ Checkpoint test signal:
   Commit and an application message through the store, restart with the cursor
   already advanced, and skip replayed entries without asking OpenMLS to process
   an already-applied epoch/message again.
+- The pending-Welcome checkpoint covers the remaining claim/activation crash
+  window: after Bob claims a Welcome, the server no longer returns it from
+  `claim_welcomes`; Bob persists the Welcome payload and ratchet tree in the
+  encrypted client snapshot, restarts, activates from local state, clears the
+  pending inbox entry, and only then acks the server. A companion failure test
+  corrupts the stored ratchet tree and proves OpenMLS rejection does not drop
+  the only local pending-Welcome copy.
 - The first remote Commit checkpoint adds a real ordered-log client API:
   application entries decrypt, own Commit entries merge only with pending local
   state, and remote Commit entries validate the log envelope before processing
