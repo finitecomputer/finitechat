@@ -457,6 +457,14 @@ appropriate:
 - `conversation_create_is_explicit_durable_event`
 - `first_message_lazily_materializes_missing_conversation`
 - `reaction_edit_and_receipt_do_not_push_by_default`
+- `topic_create_is_conversation_create_with_topic_metadata`
+- `topic_message_routes_by_conversation_id`
+- `topic_activity_is_scoped_by_conversation_id`
+- `telegram_thread_id_imports_to_topic_conversation_id`
+- `topic_skill_binding_is_encrypted_conversation_metadata`
+- `new_command_inside_topic_starts_segment_not_conversation`
+- `segment_start_is_durable_but_push_never`
+- `agent_prompt_context_resets_at_latest_segment_boundary`
 
 ## Planned Attachment Scenarios
 

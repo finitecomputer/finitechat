@@ -1,0 +1,45 @@
+# Finite Chat
+
+Finite Chat is an encrypted chat and command transport. Its language separates
+cryptographic delivery boundaries from user-facing conversation structure.
+
+## Language
+
+**Room**:
+An MLS group plus one server-ordered delivery log.
+_Avoid_: Chat, topic, conversation
+
+**Conversation**:
+An application-level session inside a room.
+_Avoid_: Room, MLS group
+
+**Topic**:
+A first-class user-facing conversation lane inside a room.
+_Avoid_: Thread, room
+
+**Segment**:
+A bounded context window inside a conversation.
+_Avoid_: Topic, conversation, room
+
+**Activity**:
+TTL-bound encrypted intermediate state inside a room or conversation.
+_Avoid_: Message, notification
+
+## Relationships
+
+- A **Room** contains zero or more **Conversations**.
+- A **Topic** is a **Conversation** presented as a named lane.
+- A **Conversation** contains one or more **Segments** when an app supports context resets.
+- A **Segment** belongs to exactly one **Conversation**.
+- **Activity** may be scoped to a **Room** or to one **Conversation**.
+
+## Example Dialogue
+
+> **Dev:** "If the user runs `/new` in the Deploys topic, do we create a new topic?"
+> **Domain expert:** "No. Deploys stays the same Topic; `/new` starts a new Segment inside it."
+
+## Flagged Ambiguities
+
+- "New chat" can mean creating a new **Topic** from the app shell, or starting a
+  new **Segment** inside an existing **Topic**. Resolved: app-level "New chat"
+  creates a Topic; `/new` inside a Topic creates a Segment.

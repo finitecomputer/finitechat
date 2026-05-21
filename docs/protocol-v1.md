@@ -55,6 +55,17 @@ chat" is a conversation, not a separate MLS group. Conversations do not define
 membership, encryption, ordering authority, or delivery boundaries; the room
 does.
 
+`Topic`
+
+A first-class user-facing conversation lane inside a room. Protocol messages use
+`conversation_id` for topics; "topic" is product language, not a second delivery
+or encryption boundary.
+
+`Segment`
+
+A bounded context window inside a conversation. A `/new` command inside an
+existing topic starts a new segment, not a new conversation or room.
+
 `Room Server`
 
 Delivery Service for KeyPackages, ordered room log entries, Welcomes, sessions,
@@ -376,11 +387,19 @@ session without scanning every decrypted payload in a room. Rich conversation
 state such as title, preview text, runtime status, and activity kind remains in
 the encrypted payload.
 
+Finite Chat clients may present conversations as topics. A topic is still a
+conversation: it has a stable `conversation_id`, encrypted title/settings, and
+conversation-scoped messages, receipts, activity, and command requests. External
+topic systems such as Telegram `message_thread_id` or Hermes `thread_id` should
+map into this layer, not into rooms.
+
 Finite Chat reserves generic durable chat kinds:
 
 - `conversation.create`: creates an app-level conversation inside a room;
 - `conversation.update`: updates encrypted conversation metadata;
 - `conversation.archive`: marks a conversation archived for the app projection;
+- `conversation.segment.start`: starts a new context segment inside an existing
+  conversation;
 - `chat.message`: user-visible message;
 - `chat.edit`: user-visible message edit;
 - `chat.reaction`: reaction to a message;
@@ -391,6 +410,11 @@ lazily materialize a conversation when it sees the first durable event for an
 unknown `conversation_id`, but explicit `conversation.create` is preferred for
 clear ordering and projection behavior.
 
+`conversation.segment.start` is used when an app wants a fresh context inside an
+existing topic, for example Hermes `/new` in a Telegram topic. It is a durable
+encrypted event so every device agrees on the boundary, but it does not create a
+new conversation, room, membership set, delivery log, or cryptographic state.
+
 Push policy is part of the server-visible envelope, not the encrypted semantic
 kind. V1 defaults are:
 
@@ -398,6 +422,7 @@ kind. V1 defaults are:
   policy;
 - `chat.edit`, `chat.reaction`, `chat.receipt`, and conversation metadata:
   `push_policy = never`;
+- `conversation.segment.start`: `push_policy = never`;
 - `runtime.command.request`: may wake the encrypted target runtime device, but
   should not create a user notification by default;
 - `runtime.command.result`: push-eligible only when the receiving app maps it to
@@ -511,6 +536,11 @@ request ledger entry before scheduling execution. The request ledger should
 deduplicate replays by request id, sender, conversation, and original message
 id. Execution workers read the ledger; live streams and push wakes only cause
 sync.
+
+When a runtime builds prompt context for a topic, it should respect the latest
+accepted `conversation.segment.start` event in that conversation unless the
+application explicitly opts into older history. The transcript remains visible
+and durable; only the runtime's active context window resets.
 
 Cancellation is also durable. A `runtime.command.cancel` references the
 encrypted `request_id`. If cancellation wins before terminal result, the

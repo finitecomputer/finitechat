@@ -95,6 +95,34 @@ Relevant files:
 - `apps/dashboard/src/lib/finite-relay-client.ts`
 - `apps/dashboard/src/lib/chat-proxy.ts`
 
+## Hermes And OpenClaw Topics
+
+Hermes already models the distinction Finite Chat needs for first-class topics:
+
+- `gateway/session.py` stores `SessionSource.chat_id` plus optional
+  `thread_id`; Telegram forum topics, Discord threads, and Slack threads are
+  all represented as thread ids under a parent chat.
+- `build_session_key` makes `thread_id` part of the stable session key. For
+  group/channel threads, the default is a shared session across participants,
+  matching Telegram forum topic UX.
+- `gateway/delivery.py` parses delivery targets as
+  `platform:chat_id:thread_id` and forwards `thread_id` through send metadata.
+- `gateway/platforms/telegram.py` maps metadata `thread_id` to Telegram
+  `message_thread_id`, extracts inbound `message.message_thread_id`, resolves
+  topic names, and supports topic-specific skill binding.
+- Finitecomputer's Hermes adapter already treats finite `thread_id` as the
+  inbound/outbound session key for gateway events.
+
+This supports the Finite Chat mapping: a topic is a user-facing conversation
+inside a room, backed by `conversation_id`. A `/new` command inside a topic
+should start a new segment inside that conversation, not create a new
+conversation or room.
+
+OpenClaw/Pikachat has a simpler shape: direct and group conversations map to
+session keys, and the plugin keeps a `sessionKey -> group/account` table so
+tools can route replies. It does not add a separate topic primitive, which makes
+Finite Chat's conversation/topic layer the useful missing concept.
+
 ## Dependency Audit
 
 OpenMLS credential spike:

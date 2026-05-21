@@ -49,6 +49,26 @@ Transport should start with HTTP mutations, cursor-based pull sync, and SSE
 hints. WebSockets are not needed for v1. SSE and relay wakes only trigger sync;
 durable ordered room state remains the source of truth.
 
+## Topics And New Chat
+
+Finitecomputer should ship first-class topics as the product surface for Finite
+Chat conversations. One project or agent runtime gets one encrypted room, and
+that room can contain many topics. Creating a new topic appends
+`conversation.create` with encrypted topic metadata such as title, description,
+model/skill binding, and external bridge metadata.
+
+The app shell's "New chat" action should create a new topic. A `/new` command
+inside an existing topic should not create another topic; it should append
+`conversation.segment.start` inside the same `conversation_id`. The UI can render
+that event as a divider, while the runtime treats it as the start of a fresh
+prompt context for that topic.
+
+Hermes `thread_id` and Telegram `message_thread_id` map naturally to topic
+`conversation_id`. Finite Chat should store external platform identifiers and
+topic names in encrypted conversation metadata. The cleartext `conversation_id`
+exists for routing and indexing only; it does not authorize access and it does
+not need to expose the external platform's raw identifier.
+
 ## Proposed Landing Shape
 
 Add an encrypted mode in finitecomputer with four layers:
