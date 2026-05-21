@@ -118,6 +118,9 @@ Proven client scenarios:
 - `client_processes_remote_remove_commit_before_post_remove_messages`
 - `stale_removed_device_can_process_removal_but_not_future_ciphertext`
 - `client_recovers_losing_same_epoch_add_commit_and_retries`
+- `client_recovers_losing_same_epoch_update_commit_and_retries`
+- `client_recovers_losing_same_epoch_remove_commit_and_retries`
+- `client_drops_losing_pending_commit_when_winning_race_removes_it`
 - `client_key_package_replenishment_edges_use_real_packages`
 - `new_device_history_policy_starts_at_add_commit_not_prior_messages`
 - `client_links_new_device_into_existing_rooms_with_distinct_key_packages`
@@ -240,6 +243,11 @@ Checkpoint test signal:
   clears the loser, processes the winner, and lets Bob retry at epoch 2. The
   retry reuses the still-leased Dana KeyPackage because the rejected Commit did
   not consume it or release a Welcome.
+- The broader same-epoch recovery checkpoint keeps that same branch under real
+  OpenMLS for non-add operations. An update loser retries after an update
+  winner, a remove loser retries after an update winner, and a device whose
+  pending update lost because it was removed clears pending state, cannot retry,
+  cannot send locally or through the server, and stops receiving future entries.
 - The KeyPackage replenishment checkpoint uses real OpenMLS package bytes for
   the client boundary: duplicate upload is rejected, account claim exhaustion
   returns no packages, uploading a fresh package replenishes availability, and

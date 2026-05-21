@@ -201,7 +201,8 @@ Current OpenMLS scope:
   fetch and process its removal Commit, but cannot send or decrypt post-removal
   ciphertext.
 - same-epoch loser recovery proof where a losing client clears its pending
-  Commit after observing the winner, rolls forward, retries, and gets accepted.
+  Commit after observing the winner, rolls forward, retries when still a
+  member, or becomes locally unable to send when the winning Commit removed it.
 - KeyPackage replenishment edge proof with real OpenMLS package bytes covering
   duplicate upload rejection, account-claim exhaustion, fresh-package
   replenishment, and lease expiry/reclaim.
@@ -235,9 +236,10 @@ Current known gap:
 - Removal/revocation is proven for stale local MLS state and server delivery
   gating. Production still needs policy and UX for who may revoke which device,
   plus durable device-status records.
-- Same-epoch loser recovery is proven for add Commits. Broader race matrices
-  across remove/update combinations can be added, but the key recovery shape is
-  now exercised with real OpenMLS state.
+- Same-epoch loser recovery is proven with real OpenMLS state for add/add,
+  update/update, remove-after-update, and removed-loser races. A larger
+  randomized operation-order fuzzer can still broaden confidence, but the core
+  pending-Commit recovery branch is no longer add-only.
 - KeyPackage edge behavior is covered across real-client, sim, and SQLite
   suites. Production still needs background policy for how many packages each
   device keeps available per account and room fanout budget.
@@ -291,9 +293,9 @@ Good tests:
 - stale removed device can sync through the removal Commit, is rejected by the
   server at old and faked-new epochs, transitions local MLS state to removed,
   and cannot decrypt leaked post-remove ciphertext.
-- same-epoch add loser observes the accepted winner, clears its pending Commit,
-  retries from the new epoch with the still-leased KeyPackage, and then sends
-  decryptable post-retry messages.
+- same-epoch losers observe the accepted winner, clear pending local Commit
+  state, retry from the new epoch when still members, and stop sending when the
+  winning Commit removed them.
 - real KeyPackage bytes cover duplicate upload, exhausted account claim,
   replenishment by fresh upload, and lease expiry/reclaim; sim/SQLite cover
   consumed-package reuse rejection and max-device caps.

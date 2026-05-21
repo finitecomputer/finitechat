@@ -1283,6 +1283,269 @@ fn client_recovers_losing_same_epoch_add_commit_and_retries() {
 }
 
 #[test]
+fn client_recovers_losing_same_epoch_update_commit_and_retries() {
+    let mut world = active_alice_bob_charlie_room();
+    let alice_ref = world.alice.device_ref().clone();
+    let bob_ref = world.bob.device_ref().clone();
+
+    let alice_winner = world
+        .alice
+        .prepare_self_update_commit(ROOM_ID, "race_alice_update_wins")
+        .unwrap();
+    let bob_loser = world
+        .bob
+        .prepare_self_update_commit(ROOM_ID, "race_bob_update_loses")
+        .unwrap();
+    let alice_accepted = world.server.submit_commit(alice_winner.request).unwrap();
+    assert_wrong_epoch(world.server.submit_commit(bob_loser.request).unwrap_err());
+    assert!(world.bob.has_pending_commit(ROOM_ID).unwrap());
+
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.bob, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert!(!world.bob.has_pending_commit(ROOM_ID).unwrap());
+    assert_eq!(world.bob.group_epoch(ROOM_ID).unwrap(), 3);
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.alice, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.charlie, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref,
+            epoch: 3,
+        }
+    );
+
+    let bob_retry = world
+        .bob
+        .prepare_self_update_commit(ROOM_ID, "race_bob_update_retry")
+        .unwrap();
+    let bob_accepted = world.server.submit_commit(bob_retry.request).unwrap();
+    assert_eq!(bob_accepted.seq, alice_accepted.seq + 1);
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.bob, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref.clone(),
+            epoch: 4,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.alice, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref.clone(),
+            epoch: 4,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.charlie, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref,
+            epoch: 4,
+        }
+    );
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"update race recovered"}}"#;
+    let request = world
+        .charlie
+        .create_application_request(ROOM_ID, plaintext, "charlie_after_update_race")
+        .unwrap();
+    world.server.append_event(request).unwrap();
+    assert_device_decrypts_after(&world.server, &mut world.alice, bob_accepted.seq, plaintext);
+    assert_device_decrypts_after(&world.server, &mut world.bob, bob_accepted.seq, plaintext);
+}
+
+#[test]
+fn client_recovers_losing_same_epoch_remove_commit_and_retries() {
+    let mut world = active_alice_bob_charlie_room();
+    let alice_ref = world.alice.device_ref().clone();
+    let bob_ref = world.bob.device_ref().clone();
+    let charlie_ref = world.charlie.device_ref().clone();
+
+    let alice_winner = world
+        .alice
+        .prepare_self_update_commit(ROOM_ID, "race_update_beats_remove")
+        .unwrap();
+    let bob_loser = world
+        .bob
+        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "race_bob_remove_loses")
+        .unwrap();
+    let alice_accepted = world.server.submit_commit(alice_winner.request).unwrap();
+    assert_wrong_epoch(world.server.submit_commit(bob_loser.request).unwrap_err());
+    assert!(world.bob.has_pending_commit(ROOM_ID).unwrap());
+
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.bob, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert!(!world.bob.has_pending_commit(ROOM_ID).unwrap());
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.alice, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.charlie, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref,
+            epoch: 3,
+        }
+    );
+
+    let bob_retry = world
+        .bob
+        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "race_bob_remove_retry")
+        .unwrap();
+    let remove_accepted = world.server.submit_commit(bob_retry.request).unwrap();
+    assert_eq!(remove_accepted.seq, alice_accepted.seq + 1);
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.bob, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref.clone(),
+            epoch: 4,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.alice, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref.clone(),
+            epoch: 4,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.charlie, alice_accepted.seq),
+        AppliedLogEntry::Commit {
+            sender: bob_ref,
+            epoch: 4,
+        }
+    );
+    assert!(matches!(
+        world
+            .charlie
+            .create_application_request(ROOM_ID, b"removed", "charlie_after_remove_race"),
+        Err(ClientError::CreateApplicationMessage)
+    ));
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"remove race recovered"}}"#;
+    let request = world
+        .bob
+        .create_application_request(ROOM_ID, plaintext, "bob_after_remove_race")
+        .unwrap();
+    world.server.append_event(request).unwrap();
+    assert_device_decrypts_after(
+        &world.server,
+        &mut world.alice,
+        remove_accepted.seq,
+        plaintext,
+    );
+    let charlie_page = world
+        .server
+        .sync_events(ROOM_ID, &charlie_ref, remove_accepted.seq)
+        .unwrap();
+    assert!(charlie_page.entries.is_empty());
+}
+
+#[test]
+fn client_drops_losing_pending_commit_when_winning_race_removes_it() {
+    let mut world = active_alice_bob_charlie_room();
+    let alice_ref = world.alice.device_ref().clone();
+    let bob_ref = world.bob.device_ref().clone();
+
+    let bob_loser = world
+        .bob
+        .prepare_self_update_commit(ROOM_ID, "race_removed_bob_update_loses")
+        .unwrap();
+    let alice_winner = world
+        .alice
+        .prepare_remove_member_commit(ROOM_ID, &bob_ref, "race_alice_removes_bob")
+        .unwrap();
+    let remove_accepted = world.server.submit_commit(alice_winner.request).unwrap();
+    assert_wrong_epoch(world.server.submit_commit(bob_loser.request).unwrap_err());
+    assert!(world.bob.has_pending_commit(ROOM_ID).unwrap());
+
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.bob, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert!(!world.bob.has_pending_commit(ROOM_ID).unwrap());
+    assert_eq!(world.bob.group_epoch(ROOM_ID).unwrap(), 3);
+    assert!(matches!(
+        world
+            .bob
+            .prepare_self_update_commit(ROOM_ID, "race_removed_bob_update_retry"),
+        Err(ClientError::SelfUpdate)
+    ));
+    assert!(matches!(
+        world
+            .bob
+            .create_application_request(ROOM_ID, b"removed", "removed_bob_after_race"),
+        Err(ClientError::CreateApplicationMessage)
+    ));
+    assert_eq!(
+        world
+            .server
+            .append_event(fake_application_request(
+                bob_ref.clone(),
+                3,
+                "removed_bob_fake_send_after_race"
+            ))
+            .unwrap_err(),
+        EngineError::SenderNotActive(bob_ref)
+    );
+
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.alice, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref.clone(),
+            epoch: 3,
+        }
+    );
+    assert_eq!(
+        apply_one_commit(&world.server, &mut world.charlie, world.last_seq),
+        AppliedLogEntry::Commit {
+            sender: alice_ref,
+            epoch: 3,
+        }
+    );
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"removed loser cannot follow"}}"#;
+    let request = world
+        .alice
+        .create_application_request(ROOM_ID, plaintext, "alice_after_removed_loser")
+        .unwrap();
+    world.server.append_event(request).unwrap();
+    assert_device_decrypts_after(
+        &world.server,
+        &mut world.charlie,
+        remove_accepted.seq,
+        plaintext,
+    );
+    let removed_bob_page = world
+        .server
+        .sync_events(ROOM_ID, world.bob.device_ref(), remove_accepted.seq)
+        .unwrap();
+    assert!(removed_bob_page.entries.is_empty());
+}
+
+#[test]
 fn client_key_package_replenishment_edges_use_real_packages() {
     let alice_phone = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_phone_replenish");
     let mut server = DeliveryService::new();
@@ -2371,6 +2634,13 @@ fn fake_application_request(
         ),
         idempotency_key: idempotency_key.to_string(),
     }
+}
+
+fn assert_wrong_epoch(error: EngineError) {
+    assert!(
+        matches!(error, EngineError::WrongEpoch { .. }),
+        "expected WrongEpoch, got {error:?}"
+    );
 }
 
 struct ScenarioAliceDevice {
