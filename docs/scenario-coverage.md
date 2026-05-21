@@ -373,3 +373,12 @@ but `DeviceRevoked` in SQLite. The store now matches the reducer ordering.
 
 Push outbox rows are not implemented yet; when they land, this matrix should add
 a failure point after outbox enqueue and assert exactly one durable wake record.
+
+## Planned Activity Scenarios
+
+The Pika typing-indicator behavior should become explicit Finite Chat protocol
+coverage before the room server owns push fanout:
+
+- `ephemeral_activity_never_enqueues_push`
+- `ephemeral_activity_expires_without_transcript_entry`
+- `ephemeral_activity_does_not_create_command_inbox_work`

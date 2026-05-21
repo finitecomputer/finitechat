@@ -53,6 +53,19 @@ server per room.
 Delivery Service for KeyPackages, ordered room log entries, Welcomes, sessions,
 membership intervals, repair reports, and push wake outbox records.
 
+`Durable Application Event`
+
+An encrypted room event that is part of the durable room log. Chat messages,
+conversation updates, command requests, and command results are durable
+application events unless their kind explicitly says otherwise.
+
+`Ephemeral Activity Event`
+
+An encrypted, TTL-bound room event for intermediate state such as typing,
+thinking, working, uploading, or presence refreshes. The room server may route
+and cache it briefly, but it is not durable history and never creates unread
+state or push notifications.
+
 ## Invariants
 
 - A room has one canonical server sequence.
@@ -76,6 +89,12 @@ membership intervals, repair reports, and push wake outbox records.
 - Encrypted application messages use MLS protection. Do not add an extra
   application-message encryption layer unless a future threat model names the
   additional boundary. Local database encryption is separate at-rest protection.
+- Durable application events and ephemeral activity events are distinct
+  envelope classes. The server can see the class and push policy, but not the
+  encrypted activity kind.
+- Ephemeral activity events must carry `push_policy = never` and an explicit
+  expiry. They must not create push outbox records, unread counts, durable
+  transcript entries, or command inbox work.
 
 ## V1 Limits
 
@@ -260,6 +279,18 @@ that would turn a lost response retry into a possible duplicate mutation.
 Finite Chat orders encrypted application messages. The room server sees the
 `FiniteEnvelope` routing fields and opaque payload bytes; clients decrypt and
 interpret the plaintext.
+
+The envelope distinguishes durable application events from ephemeral activity
+events before decryption:
+
+- `durable`: ordered room-log data, push-eligible according to room and client
+  policy;
+- `ephemeral`: best-effort activity state, always `push_policy = never`, with a
+  short explicit expiry.
+
+The encrypted activity payload owns the semantic kind. The server does not need
+to know whether an ephemeral event means typing, thinking, working, uploading,
+or another generic chat activity.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
