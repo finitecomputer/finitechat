@@ -95,6 +95,7 @@ Proven SQLite restart scenarios:
 - `sqlite_link_payload_limit_is_rejected`
 - `sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay`
 - `sqlite_commit_crash_matrix_rolls_back_and_retry_converges`
+- `sqlite_commit_epoch_unique_index_blocks_second_commit_row`
 
 The SQLite crash matrix injects transaction rollbacks after log append, room
 head update, removed membership update, added membership insert, KeyPackage

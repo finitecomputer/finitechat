@@ -12,7 +12,7 @@ use finitechat_proto::{
     WelcomeState,
 };
 use finitechat_store::{SqliteDeliveryStore, StoreError};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode, params};
 use tempfile::TempDir;
 
 struct SqliteWorld {
@@ -377,6 +377,15 @@ fn crash_commit_idempotency_count(db_path: &Path) -> i64 {
     .unwrap()
 }
 
+fn assert_sqlite_constraint(error: rusqlite::Error) {
+    match error {
+        rusqlite::Error::SqliteFailure(sqlite_error, _) => {
+            assert_eq!(sqlite_error.code, ErrorCode::ConstraintViolation);
+        }
+        other => panic!("expected sqlite constraint error, got {other:?}"),
+    }
+}
+
 fn assert_crash_commit_rolled_back(world: &SqliteWorld) {
     let reopened = world.reopen();
     let room = room(&reopened, &world.room_id);
@@ -558,7 +567,48 @@ fn sqlite_rejected_commit_is_replayable_after_reopen() {
             actual: 0
         }
     ));
+    assert_eq!(room(&reopened, &world.room_id).log.len(), 1);
+    assert_eq!(
+        key_package(&reopened, "kp_charlie_1").state,
+        KeyPackageState::Leased
+    );
     assert!(maybe_welcome(&reopened, "welcome_charlie_1").is_none());
+}
+
+#[test]
+fn sqlite_commit_epoch_unique_index_blocks_second_commit_row() {
+    let mut world = SqliteWorld::direct_room();
+    world.upload_and_claim(bob(), "kp_bob_1");
+    let request =
+        world.add_device_request(alice(), bob(), "kp_bob_1", "welcome_bob_1", 0, "winner");
+    world.server.submit_commit(request).unwrap();
+
+    let conn = Connection::open(&world.db_path).unwrap();
+    let sender = alice();
+    let err = conn
+        .execute(
+            r#"
+            INSERT INTO room_log_entries (
+              room_id, seq, message_id, sender_account_id, sender_device_id,
+              kind, epoch, mls_group_id, payload, idempotency_key
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'commit', ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                world.room_id.as_str(),
+                2_i64,
+                "manual_same_epoch_commit",
+                sender.account_id,
+                sender.device_id,
+                0_i64,
+                world.group_id.as_str(),
+                b"manual".as_slice(),
+                "manual_same_epoch",
+            ],
+        )
+        .unwrap_err();
+
+    assert_sqlite_constraint(err);
+    assert_eq!(room(&world.reopen(), "room_direct").log.len(), 1);
 }
 
 #[test]

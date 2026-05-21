@@ -35,6 +35,9 @@ The store still uses SQLite for local/dev and first-server proof, but the
 authoritative state layout is no longer a JSON snapshot.
 SQLite connections set `journal_mode = WAL` and `synchronous = FULL`
 explicitly so tests do not inherit durability behavior from library defaults.
+Write transactions use `BEGIN IMMEDIATE`, and room-head updates include the
+epoch and sequence they consumed. Commit rows also have a partial unique index
+on `(room_id, epoch)` for `kind = 'commit'`.
 
 It proves:
 
@@ -42,6 +45,7 @@ It proves:
 - idempotency capacity rejects new mutations without breaking existing replay;
 - Commit side effects are persisted together;
 - Commit transaction rollback after intermediate side effects converges on retry;
+- same-epoch Commit losers cannot create duplicate log rows or Welcomes;
 - KeyPackage leases and consumption survive reopen;
 - Welcome release, claim, ack, failure, and resume states survive reopen;
 - direct-room identity constraints survive reopen;

@@ -16,7 +16,7 @@ use finitechat_proto::{
     MlsGroupId, RoomId, RoomLogEntry, RoomStatus, Seq, WelcomeState, validate_bytes_len,
     validate_room_id, validate_string_bytes,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -600,7 +600,7 @@ impl SqliteDeliveryStore {
         f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
@@ -611,7 +611,7 @@ impl SqliteDeliveryStore {
         f: impl FnOnce(&Transaction<'_>) -> Result<Result<T, EngineError>, StoreError>,
     ) -> Result<T, StoreError> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result?)
@@ -708,6 +708,10 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           PRIMARY KEY (room_id, seq),
           UNIQUE (room_id, message_id)
         );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_room_commit_epoch_unique
+        ON room_log_entries (room_id, epoch)
+        WHERE kind = 'commit';
 
         CREATE TABLE IF NOT EXISTS room_membership_intervals (
           room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
@@ -820,7 +824,14 @@ fn append_event_inner(
         &request.envelope,
         &request.idempotency_key,
     )?;
-    update_room_head(tx, &request.room_id, room.current_epoch, seq)?;
+    update_room_head(
+        tx,
+        &request.room_id,
+        room.current_epoch,
+        room.last_seq,
+        room.current_epoch,
+        seq,
+    )?;
     Ok(Ok(EventAccepted { seq, message_id }))
 }
 
@@ -861,7 +872,14 @@ fn submit_commit_inner(
         &request.envelope,
         &request.idempotency_key,
     )?;
-    update_room_head(tx, &request.room_id, next_epoch, seq)?;
+    update_room_head(
+        tx,
+        &request.room_id,
+        room.current_epoch,
+        room.last_seq,
+        next_epoch,
+        seq,
+    )?;
     apply_membership_delta(tx, &request.room_id, seq, next_epoch, request)?;
 
     let released_welcomes = request
@@ -1171,22 +1189,32 @@ fn insert_log_entry(
 fn update_room_head(
     tx: &Transaction<'_>,
     room_id: &str,
+    expected_epoch: Epoch,
+    expected_seq: Seq,
     next_epoch: Epoch,
     next_seq: Seq,
 ) -> Result<(), StoreError> {
     let updated = tx.execute(
-        "UPDATE rooms SET current_epoch = ?1, last_seq = ?2 WHERE room_id = ?3",
+        r#"
+        UPDATE rooms
+        SET current_epoch = ?1, last_seq = ?2
+        WHERE room_id = ?3
+          AND current_epoch = ?4
+          AND last_seq = ?5
+        "#,
         params![
             to_i64("current_epoch", next_epoch)?,
             to_i64("last_seq", next_seq)?,
             room_id,
+            to_i64("expected_epoch", expected_epoch)?,
+            to_i64("expected_seq", expected_seq)?,
         ],
     )?;
     if updated == 1 {
         Ok(())
     } else {
         Err(StoreError::CorruptState(format!(
-            "room {room_id} disappeared during update"
+            "room {room_id} head changed during transaction"
         )))
     }
 }

@@ -111,12 +111,12 @@ Current SQLite scope:
 - reopen tests for accepted Commit replay, rejected Commit replay,
   KeyPackages, Welcomes, direct-room rules, and link sessions;
 - crash-matrix tests for Commit transaction rollback and retry convergence;
+- same-epoch Commit uniqueness enforced by SQLite schema and mutation tests;
 - same schema direction intended for the Postgres canary store.
 
 Good tests:
 
 - crash matrix around Commit transaction side effects;
-- SQLite unique index blocks same-epoch Commit race;
 - restart after lost response returns replayed idempotency result;
 - replayable rejects are stable.
 
