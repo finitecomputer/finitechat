@@ -95,3 +95,16 @@ Relevant files:
 - `apps/dashboard/src/lib/finite-relay-client.ts`
 - `apps/dashboard/src/lib/chat-proxy.ts`
 
+## Dependency Audit
+
+OpenMLS credential spike:
+
+- `openmls = 0.8.1`, MIT, used only for `BasicCredential`/`Credential`
+  identity-byte integration in this checkpoint. The RustCrypto provider,
+  OpenMLS SQLite storage, and `openmls_basic_credential` are intentionally not
+  added yet because no room traffic or KeyPackage generation is implemented in
+  this slice. Notable transitive dependencies in this slice are
+  `openmls_traits`, `tls_codec`, `zeroize`, and `rayon`.
+- `secp256k1 = 0.29.1`, CC0-1.0, used for Nostr-compatible BIP340 Schnorr
+  account signatures. The full `nostr-sdk` and bech32 parsing are intentionally
+  not added; the protocol boundary stores raw 32-byte Nostr public keys.

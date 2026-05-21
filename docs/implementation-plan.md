@@ -136,6 +136,8 @@ Production server store:
 
 ### Phase 2: OpenMLS Spike
 
+Status in this repo: credential proof started.
+
 Deliverables:
 
 - `FiniteDeviceCredentialV1` in MLS `BasicCredential` identity bytes.
@@ -144,6 +146,14 @@ Deliverables:
 - parseable PublicMessage/handshake routing checks.
 - Welcome activation with ratchet tree material.
 - local MLS client store with encrypted-at-rest SQLite.
+
+Current OpenMLS scope:
+
+- `finitechat-mls` crate with bounded binary `FiniteDeviceCredentialV1`
+  encoding;
+- Nostr-compatible BIP340 Schnorr signature over the device credential binding;
+- explicit expected account/device/leaf-key verification API;
+- OpenMLS `BasicCredential` identity-byte roundtrip test.
 
 Good tests:
 

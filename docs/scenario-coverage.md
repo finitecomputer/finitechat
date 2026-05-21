@@ -1,12 +1,14 @@
 # Scenario Coverage
 
-Status: fake-MLS reducer scenarios and SQLite restart scenarios passing.
+Status: fake-MLS reducer scenarios, SQLite restart scenarios, and the first
+OpenMLS credential spike passing.
 
 Run:
 
 ```sh
 cargo test -p finitechat-sim --test scenarios
 cargo test -p finitechat-store --test sqlite_scenarios
+cargo test -p finitechat-mls
 ```
 
 ## Proven Scenarios
@@ -59,7 +61,8 @@ These tests prove protocol ordering, idempotency, delivery, and state-machine
 rules before real MLS is wired in. They intentionally do not prove OpenMLS
 cryptographic correctness.
 
-OpenMLS-specific scenarios are represented as fake validation gates for now:
+Some OpenMLS-specific scenarios are represented as fake validation gates for
+now:
 
 - device credential validation;
 - changed LeafNode credential validation;
@@ -67,6 +70,27 @@ OpenMLS-specific scenarios are represented as fake validation gates for now:
 - local pending Commit merge only after server-log observation.
 
 Those gates become real OpenMLS tests in Phase 2.
+
+## OpenMLS Credential Proof
+
+The first real OpenMLS-facing tests live in `crates/finitechat-mls/src/lib.rs`.
+
+Proven credential scenarios:
+
+- `nostr_signed_device_credential_verifies`
+- `wrong_account_key_rejects`
+- `wrong_device_id_rejects`
+- `wrong_mls_leaf_key_rejects`
+- `tampered_signature_payload_rejects`
+- `expired_credential_rejects`
+- `not_yet_valid_credential_rejects`
+- `invalid_sizes_reject_before_signing`
+- `openmls_basic_credential_round_trips_finite_identity_bytes`
+
+This proves the identity refinement from the protocol docs: OpenMLS carries the
+credential bytes, but Finite Chat clients verify the Nostr-rooted account,
+device id, and MLS leaf signing key locally. The server can order room entries
+without deciding who a device is.
 
 ## SQLite Follow-Up
 
