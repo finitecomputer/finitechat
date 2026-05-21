@@ -395,7 +395,10 @@ coverage before the room server owns push fanout:
 - `activity_projection_rolls_up_identity_for_normal_ui`
 - `activity_projection_does_not_clear_sibling_device_activity`
 - `activity_refresh_extends_matching_device_expiry`
-- `activity_clear_removes_matching_device_kind`
+- `activity_clear_removes_matching_device_kind_and_activity_id`
 - `activity_clear_does_not_remove_unrelated_kind`
+- `activity_clear_does_not_remove_different_activity_id`
+- `stale_agent_activity_clear_does_not_hide_newer_run`
+- `long_running_agent_activity_uses_command_or_run_id`
 - `long_running_agent_activity_survives_refresh_without_push`
 - `ephemeral_activity_expiry_is_bounded`

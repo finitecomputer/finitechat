@@ -123,7 +123,7 @@ activity event before expiry, and end it early with an explicit clear.
 - Ephemeral activity expiry is a lease. A newer activity event for the same
   projection key replaces the previous expiry, and an explicit clear removes
   the matching device-scoped activity before expiry. Clears must not remove
-  sibling devices or unrelated activity kinds.
+  sibling devices, unrelated activity kinds, or a different activity id.
 
 ## V1 Limits
 
@@ -343,18 +343,25 @@ limit. Long-running senders should refresh the activity while work continues
 and send an explicit clear when a durable message, command result, or terminal
 failure makes the intermediate state obsolete.
 
+The encrypted activity payload may carry an `activity_id`. Clients normalize a
+missing `activity_id` to a reserved default value for short-lived single-state
+activity such as human typing. Long-running agent activity should set
+`activity_id` to the command, request, or run id that caused the work. Refreshes
+and clears match on the normalized activity id, so a delayed clear for an old
+operation cannot erase a newer `working` indicator from the same device.
+
 The server authorizes ephemeral activity against its current device ledger and
 membership cache before forwarding or caching it. This check is not identity
 proof; clients still verify Nostr-rooted MLS credentials locally. It only keeps
 non-members, pending devices, and removed or revoked devices from creating live
 room activity.
 
-After decryption, clients project activity by
-`(room_id, conversation_id, account_id, device_id, activity_kind)`. Normal UI
-may roll this up to an identity-level display such as "Alice is typing" or
-"Runtime is working", but device remains the source of truth. Device-specific
-views can expose the exact active device when that matters, such as targeting a
-runtime device with GPU access.
+After decryption, clients project activity by `(room_id, conversation_id,
+account_id, device_id, activity_kind, normalized_activity_id)`. Normal UI may
+roll this up to an identity-level display such as "Alice is typing" or
+"Runtime is working", but device and activity id remain the source of truth.
+Device-specific views can expose the exact active device when that matters,
+such as targeting a runtime device with GPU access.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
