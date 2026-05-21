@@ -3,7 +3,7 @@
 ## Existing Seam
 
 Do not replace the current outbound relay shape. It is the right boundary for
-hosted runtimes:
+hosted runtimes and for agents running elsewhere:
 
 ```text
 Dashboard route
@@ -18,6 +18,14 @@ Dashboard route
 
 Finite Chat should first replace the semantics behind "chat event" and "chat
 message", not the dashboard shell.
+
+The long-term product boundary is not the host control plane. A `finite` or
+`finitec` daemon should be deployable inside any agent, hosted anywhere, and
+should connect outward to Finite. The dashboard and Finite Chat app read Finite
+relay/projection state and send typed commands through that outbound agent
+connection. Hosted-runner admin remains only for infrastructure Finite operates,
+such as hostname reservation, auth policy, route rendering, and runner image
+rollouts.
 
 The hosted finitecomputer web path is a trusted-server-client mode, not true
 end-to-end encryption. A server-side Rust Finite Chat client may decrypt room
@@ -34,11 +42,16 @@ server.
 ## Command/RPC Mapping
 
 Dashboard and Hermes commands ride inside Finite Chat durable application
-events, not a separate RPC channel. The dashboard sends
+events, not a separate dashboard-to-runtime backdoor. The dashboard sends
 `runtime.command.request` as an encrypted durable event in the Project runtime
 room. The runtime device syncs ordered room entries, decrypts the request,
 validates sender and target policy locally, persists a request ledger entry, and
 then schedules execution.
+
+Chat payloads and management commands stay separate at the application-kind
+level. Chat messages, receipts, attachments, and topic updates are not shoved
+through a generic command queue; management commands are typed, allowlisted
+runtime requests with idempotent handlers.
 
 Intermediate states such as thinking, working, tool-running, upload progress,
 or runtime presence use ephemeral activity events with `push_policy = never`.
@@ -62,8 +75,7 @@ durable ordered room state remains the source of truth.
 
 ## Dashboard Command Audit
 
-The current finitecomputer relay surface on `origin/finitec-inference-profiles`
-has four categories:
+The current finitecomputer relay surface on `main` has four categories:
 
 - Projection reads: `chat.bootstrap`, `chat.list_threads`,
   `chat.list_messages`, `chat.list_slash_commands`, and `chat.get_attachment`.
@@ -79,11 +91,16 @@ has four categories:
   connection commands. These should use `runtime.command.request` and
   `runtime.command.result` with namespaced encrypted command names such as
   `finitecomputer.runtime.inference.apply`.
-- Host control-plane operations: published-site access, repo provisioning,
-  Google OAuth handoff, Telegram env setup, Codex auth orchestration, and pod
-  restarts. These can stay on the host control-plane path until the runtime
-  itself owns those secrets and side effects. Finite Chat should not pretend to
-  replace the host control plane.
+- Decoupling targets: published-app inventory, runtime-owned connection status,
+  Telegram/Matrix/Hermes config, Codex status, local skills sync, and other
+  portable agent capabilities should move behind the finitec daemon boundary.
+  The practical test is whether the feature can work for an agent outside
+  Finite's k3s cluster with only `finite` installed.
+- Hosted-runner admin: hostname reservation, hosted auth policy, route
+  rendering, runner image updates, and emergency pod/runner operations can stay
+  outside Finite Chat because they are infrastructure Finite operates. These
+  paths should not become product-level dependencies for self-hosted or
+  bring-your-own-agent users.
 
 Config-editing commands must be serialized per target runtime resource. For
 example, inference profile apply, rollback, and gateway restart all touch Hermes
@@ -114,15 +131,19 @@ not need to expose the external platform's raw identifier.
 
 ## Proposed Landing Shape
 
-Add a Finite Chat-backed mode in finitecomputer with four layers:
+Add a Finite Chat-backed mode in finitecomputer with five layers:
 
 1. `finitechat-proto`: shared DTOs used by dashboard server routes, finited,
    finitec, and tests.
 2. `finitechat-engine`: reducer/store used by `finited` in local/dev and by a
    future canary room server.
-3. `finitechatd`: local daemon that owns device secrets, MLS state, sync,
+3. `finitechatd`: local user daemon that owns device secrets, MLS state, sync,
    projections, command ledger, and attachment download/upload.
-4. `finitec encrypted-chat`: runtime/client commands that manage device state,
+4. `finite`/`finitec` agent daemon: the portable process installed inside any
+   agent runtime. It owns the outbound connection, runtime device state,
+   management command handlers, Hermes/agent adapters, heartbeat, and local
+   capability reporting.
+5. `finitec encrypted-chat`: runtime/client commands that manage device state,
    KeyPackages, Welcome claim/ack, room sync, and Hermes gateway bridge.
 
 The dashboard should keep the current `FiniteChat` component contract as long as
@@ -130,9 +151,9 @@ possible. The server route can translate encrypted room state into the existing
 render model while the encrypted transcript becomes canonical.
 
 The standalone Finite Chat product should grow from the CLI/daemon first. The
-finitecomputer integration can consume that daemon surface initially; Electron
-and native apps can reuse the same Rust core when the local true-E2EE clients
-are ready.
+finitecomputer integration should consume the same daemon surface that a
+self-hosted or third-party agent can use. Electron and native apps can reuse the
+same Rust core when the local true-E2EE clients are ready.
 
 ## Mapping To Current Files
 

@@ -504,6 +504,17 @@ Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
 application data, not authoritative room-server state.
 
+The intended deployment model is portable: a `finite` or `finitec` daemon can run
+inside an agent hosted anywhere and connect outward to Finite. Protocol features
+should not assume Kubernetes, pod exec, dashboard-reachable HTTP servers, or a
+central control-plane database. If a capability only works because Finite hosts
+the runner, it is hosted-runner admin, not a generic Finite Chat command.
+
+Chat and management are separated by application kind. Runtime commands are
+typed, allowlisted management requests with idempotent handlers; chat messages,
+attachments, receipts, and topic events are normal chat application data and
+must not be transported over a generic management queue.
+
 Read-mostly runtime status should usually be represented as encrypted
 latest-state projection data, not as a command request for every UI render.
 Commands are for work that needs runtime scheduling, authorization, mutation, or

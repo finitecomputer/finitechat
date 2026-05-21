@@ -438,7 +438,10 @@ application payload behavior:
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_config_commands_serialize_per_resource`
 - `runtime_config_command_result_includes_post_mutation_status`
-- `host_control_plane_operation_does_not_use_chat_command`
+- `portable_agent_command_does_not_assume_hosted_runner`
+- `hosted_runner_admin_operation_stays_out_of_generic_chat_command`
+- `dashboard_does_not_require_inbound_agent_http`
+- `chat_payloads_do_not_travel_over_generic_management_queue`
 
 ## Planned Transport Scenarios
 

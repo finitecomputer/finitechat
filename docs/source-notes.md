@@ -125,8 +125,28 @@ Finite Chat's conversation/topic layer the useful missing concept.
 
 ## Finitecomputer Command Audit
 
-Audited `origin/finitec-inference-profiles` in a detached worktree at commit
-`2ca7364`.
+Audited finitecomputer `main` on 2026-05-21. The local checkout had an
+unrelated modified `docs/canary-roadmap.md`; this audit read only.
+
+The decoupling planning docs change the interpretation of the command split.
+The target is not "leave everything host-control-plane-shaped". Finite Computer
+wants a `finite` binary or finitec-owned daemon that can run inside any agent,
+hosted anywhere, connect outward to Finite, and expose chat plus Finite
+Computer capabilities without an inbound dashboard-to-runtime path.
+
+Relevant docs:
+
+- `FINITE_COMPUTER_BRIEF.md`: `finite` runs inside any agent, hosted anywhere,
+  bridges that agent to Finite Computer, and exposes capabilities beyond chat.
+- `docs/relay-heartbeat-and-coupling-audit.md`: the correct boundary is machine
+  connects outward to Finite, and Finite reads relay state instead of reaching
+  into a pod.
+- `docs/finitec-transport-migration-ledger.md`: surfaces should move toward the
+  Finite Chat / finitec boundary; hosted-runner admin is only for runtimes
+  Finite hosts; do not add direct dashboard-to-runtime paths.
+- `docs/archive/plans/decoupling-release-train-runbook.md`: the practical test
+  is whether a feature can work for an agent outside the k3s cluster with only
+  finitec installed.
 
 The dashboard relay client posts `{ lane, kind, ttlSecs, payload }` and waits
 for a result. Chat calls are restricted to `chat.*`, while other runtime calls
@@ -151,15 +171,18 @@ Current relay kinds handled by `finitec relay run`:
 - `runtime.gateway.restart`
 
 Finite Chat should split these by responsibility. Chat reads become projection
-reads, chat writes become durable chat events, runtime/config mutations become
-`runtime.command.request` payloads, and host-owned control-plane work should stay
-outside Finite Chat.
+reads, chat writes become durable chat events, and portable runtime/config
+mutations become `runtime.command.request` payloads handled by the finitec
+daemon. Hosted-runner infrastructure remains outside the generic Finite Chat
+protocol, but only because it is about Finite's hosting substrate, not because
+the central control plane is the desired product boundary.
 
-The dashboard also has host-side operations that do not currently use relay:
-published-site auth updates, repo provisioning, Telegram env setup, Google
-Workspace OAuth credential handoff, Codex auth orchestration, and pod restarts.
-Those are control-plane responsibilities unless a future runtime client owns the
-secrets and side effects directly.
+The dashboard also has host-side operations that do not currently use relay.
+Published-site auth, route rendering, runner image updates, and emergency pod
+operations are hosted-runner admin. Published-app inventory, connection status,
+Telegram/Matrix/Hermes config, Codex status, local skills sync, and any other
+agent-portable capability should move toward finitec-owned commands and status
+projections.
 
 ## Dependency Audit
 
