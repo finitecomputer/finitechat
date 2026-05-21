@@ -407,3 +407,6 @@ coverage before the room server owns push fanout:
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
 - `durable_terminal_clear_is_sender_scoped`
 - `durable_terminal_clear_does_not_remove_different_activity_id`
+- `reserved_activity_kinds_render_generically`
+- `unknown_namespaced_activity_kind_is_preserved`
+- `app_specific_activity_kind_does_not_trigger_generic_ui`

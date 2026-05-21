@@ -76,6 +76,14 @@ Ephemeral activity uses the same active-member authorization boundary as
 durable sends. Senders refresh long-running activity by sending a newer
 activity event before expiry, and end it early with an explicit clear.
 
+`Activity Kind`
+
+An encrypted application value inside an ephemeral activity event. Finite Chat
+reserves a small generic namespace for shared UX: `typing`, `thinking`,
+`working`, `uploading`, `recording`, and `present`. Application-specific kinds
+must use a namespaced value such as `finitecomputer.indexing` or
+`hermes.tool_calling`.
+
 ## Invariants
 
 - A room has one canonical server sequence.
@@ -127,6 +135,9 @@ activity event before expiry, and end it early with an explicit clear.
 - Decrypted durable terminal events may clear matching activity projection
   state for the sender. This is a client-side projection update, not a server
   mutation or room-log side effect.
+- Generic activity kinds are reserved Finite Chat values. Unknown namespaced
+  activity kinds must be preserved in projection state and ignored by generic
+  UI unless an application-specific renderer understands them.
 
 ## V1 Limits
 
@@ -352,6 +363,12 @@ activity such as human typing. Long-running agent activity should set
 `activity_id` to the command, request, or run id that caused the work. Refreshes
 and clears match on the normalized activity id, so a delayed clear for an old
 operation cannot erase a newer `working` indicator from the same device.
+
+The encrypted activity payload also carries an `activity_kind`. Generic clients
+may render reserved Finite Chat kinds consistently across human chat and agent
+chat: `typing`, `thinking`, `working`, `uploading`, `recording`, and `present`.
+Application-specific activity uses namespaced kinds and must not change generic
+Finite Chat behavior unless the client opts into that namespace.
 
 Durable terminal events may also carry encrypted activity-clear declarations,
 such as `(activity_kind, activity_id)`. Clients apply these clears to the
