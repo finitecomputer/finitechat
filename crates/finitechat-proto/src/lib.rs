@@ -1970,6 +1970,54 @@ impl EphemeralActivityProjection {
         self.entries.get(&key)
     }
 
+    pub fn collect_account_activity<'a>(
+        &'a self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        account_id: &str,
+        activity_kind: &str,
+        activity_id: Option<&str>,
+        output: &mut Vec<&'a EphemeralActivityProjectionEntry>,
+    ) -> Result<u32, EphemeralActivityProjectionError> {
+        validate_room_id(room_id)?;
+        if let Some(conversation_id) = conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)?;
+        generic_activity_kind_v1(activity_kind)?;
+        let normalized_activity_id = activity_id.unwrap_or(FINITECHAT_DEFAULT_ACTIVITY_ID);
+        validate_bytes_non_empty(
+            "ephemeral_activity.activity_id",
+            normalized_activity_id.len(),
+        )?;
+        validate_string_bytes(
+            "ephemeral_activity.activity_id",
+            normalized_activity_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+
+        output.clear();
+        // The projection has a fixed entry cap, so this scan is visibly bounded.
+        for entry in self.entries.values() {
+            if entry.room_id == room_id
+                && entry.conversation_id.as_deref() == conversation_id
+                && entry.sender.account_id == account_id
+                && entry.activity_kind == activity_kind
+                && entry.activity_id == normalized_activity_id
+            {
+                output.push(entry);
+            }
+        }
+        let count = u32::try_from(output.len()).map_err(|_| {
+            EphemeralActivityProjectionError::CapacityExceeded {
+                max_records: u32::MAX,
+            }
+        })?;
+        assert!(count <= MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES);
+        Ok(count)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -4081,6 +4129,54 @@ mod tests {
             assert!(expiry_millis > 0);
             assert!(expiry_millis <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
         }
+    }
+
+    #[test]
+    fn activity_projection_rolls_up_identity_for_normal_ui() {
+        let phone = device("alice_npub", "phone");
+        let laptop = device("alice_npub", "laptop");
+        let bob_phone = device("bob_npub", "phone");
+        let mut projection = EphemeralActivityProjection::default();
+        for sender in [&phone, &laptop, &bob_phone] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), sender, 1_000, 11_000),
+                    &activity_set(FINITECHAT_ACTIVITY_KIND_TYPING, None, br#"{}"#),
+                )
+                .unwrap();
+        }
+
+        let mut entries = Vec::with_capacity(2);
+        let count = projection
+            .collect_account_activity(
+                "room_1",
+                Some("topic_1"),
+                "alice_npub",
+                FINITECHAT_ACTIVITY_KIND_TYPING,
+                None,
+                &mut entries,
+            )
+            .unwrap();
+        let device_ids = entries
+            .iter()
+            .map(|entry| entry.sender.device_id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(count, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(device_ids, BTreeSet::from(["laptop", "phone"]));
+        assert_eq!(projection.len(), 3);
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &bob_phone,
+                    FINITECHAT_ACTIVITY_KIND_TYPING,
+                    None,
+                )
+                .is_some()
+        );
     }
 
     #[test]

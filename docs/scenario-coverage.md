@@ -499,6 +499,7 @@ coverage before the room server owns push fanout:
 - `present_without_conversation_id_is_room_scoped`
 - `present_with_conversation_id_is_conversation_scoped`
 - `activity_default_expiry_guidance_stays_within_v1_cap`
+- `activity_projection_rolls_up_identity_for_normal_ui`
 - `durable_chat_message_clears_matching_default_typing`
 - `durable_command_result_clears_matching_working_activity`
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
@@ -507,10 +508,6 @@ coverage before the room server owns push fanout:
 - `server_activity_cache_keeps_kind_and_activity_id_opaque`
 - `server_activity_cache_preserves_multiple_opaque_events_per_route`
 - `activity_projection_expires_and_rejects_bad_lease_windows`
-
-Still planned:
-
-- `activity_projection_rolls_up_identity_for_normal_ui`
 
 ## Command/RPC Scenarios
 
