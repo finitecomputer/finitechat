@@ -795,6 +795,61 @@ fn runtime_config_command_result_includes_post_mutation_status() {
 }
 
 #[test]
+fn runtime_state_snapshot_after_command_result_retries_idempotently() {
+    let mut world = world_with_runtime();
+    let result = runtime_command_result("restart_snapshot_retry");
+    let result_accepted = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: bob(),
+            epoch: 1,
+            payload: runtime_command_result_payload(&result),
+            idempotency_key: "restart_snapshot_retry_result".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandResult.delivery_policy(),
+        },
+    );
+    let snapshot_payload = runtime_gateway_snapshot_payload(&world.server, &world.room_id, "live");
+
+    let first = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: bob(),
+            epoch: 1,
+            payload: snapshot_payload.clone(),
+            idempotency_key: "restart_snapshot_retry_status".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+        },
+    );
+    let replay = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: bob(),
+            epoch: 1,
+            payload: snapshot_payload,
+            idempotency_key: "restart_snapshot_retry_status".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+        },
+    );
+
+    assert_eq!(replay, first);
+    assert!(first.seq > result_accepted.seq);
+    assert_eq!(
+        runtime_state_snapshot_count(&world.server, &world.room_id, "runtime.gateway"),
+        1
+    );
+    let effect = world.server.application_effect(&first.message_id).unwrap();
+    assert!(!effect.creates_push());
+    assert!(!effect.creates_unread());
+    assert!(!effect.creates_command_inbox_work());
+}
+
+#[test]
 fn runtime_stream_callback_only_triggers_sync() {
     let mut world = world_with_runtime();
     let accepted = append_application(
@@ -1407,6 +1462,20 @@ fn runtime_state_snapshot_seq_after(
     after_seq: u64,
 ) -> Option<u64> {
     runtime_state_snapshot_after(server, room_id, state_key, after_seq).map(|entry| entry.seq)
+}
+
+fn runtime_state_snapshot_count(server: &DeliveryService, room_id: &str, state_key: &str) -> usize {
+    server
+        .room(room_id)
+        .unwrap()
+        .log
+        .iter()
+        .filter(|entry| {
+            serde_json::from_slice::<RuntimeStateSnapshotV1>(&entry.envelope.payload)
+                .map(|snapshot| snapshot.state_key == state_key)
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 struct SnapshotLogEntry {

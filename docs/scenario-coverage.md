@@ -220,6 +220,7 @@ Proven survival scenarios:
 - `runtime_stream_callback_only_triggers_sync`
 - `command_ledger_survives_restart_after_request_before_execution`
 - `command_ledger_survives_restart_after_execution_before_result`
+- `runtime_state_snapshot_after_command_result_retries_idempotently`
 - `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
 The survival harness now uses the shared `RuntimeCommandLedger` and typed
@@ -550,7 +551,6 @@ application payload behavior:
 Finite Chat should remain the runtime control surface when Hermes, inference, or
 bridge adapters are unhealthy:
 
-- `runtime_state_snapshot_after_command_result_retries_idempotently`
 - `sse_hint_during_hermes_down_only_triggers_pull_sync`
 - `daemon_restart_while_gateway_down_preserves_mls_and_cursors`
 - `broken_gateway_poll_does_not_block_keypackage_replenishment`
