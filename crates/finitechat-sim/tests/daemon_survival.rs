@@ -20,6 +20,7 @@ enum GatewayState {
     Down,
     Hung,
     RestartFails,
+    InvalidOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +177,7 @@ impl FakeDaemon {
             GatewayState::Down => "down",
             GatewayState::Hung => "hung",
             GatewayState::RestartFails => "down",
+            GatewayState::InvalidOutput => "degraded",
         };
         let accepted = append_application(
             server,
@@ -477,6 +479,44 @@ fn dashboard_reads_stale_snapshot_while_heartbeat_is_fresh() {
     assert!(matches!(err, RuntimeStateProjectionError::Expired { .. }));
     assert_eq!(world.server.command_inbox_len(), 0);
     assert_eq!(world.server.unread_len(), 0);
+}
+
+#[test]
+fn hermes_invalid_output_marks_gateway_degraded_without_projection_corruption() {
+    let mut world = world_with_runtime();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::InvalidOutput,
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    let snapshot =
+        runtime_state_snapshot_after(&world.server, &world.room_id, "runtime.gateway", 1).unwrap();
+    let mut projection = RuntimeStateProjection::default();
+    projection
+        .apply(RuntimeStateProjectionEntry {
+            room_id: world.room_id.clone(),
+            source: bob(),
+            accepted_seq: snapshot.seq,
+            snapshot: snapshot.snapshot,
+        })
+        .unwrap();
+    let status: serde_json::Value = projection
+        .require_fresh_json(
+            &world.room_id,
+            &bob(),
+            "runtime.gateway",
+            "finitecomputer.runtime.gateway.status.v1",
+            2_500,
+        )
+        .unwrap();
+
+    assert_eq!(daemon.gateway, GatewayState::InvalidOutput);
+    assert_eq!(status["status"], "degraded");
+    assert_eq!(world.server.command_inbox_len(), 0);
 }
 
 #[test]
