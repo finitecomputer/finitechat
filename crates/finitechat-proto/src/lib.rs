@@ -1914,6 +1914,34 @@ impl EphemeralActivityProjection {
         Ok(removed)
     }
 
+    pub fn clear_from_durable_application_event(
+        &mut self,
+        room_id: &str,
+        sender: &DeviceRef,
+        event: &DecryptedApplicationEventV1,
+    ) -> Result<u32, EphemeralActivityProjectionError> {
+        validate_room_id(room_id)?;
+        sender.validate_limits()?;
+        event.validate_limits()?;
+        match event.kind {
+            DurableAppEventKind::ChatMessage => {
+                let clear = RuntimeActivityClearV1 {
+                    activity_kind: FINITECHAT_ACTIVITY_KIND_TYPING.to_string(),
+                    activity_id: None,
+                    conversation_id: None,
+                };
+                let removed = self.clear_from_durable_terminal(
+                    room_id,
+                    event.conversation_id.as_deref(),
+                    sender,
+                    &clear,
+                )?;
+                if removed { Ok(1) } else { Ok(0) }
+            }
+            _ => Ok(0),
+        }
+    }
+
     pub fn expire_at(&mut self, now_ms: u64) -> Result<u32, EphemeralActivityProjectionError> {
         let before = self.entries.len();
         self.entries.retain(|_, entry| entry.expires_at_ms > now_ms);
@@ -4053,6 +4081,230 @@ mod tests {
             assert!(expiry_millis > 0);
             assert!(expiry_millis <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
         }
+    }
+
+    #[test]
+    fn durable_chat_message_clears_matching_default_typing() {
+        let phone = device("alice_npub", "phone");
+        let laptop = device("alice_npub", "laptop");
+        let mut projection = EphemeralActivityProjection::default();
+        for sender in [&phone, &laptop] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), sender, 1_000, 11_000),
+                    &activity_set(FINITECHAT_ACTIVITY_KIND_TYPING, None, br#"{}"#),
+                )
+                .unwrap();
+        }
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &phone, 1_000, 11_000),
+                &activity_set(FINITECHAT_ACTIVITY_KIND_WORKING, Some("run_1"), br#"{}"#),
+            )
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .clear_from_durable_application_event(
+                    "room_1",
+                    &phone,
+                    &application_event(DurableAppEventKind::ChatMessage, Some("topic_1"), b"hi"),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &phone,
+                    FINITECHAT_ACTIVITY_KIND_TYPING,
+                    None,
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &laptop,
+                    FINITECHAT_ACTIVITY_KIND_TYPING,
+                    None,
+                )
+                .is_some()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &phone,
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("run_1"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn durable_command_result_clears_matching_working_activity() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                &activity_set(
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("restart_1"),
+                    br#"{}"#,
+                ),
+            )
+            .unwrap();
+        let mut result = runtime_command_success_result("restart_1", br#"{"status":"live"}"#);
+        result.clears_activity.push(RuntimeActivityClearV1 {
+            activity_kind: FINITECHAT_ACTIVITY_KIND_WORKING.to_string(),
+            activity_id: Some("restart_1".to_string()),
+            conversation_id: None,
+        });
+
+        assert_eq!(
+            projection
+                .clear_from_runtime_command_result("room_1", Some("topic_1"), &runtime, &result)
+                .unwrap(),
+            1
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("restart_1"),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dropped_ephemeral_clear_is_repaired_by_durable_terminal_event() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                &activity_set(
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("restart_1"),
+                    br#"{}"#,
+                ),
+            )
+            .unwrap();
+        let mut result = runtime_command_success_result("restart_1", br#"{"status":"live"}"#);
+        result.clears_activity.push(RuntimeActivityClearV1 {
+            activity_kind: FINITECHAT_ACTIVITY_KIND_WORKING.to_string(),
+            activity_id: Some("restart_1".to_string()),
+            conversation_id: None,
+        });
+
+        assert_eq!(
+            projection
+                .clear_from_runtime_command_result("room_1", Some("topic_1"), &runtime, &result)
+                .unwrap(),
+            1
+        );
+        assert!(projection.is_empty());
+    }
+
+    #[test]
+    fn durable_terminal_clear_is_sender_scoped() {
+        let runtime = device("runtime_npub", "box");
+        let sibling = device("runtime_npub", "gpu");
+        let mut projection = EphemeralActivityProjection::default();
+        for sender in [&runtime, &sibling] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), sender, 1_000, 11_000),
+                    &activity_set(
+                        FINITECHAT_ACTIVITY_KIND_WORKING,
+                        Some("restart_1"),
+                        br#"{}"#,
+                    ),
+                )
+                .unwrap();
+        }
+
+        assert!(
+            projection
+                .clear_from_durable_terminal(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    &RuntimeActivityClearV1 {
+                        activity_kind: FINITECHAT_ACTIVITY_KIND_WORKING.to_string(),
+                        activity_id: Some("restart_1".to_string()),
+                        conversation_id: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &sibling,
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("restart_1"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn durable_terminal_clear_does_not_remove_different_activity_id() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        for activity_id in ["restart_1", "restart_2"] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                    &activity_set(
+                        FINITECHAT_ACTIVITY_KIND_WORKING,
+                        Some(activity_id),
+                        br#"{}"#,
+                    ),
+                )
+                .unwrap();
+        }
+
+        assert!(
+            projection
+                .clear_from_durable_terminal(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    &RuntimeActivityClearV1 {
+                        activity_kind: FINITECHAT_ACTIVITY_KIND_WORKING.to_string(),
+                        activity_id: Some("restart_1".to_string()),
+                        conversation_id: None,
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_WORKING,
+                    Some("restart_2"),
+                )
+                .is_some()
+        );
     }
 
     #[test]
