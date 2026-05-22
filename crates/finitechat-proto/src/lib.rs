@@ -1783,6 +1783,13 @@ impl EphemeralActivityProjection {
                 }
             }
             EphemeralActivityActionV1::Clear => {
+                if let Some(entry) = self.entries.get(&key) {
+                    // Ephemeral packets are unordered hints. An older clear must
+                    // not erase a newer refreshed activity for the same route.
+                    if entry.received_at_ms > context.received_at_ms {
+                        return Ok(EphemeralActivityProjectionDecision::ClearMiss);
+                    }
+                }
                 if self.entries.remove(&key).is_some() {
                     Ok(EphemeralActivityProjectionDecision::Cleared)
                 } else {
@@ -3641,6 +3648,165 @@ mod tests {
                     "working",
                     Some("restart_1"),
                 )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_clear_does_not_remove_unrelated_kind() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        for kind in ["typing", "working"] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                    &activity_set(kind, Some("shared_id"), br#"{}"#),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 2_000, 12_000),
+                    &activity_clear("typing", Some("shared_id")),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Cleared
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "typing",
+                    Some("shared_id"),
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("shared_id"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_clear_does_not_remove_different_activity_id() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        for activity_id in ["run_1", "run_2"] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                    &activity_set("working", Some(activity_id), br#"{}"#),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 2_000, 12_000),
+                    &activity_clear("working", Some("run_1")),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Cleared
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("run_1"),
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("run_2"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_agent_activity_clear_does_not_hide_newer_run() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 2_000, 12_000),
+                &activity_set("working", Some("run_1"), br#"{"phase":"new"}"#),
+            )
+            .unwrap();
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 1_500, 11_500),
+                    &activity_clear("working", Some("run_1")),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::ClearMiss
+        );
+        let current = projection
+            .get(
+                "room_1",
+                Some("topic_1"),
+                &runtime,
+                "working",
+                Some("run_1"),
+            )
+            .unwrap();
+        assert_eq!(current.received_at_ms, 2_000);
+        assert_eq!(current.payload, br#"{"phase":"new"}"#);
+    }
+
+    #[test]
+    fn conversation_id_does_not_authorize_cross_room_activity() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        for room_id in ["room_1", "room_2"] {
+            projection
+                .apply(
+                    activity_context(room_id, Some("topic_1"), &runtime, 1_000, 11_000),
+                    &activity_set("present", None, br#"{}"#),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 2_000, 12_000),
+                    &activity_clear("present", None),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Cleared
+        );
+        assert!(
+            projection
+                .get("room_1", Some("topic_1"), &runtime, "present", None)
+                .is_none()
+        );
+        assert!(
+            projection
+                .get("room_2", Some("topic_1"), &runtime, "present", None)
                 .is_some()
         );
     }

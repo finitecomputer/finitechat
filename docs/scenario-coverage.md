@@ -481,23 +481,23 @@ coverage before the room server owns push fanout:
 - `ephemeral_activity_never_enqueues_push_or_advances_sequence`
 - `ephemeral_activity_rejects_pending_unacked_device`
 - `ephemeral_activity_rejects_removed_or_revoked_device`
+- `ephemeral_activity_rejects_non_member_device`
 - `ephemeral_activity_expiry_is_bounded`
+- `ephemeral_activity_payload_is_opaque_to_server`
+- `ephemeral_activity_epoch_mismatch_drops_without_repair`
 - `server_activity_cache_enforces_per_route_limit_without_seq_gap`
 - `activity_projection_keeps_devices_separate_and_clear_scoped`
 - `activity_refresh_extends_matching_device_expiry`
 - `durable_terminal_clear_is_sender_and_activity_scoped`
+- `conversation_id_does_not_authorize_cross_room_activity`
+- `activity_clear_does_not_remove_unrelated_kind`
+- `activity_clear_does_not_remove_different_activity_id`
+- `stale_agent_activity_clear_does_not_hide_newer_run`
 - `activity_projection_expires_and_rejects_bad_lease_windows`
 
 Still planned:
 
-- `ephemeral_activity_rejects_non_member_device`
-- `ephemeral_activity_payload_is_opaque_to_server`
-- `ephemeral_activity_epoch_mismatch_drops_without_repair`
-- `conversation_id_does_not_authorize_cross_room_activity`
 - `activity_projection_rolls_up_identity_for_normal_ui`
-- `activity_clear_does_not_remove_unrelated_kind`
-- `activity_clear_does_not_remove_different_activity_id`
-- `stale_agent_activity_clear_does_not_hide_newer_run`
 - `durable_chat_message_clears_matching_default_typing`
 - `durable_command_result_clears_matching_working_activity`
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`

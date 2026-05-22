@@ -2609,6 +2609,28 @@ fn ephemeral_activity_rejects_pending_unacked_device() {
 }
 
 #[test]
+fn ephemeral_activity_rejects_non_member_device() {
+    let mut world = SimWorld::direct_room().unwrap();
+    world.server.register_device(charlie()).unwrap();
+    let activity = ephemeral_activity_request(&world, charlie(), 0, None, 1_000);
+
+    assert_eq!(
+        world
+            .server
+            .append_ephemeral_activity(activity)
+            .unwrap_err(),
+        EngineError::SenderNotActive(charlie())
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 0);
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, None, &charlie()),
+        0
+    );
+}
+
+#[test]
 fn ephemeral_activity_rejects_removed_or_revoked_device() {
     let mut world = SimWorld::direct_room().unwrap();
     provision_bob(&mut world);
@@ -2659,6 +2681,55 @@ fn ephemeral_activity_expiry_is_bounded() {
             .unwrap_err(),
         EngineError::EphemeralActivityExpiryTooLong { .. }
     ));
+}
+
+#[test]
+fn ephemeral_activity_payload_is_opaque_to_server() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let mut activity = ephemeral_activity_request(&world, alice(), 0, Some("topic_opaque"), 1_000);
+    activity.payload = vec![
+        0xff, 0x00, b'{', b'n', b'o', b't', b'_', b'j', b's', b'o', b'n',
+    ];
+
+    let accepted = world.server.append_ephemeral_activity(activity).unwrap();
+
+    assert_eq!(accepted.cached_events_for_route, 1);
+    assert_eq!(
+        world.server.ephemeral_activity_len_for_route(
+            &world.room_id,
+            Some("topic_opaque"),
+            &alice()
+        ),
+        1
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 0);
+    assert_eq!(world.server.push_outbox_len(), 0);
+}
+
+#[test]
+fn ephemeral_activity_epoch_mismatch_drops_without_repair() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let activity = ephemeral_activity_request(&world, alice(), 99, Some("topic_1"), 1_000);
+
+    assert_eq!(
+        world
+            .server
+            .append_ephemeral_activity(activity)
+            .unwrap_err(),
+        EngineError::WrongEpoch {
+            expected: 0,
+            actual: 99
+        }
+    );
+    let room = world.server.room(&world.room_id).unwrap();
+    assert_eq!(room.status, RoomStatus::Open);
+    assert_eq!(room.last_seq, 0);
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        0
+    );
 }
 
 #[test]
