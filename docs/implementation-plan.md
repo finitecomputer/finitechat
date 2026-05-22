@@ -254,6 +254,20 @@ Current OpenMLS scope:
 
 Current known gap:
 
+- Generic app-event policy is now executable in `finitechat-proto`,
+  `finitechat-engine`, and `finitechat-store`: chat messages, receipts,
+  segment starts, runtime state snapshots, runtime command requests, and
+  command results have explicit push/unread/command-inbox policy, with SQLite
+  reopen coverage for non-notifying and command-inbox behavior.
+- Ephemeral activity now has a reducer/store path separate from the canonical
+  room sequence. It is member-authorized at the current room head, expiry
+  bounded, cache bounded per route, not persisted across store reopen, and
+  ignored by durable sync cursors.
+- The first daemon survival harness proves a fake runtime daemon can start with
+  Hermes down, sync room events while the gateway is hung, publish non-notifying
+  gateway state snapshots, and resume a recorded gateway restart command after
+  a daemon restart before execution. Production still needs the real finitec
+  command ledger and runtime adapter implementation.
 - Client SQLite persistence now encrypts the client-state snapshot with a
   Nostr-derived wrapping key and stores per-room applied cursors plus pending
   claimed Welcomes. Production still needs OS keychain/passphrase unlock

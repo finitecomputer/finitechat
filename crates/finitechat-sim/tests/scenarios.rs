@@ -1,11 +1,13 @@
 use finitechat_engine::{
-    AppendEventRequest, CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, DeviceStatus,
-    EngineError, LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest,
-    UploadKeyPackageRequest, device, envelope,
+    AppendApplicationEventRequest, AppendEphemeralActivityRequest, AppendEventRequest,
+    CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, DeviceStatus, EngineError,
+    LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest, UploadKeyPackageRequest,
+    device, envelope,
 };
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, KeyPackageState, LogEntryKind,
+    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
     MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE, MAX_SYNC_PAGE_ENTRIES,
     MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
     ProtocolLimitError, RoomStatus, WelcomeState,
@@ -1970,4 +1972,265 @@ fn group_room_rejects_too_many_devices_for_one_account() {
             .welcome("welcome_alice_extra_overflow")
             .is_none()
     );
+}
+
+#[test]
+fn chat_receipt_is_durable_but_push_never() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"chat.receipt","message_id":"m1"}"#,
+        "receipt_1",
+        DurableAppEventKind::ChatReceipt.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+    let effect = world
+        .server
+        .application_effect(&accepted.message_id)
+        .unwrap();
+    assert!(!effect.creates_push());
+    assert!(!effect.creates_unread());
+}
+
+#[test]
+fn runtime_state_snapshot_is_durable_but_push_never() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.state.snapshot","state_key":"runtime.gateway"}"#,
+        "state_snapshot_1",
+        DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn runtime_command_request_creates_command_inbox_work() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","command":"finitecomputer.runtime.gateway.restart"}"#,
+        "command_request_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 1);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 1);
+    assert!(
+        world
+            .server
+            .application_effect(&accepted.message_id)
+            .unwrap()
+            .creates_command_inbox_work()
+    );
+}
+
+#[test]
+fn conversation_segment_start_is_durable_but_push_never() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"conversation.segment.start","conversation_id":"topic_1"}"#,
+        "segment_start_1",
+        DurableAppEventKind::ConversationSegmentStart.delivery_policy(),
+    );
+
+    world.server.append_application_event(request).unwrap();
+
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn ephemeral_activity_never_enqueues_push_or_advances_sequence() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let activity = ephemeral_activity_request(&world, alice(), 0, Some("topic_1"), 1_000);
+
+    let accepted = world.server.append_ephemeral_activity(activity).unwrap();
+
+    assert_eq!(accepted.cached_events_for_route, 1);
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        1
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 0);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+    let page = world
+        .server
+        .sync_events(&world.room_id, &alice(), 0)
+        .unwrap();
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+}
+
+#[test]
+fn ephemeral_activity_rejects_pending_unacked_device() {
+    let mut world = SimWorld::direct_room().unwrap();
+    world
+        .add_device_commit(
+            alice(),
+            bob(),
+            "kp_bob_ephemeral_pending",
+            "welcome_bob_ephemeral_pending",
+            0,
+            "add_bob_ephemeral_pending",
+        )
+        .unwrap();
+    let activity = ephemeral_activity_request(&world, bob(), 1, None, 1_000);
+
+    assert_eq!(
+        world
+            .server
+            .append_ephemeral_activity(activity)
+            .unwrap_err(),
+        EngineError::SenderNotActive(bob())
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 1);
+}
+
+#[test]
+fn ephemeral_activity_rejects_removed_or_revoked_device() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+    let remove = world
+        .remove_device_request(alice(), bob(), 1, "remove_bob_ephemeral")
+        .unwrap();
+    world.server.submit_commit(remove).unwrap();
+    let removed_activity = ephemeral_activity_request(&world, bob(), 2, None, 1_000);
+    assert_eq!(
+        world
+            .server
+            .append_ephemeral_activity(removed_activity)
+            .unwrap_err(),
+        EngineError::SenderNotActive(bob())
+    );
+
+    world.server.revoke_device(alice()).unwrap();
+    let revoked_activity = ephemeral_activity_request(&world, alice(), 2, None, 1_000);
+    assert_eq!(
+        world
+            .server
+            .append_ephemeral_activity(revoked_activity)
+            .unwrap_err(),
+        EngineError::DeviceRevoked(alice())
+    );
+}
+
+#[test]
+fn ephemeral_activity_expiry_is_bounded() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let expired = AppendEphemeralActivityRequest {
+        expires_at_ms: 1_000,
+        ..ephemeral_activity_request(&world, alice(), 0, None, 1_000)
+    };
+    assert_eq!(
+        world.server.append_ephemeral_activity(expired).unwrap_err(),
+        EngineError::EphemeralActivityAlreadyExpired
+    );
+
+    let too_long = AppendEphemeralActivityRequest {
+        expires_at_ms: 1_000 + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS + 1,
+        ..ephemeral_activity_request(&world, alice(), 0, None, 1_000)
+    };
+    assert!(matches!(
+        world
+            .server
+            .append_ephemeral_activity(too_long)
+            .unwrap_err(),
+        EngineError::EphemeralActivityExpiryTooLong { .. }
+    ));
+}
+
+#[test]
+fn server_activity_cache_enforces_per_route_limit_without_seq_gap() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for index in 0..(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE + 1) {
+        let mut activity = ephemeral_activity_request(&world, alice(), 0, Some("topic_1"), 1_000);
+        activity.payload = format!("activity-{index}").into_bytes();
+        world.server.append_ephemeral_activity(activity).unwrap();
+    }
+
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE as usize
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 0);
+}
+
+fn application_event_request(
+    world: &SimWorld,
+    sender: DeviceRef,
+    epoch: u64,
+    payload: &[u8],
+    idempotency_key: &str,
+    delivery_policy: ApplicationDeliveryPolicy,
+) -> AppendApplicationEventRequest {
+    AppendApplicationEventRequest {
+        event: AppendEventRequest {
+            room_id: world.room_id.clone(),
+            sender: sender.clone(),
+            envelope: envelope(
+                world.room_id.clone(),
+                world.group_id.clone(),
+                sender,
+                epoch,
+                LogEntryKind::Application,
+                payload.to_vec(),
+            ),
+            idempotency_key: idempotency_key.to_string(),
+        },
+        delivery_policy,
+    }
+}
+
+fn ephemeral_activity_request(
+    world: &SimWorld,
+    sender: DeviceRef,
+    epoch: u64,
+    conversation_id: Option<&str>,
+    received_at_ms: u64,
+) -> AppendEphemeralActivityRequest {
+    AppendEphemeralActivityRequest {
+        room_id: world.room_id.clone(),
+        mls_group_id: world.group_id.clone(),
+        epoch,
+        sender,
+        conversation_id: conversation_id.map(str::to_string),
+        payload: b"opaque activity ciphertext".to_vec(),
+        received_at_ms,
+        expires_at_ms: received_at_ms + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+    }
 }

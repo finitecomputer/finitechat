@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub type AccountId = String;
@@ -14,6 +14,8 @@ pub type KeyPackageHash = String;
 pub type WelcomeId = String;
 pub type LeaseToken = String;
 pub type IdempotencyKey = String;
+pub type ConversationId = String;
+pub type RuntimeStateKey = String;
 pub type Epoch = u64;
 pub type Seq = u64;
 
@@ -32,6 +34,10 @@ pub const MAX_WELCOME_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_RATCHET_TREE_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE: u32 = 4096;
 pub const MAX_LINK_SESSION_PAYLOAD_BYTES: u32 = 1024 * 1024;
+pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
+pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
+pub const MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30 * 60 * 1000;
+pub const MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE: u32 = 64;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: u32 = 128;
 pub const MAX_ACCOUNT_ID_BYTES: u32 = 128;
 pub const MAX_DEVICE_ID_BYTES: u32 = 128;
@@ -56,6 +62,10 @@ const _: () = {
     assert!(MAX_RATCHET_TREE_PAYLOAD_BYTES > 0);
     assert!(MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE > 0);
     assert!(MAX_LINK_SESSION_PAYLOAD_BYTES > 0);
+    assert!(MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES > 0);
+    assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
+    assert!(MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS > 0);
+    assert!(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE > 0);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
 };
 
@@ -105,6 +115,234 @@ pub struct FiniteEnvelope {
     pub kind: LogEntryKind,
     #[serde(with = "bytes_as_vec")]
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushPolicy {
+    Default,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadPolicy {
+    Default,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandInboxPolicy {
+    Create,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationDeliveryPolicy {
+    pub push: PushPolicy,
+    pub unread: UnreadPolicy,
+    pub command_inbox: CommandInboxPolicy,
+}
+
+impl ApplicationDeliveryPolicy {
+    pub const USER_VISIBLE_MESSAGE: Self = Self {
+        push: PushPolicy::Default,
+        unread: UnreadPolicy::Default,
+        command_inbox: CommandInboxPolicy::Never,
+    };
+
+    pub const NON_NOTIFYING: Self = Self {
+        push: PushPolicy::Never,
+        unread: UnreadPolicy::Never,
+        command_inbox: CommandInboxPolicy::Never,
+    };
+
+    pub const RUNTIME_COMMAND_REQUEST: Self = Self {
+        push: PushPolicy::Default,
+        unread: UnreadPolicy::Never,
+        command_inbox: CommandInboxPolicy::Create,
+    };
+
+    pub const RUNTIME_COMMAND_RESULT: Self = Self {
+        push: PushPolicy::Never,
+        unread: UnreadPolicy::Never,
+        command_inbox: CommandInboxPolicy::Never,
+    };
+
+    pub fn creates_push(self) -> bool {
+        self.push == PushPolicy::Default
+    }
+
+    pub fn creates_unread(self) -> bool {
+        self.unread == UnreadPolicy::Default
+    }
+
+    pub fn creates_command_inbox_work(self) -> bool {
+        self.command_inbox == CommandInboxPolicy::Create
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DurableAppEventKind {
+    ConversationCreate,
+    ConversationUpdate,
+    ConversationArchive,
+    ConversationSegmentStart,
+    ChatMessage,
+    ChatEdit,
+    ChatReaction,
+    ChatReceipt,
+    RuntimeStateSnapshot,
+    RuntimeCommandRequest,
+    RuntimeCommandResult,
+    RuntimeCommandCancel,
+    Namespaced {
+        name: String,
+        policy: ApplicationDeliveryPolicy,
+    },
+}
+
+impl DurableAppEventKind {
+    pub fn delivery_policy(&self) -> ApplicationDeliveryPolicy {
+        match self {
+            Self::ChatMessage => ApplicationDeliveryPolicy::USER_VISIBLE_MESSAGE,
+            Self::RuntimeCommandRequest => ApplicationDeliveryPolicy::RUNTIME_COMMAND_REQUEST,
+            Self::RuntimeCommandResult => ApplicationDeliveryPolicy::RUNTIME_COMMAND_RESULT,
+            Self::ConversationSegmentStart
+            | Self::ChatEdit
+            | Self::ChatReaction
+            | Self::ChatReceipt
+            | Self::RuntimeStateSnapshot
+            | Self::RuntimeCommandCancel => ApplicationDeliveryPolicy::NON_NOTIFYING,
+            Self::ConversationCreate | Self::ConversationUpdate | Self::ConversationArchive => {
+                ApplicationDeliveryPolicy::NON_NOTIFYING
+            }
+            Self::Namespaced { policy, .. } => *policy,
+        }
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        if let Self::Namespaced { name, .. } = self {
+            validate_string_bytes(
+                "durable_app_event.namespaced_kind",
+                name,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecryptedApplicationEventV1 {
+    pub kind: DurableAppEventKind,
+    pub conversation_id: Option<ConversationId>,
+    #[serde(with = "bytes_as_vec")]
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStateSnapshotV1 {
+    pub state_key: RuntimeStateKey,
+    pub schema: String,
+    pub revision: u64,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+    #[serde(with = "bytes_as_vec")]
+    pub status_payload: Vec<u8>,
+}
+
+impl RuntimeStateSnapshotV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_string_bytes(
+            "runtime_state.state_key",
+            &self.state_key,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_string_bytes("runtime_state.schema", &self.schema, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_len(
+            "runtime_state.status_payload",
+            self.status_payload.len(),
+            MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES,
+        )?;
+        Ok(())
+    }
+
+    pub fn is_expired_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStateProjectionEntry {
+    pub room_id: RoomId,
+    pub source: DeviceRef,
+    pub accepted_seq: Seq,
+    pub snapshot: RuntimeStateSnapshotV1,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStateProjection {
+    entries: BTreeMap<String, RuntimeStateProjectionEntry>,
+}
+
+impl RuntimeStateProjection {
+    pub fn apply(&mut self, entry: RuntimeStateProjectionEntry) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&entry.room_id)?;
+        entry.source.validate_limits()?;
+        entry.snapshot.validate_limits()?;
+        let key =
+            runtime_state_projection_key(&entry.room_id, &entry.source, &entry.snapshot.state_key)?;
+        let should_replace = self
+            .entries
+            .get(&key)
+            .map(|current| {
+                entry.snapshot.revision > current.snapshot.revision
+                    || (entry.snapshot.revision == current.snapshot.revision
+                        && entry.accepted_seq > current.accepted_seq)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            self.entries.insert(key, entry);
+        }
+        Ok(())
+    }
+
+    pub fn get(
+        &self,
+        room_id: &str,
+        source: &DeviceRef,
+        state_key: &str,
+    ) -> Option<&RuntimeStateProjectionEntry> {
+        let key = runtime_state_projection_key(room_id, source, state_key).ok()?;
+        self.entries.get(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl DecryptedApplicationEventV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        self.kind.validate_limits()?;
+        if let Some(conversation_id) = &self.conversation_id {
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        let max_payload = if self.kind == DurableAppEventKind::RuntimeStateSnapshot {
+            MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES
+        } else {
+            MAX_ENVELOPE_PAYLOAD_BYTES
+        };
+        validate_bytes_len("application_event.payload", self.payload.len(), max_payload)?;
+        Ok(())
+    }
 }
 
 impl FiniteEnvelope {
@@ -401,6 +639,27 @@ pub fn validate_item_count(
     }
 }
 
+fn runtime_state_projection_key(
+    room_id: &str,
+    source: &DeviceRef,
+    state_key: &str,
+) -> Result<String, ProtocolLimitError> {
+    validate_room_id(room_id)?;
+    source.validate_limits()?;
+    validate_string_bytes("runtime_state.state_key", state_key, MAX_OBJECT_ID_BYTES)?;
+    Ok(format!(
+        "{}|{}|{}|{}",
+        length_prefixed(room_id),
+        length_prefixed(&source.account_id),
+        length_prefixed(&source.device_id),
+        length_prefixed(state_key)
+    ))
+}
+
+fn length_prefixed(value: &str) -> String {
+    format!("{}:{value}", value.len())
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -481,5 +740,184 @@ mod tests {
             delta.validate_structure(0, "commit").unwrap_err(),
             MembershipDeltaError::DuplicateAdd(device("bob", "phone"))
         );
+    }
+
+    #[test]
+    fn durable_app_event_defaults_match_push_and_inbox_policy() {
+        assert_eq!(
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+            ApplicationDeliveryPolicy::USER_VISIBLE_MESSAGE
+        );
+        assert_eq!(
+            DurableAppEventKind::ChatReceipt.delivery_policy(),
+            ApplicationDeliveryPolicy::NON_NOTIFYING
+        );
+        assert_eq!(
+            DurableAppEventKind::ConversationSegmentStart.delivery_policy(),
+            ApplicationDeliveryPolicy::NON_NOTIFYING
+        );
+        assert_eq!(
+            DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+            ApplicationDeliveryPolicy::NON_NOTIFYING
+        );
+        assert_eq!(
+            DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+            ApplicationDeliveryPolicy::RUNTIME_COMMAND_REQUEST
+        );
+        assert_eq!(
+            DurableAppEventKind::RuntimeCommandResult.delivery_policy(),
+            ApplicationDeliveryPolicy::RUNTIME_COMMAND_RESULT
+        );
+
+        assert!(
+            DurableAppEventKind::ChatMessage
+                .delivery_policy()
+                .creates_push()
+        );
+        assert!(
+            DurableAppEventKind::ChatMessage
+                .delivery_policy()
+                .creates_unread()
+        );
+        assert!(
+            DurableAppEventKind::RuntimeCommandRequest
+                .delivery_policy()
+                .creates_command_inbox_work()
+        );
+        assert!(
+            !DurableAppEventKind::RuntimeStateSnapshot
+                .delivery_policy()
+                .creates_command_inbox_work()
+        );
+        assert!(
+            !DurableAppEventKind::RuntimeCommandResult
+                .delivery_policy()
+                .creates_push()
+        );
+    }
+
+    #[test]
+    fn runtime_state_projection_replaces_by_revision_and_sequence() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finite.gateway.v1",
+                1,
+                10,
+                br#"{"status":"down"}"#,
+            ))
+            .unwrap();
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finite.gateway.v1",
+                1,
+                9,
+                br#"{"status":"older"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            projection
+                .get("room_1", &source, "runtime.gateway")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"status":"down"}"#
+        );
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finite.gateway.v1",
+                1,
+                11,
+                br#"{"status":"restarted"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            projection
+                .get("room_1", &source, "runtime.gateway")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"status":"restarted"}"#
+        );
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finite.gateway.v1",
+                2,
+                8,
+                br#"{"status":"live"}"#,
+            ))
+            .unwrap();
+        let current = projection
+            .get("room_1", &source, "runtime.gateway")
+            .unwrap();
+        assert_eq!(current.snapshot.revision, 2);
+        assert_eq!(current.accepted_seq, 8);
+        assert_eq!(current.snapshot.status_payload, br#"{"status":"live"}"#);
+    }
+
+    #[test]
+    fn runtime_state_projection_preserves_unknown_schema_and_expiry() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.capabilities",
+                "vendor.future-schema.v9",
+                1,
+                10,
+                br#"{"unrecognized":true}"#,
+            ))
+            .unwrap();
+
+        let current = projection
+            .get("room_1", &source, "runtime.capabilities")
+            .unwrap();
+        assert_eq!(current.snapshot.schema, "vendor.future-schema.v9");
+        assert_eq!(current.snapshot.status_payload, br#"{"unrecognized":true}"#);
+        assert!(!current.snapshot.is_expired_at(1_999));
+        assert!(current.snapshot.is_expired_at(2_000));
+    }
+
+    fn runtime_state_entry(
+        room_id: &str,
+        source: DeviceRef,
+        state_key: &str,
+        schema: &str,
+        revision: u64,
+        accepted_seq: Seq,
+        payload: &[u8],
+    ) -> RuntimeStateProjectionEntry {
+        RuntimeStateProjectionEntry {
+            room_id: room_id.to_string(),
+            source,
+            accepted_seq,
+            snapshot: RuntimeStateSnapshotV1 {
+                state_key: state_key.to_string(),
+                schema: schema.to_string(),
+                revision,
+                observed_at_ms: 1_000,
+                expires_at_ms: 2_000,
+                status_payload: payload.to_vec(),
+            },
+        }
     }
 }

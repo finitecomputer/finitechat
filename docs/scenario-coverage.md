@@ -63,6 +63,15 @@ Each item below has a named test in
 - `idempotency_capacity_rejects_new_mutations_but_allows_replay`
 - `direct_room_rejects_too_many_devices_for_one_account`
 - `multi_device_pending_invite_action_order_fuzz_keeps_server_roles_separate`
+- `chat_receipt_is_durable_but_push_never`
+- `runtime_state_snapshot_is_durable_but_push_never`
+- `runtime_command_request_creates_command_inbox_work`
+- `conversation_segment_start_is_durable_but_push_never`
+- `ephemeral_activity_never_enqueues_push_or_advances_sequence`
+- `ephemeral_activity_rejects_pending_unacked_device`
+- `ephemeral_activity_rejects_removed_or_revoked_device`
+- `ephemeral_activity_expiry_is_bounded`
+- `server_activity_cache_enforces_per_route_limit_without_seq_gap`
 
 ## Meaning Of Fake-MLS
 
@@ -144,6 +153,40 @@ This proves the identity refinement from the protocol docs: OpenMLS carries the
 credential bytes, but Finite Chat clients verify the Nostr-rooted account,
 device id, and MLS leaf signing key locally. The server can order room entries
 without deciding who a device is.
+
+## Application Policy Proof
+
+The protocol crate now owns default delivery policies for generic durable app
+kinds. Proven unit scenarios:
+
+- `durable_app_event_defaults_match_push_and_inbox_policy`
+- `runtime_state_projection_replaces_by_revision_and_sequence`
+- `runtime_state_projection_preserves_unknown_schema_and_expiry`
+
+The in-memory and SQLite stores now record delivery effects separately from
+opaque MLS payload bytes. This proves that Finite Chat can enforce
+push/unread/command-inbox behavior without requiring the room server to decrypt
+semantic app payloads.
+
+SQLite parity scenarios:
+
+- `sqlite_chat_receipt_is_durable_but_push_never_after_reopen`
+- `sqlite_runtime_state_snapshot_does_not_create_unread_or_inbox_work`
+- `sqlite_runtime_command_request_creates_command_inbox_work_after_reopen`
+- `sqlite_ephemeral_activity_does_not_persist_or_advance_sequence`
+- `sqlite_ephemeral_activity_rejects_pending_and_removed_devices`
+
+## Daemon Survival Proof
+
+The first daemon survival harness lives in
+`crates/finitechat-sim/tests/daemon_survival.rs`. It uses fake runtime health,
+but the real Delivery Service reducer and app-event policies.
+
+Proven survival scenarios:
+
+- `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
+- `hermes_hang_does_not_block_room_sync_or_state_snapshot`
+- `command_ledger_survives_restart_after_request_before_execution`
 
 Checkpoint test signal:
 
@@ -379,17 +422,9 @@ a failure point after outbox enqueue and assert exactly one durable wake record.
 The Pika typing-indicator behavior should become explicit Finite Chat protocol
 coverage before the room server owns push fanout:
 
-- `ephemeral_activity_never_enqueues_push`
-- `ephemeral_activity_expires_without_transcript_entry`
-- `ephemeral_activity_does_not_create_command_inbox_work`
-- `ephemeral_activity_does_not_advance_room_sequence`
-- `durable_sync_cursor_ignores_ephemeral_activity`
 - `ephemeral_activity_rejects_non_member_device`
-- `ephemeral_activity_rejects_pending_unacked_device`
-- `ephemeral_activity_rejects_removed_or_revoked_device`
 - `ephemeral_activity_payload_is_opaque_to_server`
 - `ephemeral_activity_epoch_mismatch_drops_without_repair`
-- `ephemeral_activity_routes_by_optional_conversation_id`
 - `conversation_id_does_not_authorize_cross_room_activity`
 - `activity_projection_keeps_devices_separate`
 - `activity_projection_rolls_up_identity_for_normal_ui`
@@ -401,7 +436,6 @@ coverage before the room server owns push fanout:
 - `stale_agent_activity_clear_does_not_hide_newer_run`
 - `long_running_agent_activity_uses_command_or_run_id`
 - `long_running_agent_activity_survives_refresh_without_push`
-- `ephemeral_activity_expiry_is_bounded`
 - `durable_chat_message_clears_matching_default_typing`
 - `durable_command_result_clears_matching_working_activity`
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
@@ -415,7 +449,6 @@ coverage before the room server owns push fanout:
 - `activity_default_expiry_guidance_stays_within_v1_cap`
 - `server_activity_cache_keeps_kind_and_activity_id_opaque`
 - `server_activity_cache_preserves_multiple_opaque_events_per_route`
-- `server_activity_cache_enforces_per_route_limit_without_seq_gap`
 
 ## Planned Command/RPC Scenarios
 
@@ -436,10 +469,6 @@ application payload behavior:
 - `runtime_command_result_clears_matching_activity`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`
-- `runtime_state_snapshot_is_durable_but_push_never`
-- `runtime_state_snapshot_does_not_create_unread_or_inbox_work`
-- `runtime_state_projection_replaces_by_state_key_and_revision`
-- `runtime_state_projection_uses_room_sequence_to_break_revision_ties`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
 - `runtime_state_snapshot_unknown_schema_is_preserved`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
@@ -457,19 +486,13 @@ application payload behavior:
 Finite Chat should remain the runtime control surface when Hermes, inference, or
 bridge adapters are unhealthy:
 
-- `daemon_starts_when_hermes_is_absent`
-- `daemon_syncs_room_events_while_gateway_is_down`
 - `daemon_publishes_gateway_down_snapshot_without_hermes`
 - `daemon_publishes_inference_degraded_snapshot_without_agent_reply`
 - `dashboard_reads_stale_snapshot_while_heartbeat_is_fresh`
-- `gateway_restart_command_records_request_before_execution`
-- `gateway_restart_command_executes_when_gateway_is_down`
 - `gateway_restart_success_publishes_result_and_snapshot`
 - `gateway_restart_failure_publishes_terminal_result_without_retry_storm`
-- `hermes_hang_times_out_without_blocking_room_sync`
 - `hermes_invalid_output_marks_gateway_degraded_without_projection_corruption`
 - `inference_timeout_preserves_user_message_and_clears_activity`
-- `command_ledger_survives_restart_after_request_before_execution`
 - `command_ledger_survives_restart_after_execution_before_result`
 - `runtime_state_snapshot_after_command_result_retries_idempotently`
 - `sse_hint_during_hermes_down_only_triggers_pull_sync`
@@ -494,9 +517,7 @@ V1 transport should prove streams are hints and pull sync is authoritative:
 Generic chat payload semantics should stay small and non-notifying where
 appropriate:
 
-- `chat_receipt_is_durable_but_push_never`
 - `chat_receipt_is_encrypted_payload_semantics`
-- `chat_receipt_does_not_increment_unread`
 - `conversation_create_is_explicit_durable_event`
 - `first_message_lazily_materializes_missing_conversation`
 - `reaction_edit_and_receipt_do_not_push_by_default`
@@ -506,7 +527,6 @@ appropriate:
 - `telegram_thread_id_imports_to_topic_conversation_id`
 - `topic_skill_binding_is_encrypted_conversation_metadata`
 - `new_command_inside_topic_starts_segment_not_conversation`
-- `segment_start_is_durable_but_push_never`
 - `segment_boundary_is_projected_without_protocol_managed_prompt_state`
 
 ## Planned Attachment Scenarios

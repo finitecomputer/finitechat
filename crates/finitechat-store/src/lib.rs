@@ -3,22 +3,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult,
-    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeviceMembership, DeviceRecord,
-    DeviceStatus, EngineError, EventAccepted, KeyPackageInventory, KeyPackageRecord, LinkSessionId,
+    AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
+    AppendEphemeralActivityRequest, AppendEventRequest, ApplicationDeliveryEffect,
+    ClaimKeyPackageResult, CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest,
+    DeviceMembership, DeviceRecord, DeviceStatus, EngineError, EphemeralActivityAccepted,
+    EphemeralActivityRecord, EventAccepted, KeyPackageInventory, KeyPackageRecord, LinkSessionId,
     LinkSessionRecord, LinkSessionState, ListAccountRoomsPage, ListAccountRoomsRequest,
     MembershipInterval, RoomRecord, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest,
-    WelcomeRecord, direct_room_key, direct_room_key_string, idempotency_scope_key, lease_token_for,
-    request_hash, staged_welcomes_by_id, sync_events_page_for_room,
+    WelcomeRecord, direct_room_key, direct_room_key_string, ephemeral_activity_route_key,
+    idempotency_scope_key, lease_token_for, request_hash, staged_welcomes_by_id,
+    sync_events_page_for_room, validate_activity_expiry,
 };
 use finitechat_proto::{
-    AccountId, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState, LeaseToken, LogEntryKind,
-    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, ProtocolLimitError, RoomId,
-    RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
-    validate_bytes_non_empty, validate_room_id, validate_string_bytes,
+    AccountId, ApplicationDeliveryPolicy, DeviceRef, Epoch, FiniteEnvelope, KeyPackageState,
+    LeaseToken, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_WELCOME_CLAIMS_PER_REQUEST, MessageId, MlsGroupId, ProtocolLimitError,
+    RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId, WelcomeState,
+    validate_bytes_len, validate_bytes_non_empty, validate_room_id, validate_string_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct SqliteDeliveryStore {
     db_path: PathBuf,
+    ephemeral_activity: BTreeMap<String, Vec<EphemeralActivityRecord>>,
 }
 
 #[derive(Debug, Error)]
@@ -58,7 +62,10 @@ impl SqliteDeliveryStore {
             })?;
         }
 
-        let store = Self { db_path };
+        let store = Self {
+            db_path,
+            ephemeral_activity: BTreeMap::new(),
+        };
         let conn = store.connect()?;
         migrate(&conn)?;
         Ok(store)
@@ -331,6 +338,150 @@ impl SqliteDeliveryStore {
             )?;
             Ok(result)
         })
+    }
+
+    pub fn append_application_event(
+        &mut self,
+        request: AppendApplicationEventRequest,
+    ) -> Result<EventAccepted, StoreError> {
+        request.validate_limits().map_err(EngineError::from)?;
+        if request.event.envelope.kind != LogEntryKind::Application {
+            return Err(EngineError::WrongEnvelopeKind {
+                expected: LogEntryKind::Application,
+                actual: request.event.envelope.kind,
+            }
+            .into());
+        }
+
+        self.with_replayable_engine_result(|tx| {
+            let request_hash = request_hash(&request)?;
+            let scope_key = idempotency_scope_key(
+                &request.event.room_id,
+                &request.event.sender,
+                "append_event",
+                &request.event.idempotency_key,
+            );
+            if let Some(response) = load_idempotency(tx, &scope_key)? {
+                if response.request_hash != request_hash {
+                    return Ok(Err(EngineError::ConflictingIdempotencyKey));
+                }
+                return response.response.into_event_result();
+            }
+
+            ensure_idempotency_capacity(tx, &request.event.room_id, &request.event.sender)?;
+            let result = append_event_inner(tx, &request.event)?;
+            if let Ok(accepted) = &result {
+                insert_application_delivery_effect(
+                    tx,
+                    &request.event.room_id,
+                    accepted.seq,
+                    &accepted.message_id,
+                    &request.event.sender,
+                    request.delivery_policy,
+                )?;
+            }
+            insert_idempotency(
+                tx,
+                &scope_key,
+                &request.event.room_id,
+                &request.event.sender,
+                "append_event",
+                &request_hash,
+                &PersistedIdempotencyResponse::Event(result.clone()),
+            )?;
+            Ok(result)
+        })
+    }
+
+    pub fn append_ephemeral_activity(
+        &mut self,
+        request: AppendEphemeralActivityRequest,
+    ) -> Result<EphemeralActivityAccepted, StoreError> {
+        let conn = self.connect()?;
+        request.validate_limits().map_err(EngineError::from)?;
+        ensure_device_not_revoked(&conn, &request.sender)?;
+        let room = load_room(&conn, &request.room_id)?
+            .ok_or_else(|| EngineError::RoomNotFound(request.room_id.clone()))?;
+        if room.status != RoomStatus::Open {
+            return Err(EngineError::RoomNotOpen.into());
+        }
+        if request.mls_group_id != room.mls_group_id {
+            return Err(EngineError::EnvelopeGroupMismatch.into());
+        }
+        if request.epoch != room.current_epoch {
+            return Err(EngineError::WrongEpoch {
+                expected: room.current_epoch,
+                actual: request.epoch,
+            }
+            .into());
+        }
+        if !room.device_active_at_head(&request.sender) {
+            return Err(EngineError::SenderNotActive(request.sender).into());
+        }
+        validate_activity_expiry(request.received_at_ms, request.expires_at_ms)?;
+
+        let route_key = ephemeral_activity_route_key(
+            &request.room_id,
+            request.conversation_id.as_deref(),
+            &request.sender,
+        );
+        let record = EphemeralActivityRecord {
+            room_id: request.room_id,
+            mls_group_id: request.mls_group_id,
+            epoch: request.epoch,
+            sender: request.sender,
+            conversation_id: request.conversation_id,
+            payload: request.payload,
+            received_at_ms: request.received_at_ms,
+            expires_at_ms: request.expires_at_ms,
+        };
+        let records = self
+            .ephemeral_activity
+            .entry(route_key.clone())
+            .or_default();
+        records.push(record);
+        while records.len() > MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE as usize {
+            records.remove(0);
+        }
+        let cached_events_for_route =
+            u32::try_from(records.len()).map_err(|_| EngineError::RuntimeCounterOverflow)?;
+        Ok(EphemeralActivityAccepted {
+            route_key,
+            cached_events_for_route,
+        })
+    }
+
+    pub fn application_effect(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<ApplicationDeliveryEffect>, StoreError> {
+        let conn = self.connect()?;
+        load_application_delivery_effect(&conn, message_id)
+    }
+
+    pub fn push_outbox_len(&self) -> Result<usize, StoreError> {
+        count_application_effects(&self.connect()?, "creates_push")
+    }
+
+    pub fn unread_len(&self) -> Result<usize, StoreError> {
+        count_application_effects(&self.connect()?, "creates_unread")
+    }
+
+    pub fn command_inbox_len(&self) -> Result<usize, StoreError> {
+        count_application_effects(&self.connect()?, "creates_command_inbox_work")
+    }
+
+    pub fn ephemeral_activity_len_for_route(
+        &self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+    ) -> usize {
+        let route_key = ephemeral_activity_route_key(room_id, conversation_id, sender);
+        self.ephemeral_activity
+            .get(&route_key)
+            .map(Vec::len)
+            .unwrap_or(0)
     }
 
     pub fn submit_commit(
@@ -813,6 +964,19 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_room_commit_epoch_unique
         ON room_log_entries (room_id, epoch)
         WHERE kind = 'commit';
+
+        CREATE TABLE IF NOT EXISTS application_delivery_effects (
+          message_id TEXT PRIMARY KEY,
+          room_id TEXT NOT NULL,
+          seq INTEGER NOT NULL CHECK (seq > 0),
+          sender_account_id TEXT NOT NULL,
+          sender_device_id TEXT NOT NULL,
+          delivery_policy_json TEXT NOT NULL,
+          creates_push INTEGER NOT NULL CHECK (creates_push IN (0, 1)),
+          creates_unread INTEGER NOT NULL CHECK (creates_unread IN (0, 1)),
+          creates_command_inbox_work INTEGER NOT NULL CHECK (creates_command_inbox_work IN (0, 1)),
+          FOREIGN KEY (room_id, seq) REFERENCES room_log_entries(room_id, seq) ON DELETE CASCADE
+        );
 
         CREATE TABLE IF NOT EXISTS room_membership_intervals (
           room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
@@ -1486,6 +1650,37 @@ fn insert_log_entry(
     Ok(())
 }
 
+fn insert_application_delivery_effect(
+    tx: &Transaction<'_>,
+    room_id: &str,
+    seq: Seq,
+    message_id: &str,
+    sender: &DeviceRef,
+    delivery_policy: ApplicationDeliveryPolicy,
+) -> Result<(), StoreError> {
+    tx.execute(
+        r#"
+        INSERT INTO application_delivery_effects (
+          message_id, room_id, seq, sender_account_id, sender_device_id,
+          delivery_policy_json, creates_push, creates_unread, creates_command_inbox_work
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(message_id) DO NOTHING
+        "#,
+        params![
+            message_id,
+            room_id,
+            to_i64("application_delivery_effect.seq", seq)?,
+            sender.account_id,
+            sender.device_id,
+            serde_json::to_string(&delivery_policy)?,
+            bool_to_i64(delivery_policy.creates_push()),
+            bool_to_i64(delivery_policy.creates_unread()),
+            bool_to_i64(delivery_policy.creates_command_inbox_work()),
+        ],
+    )?;
+    Ok(())
+}
+
 fn update_room_head(
     tx: &Transaction<'_>,
     room_id: &str,
@@ -1764,6 +1959,69 @@ fn load_room_log(conn: &Connection, room_id: &str) -> Result<Vec<RoomLogEntry>, 
         });
     }
     Ok(entries)
+}
+
+fn load_application_delivery_effect(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<ApplicationDeliveryEffect>, StoreError> {
+    conn.query_row(
+        r#"
+        SELECT room_id, seq, sender_account_id, sender_device_id, delivery_policy_json
+        FROM application_delivery_effects
+        WHERE message_id = ?1
+        "#,
+        params![message_id],
+        |row| {
+            let seq: i64 = row.get(1)?;
+            if seq < 0 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("application_delivery_effect.seq is negative: {seq}"),
+                    )),
+                ));
+            }
+            let delivery_policy_json: String = row.get(4)?;
+            let delivery_policy: ApplicationDeliveryPolicy =
+                serde_json::from_str(&delivery_policy_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(ApplicationDeliveryEffect {
+                room_id: row.get(0)?,
+                seq: seq as u64,
+                message_id: message_id.to_string(),
+                sender: DeviceRef {
+                    account_id: row.get(2)?,
+                    device_id: row.get(3)?,
+                },
+                delivery_policy,
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn count_application_effects(conn: &Connection, column: &'static str) -> Result<usize, StoreError> {
+    debug_assert!(
+        matches!(
+            column,
+            "creates_push" | "creates_unread" | "creates_command_inbox_work"
+        ),
+        "unknown application effect column"
+    );
+    let sql = format!("SELECT COUNT(*) FROM application_delivery_effects WHERE {column} = 1");
+    let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+    usize::try_from(count).map_err(|_| {
+        StoreError::CorruptState(format!("application effect count is negative: {count}"))
+    })
 }
 
 fn load_room_membership(

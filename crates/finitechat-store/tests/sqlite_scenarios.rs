@@ -2,13 +2,15 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use finitechat_engine::{
-    AppendEventRequest, CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest,
-    DeliveryService, DeviceStatus, EngineError, KeyPackageRecord, LinkSessionRecord,
-    LinkSessionState, ListAccountRoomsRequest, RoomRecord, SubmitCommitRequest,
-    UploadKeyPackageRequest, WelcomeRecord, device, envelope, idempotency_scope_key,
+    AppendApplicationEventRequest, AppendEphemeralActivityRequest, AppendEventRequest,
+    CommitAccepted, CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, DeviceStatus,
+    EngineError, KeyPackageRecord, LinkSessionRecord, LinkSessionState, ListAccountRoomsRequest,
+    RoomRecord, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, device, envelope,
+    idempotency_scope_key,
 };
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
+    ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, KeyPackageState, LogEntryKind,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
     MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaV1,
     MembershipRemoveV1, ProtocolLimitError, RoomStatus, StagedWelcomeV1, WelcomeState,
@@ -202,6 +204,51 @@ impl SqliteWorld {
                 body.as_bytes().to_vec(),
             ),
             idempotency_key: idempotency_key.to_string(),
+        }
+    }
+
+    fn application_event_request(
+        &self,
+        sender: DeviceRef,
+        epoch: u64,
+        payload: &[u8],
+        idempotency_key: &str,
+        delivery_policy: ApplicationDeliveryPolicy,
+    ) -> AppendApplicationEventRequest {
+        AppendApplicationEventRequest {
+            event: AppendEventRequest {
+                room_id: self.room_id.clone(),
+                sender: sender.clone(),
+                envelope: envelope(
+                    self.room_id.clone(),
+                    self.group_id.clone(),
+                    sender,
+                    epoch,
+                    LogEntryKind::Application,
+                    payload.to_vec(),
+                ),
+                idempotency_key: idempotency_key.to_string(),
+            },
+            delivery_policy,
+        }
+    }
+
+    fn ephemeral_activity_request(
+        &self,
+        sender: DeviceRef,
+        epoch: u64,
+        conversation_id: Option<&str>,
+        received_at_ms: u64,
+    ) -> AppendEphemeralActivityRequest {
+        AppendEphemeralActivityRequest {
+            room_id: self.room_id.clone(),
+            mls_group_id: self.group_id.clone(),
+            epoch,
+            sender,
+            conversation_id: conversation_id.map(str::to_string),
+            payload: b"opaque activity ciphertext".to_vec(),
+            received_at_ms,
+            expires_at_ms: received_at_ms + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
         }
     }
 
@@ -2125,5 +2172,151 @@ fn sqlite_idempotency_capacity_rejects_new_mutations_but_allows_replay() {
     assert_eq!(
         room(&world.reopen(), &world.room_id).log.len(),
         MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE as usize
+    );
+}
+
+#[test]
+fn sqlite_chat_receipt_is_durable_but_push_never_after_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let request = world.application_event_request(
+        alice(),
+        0,
+        br#"{"type":"chat.receipt","message_id":"m1"}"#,
+        "sqlite_receipt_1",
+        DurableAppEventKind::ChatReceipt.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+    let reopened = world.reopen();
+
+    assert_eq!(room(&reopened, &world.room_id).last_seq, 1);
+    assert_eq!(reopened.push_outbox_len().unwrap(), 0);
+    assert_eq!(reopened.unread_len().unwrap(), 0);
+    assert_eq!(reopened.command_inbox_len().unwrap(), 0);
+    assert!(
+        !reopened
+            .application_effect(&accepted.message_id)
+            .unwrap()
+            .unwrap()
+            .creates_push()
+    );
+}
+
+#[test]
+fn sqlite_runtime_state_snapshot_does_not_create_unread_or_inbox_work() {
+    let mut world = SqliteWorld::direct_room();
+    let request = world.application_event_request(
+        alice(),
+        0,
+        br#"{"type":"runtime.state.snapshot","state_key":"runtime.gateway"}"#,
+        "sqlite_state_1",
+        DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+    );
+
+    world.server.append_application_event(request).unwrap();
+    let reopened = world.reopen();
+
+    assert_eq!(room(&reopened, &world.room_id).last_seq, 1);
+    assert_eq!(reopened.push_outbox_len().unwrap(), 0);
+    assert_eq!(reopened.unread_len().unwrap(), 0);
+    assert_eq!(reopened.command_inbox_len().unwrap(), 0);
+}
+
+#[test]
+fn sqlite_runtime_command_request_creates_command_inbox_work_after_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let request = world.application_event_request(
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","command":"finitecomputer.runtime.gateway.restart"}"#,
+        "sqlite_command_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+    let replay = world
+        .server
+        .append_application_event(world.application_event_request(
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","command":"finitecomputer.runtime.gateway.restart"}"#,
+        "sqlite_command_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    ));
+    assert_eq!(replay.unwrap(), accepted);
+
+    let reopened = world.reopen();
+    assert_eq!(reopened.push_outbox_len().unwrap(), 1);
+    assert_eq!(reopened.unread_len().unwrap(), 0);
+    assert_eq!(reopened.command_inbox_len().unwrap(), 1);
+    assert!(
+        reopened
+            .application_effect(&accepted.message_id)
+            .unwrap()
+            .unwrap()
+            .creates_command_inbox_work()
+    );
+}
+
+#[test]
+fn sqlite_ephemeral_activity_does_not_persist_or_advance_sequence() {
+    let mut world = SqliteWorld::direct_room();
+    let activity = world.ephemeral_activity_request(alice(), 0, Some("topic_1"), 1_000);
+
+    world.server.append_ephemeral_activity(activity).unwrap();
+
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        1
+    );
+    assert_eq!(room(&world.server, &world.room_id).last_seq, 0);
+    assert!(
+        world
+            .server
+            .sync_events(&world.room_id, &alice(), 0)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let reopened = world.reopen();
+    assert_eq!(
+        reopened.ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        0
+    );
+    assert_eq!(room(&reopened, &world.room_id).last_seq, 0);
+}
+
+#[test]
+fn sqlite_ephemeral_activity_rejects_pending_and_removed_devices() {
+    let mut world = SqliteWorld::direct_room();
+    world.upload_and_claim(bob(), "kp_sqlite_ephemeral_bob");
+    let add = world.add_device_request(
+        alice(),
+        bob(),
+        "kp_sqlite_ephemeral_bob",
+        "welcome_sqlite_ephemeral_bob",
+        0,
+        "add_sqlite_ephemeral_bob",
+    );
+    world.server.submit_commit(add).unwrap();
+    let pending = world.ephemeral_activity_request(bob(), 1, None, 1_000);
+    assert_eq!(
+        store_engine_error(world.server.append_ephemeral_activity(pending).unwrap_err()),
+        EngineError::SenderNotActive(bob())
+    );
+
+    world.server.claim_welcomes(&bob()).unwrap();
+    world
+        .server
+        .ack_welcome("welcome_sqlite_ephemeral_bob", true)
+        .unwrap();
+    let remove = world.remove_device_request(alice(), bob(), 1, "remove_sqlite_ephemeral_bob");
+    world.server.submit_commit(remove).unwrap();
+    let removed = world.ephemeral_activity_request(bob(), 2, None, 1_000);
+    assert_eq!(
+        store_engine_error(world.server.append_ephemeral_activity(removed).unwrap_err()),
+        EngineError::SenderNotActive(bob())
     );
 }

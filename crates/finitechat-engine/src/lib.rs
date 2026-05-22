@@ -1,14 +1,16 @@
 use finitechat_proto::{
-    AccountId, DeviceId, DeviceRef, Epoch, FiniteEnvelope, IdempotencyKey, KeyPackageHash,
-    KeyPackageId, KeyPackageRef, KeyPackageState, LeaseToken, LogEntryKind,
-    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES,
-    MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1,
-    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq,
-    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
-    validate_idempotency_key, validate_mls_group_id, validate_room_id, validate_string_bytes,
+    AccountId, ApplicationDeliveryPolicy, ConversationId, DeviceId, DeviceRef, Epoch,
+    FiniteEnvelope, IdempotencyKey, KeyPackageHash, KeyPackageId, KeyPackageRef, KeyPackageState,
+    LeaseToken, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
+    ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
+    WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
+    validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,8 @@ pub struct DeliveryService {
     welcomes: BTreeMap<WelcomeId, WelcomeRecord>,
     link_sessions: BTreeMap<LinkSessionId, LinkSessionRecord>,
     idempotency: BTreeMap<String, IdempotencyRecord>,
+    application_effects: BTreeMap<MessageId, ApplicationDeliveryEffect>,
+    ephemeral_activity: BTreeMap<String, Vec<EphemeralActivityRecord>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +166,65 @@ pub struct AppendEventRequest {
     pub sender: DeviceRef,
     pub envelope: FiniteEnvelope,
     pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendApplicationEventRequest {
+    pub event: AppendEventRequest,
+    pub delivery_policy: ApplicationDeliveryPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationDeliveryEffect {
+    pub room_id: RoomId,
+    pub seq: Seq,
+    pub message_id: MessageId,
+    pub sender: DeviceRef,
+    pub delivery_policy: ApplicationDeliveryPolicy,
+}
+
+impl ApplicationDeliveryEffect {
+    pub fn creates_push(&self) -> bool {
+        self.delivery_policy.creates_push()
+    }
+
+    pub fn creates_unread(&self) -> bool {
+        self.delivery_policy.creates_unread()
+    }
+
+    pub fn creates_command_inbox_work(&self) -> bool {
+        self.delivery_policy.creates_command_inbox_work()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendEphemeralActivityRequest {
+    pub room_id: RoomId,
+    pub mls_group_id: MlsGroupId,
+    pub epoch: Epoch,
+    pub sender: DeviceRef,
+    pub conversation_id: Option<ConversationId>,
+    pub payload: Vec<u8>,
+    pub received_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralActivityAccepted {
+    pub route_key: String,
+    pub cached_events_for_route: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralActivityRecord {
+    pub room_id: RoomId,
+    pub mls_group_id: MlsGroupId,
+    pub epoch: Epoch,
+    pub sender: DeviceRef,
+    pub conversation_id: Option<ConversationId>,
+    pub payload: Vec<u8>,
+    pub received_at_ms: u64,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +413,30 @@ impl AppendEventRequest {
         self.sender.validate_limits()?;
         self.envelope.validate_limits()?;
         validate_idempotency_key(&self.idempotency_key)?;
+        Ok(())
+    }
+}
+
+impl AppendApplicationEventRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        self.event.validate_limits()
+    }
+}
+
+impl AppendEphemeralActivityRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(&self.room_id)?;
+        validate_mls_group_id(&self.mls_group_id)?;
+        self.sender.validate_limits()?;
+        if let Some(conversation_id) = &self.conversation_id {
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        validate_bytes_non_empty("ephemeral_activity.payload", self.payload.len())?;
+        validate_bytes_len(
+            "ephemeral_activity.payload",
+            self.payload.len(),
+            MAX_ENVELOPE_PAYLOAD_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -743,6 +830,143 @@ impl DeliveryService {
             },
         );
         result
+    }
+
+    pub fn append_application_event(
+        &mut self,
+        request: AppendApplicationEventRequest,
+    ) -> Result<EventAccepted, EngineError> {
+        request.validate_limits()?;
+        if request.event.envelope.kind != LogEntryKind::Application {
+            return Err(EngineError::WrongEnvelopeKind {
+                expected: LogEntryKind::Application,
+                actual: request.event.envelope.kind,
+            });
+        }
+
+        let accepted = self.append_event(request.event.clone())?;
+        self.record_application_delivery_effect(
+            &request.event.room_id,
+            &request.event.sender,
+            accepted.seq,
+            &accepted.message_id,
+            request.delivery_policy,
+        );
+        Ok(accepted)
+    }
+
+    pub fn append_ephemeral_activity(
+        &mut self,
+        request: AppendEphemeralActivityRequest,
+    ) -> Result<EphemeralActivityAccepted, EngineError> {
+        request.validate_limits()?;
+        ensure_device_not_revoked(&self.devices, &request.sender)?;
+        let room = self
+            .rooms
+            .get(&request.room_id)
+            .ok_or_else(|| EngineError::RoomNotFound(request.room_id.clone()))?;
+        validate_room_open(room)?;
+        if request.mls_group_id != room.mls_group_id {
+            return Err(EngineError::EnvelopeGroupMismatch);
+        }
+        if request.epoch != room.current_epoch {
+            return Err(EngineError::WrongEpoch {
+                expected: room.current_epoch,
+                actual: request.epoch,
+            });
+        }
+        if !room.device_active_at_head(&request.sender) {
+            return Err(EngineError::SenderNotActive(request.sender));
+        }
+        validate_activity_expiry(request.received_at_ms, request.expires_at_ms)?;
+
+        let route_key = ephemeral_activity_route_key(
+            &request.room_id,
+            request.conversation_id.as_deref(),
+            &request.sender,
+        );
+        let record = EphemeralActivityRecord {
+            room_id: request.room_id,
+            mls_group_id: request.mls_group_id,
+            epoch: request.epoch,
+            sender: request.sender,
+            conversation_id: request.conversation_id,
+            payload: request.payload,
+            received_at_ms: request.received_at_ms,
+            expires_at_ms: request.expires_at_ms,
+        };
+        let records = self
+            .ephemeral_activity
+            .entry(route_key.clone())
+            .or_default();
+        records.retain(|record| record.expires_at_ms > record.received_at_ms);
+        records.push(record);
+        while records.len() > MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE as usize {
+            records.remove(0);
+        }
+        let cached_events_for_route =
+            u32::try_from(records.len()).map_err(|_| EngineError::RuntimeCounterOverflow)?;
+        Ok(EphemeralActivityAccepted {
+            route_key,
+            cached_events_for_route,
+        })
+    }
+
+    pub fn application_effect(&self, message_id: &str) -> Option<&ApplicationDeliveryEffect> {
+        self.application_effects.get(message_id)
+    }
+
+    pub fn push_outbox_len(&self) -> usize {
+        self.application_effects
+            .values()
+            .filter(|effect| effect.creates_push())
+            .count()
+    }
+
+    pub fn unread_len(&self) -> usize {
+        self.application_effects
+            .values()
+            .filter(|effect| effect.creates_unread())
+            .count()
+    }
+
+    pub fn command_inbox_len(&self) -> usize {
+        self.application_effects
+            .values()
+            .filter(|effect| effect.creates_command_inbox_work())
+            .count()
+    }
+
+    pub fn ephemeral_activity_len_for_route(
+        &self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+    ) -> usize {
+        let route_key = ephemeral_activity_route_key(room_id, conversation_id, sender);
+        self.ephemeral_activity
+            .get(&route_key)
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    fn record_application_delivery_effect(
+        &mut self,
+        room_id: &str,
+        sender: &DeviceRef,
+        seq: Seq,
+        message_id: &str,
+        delivery_policy: ApplicationDeliveryPolicy,
+    ) {
+        self.application_effects
+            .entry(message_id.to_string())
+            .or_insert_with(|| ApplicationDeliveryEffect {
+                room_id: room_id.to_string(),
+                seq,
+                message_id: message_id.to_string(),
+                sender: sender.clone(),
+                delivery_policy,
+            });
     }
 
     pub fn submit_commit(
@@ -1506,6 +1730,10 @@ pub enum EngineError {
     EnvelopeSenderMismatch,
     #[error("sender is not active: {0:?}")]
     SenderNotActive(DeviceRef),
+    #[error("ephemeral activity expiry must be after receipt")]
+    EphemeralActivityAlreadyExpired,
+    #[error("ephemeral activity expiry window {actual_millis}ms exceeds max {max_millis}ms")]
+    EphemeralActivityExpiryTooLong { max_millis: u64, actual_millis: u64 },
     #[error("reporter was not a member for offending seq: {0:?}")]
     ReporterNotInInterval(DeviceRef),
     #[error("conflicting idempotency key")]
@@ -1530,6 +1758,8 @@ pub enum EngineError {
     LinkSessionNotReady,
     #[error("bad link session claim token")]
     BadLinkSessionClaimToken,
+    #[error("runtime worker counter overflow")]
+    RuntimeCounterOverflow,
     #[error("direct room cannot add third account: {0}")]
     DirectRoomThirdAccount(AccountId),
     #[error(transparent)]
@@ -1754,6 +1984,38 @@ fn validate_envelope(
         return Err(EngineError::EnvelopeGroupMismatch);
     }
     Ok(())
+}
+
+pub fn validate_activity_expiry(
+    received_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<(), EngineError> {
+    if expires_at_ms <= received_at_ms {
+        return Err(EngineError::EphemeralActivityAlreadyExpired);
+    }
+    let window = expires_at_ms - received_at_ms;
+    if window > MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS {
+        return Err(EngineError::EphemeralActivityExpiryTooLong {
+            max_millis: MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+            actual_millis: window,
+        });
+    }
+    Ok(())
+}
+
+pub fn ephemeral_activity_route_key(
+    room_id: &str,
+    conversation_id: Option<&str>,
+    sender: &DeviceRef,
+) -> String {
+    let conversation = conversation_id.unwrap_or("");
+    format!(
+        "{}|{}|{}|{}",
+        length_prefixed(room_id),
+        length_prefixed(conversation),
+        length_prefixed(&sender.account_id),
+        length_prefixed(&sender.device_id)
+    )
 }
 
 pub fn request_hash<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
