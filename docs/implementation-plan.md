@@ -383,7 +383,9 @@ Good tests:
 - Ephemeral activity now has a decrypted client projection: activity is keyed
   by room, conversation, account, device, kind, and normalized activity id;
   refreshes, clears, durable terminal clears, and expiry are bounded and
-  sender-scoped.
+  sender-scoped. Runtime command results validate their terminal payload before
+  applying bounded activity clears, so dropped ephemeral clears do not leave
+  stale `working` or `thinking` state behind.
 - `finitechat-blob` now proves the Blossom-shaped HTTP seam without adding a
   networking dependency: upload requests contain ciphertext only, upload
   responses verify descriptor hash/size before references exist, and download

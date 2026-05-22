@@ -520,6 +520,10 @@ activity; a `runtime.command.result`, assistant response, or terminal failure
 can clear the matching `thinking` or `working` activity for its run id. This
 gives correctness when the explicit ephemeral clear was dropped.
 
+For `runtime.command.result`, clients validate the terminal result shape before
+applying its bounded clear list. Invalid result payloads must not mutate
+activity projection state.
+
 The server authorizes ephemeral activity against its current device ledger and
 membership cache before forwarding or caching it. This check is not identity
 proof; clients still verify Nostr-rooted MLS credentials locally. It only keeps

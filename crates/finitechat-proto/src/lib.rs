@@ -814,6 +814,15 @@ pub enum RuntimeCommandLedgerError {
     Protocol(#[from] ProtocolLimitError),
 }
 
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RuntimeCommandActivityClearError {
+    #[error(transparent)]
+    Payload(#[from] RuntimeCommandPayloadError),
+    #[error(transparent)]
+    Projection(#[from] EphemeralActivityProjectionError),
+}
+
 impl RuntimeStateProjection {
     pub fn apply(&mut self, entry: RuntimeStateProjectionEntry) -> Result<(), ProtocolLimitError> {
         validate_room_id(&entry.room_id)?;
@@ -1668,6 +1677,26 @@ impl EphemeralActivityProjection {
             activity_id,
         )?;
         Ok(self.entries.remove(&key).is_some())
+    }
+
+    pub fn clear_from_runtime_command_result(
+        &mut self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+        result: &RuntimeCommandResultV1,
+    ) -> Result<u32, RuntimeCommandActivityClearError> {
+        result.validate_structure()?;
+        let mut removed = 0u32;
+        // `validate_structure` bounds this loop by
+        // `MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS`.
+        for clear in &result.clears_activity {
+            if self.clear_from_durable_terminal(room_id, conversation_id, sender, clear)? {
+                removed += 1;
+            }
+        }
+        assert!(removed <= MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS);
+        Ok(removed)
     }
 
     pub fn expire_at(&mut self, now_ms: u64) -> Result<u32, EphemeralActivityProjectionError> {
@@ -3197,6 +3226,110 @@ mod tests {
                     "room_1",
                     Some("topic_1"),
                     &sibling,
+                    "working",
+                    Some("restart_1"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_command_result_clears_matching_activity() {
+        let runtime = device("runtime_npub", "box");
+        let sibling = device("runtime_npub", "gpu");
+        let mut projection = EphemeralActivityProjection::default();
+        for (sender, activity_id) in [
+            (&runtime, "restart_1"),
+            (&runtime, "restart_2"),
+            (&sibling, "restart_1"),
+        ] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), sender, 1_000, 11_000),
+                    &activity_set("working", Some(activity_id), br#"{}"#),
+                )
+                .unwrap();
+        }
+        let mut result = runtime_command_success_result("restart_1", br#"{"status":"live"}"#);
+        result.clears_activity.push(RuntimeActivityClearV1 {
+            activity_kind: "working".to_string(),
+            activity_id: Some("restart_1".to_string()),
+            conversation_id: None,
+        });
+
+        assert_eq!(
+            projection
+                .clear_from_runtime_command_result("room_1", Some("topic_1"), &runtime, &result,)
+                .unwrap(),
+            1
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("restart_1"),
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("restart_2"),
+                )
+                .is_some()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &sibling,
+                    "working",
+                    Some("restart_1"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_command_result_clear_rejects_invalid_result_before_mutation() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                &activity_set("working", Some("restart_1"), br#"{}"#),
+            )
+            .unwrap();
+        let mut result = runtime_command_success_result("restart_1", br#"{"status":"live"}"#);
+        result.payload_kind = RuntimeCommandPayloadKindV1::Request;
+        result.clears_activity.push(RuntimeActivityClearV1 {
+            activity_kind: "working".to_string(),
+            activity_id: Some("restart_1".to_string()),
+            conversation_id: None,
+        });
+
+        assert!(matches!(
+            projection
+                .clear_from_runtime_command_result("room_1", Some("topic_1"), &runtime, &result,)
+                .unwrap_err(),
+            RuntimeCommandActivityClearError::Payload(
+                RuntimeCommandPayloadError::WrongPayloadKind { .. }
+            )
+        ));
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
                     "working",
                     Some("restart_1"),
                 )

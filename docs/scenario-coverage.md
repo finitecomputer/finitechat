@@ -168,6 +168,8 @@ kinds. Proven unit scenarios:
 - `activity_projection_keeps_devices_separate_and_clear_scoped`
 - `activity_refresh_extends_matching_device_expiry`
 - `durable_terminal_clear_is_sender_and_activity_scoped`
+- `runtime_command_result_clears_matching_activity`
+- `runtime_command_result_clear_rejects_invalid_result_before_mutation`
 - `activity_projection_expires_and_rejects_bad_lease_windows`
 - `topic_message_routes_by_conversation_id`
 - `first_message_lazily_materializes_missing_conversation`
@@ -506,6 +508,7 @@ application payload behavior:
 - `runtime_command_cancel_races_with_result_first_terminal_wins`
 - `runtime_command_cancel_validates_kind_reason_and_known_request`
 - `runtime_command_terminal_event_must_follow_request_sequence`
+- `runtime_command_result_clears_matching_activity`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_wake_hint_is_non_authoritative`
@@ -518,7 +521,6 @@ Still planned:
 - `runtime_command_retry_reuses_message_id_and_idempotency_key`
 - `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
 - `runtime_stream_callback_only_triggers_sync`
-- `runtime_command_result_clears_matching_activity`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
