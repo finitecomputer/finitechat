@@ -404,7 +404,8 @@ Good tests:
   messages, recovery commands, gateway health changes, restarts, and
   crash-after-ledger-write points. It keeps sync cursors monotonic, command
   ledgers bounded, snapshots non-notifying, and pending recovery work
-  eventually empty.
+  eventually empty. A stream/SSE hint proof shows callbacks only mark
+  `needs_pull`; command execution waits until ordered sync records the request.
 - Topic/segment projection is now executable: clients project conversations by
   `(room_id, conversation_id)`, can lazily materialize a topic from the first
   message, archive one topic without siblings, and apply `/new` as a bounded

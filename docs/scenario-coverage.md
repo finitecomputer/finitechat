@@ -210,6 +210,7 @@ Proven survival scenarios:
 - `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
+- `runtime_stream_callback_only_triggers_sync`
 - `command_ledger_survives_restart_after_request_before_execution`
 - `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
@@ -520,6 +521,7 @@ application payload behavior:
 - `unkeyed_runtime_commands_do_not_block_keyed_resources`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `runtime_sync_persists_request_ledger_before_execution`
+- `runtime_stream_callback_only_triggers_sync`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
@@ -527,7 +529,6 @@ Still planned:
 
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
-- `runtime_stream_callback_only_triggers_sync`
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
 - `runtime_state_snapshot_unknown_schema_is_preserved`
@@ -568,6 +569,7 @@ V1 transport should prove streams are hints and pull sync is authoritative:
 - `sync_projection_rejects_replayed_or_wrong_room_pages`
 - `sync_projection_rebuilds_same_view_after_restart`
 - `stream_callback_never_executes_command_directly`
+- `runtime_stream_callback_only_triggers_sync`
 - `websocket_transport_not_required_for_v1`
 - `push_wake_and_sse_share_hint_only_semantics`
 

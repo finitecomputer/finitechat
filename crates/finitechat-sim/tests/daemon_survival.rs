@@ -1,5 +1,6 @@
 use finitechat_engine::{
-    AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted, envelope,
+    AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted,
+    RoomSyncProjection, envelope,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
@@ -280,6 +281,54 @@ fn runtime_state_command_result_publishes_post_mutation_snapshot() {
     assert!(!snapshot_effect.creates_push());
     assert!(!snapshot_effect.creates_unread());
     assert!(!snapshot_effect.creates_command_inbox_work());
+}
+
+#[test]
+fn runtime_stream_callback_only_triggers_sync() {
+    let mut world = world_with_runtime();
+    let accepted = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_command_request_payload("restart_stream_hint"),
+            idempotency_key: "restart_stream_hint".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut projection = RoomSyncProjection::default();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    assert!(
+        projection
+            .observe_stream_hint(&world.room_id, accepted.seq)
+            .unwrap()
+    );
+    assert_eq!(projection.server_cursor(), 0);
+    assert!(projection.applied_message_ids().is_empty());
+    assert!(daemon.ledger.is_empty());
+    assert_eq!(daemon.gateway, GatewayState::Down);
+    assert!(command_result_seq(&world.server, &world.room_id, "restart_stream_hint").is_none());
+
+    daemon.sync_tick(&mut world.server);
+
+    assert_eq!(daemon.gateway, GatewayState::Live);
+    assert_eq!(
+        daemon
+            .ledger
+            .get(&world.room_id, None, &alice(), "restart_stream_hint")
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Succeeded
+    );
+    assert!(command_result_seq(&world.server, &world.room_id, "restart_stream_hint").is_some());
 }
 
 #[test]
