@@ -4,7 +4,7 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
-    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_RUNTIME_COMMAND_LEDGER_RECORDS,
+    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeCommandErrorV1,
     RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
     RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
     RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalContext,
@@ -19,6 +19,7 @@ enum GatewayState {
     Live,
     Down,
     Hung,
+    RestartFails,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +116,12 @@ impl FakeDaemon {
         for record in pending {
             match record.command.as_str() {
                 "finitecomputer.runtime.gateway.restart" => {
-                    self.gateway = GatewayState::Live;
-                    let result = runtime_command_result(&record.request_id);
+                    let result = if self.gateway == GatewayState::RestartFails {
+                        runtime_command_failed_result(&record.request_id)
+                    } else {
+                        self.gateway = GatewayState::Live;
+                        runtime_command_result(&record.request_id)
+                    };
                     self.append_runtime_command_result(server, &record, &result);
                 }
                 "finitecomputer.runtime.config.update" => {
@@ -170,6 +175,7 @@ impl FakeDaemon {
             GatewayState::Live => "live",
             GatewayState::Down => "down",
             GatewayState::Hung => "hung",
+            GatewayState::RestartFails => "down",
         };
         let accepted = append_application(
             server,
@@ -559,6 +565,50 @@ fn gateway_restart_success_publishes_result_and_snapshot() {
 }
 
 #[test]
+fn gateway_restart_failure_publishes_terminal_result_without_retry_storm() {
+    let mut world = world_with_runtime();
+    append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_command_request_payload("restart_failure_1"),
+            idempotency_key: "restart_failure_1".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::RestartFails,
+    );
+
+    daemon.sync_tick(&mut world.server);
+    daemon.sync_tick(&mut world.server);
+
+    let result =
+        runtime_command_result_after(&world.server, &world.room_id, "restart_failure_1").unwrap();
+    let record = daemon
+        .ledger
+        .get(&world.room_id, None, &alice(), "restart_failure_1")
+        .unwrap();
+    assert_eq!(result.result.status, RuntimeCommandTerminalStatusV1::Failed);
+    assert_eq!(
+        result.result.error.as_ref().unwrap().code,
+        "gateway_restart_failed"
+    );
+    assert_eq!(record.status, RuntimeCommandLedgerStatus::Failed);
+    assert_eq!(
+        runtime_command_result_count(&world.server, &world.room_id, "restart_failure_1"),
+        1
+    );
+    assert_eq!(daemon.gateway, GatewayState::RestartFails);
+}
+
+#[test]
 fn runtime_config_command_result_includes_post_mutation_status() {
     let mut world = world_with_runtime();
     append_application(
@@ -945,6 +995,20 @@ fn runtime_command_result(request_id: &str) -> RuntimeCommandResultV1 {
     }
 }
 
+fn runtime_command_failed_result(request_id: &str) -> RuntimeCommandResultV1 {
+    RuntimeCommandResultV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Result,
+        request_id: request_id.to_string(),
+        status: RuntimeCommandTerminalStatusV1::Failed,
+        body: None,
+        error: Some(RuntimeCommandErrorV1 {
+            code: "gateway_restart_failed".to_string(),
+            message: "gateway restart failed".to_string(),
+        }),
+        clears_activity: Vec::new(),
+    }
+}
+
 fn runtime_config_command_result(
     request_id: &str,
     config_generation: u64,
@@ -1051,6 +1115,24 @@ fn command_result_seq(server: &DeliveryService, room_id: &str, request_id: &str)
                 .unwrap_or(false)
         })
         .map(|entry| entry.seq)
+}
+
+fn runtime_command_result_count(
+    server: &DeliveryService,
+    room_id: &str,
+    request_id: &str,
+) -> usize {
+    server
+        .room(room_id)
+        .unwrap()
+        .log
+        .iter()
+        .filter(|entry| {
+            serde_json::from_slice::<RuntimeCommandResultV1>(&entry.envelope.payload)
+                .map(|result| result.request_id == request_id)
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 fn runtime_chat_message_count_from(
