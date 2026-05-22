@@ -530,15 +530,12 @@ application payload behavior:
 - `runtime_state_slow_refresh_cadence_is_bounded`
 - `runtime_liveness_heartbeat_is_not_encrypted_runtime_state`
 - `runtime_config_command_result_includes_post_mutation_status`
-- `runtime_wake_hint_is_non_authoritative`
-- `runtime_target_policy_uses_decrypted_payload`
-
-Still planned:
-
 - `portable_agent_command_does_not_assume_hosted_runner`
 - `hosted_runner_admin_operation_stays_out_of_generic_chat_command`
 - `dashboard_does_not_require_inbound_agent_http`
 - `chat_payloads_do_not_travel_over_generic_management_queue`
+- `runtime_wake_hint_is_non_authoritative`
+- `runtime_target_policy_uses_decrypted_payload`
 
 ## Planned Daemon Survival Scenarios
 
