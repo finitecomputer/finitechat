@@ -16,6 +16,9 @@ pub type LeaseToken = String;
 pub type IdempotencyKey = String;
 pub type ConversationId = String;
 pub type RuntimeStateKey = String;
+pub type RuntimeCommandRequestId = String;
+pub type RuntimeCommandName = String;
+pub type RuntimeCommandResourceKey = String;
 pub type AttachmentBlobUrl = String;
 pub type AttachmentHash = String;
 pub type Epoch = u64;
@@ -46,6 +49,10 @@ pub const MAX_ATTACHMENT_KEY_HEX_BYTES: u32 = 64;
 pub const MAX_ATTACHMENT_NONCE_HEX_BYTES: u32 = 24;
 pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
+pub const MAX_RUNTIME_COMMAND_PAYLOAD_BYTES: u32 = 128 * 1024;
+pub const MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES: u32 = 2048;
+pub const MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS: u32 = 16;
+pub const MAX_RUNTIME_COMMAND_LEDGER_RECORDS: u32 = 1024;
 pub const MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30 * 60 * 1000;
 pub const MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE: u32 = 64;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: u32 = 128;
@@ -84,6 +91,11 @@ const _: () = {
     assert!(MAX_ATTACHMENT_NONCE_HEX_BYTES == 24);
     assert!(MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
+    assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES > 0);
+    assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES < MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES > 0);
+    assert!(MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS > 0);
+    assert!(MAX_RUNTIME_COMMAND_LEDGER_RECORDS > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE > 0);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
@@ -463,6 +475,160 @@ pub struct RuntimeStateProjection {
     entries: BTreeMap<String, RuntimeStateProjectionEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeCommandPayloadKindV1 {
+    #[serde(rename = "runtime.command.request")]
+    Request,
+    #[serde(rename = "runtime.command.result")]
+    Result,
+    #[serde(rename = "runtime.command.cancel")]
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandTargetV1 {
+    pub account_id: AccountId,
+    pub device_id: Option<DeviceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandJsonPayloadV1 {
+    pub schema: String,
+    #[serde(with = "bytes_as_vec")]
+    pub json_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeActivityClearV1 {
+    pub activity_kind: String,
+    pub activity_id: Option<String>,
+    pub conversation_id: Option<ConversationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandRequestV1 {
+    #[serde(rename = "type")]
+    pub payload_kind: RuntimeCommandPayloadKindV1,
+    pub request_id: RuntimeCommandRequestId,
+    pub command: RuntimeCommandName,
+    pub target: RuntimeCommandTargetV1,
+    pub resource_key: Option<RuntimeCommandResourceKey>,
+    pub body: RuntimeCommandJsonPayloadV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCommandTerminalStatusV1 {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandResultV1 {
+    #[serde(rename = "type")]
+    pub payload_kind: RuntimeCommandPayloadKindV1,
+    pub request_id: RuntimeCommandRequestId,
+    pub status: RuntimeCommandTerminalStatusV1,
+    pub body: Option<RuntimeCommandJsonPayloadV1>,
+    pub error: Option<RuntimeCommandErrorV1>,
+    #[serde(default)]
+    pub clears_activity: Vec<RuntimeActivityClearV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandCancelV1 {
+    #[serde(rename = "type")]
+    pub payload_kind: RuntimeCommandPayloadKindV1,
+    pub request_id: RuntimeCommandRequestId,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCommandLedgerStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCommandLedgerDecision {
+    Recorded,
+    Replayed,
+    IgnoredTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandLedgerRecord {
+    pub room_id: RoomId,
+    pub conversation_id: Option<ConversationId>,
+    pub request_id: RuntimeCommandRequestId,
+    pub command: RuntimeCommandName,
+    pub sender: DeviceRef,
+    pub target: RuntimeCommandTargetV1,
+    pub original_message_id: MessageId,
+    pub accepted_seq: Seq,
+    pub resource_key: Option<RuntimeCommandResourceKey>,
+    pub status: RuntimeCommandLedgerStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCommandLedger {
+    records: BTreeMap<String, RuntimeCommandLedgerRecord>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeCommandIngressContext<'a> {
+    pub room_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub accepted_seq: Seq,
+    pub original_message_id: &'a str,
+    pub sender: &'a DeviceRef,
+    pub local_device: &'a DeviceRef,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RuntimeCommandPayloadError {
+    #[error("runtime command payload kind {actual:?} does not match expected {expected:?}")]
+    WrongPayloadKind {
+        expected: RuntimeCommandPayloadKindV1,
+        actual: RuntimeCommandPayloadKindV1,
+    },
+    #[error("runtime command result {request_id} is missing a body for success")]
+    SuccessMissingBody { request_id: RuntimeCommandRequestId },
+    #[error("runtime command result {request_id} is missing an error for failure")]
+    FailureMissingError { request_id: RuntimeCommandRequestId },
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RuntimeCommandLedgerError {
+    #[error("runtime command request id conflict for {request_id}")]
+    ConflictingRequestId { request_id: RuntimeCommandRequestId },
+    #[error("runtime command request not found for {request_id}")]
+    RequestNotFound { request_id: RuntimeCommandRequestId },
+    #[error("runtime command status {status:?} is not terminal")]
+    NonTerminalStatus { status: RuntimeCommandLedgerStatus },
+    #[error("runtime command ledger capacity exceeded: max {max_records}")]
+    CapacityExceeded { max_records: u32 },
+    #[error(transparent)]
+    Payload(#[from] RuntimeCommandPayloadError),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
+}
+
 impl RuntimeStateProjection {
     pub fn apply(&mut self, entry: RuntimeStateProjectionEntry) -> Result<(), ProtocolLimitError> {
         validate_room_id(&entry.room_id)?;
@@ -554,6 +720,350 @@ impl RuntimeStateProjection {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+impl RuntimeCommandTargetV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.target.account_id", self.account_id.len())?;
+        validate_string_bytes(
+            "runtime_command.target.account_id",
+            &self.account_id,
+            MAX_ACCOUNT_ID_BYTES,
+        )?;
+        if let Some(device_id) = &self.device_id {
+            validate_bytes_non_empty("runtime_command.target.device_id", device_id.len())?;
+            validate_string_bytes(
+                "runtime_command.target.device_id",
+                device_id,
+                MAX_DEVICE_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn matches_device(&self, device: &DeviceRef) -> bool {
+        self.account_id == device.account_id
+            && self
+                .device_id
+                .as_ref()
+                .is_none_or(|device_id| *device_id == device.device_id)
+    }
+}
+
+impl RuntimeCommandJsonPayloadV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.payload.schema", self.schema.len())?;
+        validate_string_bytes(
+            "runtime_command.payload.schema",
+            &self.schema,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty(
+            "runtime_command.payload.json_payload",
+            self.json_payload.len(),
+        )?;
+        validate_bytes_len(
+            "runtime_command.payload.json_payload",
+            self.json_payload.len(),
+            MAX_RUNTIME_COMMAND_PAYLOAD_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl RuntimeActivityClearV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_activity_clear.kind", self.activity_kind.len())?;
+        validate_string_bytes(
+            "runtime_activity_clear.kind",
+            &self.activity_kind,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(activity_id) = &self.activity_id {
+            validate_bytes_non_empty("runtime_activity_clear.activity_id", activity_id.len())?;
+            validate_string_bytes(
+                "runtime_activity_clear.activity_id",
+                activity_id,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        if let Some(conversation_id) = &self.conversation_id {
+            validate_bytes_non_empty(
+                "runtime_activity_clear.conversation_id",
+                conversation_id.len(),
+            )?;
+            validate_string_bytes(
+                "runtime_activity_clear.conversation_id",
+                conversation_id,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeCommandRequestV1 {
+    pub fn validate_structure(&self) -> Result<(), RuntimeCommandPayloadError> {
+        if self.payload_kind != RuntimeCommandPayloadKindV1::Request {
+            return Err(RuntimeCommandPayloadError::WrongPayloadKind {
+                expected: RuntimeCommandPayloadKindV1::Request,
+                actual: self.payload_kind,
+            });
+        }
+        self.validate_limits()?;
+        Ok(())
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.request_id", self.request_id.len())?;
+        validate_string_bytes(
+            "runtime_command.request_id",
+            &self.request_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("runtime_command.command", self.command.len())?;
+        validate_string_bytes(
+            "runtime_command.command",
+            &self.command,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        self.target.validate_limits()?;
+        if let Some(resource_key) = &self.resource_key {
+            validate_bytes_non_empty("runtime_command.resource_key", resource_key.len())?;
+            validate_string_bytes(
+                "runtime_command.resource_key",
+                resource_key,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        self.body.validate_limits()?;
+        Ok(())
+    }
+}
+
+impl RuntimeCommandErrorV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.error.code", self.code.len())?;
+        validate_string_bytes(
+            "runtime_command.error.code",
+            &self.code,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("runtime_command.error.message", self.message.len())?;
+        validate_string_bytes(
+            "runtime_command.error.message",
+            &self.message,
+            MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl RuntimeCommandResultV1 {
+    pub fn validate_structure(&self) -> Result<(), RuntimeCommandPayloadError> {
+        if self.payload_kind != RuntimeCommandPayloadKindV1::Result {
+            return Err(RuntimeCommandPayloadError::WrongPayloadKind {
+                expected: RuntimeCommandPayloadKindV1::Result,
+                actual: self.payload_kind,
+            });
+        }
+        self.validate_limits()?;
+        match self.status {
+            RuntimeCommandTerminalStatusV1::Succeeded if self.body.is_none() => {
+                Err(RuntimeCommandPayloadError::SuccessMissingBody {
+                    request_id: self.request_id.clone(),
+                })
+            }
+            RuntimeCommandTerminalStatusV1::Failed if self.error.is_none() => {
+                Err(RuntimeCommandPayloadError::FailureMissingError {
+                    request_id: self.request_id.clone(),
+                })
+            }
+            RuntimeCommandTerminalStatusV1::Succeeded
+            | RuntimeCommandTerminalStatusV1::Failed
+            | RuntimeCommandTerminalStatusV1::Cancelled => Ok(()),
+        }
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.request_id", self.request_id.len())?;
+        validate_string_bytes(
+            "runtime_command.request_id",
+            &self.request_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(body) = &self.body {
+            body.validate_limits()?;
+        }
+        if let Some(error) = &self.error {
+            error.validate_limits()?;
+        }
+        validate_item_count(
+            "runtime_command.clears_activity",
+            self.clears_activity.len(),
+            MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS,
+        )?;
+        for clear in &self.clears_activity {
+            clear.validate_limits()?;
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeCommandCancelV1 {
+    pub fn validate_structure(&self) -> Result<(), RuntimeCommandPayloadError> {
+        if self.payload_kind != RuntimeCommandPayloadKindV1::Cancel {
+            return Err(RuntimeCommandPayloadError::WrongPayloadKind {
+                expected: RuntimeCommandPayloadKindV1::Cancel,
+                actual: self.payload_kind,
+            });
+        }
+        self.validate_limits()?;
+        Ok(())
+    }
+
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_command.request_id", self.request_id.len())?;
+        validate_string_bytes(
+            "runtime_command.request_id",
+            &self.request_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(reason) = &self.reason {
+            validate_bytes_non_empty("runtime_command.cancel.reason", reason.len())?;
+            validate_string_bytes("runtime_command.cancel.reason", reason, MAX_OBJECT_ID_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeCommandLedger {
+    pub fn record_request(
+        &mut self,
+        context: RuntimeCommandIngressContext<'_>,
+        request: &RuntimeCommandRequestV1,
+    ) -> Result<RuntimeCommandLedgerDecision, RuntimeCommandLedgerError> {
+        context.validate_limits()?;
+        request.validate_structure()?;
+        if !request.target.matches_device(context.local_device) {
+            return Ok(RuntimeCommandLedgerDecision::IgnoredTarget);
+        }
+
+        let key = runtime_command_ledger_key(
+            context.room_id,
+            context.conversation_id,
+            context.sender,
+            &request.request_id,
+        )?;
+        if let Some(record) = self.records.get(&key) {
+            if record.original_message_id == context.original_message_id
+                && record.accepted_seq == context.accepted_seq
+                && record.command == request.command
+            {
+                return Ok(RuntimeCommandLedgerDecision::Replayed);
+            }
+            return Err(RuntimeCommandLedgerError::ConflictingRequestId {
+                request_id: request.request_id.clone(),
+            });
+        }
+        if self.records.len() >= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize {
+            return Err(RuntimeCommandLedgerError::CapacityExceeded {
+                max_records: MAX_RUNTIME_COMMAND_LEDGER_RECORDS,
+            });
+        }
+
+        self.records.insert(
+            key,
+            RuntimeCommandLedgerRecord {
+                room_id: context.room_id.to_string(),
+                conversation_id: context.conversation_id.map(str::to_string),
+                request_id: request.request_id.clone(),
+                command: request.command.clone(),
+                sender: context.sender.clone(),
+                target: request.target.clone(),
+                original_message_id: context.original_message_id.to_string(),
+                accepted_seq: context.accepted_seq,
+                resource_key: request.resource_key.clone(),
+                status: RuntimeCommandLedgerStatus::Pending,
+            },
+        );
+        assert!(self.records.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
+        Ok(RuntimeCommandLedgerDecision::Recorded)
+    }
+
+    pub fn mark_terminal(
+        &mut self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+        request_id: &str,
+        status: RuntimeCommandLedgerStatus,
+    ) -> Result<(), RuntimeCommandLedgerError> {
+        validate_room_id(room_id)?;
+        if let Some(conversation_id) = conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        sender.validate_limits()?;
+        validate_bytes_non_empty("runtime_command.request_id", request_id.len())?;
+        validate_string_bytes(
+            "runtime_command.request_id",
+            request_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if status == RuntimeCommandLedgerStatus::Pending {
+            return Err(RuntimeCommandLedgerError::NonTerminalStatus { status });
+        }
+        let key = runtime_command_ledger_key(room_id, conversation_id, sender, request_id)?;
+        let record = self.records.get_mut(&key).ok_or_else(|| {
+            RuntimeCommandLedgerError::RequestNotFound {
+                request_id: request_id.to_string(),
+            }
+        })?;
+        record.status = status;
+        Ok(())
+    }
+
+    pub fn pending_requests(&self) -> Vec<&RuntimeCommandLedgerRecord> {
+        self.records
+            .values()
+            .filter(|record| record.status == RuntimeCommandLedgerStatus::Pending)
+            .collect()
+    }
+
+    pub fn get(
+        &self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+        request_id: &str,
+    ) -> Option<&RuntimeCommandLedgerRecord> {
+        let key = runtime_command_ledger_key(room_id, conversation_id, sender, request_id).ok()?;
+        self.records.get(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+impl RuntimeCommandIngressContext<'_> {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(self.room_id)?;
+        if let Some(conversation_id) = self.conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        validate_bytes_non_empty("message_id", self.original_message_id.len())?;
+        validate_string_bytes("message_id", self.original_message_id, MAX_OBJECT_ID_BYTES)?;
+        self.sender.validate_limits()?;
+        self.local_device.validate_limits()?;
+        Ok(())
     }
 }
 
@@ -902,6 +1412,32 @@ fn runtime_state_projection_key(
         length_prefixed(&source.account_id),
         length_prefixed(&source.device_id),
         length_prefixed(state_key)
+    ))
+}
+
+fn runtime_command_ledger_key(
+    room_id: &str,
+    conversation_id: Option<&str>,
+    sender: &DeviceRef,
+    request_id: &str,
+) -> Result<String, ProtocolLimitError> {
+    validate_room_id(room_id)?;
+    if let Some(conversation_id) = conversation_id {
+        validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+    }
+    sender.validate_limits()?;
+    validate_string_bytes(
+        "runtime_command.request_id",
+        request_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    Ok(format!(
+        "{}|{}|{}|{}|{}",
+        length_prefixed(room_id),
+        length_prefixed(conversation_id.unwrap_or("")),
+        length_prefixed(&sender.account_id),
+        length_prefixed(&sender.device_id),
+        length_prefixed(request_id)
     ))
 }
 
@@ -1306,6 +1842,228 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_command_request_validates_kind_body_and_target_policy() {
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let account_target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: None,
+        };
+        let device_target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: Some("runtime_box".to_string()),
+        };
+        let other_device_target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: Some("gpu_worker".to_string()),
+        };
+
+        let request = runtime_command_request(
+            "restart_1",
+            "finitecomputer.runtime.gateway.restart",
+            account_target.clone(),
+            br#"{}"#,
+        );
+        request.validate_structure().unwrap();
+        assert!(account_target.matches_device(&local_runtime));
+        assert!(device_target.matches_device(&local_runtime));
+        assert!(!other_device_target.matches_device(&local_runtime));
+
+        let mut wrong_kind = request.clone();
+        wrong_kind.payload_kind = RuntimeCommandPayloadKindV1::Result;
+        assert!(matches!(
+            wrong_kind.validate_structure().unwrap_err(),
+            RuntimeCommandPayloadError::WrongPayloadKind { .. }
+        ));
+
+        let mut empty_schema = request;
+        empty_schema.body.schema.clear();
+        assert!(matches!(
+            empty_schema.validate_structure().unwrap_err(),
+            RuntimeCommandPayloadError::Protocol(ProtocolLimitError::BytesEmpty { field })
+                if field == "runtime_command.payload.schema"
+        ));
+    }
+
+    #[test]
+    fn runtime_command_result_requires_terminal_shape_and_bounded_clears() {
+        let ok_result = RuntimeCommandResultV1 {
+            payload_kind: RuntimeCommandPayloadKindV1::Result,
+            request_id: "restart_1".to_string(),
+            status: RuntimeCommandTerminalStatusV1::Succeeded,
+            body: Some(runtime_command_body(br#"{"status":"ok"}"#)),
+            error: None,
+            clears_activity: vec![RuntimeActivityClearV1 {
+                activity_kind: "working".to_string(),
+                activity_id: Some("restart_1".to_string()),
+                conversation_id: Some("topic_1".to_string()),
+            }],
+        };
+        ok_result.validate_structure().unwrap();
+
+        let missing_success_body = RuntimeCommandResultV1 {
+            body: None,
+            ..ok_result.clone()
+        };
+        assert!(matches!(
+            missing_success_body.validate_structure().unwrap_err(),
+            RuntimeCommandPayloadError::SuccessMissingBody { .. }
+        ));
+
+        let missing_failure_error = RuntimeCommandResultV1 {
+            status: RuntimeCommandTerminalStatusV1::Failed,
+            body: None,
+            error: None,
+            clears_activity: Vec::new(),
+            ..ok_result.clone()
+        };
+        assert!(matches!(
+            missing_failure_error.validate_structure().unwrap_err(),
+            RuntimeCommandPayloadError::FailureMissingError { .. }
+        ));
+
+        let too_many_clears = RuntimeCommandResultV1 {
+            clears_activity: vec![
+                RuntimeActivityClearV1 {
+                    activity_kind: "working".to_string(),
+                    activity_id: None,
+                    conversation_id: None,
+                };
+                MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS as usize + 1
+            ],
+            ..ok_result
+        };
+        assert!(matches!(
+            too_many_clears.validate_structure().unwrap_err(),
+            RuntimeCommandPayloadError::Protocol(ProtocolLimitError::TooManyItems { field, .. })
+                if field == "runtime_command.clears_activity"
+        ));
+    }
+
+    #[test]
+    fn runtime_command_ledger_records_after_decrypted_target_policy() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let targeted = runtime_command_request(
+            "restart_1",
+            "finitecomputer.runtime.gateway.restart",
+            RuntimeCommandTargetV1 {
+                account_id: "runtime_npub".to_string(),
+                device_id: Some("runtime_box".to_string()),
+            },
+            br#"{}"#,
+        );
+        let not_for_local_device = runtime_command_request(
+            "restart_2",
+            "finitecomputer.runtime.gateway.restart",
+            RuntimeCommandTargetV1 {
+                account_id: "runtime_npub".to_string(),
+                device_id: Some("other_device".to_string()),
+            },
+            br#"{}"#,
+        );
+        let mut ledger = RuntimeCommandLedger::default();
+
+        assert_eq!(
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: 12,
+                        original_message_id: "message_1",
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    &targeted,
+                )
+                .unwrap(),
+            RuntimeCommandLedgerDecision::Recorded
+        );
+        assert_eq!(
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: 12,
+                        original_message_id: "message_1",
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    &targeted,
+                )
+                .unwrap(),
+            RuntimeCommandLedgerDecision::Replayed
+        );
+        assert_eq!(
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: 13,
+                        original_message_id: "message_2",
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    &targeted,
+                )
+                .unwrap_err(),
+            RuntimeCommandLedgerError::ConflictingRequestId {
+                request_id: "restart_1".to_string()
+            }
+        );
+        assert_eq!(
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: 14,
+                        original_message_id: "message_3",
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    &not_for_local_device,
+                )
+                .unwrap(),
+            RuntimeCommandLedgerDecision::IgnoredTarget
+        );
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.pending_requests().len(), 1);
+
+        assert!(matches!(
+            ledger
+                .mark_terminal(
+                    "room_1",
+                    Some("topic_1"),
+                    &sender,
+                    "restart_1",
+                    RuntimeCommandLedgerStatus::Pending,
+                )
+                .unwrap_err(),
+            RuntimeCommandLedgerError::NonTerminalStatus { .. }
+        ));
+        ledger
+            .mark_terminal(
+                "room_1",
+                Some("topic_1"),
+                &sender,
+                "restart_1",
+                RuntimeCommandLedgerStatus::Succeeded,
+            )
+            .unwrap();
+        assert!(ledger.pending_requests().is_empty());
+        assert_eq!(
+            ledger
+                .get("room_1", Some("topic_1"), &sender, "restart_1")
+                .unwrap()
+                .status,
+            RuntimeCommandLedgerStatus::Succeeded
+        );
+    }
+
     fn runtime_state_entry(
         room_id: &str,
         source: DeviceRef,
@@ -1327,6 +2085,29 @@ mod tests {
                 expires_at_ms: 2_000,
                 status_payload: payload.to_vec(),
             },
+        }
+    }
+
+    fn runtime_command_request(
+        request_id: &str,
+        command: &str,
+        target: RuntimeCommandTargetV1,
+        body: &[u8],
+    ) -> RuntimeCommandRequestV1 {
+        RuntimeCommandRequestV1 {
+            payload_kind: RuntimeCommandPayloadKindV1::Request,
+            request_id: request_id.to_string(),
+            command: command.to_string(),
+            target,
+            resource_key: Some("hermes.config".to_string()),
+            body: runtime_command_body(body),
+        }
+    }
+
+    fn runtime_command_body(body: &[u8]) -> RuntimeCommandJsonPayloadV1 {
+        RuntimeCommandJsonPayloadV1 {
+            schema: "finitecomputer.runtime.command.body.v1".to_string(),
+            json_payload: body.to_vec(),
         }
     }
 }

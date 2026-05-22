@@ -370,6 +370,11 @@ Good tests:
   reads: callers must name the state key, schema, and current time; missing,
   stale, schema-mismatched, and malformed payloads are errors, not reasons to
   create status command work.
+- Runtime command payloads and the command ledger are now typed and bounded:
+  command requests name an encrypted target account/device, schema-tagged JSON
+  body, resource key, and request id; the runtime ledger records only
+  decrypted requests for the local device, rejects conflicting request-id reuse,
+  and must be written before execution.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

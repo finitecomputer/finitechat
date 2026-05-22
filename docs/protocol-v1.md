@@ -197,6 +197,9 @@ These are protocol constants, not tuning hints:
 - attachment plaintext: `32 MiB`;
 - runtime state snapshot payload: `64 KiB`;
 - runtime state keys per room/device: `128`;
+- runtime command JSON payload: `128 KiB`;
+- runtime command activity clears per result: `16`;
+- runtime command ledger records per daemon/client: `1024`;
 - ephemeral activity expiry: `30 minutes` from server receipt;
 - ephemeral activity cache entries per room/conversation/device route: `64`;
 - idempotency key: `128` bytes;
@@ -573,6 +576,11 @@ activity-clear declarations. The room server does not parse or validate those
 fields. It only orders the durable event bytes, applies envelope limits, and
 replays idempotent append results.
 
+V1 command payloads use typed JSON envelopes with a schema-tagged bounded JSON
+body. The request target is part of the encrypted payload. A runtime records a
+request only when that decrypted target matches the local account/device; any
+cleartext wake hint is merely a way to decide who should sync sooner.
+
 `request_id` is an encrypted app-level correlation id, not a server mutation id.
 The server-level retry identity remains the serialized envelope `message_id`
 plus the mutation idempotency key. If a sender loses the append response for a
@@ -591,8 +599,8 @@ A runtime processes command requests by syncing ordered durable events,
 decrypting them, validating sender and target policy locally, and recording a
 request ledger entry before scheduling execution. The request ledger should
 deduplicate replays by request id, sender, conversation, and original message
-id. Execution workers read the ledger; live streams and push wakes only cause
-sync.
+id, reject conflicting reuse, and remain bounded. Execution workers read the
+ledger; live streams and push wakes only cause sync.
 
 Finite Chat only records ordered segment boundaries. The app/runtime owns what a
 segment means for its prompt context or local memory. A Hermes bridge can map

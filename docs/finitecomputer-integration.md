@@ -53,6 +53,12 @@ level. Chat messages, receipts, attachments, and topic updates are not shoved
 through a generic command queue; management commands are typed, allowlisted
 runtime requests with idempotent handlers.
 
+Command payloads should use the Finite Chat v1 typed runtime command shape:
+`runtime.command.request` with `request_id`, command name, encrypted target
+account/device, optional resource key, schema id, and bounded JSON body.
+finitecomputer command bodies should use namespaced schema ids such as
+`finitecomputer.runtime.inference.apply.v1`, not ad hoc unversioned maps.
+
 Intermediate states such as thinking, working, tool-running, upload progress,
 or runtime presence use ephemeral activity events with `push_policy = never`.
 User-visible output, durable checkpoints, terminal success, terminal failure,

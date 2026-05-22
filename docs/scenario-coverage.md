@@ -162,6 +162,9 @@ kinds. Proven unit scenarios:
 - `durable_app_event_defaults_match_push_and_inbox_policy`
 - `runtime_state_projection_replaces_by_revision_and_sequence`
 - `runtime_state_projection_preserves_unknown_schema_and_expiry`
+- `runtime_command_request_validates_kind_body_and_target_policy`
+- `runtime_command_result_requires_terminal_shape_and_bounded_clears`
+- `runtime_command_ledger_records_after_decrypted_target_policy`
 
 The in-memory and SQLite stores now record delivery effects separately from
 opaque MLS payload bytes. This proves that Finite Chat can enforce
@@ -187,6 +190,12 @@ Proven survival scenarios:
 - `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
 - `command_ledger_survives_restart_after_request_before_execution`
+
+The survival harness now uses the shared `RuntimeCommandLedger` and typed
+runtime command payloads instead of a test-local JSON parser. This keeps the
+recovery proof tied to the production protocol shape: target policy is
+decrypted, command bodies are schema-tagged and bounded, conflicting request id
+reuse fails, and workers execute only after a durable ledger record exists.
 
 Checkpoint test signal:
 
@@ -450,22 +459,29 @@ coverage before the room server owns push fanout:
 - `server_activity_cache_keeps_kind_and_activity_id_opaque`
 - `server_activity_cache_preserves_multiple_opaque_events_per_route`
 
-## Planned Command/RPC Scenarios
+## Command/RPC Scenarios
 
 Finitecomputer command transport should be proven as generic Finite Chat
 application payload behavior:
 
-- `runtime_command_request_is_durable_application_event`
+- `runtime_command_request_creates_command_inbox_work`
+- `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
+- `runtime_command_request_validates_kind_body_and_target_policy`
+- `runtime_command_result_requires_terminal_shape_and_bounded_clears`
+- `runtime_command_ledger_records_after_decrypted_target_policy`
+- `runtime_sync_persists_request_ledger_before_execution`
+- `runtime_wake_hint_is_non_authoritative`
+- `runtime_target_policy_uses_decrypted_payload`
+
+Still planned:
+
 - `runtime_command_result_is_durable_terminal_event`
 - `runtime_command_cancel_is_durable_and_races_with_result`
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
 - `runtime_command_retry_reuses_message_id_and_idempotency_key`
 - `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
-- `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_stream_callback_only_triggers_sync`
-- `runtime_wake_hint_is_non_authoritative`
-- `runtime_target_policy_uses_decrypted_payload`
 - `runtime_command_result_clears_matching_activity`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`

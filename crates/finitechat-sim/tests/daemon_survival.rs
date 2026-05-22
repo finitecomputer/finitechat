@@ -1,9 +1,12 @@
-use std::collections::BTreeMap;
-
 use finitechat_engine::{
     AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted, envelope,
 };
-use finitechat_proto::{ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind};
+use finitechat_proto::{
+    ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
+    RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
+    RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
+    RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalStatusV1,
+};
 use finitechat_sim::{SimWorld, alice, bob};
 use serde_json::json;
 
@@ -14,51 +17,6 @@ enum GatewayState {
     Hung,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandStatus {
-    Pending,
-    Succeeded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandRecord {
-    request_id: String,
-    command: String,
-    status: CommandStatus,
-}
-
-#[derive(Debug, Default)]
-struct CommandLedger {
-    records: BTreeMap<String, CommandRecord>,
-}
-
-impl CommandLedger {
-    fn record_request(&mut self, request_id: &str, command: &str) {
-        self.records
-            .entry(request_id.to_string())
-            .or_insert_with(|| CommandRecord {
-                request_id: request_id.to_string(),
-                command: command.to_string(),
-                status: CommandStatus::Pending,
-            });
-    }
-
-    fn pending_requests(&self) -> Vec<CommandRecord> {
-        self.records
-            .values()
-            .filter(|record| record.status == CommandStatus::Pending)
-            .cloned()
-            .collect()
-    }
-
-    fn mark_succeeded(&mut self, request_id: &str) {
-        self.records
-            .get_mut(request_id)
-            .expect("request was recorded before success")
-            .status = CommandStatus::Succeeded;
-    }
-}
-
 #[derive(Debug)]
 struct FakeDaemon {
     device: DeviceRef,
@@ -66,7 +24,7 @@ struct FakeDaemon {
     group_id: String,
     after_seq: u64,
     gateway: GatewayState,
-    ledger: CommandLedger,
+    ledger: RuntimeCommandLedger,
     last_snapshot_message_id: Option<String>,
     crash_after_recording_first_request: bool,
 }
@@ -79,13 +37,13 @@ impl FakeDaemon {
             group_id,
             after_seq: 0,
             gateway,
-            ledger: CommandLedger::default(),
+            ledger: RuntimeCommandLedger::default(),
             last_snapshot_message_id: None,
             crash_after_recording_first_request: false,
         }
     }
 
-    fn with_persisted_ledger(mut self, ledger: CommandLedger, after_seq: u64) -> Self {
+    fn with_persisted_ledger(mut self, ledger: RuntimeCommandLedger, after_seq: u64) -> Self {
         self.ledger = ledger;
         self.after_seq = after_seq;
         self
@@ -97,10 +55,20 @@ impl FakeDaemon {
             .sync_events(&self.room_id, &self.device, self.after_seq)
             .unwrap();
         for entry in &page.entries {
-            if let Some((request_id, command)) =
-                parse_gateway_restart_request(&entry.envelope.payload)
-            {
-                self.ledger.record_request(&request_id, &command);
+            if let Some(request) = parse_gateway_restart_request(&entry.envelope.payload) {
+                self.ledger
+                    .record_request(
+                        RuntimeCommandIngressContext {
+                            room_id: &self.room_id,
+                            conversation_id: None,
+                            accepted_seq: entry.seq,
+                            original_message_id: &entry.message_id,
+                            sender: &entry.sender,
+                            local_device: &self.device,
+                        },
+                        &request,
+                    )
+                    .unwrap();
                 if self.crash_after_recording_first_request {
                     self.after_seq = page.next_after_seq;
                     self.crash_after_recording_first_request = false;
@@ -114,10 +82,15 @@ impl FakeDaemon {
     }
 
     fn execute_pending(&mut self, server: &mut DeliveryService) {
-        for record in self.ledger.pending_requests() {
+        let pending = self
+            .ledger
+            .pending_requests()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in pending {
             if record.command == "finitecomputer.runtime.gateway.restart" {
                 self.gateway = GatewayState::Live;
-                self.ledger.mark_succeeded(&record.request_id);
                 append_application(
                     server,
                     ApplicationAppend {
@@ -125,18 +98,21 @@ impl FakeDaemon {
                         group_id: &self.group_id,
                         sender: self.device.clone(),
                         epoch: current_epoch(server, &self.room_id),
-                        payload: json!({
-                            "type": "runtime.command.result",
-                            "request_id": record.request_id,
-                            "status": "succeeded"
-                        })
-                        .to_string()
-                        .into_bytes(),
+                        payload: runtime_command_result_payload(&record.request_id),
                         idempotency_key: format!("result_{}", record.request_id),
                         delivery_policy: DurableAppEventKind::RuntimeCommandResult
                             .delivery_policy(),
                     },
                 );
+                self.ledger
+                    .mark_terminal(
+                        &self.room_id,
+                        record.conversation_id.as_deref(),
+                        &record.sender,
+                        &record.request_id,
+                        RuntimeCommandLedgerStatus::Succeeded,
+                    )
+                    .unwrap();
             }
         }
     }
@@ -183,13 +159,7 @@ fn daemon_starts_when_hermes_is_absent_and_restarts_gateway() {
             group_id: &world.group_id,
             sender: alice(),
             epoch: 1,
-            payload: json!({
-                "type": "runtime.command.request",
-                "request_id": "restart_1",
-                "command": "finitecomputer.runtime.gateway.restart"
-            })
-            .to_string()
-            .into_bytes(),
+            payload: runtime_command_request_payload("restart_1"),
             idempotency_key: "restart_1".to_string(),
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
         },
@@ -205,8 +175,12 @@ fn daemon_starts_when_hermes_is_absent_and_restarts_gateway() {
 
     assert_eq!(daemon.gateway, GatewayState::Live);
     assert_eq!(
-        daemon.ledger.records["restart_1"].status,
-        CommandStatus::Succeeded
+        daemon
+            .ledger
+            .get(&world.room_id, None, &alice(), "restart_1")
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Succeeded
     );
     assert_eq!(world.server.command_inbox_len(), 1);
     let snapshot_effect = world
@@ -261,13 +235,7 @@ fn command_ledger_survives_restart_after_request_before_execution() {
             group_id: &world.group_id,
             sender: alice(),
             epoch: 1,
-            payload: json!({
-                "type": "runtime.command.request",
-                "request_id": "restart_after_crash",
-                "command": "finitecomputer.runtime.gateway.restart"
-            })
-            .to_string()
-            .into_bytes(),
+            payload: runtime_command_request_payload("restart_after_crash"),
             idempotency_key: "restart_after_crash".to_string(),
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
         },
@@ -282,8 +250,12 @@ fn command_ledger_survives_restart_after_request_before_execution() {
 
     daemon.sync_tick(&mut world.server);
     assert_eq!(
-        daemon.ledger.records["restart_after_crash"].status,
-        CommandStatus::Pending
+        daemon
+            .ledger
+            .get(&world.room_id, None, &alice(), "restart_after_crash")
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Pending
     );
     assert_eq!(daemon.gateway, GatewayState::Down);
 
@@ -298,8 +270,12 @@ fn command_ledger_survives_restart_after_request_before_execution() {
 
     assert_eq!(restarted.gateway, GatewayState::Live);
     assert_eq!(
-        restarted.ledger.records["restart_after_crash"].status,
-        CommandStatus::Succeeded
+        restarted
+            .ledger
+            .get(&world.room_id, None, &alice(), "restart_after_crash")
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Succeeded
     );
 }
 
@@ -356,15 +332,46 @@ fn current_epoch(server: &DeliveryService, room_id: &str) -> u64 {
     server.room(room_id).unwrap().current_epoch
 }
 
-fn parse_gateway_restart_request(payload: &[u8]) -> Option<(String, String)> {
-    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
-    if value.get("type")?.as_str()? != "runtime.command.request" {
+fn parse_gateway_restart_request(payload: &[u8]) -> Option<RuntimeCommandRequestV1> {
+    let request: RuntimeCommandRequestV1 = serde_json::from_slice(payload).ok()?;
+    request.validate_structure().ok()?;
+    if request.command != "finitecomputer.runtime.gateway.restart" {
         return None;
     }
-    let command = value.get("command")?.as_str()?.to_string();
-    if command != "finitecomputer.runtime.gateway.restart" {
-        return None;
-    }
-    let request_id = value.get("request_id")?.as_str()?.to_string();
-    Some((request_id, command))
+    Some(request)
+}
+
+fn runtime_command_request_payload(request_id: &str) -> Vec<u8> {
+    let request = RuntimeCommandRequestV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Request,
+        request_id: request_id.to_string(),
+        command: "finitecomputer.runtime.gateway.restart".to_string(),
+        target: RuntimeCommandTargetV1 {
+            account_id: bob().account_id,
+            device_id: Some(bob().device_id),
+        },
+        resource_key: Some("hermes.config".to_string()),
+        body: RuntimeCommandJsonPayloadV1 {
+            schema: "finitecomputer.runtime.gateway.restart.v1".to_string(),
+            json_payload: br#"{}"#.to_vec(),
+        },
+    };
+    request.validate_structure().unwrap();
+    serde_json::to_vec(&request).unwrap()
+}
+
+fn runtime_command_result_payload(request_id: &str) -> Vec<u8> {
+    let result = RuntimeCommandResultV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Result,
+        request_id: request_id.to_string(),
+        status: RuntimeCommandTerminalStatusV1::Succeeded,
+        body: Some(RuntimeCommandJsonPayloadV1 {
+            schema: "finitecomputer.runtime.gateway.restart.result.v1".to_string(),
+            json_payload: br#"{"status":"live"}"#.to_vec(),
+        }),
+        error: None,
+        clears_activity: Vec::new(),
+    };
+    result.validate_structure().unwrap();
+    serde_json::to_vec(&result).unwrap()
 }
