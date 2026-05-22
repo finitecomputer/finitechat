@@ -493,6 +493,12 @@ coverage before the room server owns push fanout:
 - `activity_clear_does_not_remove_unrelated_kind`
 - `activity_clear_does_not_remove_different_activity_id`
 - `stale_agent_activity_clear_does_not_hide_newer_run`
+- `reserved_activity_kinds_render_generically`
+- `unknown_namespaced_activity_kind_is_preserved`
+- `app_specific_activity_kind_does_not_trigger_generic_ui`
+- `present_without_conversation_id_is_room_scoped`
+- `present_with_conversation_id_is_conversation_scoped`
+- `activity_default_expiry_guidance_stays_within_v1_cap`
 - `activity_projection_expires_and_rejects_bad_lease_windows`
 
 Still planned:
@@ -503,12 +509,6 @@ Still planned:
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
 - `durable_terminal_clear_is_sender_scoped`
 - `durable_terminal_clear_does_not_remove_different_activity_id`
-- `reserved_activity_kinds_render_generically`
-- `unknown_namespaced_activity_kind_is_preserved`
-- `app_specific_activity_kind_does_not_trigger_generic_ui`
-- `present_without_conversation_id_is_room_scoped`
-- `present_with_conversation_id_is_conversation_scoped`
-- `activity_default_expiry_guidance_stays_within_v1_cap`
 - `server_activity_cache_keeps_kind_and_activity_id_opaque`
 - `server_activity_cache_preserves_multiple_opaque_events_per_route`
 

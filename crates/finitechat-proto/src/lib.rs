@@ -75,6 +75,15 @@ pub const MAX_OBJECT_ID_BYTES: u32 = 128;
 pub const FINITECHAT_ATTACHMENT_BLOB_SCHEME_V1: &str = "finitechat.attachment.blob.v1";
 pub const FINITECHAT_ATTACHMENT_BLOB_ENCRYPTION_AES256_GCM_V1: &str = "aes-256-gcm.v1";
 pub const FINITECHAT_DEFAULT_ACTIVITY_ID: &str = "default";
+pub const FINITECHAT_ACTIVITY_KIND_TYPING: &str = "typing";
+pub const FINITECHAT_ACTIVITY_KIND_THINKING: &str = "thinking";
+pub const FINITECHAT_ACTIVITY_KIND_WORKING: &str = "working";
+pub const FINITECHAT_ACTIVITY_KIND_UPLOADING: &str = "uploading";
+pub const FINITECHAT_ACTIVITY_KIND_RECORDING: &str = "recording";
+pub const FINITECHAT_ACTIVITY_KIND_PRESENT: &str = "present";
+pub const FINITECHAT_ACTIVITY_TYPING_EXPIRY_MILLIS: u64 = 30 * 1000;
+pub const FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS: u64 = 2 * 60 * 1000;
+pub const FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS: u64 = 5 * 60 * 1000;
 
 const _: () = {
     assert!(MAX_ENVELOPE_PAYLOAD_BYTES > 0);
@@ -122,6 +131,10 @@ const _: () = {
     assert!(MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE > 0);
+    assert!(FINITECHAT_ACTIVITY_TYPING_EXPIRY_MILLIS > 0);
+    assert!(FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS > FINITECHAT_ACTIVITY_TYPING_EXPIRY_MILLIS);
+    assert!(FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS > FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS);
+    assert!(FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
 };
 
@@ -748,6 +761,65 @@ pub struct RuntimeCommandTerminalContext<'a> {
 pub enum EphemeralActivityActionV1 {
     Set,
     Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericActivityKindV1 {
+    Typing,
+    Thinking,
+    Working,
+    Uploading,
+    Recording,
+    Present,
+}
+
+impl GenericActivityKindV1 {
+    pub fn from_activity_kind(activity_kind: &str) -> Option<Self> {
+        match activity_kind {
+            FINITECHAT_ACTIVITY_KIND_TYPING => Some(Self::Typing),
+            FINITECHAT_ACTIVITY_KIND_THINKING => Some(Self::Thinking),
+            FINITECHAT_ACTIVITY_KIND_WORKING => Some(Self::Working),
+            FINITECHAT_ACTIVITY_KIND_UPLOADING => Some(Self::Uploading),
+            FINITECHAT_ACTIVITY_KIND_RECORDING => Some(Self::Recording),
+            FINITECHAT_ACTIVITY_KIND_PRESENT => Some(Self::Present),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Typing => FINITECHAT_ACTIVITY_KIND_TYPING,
+            Self::Thinking => FINITECHAT_ACTIVITY_KIND_THINKING,
+            Self::Working => FINITECHAT_ACTIVITY_KIND_WORKING,
+            Self::Uploading => FINITECHAT_ACTIVITY_KIND_UPLOADING,
+            Self::Recording => FINITECHAT_ACTIVITY_KIND_RECORDING,
+            Self::Present => FINITECHAT_ACTIVITY_KIND_PRESENT,
+        }
+    }
+
+    pub fn recommended_expiry_millis(self) -> u64 {
+        match self {
+            Self::Typing => FINITECHAT_ACTIVITY_TYPING_EXPIRY_MILLIS,
+            Self::Thinking | Self::Working => FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS,
+            Self::Uploading | Self::Recording | Self::Present => {
+                FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS
+            }
+        }
+    }
+}
+
+pub fn generic_activity_kind_v1(
+    activity_kind: &str,
+) -> Result<Option<GenericActivityKindV1>, ProtocolLimitError> {
+    validate_bytes_non_empty("ephemeral_activity.kind", activity_kind.len())?;
+    validate_string_bytes(
+        "ephemeral_activity.kind",
+        activity_kind,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    let generic_kind = GenericActivityKindV1::from_activity_kind(activity_kind);
+    Ok(generic_kind)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1683,12 +1755,7 @@ impl RuntimeCommandTerminalContext<'_> {
 
 impl DecryptedEphemeralActivityV1 {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
-        validate_bytes_non_empty("ephemeral_activity.kind", self.activity_kind.len())?;
-        validate_string_bytes(
-            "ephemeral_activity.kind",
-            &self.activity_kind,
-            MAX_OBJECT_ID_BYTES,
-        )?;
+        generic_activity_kind_v1(&self.activity_kind)?;
         if let Some(activity_id) = &self.activity_id {
             validate_bytes_non_empty("ephemeral_activity.activity_id", activity_id.len())?;
             validate_string_bytes(
@@ -3809,6 +3876,183 @@ mod tests {
                 .get("room_2", Some("topic_1"), &runtime, "present", None)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn reserved_activity_kinds_render_generically() {
+        let reserved = [
+            (
+                FINITECHAT_ACTIVITY_KIND_TYPING,
+                GenericActivityKindV1::Typing,
+                FINITECHAT_ACTIVITY_TYPING_EXPIRY_MILLIS,
+            ),
+            (
+                FINITECHAT_ACTIVITY_KIND_THINKING,
+                GenericActivityKindV1::Thinking,
+                FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS,
+            ),
+            (
+                FINITECHAT_ACTIVITY_KIND_WORKING,
+                GenericActivityKindV1::Working,
+                FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS,
+            ),
+            (
+                FINITECHAT_ACTIVITY_KIND_UPLOADING,
+                GenericActivityKindV1::Uploading,
+                FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS,
+            ),
+            (
+                FINITECHAT_ACTIVITY_KIND_RECORDING,
+                GenericActivityKindV1::Recording,
+                FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS,
+            ),
+            (
+                FINITECHAT_ACTIVITY_KIND_PRESENT,
+                GenericActivityKindV1::Present,
+                FINITECHAT_ACTIVITY_PRESENT_EXPIRY_MILLIS,
+            ),
+        ];
+
+        for (activity_kind, expected_kind, expected_expiry_millis) in reserved {
+            let generic_kind = generic_activity_kind_v1(activity_kind).unwrap().unwrap();
+            assert_eq!(generic_kind, expected_kind);
+            assert_eq!(generic_kind.as_str(), activity_kind);
+            assert_eq!(
+                generic_kind.recommended_expiry_millis(),
+                expected_expiry_millis
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_namespaced_activity_kind_is_preserved() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                &activity_set("finitecomputer.indexing", Some("job_1"), br#"{"pct":50}"#),
+            )
+            .unwrap();
+
+        let current = projection
+            .get(
+                "room_1",
+                Some("topic_1"),
+                &runtime,
+                "finitecomputer.indexing",
+                Some("job_1"),
+            )
+            .unwrap();
+        assert_eq!(current.activity_kind, "finitecomputer.indexing");
+        assert_eq!(current.payload, br#"{"pct":50}"#);
+    }
+
+    #[test]
+    fn app_specific_activity_kind_does_not_trigger_generic_ui() {
+        for activity_kind in ["finitecomputer.indexing", "hermes.tool_calling"] {
+            assert!(generic_activity_kind_v1(activity_kind).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn present_without_conversation_id_is_room_scoped() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+
+        projection
+            .apply(
+                activity_context("room_1", None, &runtime, 1_000, 11_000),
+                &activity_set(FINITECHAT_ACTIVITY_KIND_PRESENT, None, br#"{}"#),
+            )
+            .unwrap();
+
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    None,
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_PRESENT,
+                    None
+                )
+                .is_some()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_PRESENT,
+                    None,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn present_with_conversation_id_is_conversation_scoped() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                &activity_set(FINITECHAT_ACTIVITY_KIND_PRESENT, None, br#"{}"#),
+            )
+            .unwrap();
+
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_PRESENT,
+                    None,
+                )
+                .is_some()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    None,
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_PRESENT,
+                    None
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_2"),
+                    &runtime,
+                    FINITECHAT_ACTIVITY_KIND_PRESENT,
+                    None,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn activity_default_expiry_guidance_stays_within_v1_cap() {
+        for generic_kind in [
+            GenericActivityKindV1::Typing,
+            GenericActivityKindV1::Thinking,
+            GenericActivityKindV1::Working,
+            GenericActivityKindV1::Uploading,
+            GenericActivityKindV1::Recording,
+            GenericActivityKindV1::Present,
+        ] {
+            let expiry_millis = generic_kind.recommended_expiry_millis();
+            assert!(expiry_millis > 0);
+            assert!(expiry_millis <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
+        }
     }
 
     #[test]
