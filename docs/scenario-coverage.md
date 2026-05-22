@@ -514,6 +514,7 @@ application payload behavior:
 - `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
 - `runtime_config_commands_serialize_per_resource`
 - `unkeyed_runtime_commands_do_not_block_keyed_resources`
+- `dashboard_status_page_load_reads_projection_without_command`
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
@@ -523,7 +524,6 @@ Still planned:
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
 - `runtime_stream_callback_only_triggers_sync`
-- `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
 - `runtime_state_snapshot_unknown_schema_is_preserved`
@@ -579,6 +579,7 @@ Runtime status is encrypted application state, not request/response RPC:
 - `runtime_state_projection_fails_loudly_for_missing_stale_wrong_or_malformed_status`
 - `runtime_state_snapshot_rejects_empty_key_schema_or_payload`
 - `runtime_state_snapshot_is_durable_but_push_never`
+- `dashboard_status_page_load_reads_projection_without_command`
 
 The typed projection read path rejects missing, stale, schema-mismatched, and
 malformed payloads without issuing command work. Page loads should read this

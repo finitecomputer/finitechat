@@ -384,6 +384,9 @@ Good tests:
   durable requests: only the oldest pending command for a `(room, target,
   resource_key)` is ready, while unkeyed commands and different resources can
   proceed independently.
+- Dashboard status reads now have a reducer/projection proof: a typed
+  `runtime.state.snapshot` can rebuild a fresh status view from the ordered log
+  without creating command inbox work, unread state, or push.
 - Ephemeral activity now has a decrypted client projection: activity is keyed
   by room, conversation, account, device, kind, and normalized activity id;
   refreshes, clears, durable terminal clears, and expiry are bounded and
