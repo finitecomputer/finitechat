@@ -94,6 +94,39 @@ fn key_package_claim_returns_opaque_payload() {
 }
 
 #[test]
+fn server_routes_key_packages_without_becoming_identity_authority() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let payload_with_untrusted_claim =
+        br#"{"claimed_account":"mallory_npub","claimed_device":"phone"}"#.to_vec();
+    world
+        .server
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: "kp_bob_untrusted_identity_claim".to_string(),
+            owner: bob(),
+            key_package_ref: "ref_kp_bob_untrusted_identity_claim".to_string(),
+            key_package_hash: "hash_kp_bob_untrusted_identity_claim".to_string(),
+            key_package_payload: payload_with_untrusted_claim.clone(),
+        })
+        .unwrap();
+
+    let claimed = world
+        .server
+        .claim_key_package("kp_bob_untrusted_identity_claim")
+        .unwrap();
+
+    assert_eq!(claimed.owner, bob());
+    assert_eq!(claimed.key_package_payload, payload_with_untrusted_claim);
+    assert_eq!(
+        world
+            .server
+            .key_package("kp_bob_untrusted_identity_claim")
+            .unwrap()
+            .state,
+        KeyPackageState::Leased
+    );
+}
+
+#[test]
 fn account_key_package_claim_returns_one_available_package_per_device() {
     let mut server = DeliveryService::new();
     let bob_phone = device("bob_npub", "bob_phone");

@@ -579,6 +579,25 @@ pub enum ProductTrustModeV1 {
     PlaintextArchive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductClientKindV1 {
+    HostedWebBridge,
+    NativeDevice,
+    ElectronDaemon,
+    RuntimeDevice,
+    PlaintextArchive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceSecretLocationV1 {
+    UserDevice,
+    TrustedHostedServer,
+    RuntimeHost,
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductTrustDisclosureV1 {
     pub mode: ProductTrustModeV1,
@@ -1060,6 +1079,33 @@ impl ProductTrustDisclosureV1 {
                 read_only: true,
             },
         }
+    }
+}
+
+impl ProductClientKindV1 {
+    pub fn secret_location(self) -> DeviceSecretLocationV1 {
+        match self {
+            Self::HostedWebBridge => DeviceSecretLocationV1::TrustedHostedServer,
+            Self::NativeDevice | Self::ElectronDaemon => DeviceSecretLocationV1::UserDevice,
+            Self::RuntimeDevice => DeviceSecretLocationV1::RuntimeHost,
+            Self::PlaintextArchive => DeviceSecretLocationV1::None,
+        }
+    }
+
+    pub fn product_trust_mode(self) -> Option<ProductTrustModeV1> {
+        match self {
+            Self::HostedWebBridge => Some(ProductTrustModeV1::HostedTrustedServerClient),
+            Self::NativeDevice | Self::ElectronDaemon => Some(ProductTrustModeV1::LocalDeviceE2ee),
+            Self::PlaintextArchive => Some(ProductTrustModeV1::PlaintextArchive),
+            // Runtime devices are chat participants, not user-facing product
+            // surfaces. Their secrets stay on the runtime host and product copy
+            // belongs to the controlling user client.
+            Self::RuntimeDevice => None,
+        }
+    }
+
+    pub fn is_server_side_bridge(self) -> bool {
+        self == Self::HostedWebBridge
     }
 }
 
@@ -4937,6 +4983,79 @@ mod tests {
     }
 
     #[test]
+    fn product_client_kinds_have_explicit_secret_locations() {
+        assert_eq!(
+            ProductClientKindV1::HostedWebBridge.secret_location(),
+            DeviceSecretLocationV1::TrustedHostedServer
+        );
+        assert_eq!(
+            ProductClientKindV1::NativeDevice.secret_location(),
+            DeviceSecretLocationV1::UserDevice
+        );
+        assert_eq!(
+            ProductClientKindV1::ElectronDaemon.secret_location(),
+            DeviceSecretLocationV1::UserDevice
+        );
+        assert_eq!(
+            ProductClientKindV1::RuntimeDevice.secret_location(),
+            DeviceSecretLocationV1::RuntimeHost
+        );
+        assert_eq!(
+            ProductClientKindV1::PlaintextArchive.secret_location(),
+            DeviceSecretLocationV1::None
+        );
+    }
+
+    #[test]
+    fn native_and_electron_modes_keep_device_secrets_on_user_device() {
+        for client_kind in [
+            ProductClientKindV1::NativeDevice,
+            ProductClientKindV1::ElectronDaemon,
+        ] {
+            let trust_mode = client_kind.product_trust_mode().unwrap();
+            let disclosure = ProductTrustDisclosureV1::for_mode(trust_mode);
+
+            assert_eq!(
+                client_kind.secret_location(),
+                DeviceSecretLocationV1::UserDevice
+            );
+            assert_eq!(trust_mode, ProductTrustModeV1::LocalDeviceE2ee);
+            assert!(disclosure.may_claim_e2ee);
+            assert!(disclosure.stores_device_secrets_on_user_device);
+        }
+    }
+
+    #[test]
+    fn runtime_device_keeps_device_secret_on_runtime_host() {
+        assert_eq!(
+            ProductClientKindV1::RuntimeDevice.secret_location(),
+            DeviceSecretLocationV1::RuntimeHost
+        );
+        assert_eq!(
+            ProductClientKindV1::RuntimeDevice.product_trust_mode(),
+            None
+        );
+        assert!(!ProductClientKindV1::RuntimeDevice.is_server_side_bridge());
+    }
+
+    #[test]
+    fn hosted_web_bridge_is_not_a_local_device_e2ee_surface() {
+        let trust_mode = ProductClientKindV1::HostedWebBridge
+            .product_trust_mode()
+            .unwrap();
+        let disclosure = ProductTrustDisclosureV1::for_mode(trust_mode);
+
+        assert!(ProductClientKindV1::HostedWebBridge.is_server_side_bridge());
+        assert_eq!(
+            ProductClientKindV1::HostedWebBridge.secret_location(),
+            DeviceSecretLocationV1::TrustedHostedServer
+        );
+        assert_eq!(trust_mode, ProductTrustModeV1::HostedTrustedServerClient);
+        assert!(!disclosure.may_claim_e2ee);
+        assert!(!disclosure.stores_device_secrets_on_user_device);
+    }
+
+    #[test]
     fn local_daemon_mode_keeps_device_secrets_local() {
         let disclosure = ProductTrustDisclosureV1::for_mode(ProductTrustModeV1::LocalDeviceE2ee);
 
@@ -4954,6 +5073,84 @@ mod tests {
         assert!(!disclosure.stores_device_secrets_on_user_device);
         assert!(disclosure.read_only);
         assert!(disclosure.label.to_ascii_lowercase().contains("archive"));
+    }
+
+    #[test]
+    fn runtime_bridge_state_projection_is_scoped_by_room_source_device_and_key() {
+        let runtime_box = device("runtime_npub", "box");
+        let runtime_gpu = device("runtime_npub", "gpu");
+        let mut projection = RuntimeStateProjection::default();
+        for (room_id, source, state_key, payload) in [
+            (
+                "room_agent_a",
+                runtime_box.clone(),
+                "runtime.connection.telegram",
+                br#"{"topic":"alpha"}"#.as_slice(),
+            ),
+            (
+                "room_agent_b",
+                runtime_box.clone(),
+                "runtime.connection.telegram",
+                br#"{"topic":"beta"}"#.as_slice(),
+            ),
+            (
+                "room_agent_a",
+                runtime_gpu.clone(),
+                "runtime.connection.telegram",
+                br#"{"topic":"gpu"}"#.as_slice(),
+            ),
+            (
+                "room_agent_a",
+                runtime_box.clone(),
+                "runtime.connection.matrix",
+                br#"{"room":"matrix"}"#.as_slice(),
+            ),
+        ] {
+            projection
+                .apply(runtime_state_entry(
+                    room_id,
+                    source,
+                    state_key,
+                    "finitecomputer.bridge.status.v1",
+                    1,
+                    1,
+                    payload,
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(
+            projection
+                .get("room_agent_a", &runtime_box, "runtime.connection.telegram")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"topic":"alpha"}"#
+        );
+        assert_eq!(
+            projection
+                .get("room_agent_b", &runtime_box, "runtime.connection.telegram")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"topic":"beta"}"#
+        );
+        assert_eq!(
+            projection
+                .get("room_agent_a", &runtime_gpu, "runtime.connection.telegram")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"topic":"gpu"}"#
+        );
+        assert_eq!(
+            projection
+                .get("room_agent_a", &runtime_box, "runtime.connection.matrix")
+                .unwrap()
+                .snapshot
+                .status_payload,
+            br#"{"room":"matrix"}"#
+        );
     }
 
     fn runtime_state_entry(

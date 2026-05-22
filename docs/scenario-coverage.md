@@ -19,6 +19,7 @@ Each item below has a named test in
 
 - `create_dm_room_and_release_welcome_after_commit`
 - `key_package_claim_returns_opaque_payload`
+- `server_routes_key_packages_without_becoming_identity_authority`
 - `account_key_package_claim_returns_one_available_package_per_device`
 - `revoked_device_cannot_replenish_or_claim_key_packages`
 - `key_package_inventory_is_bounded_and_consumed_packages_free_space`
@@ -183,8 +184,13 @@ kinds. Proven unit scenarios:
 - `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
 - `archiving_topic_does_not_archive_sibling_topic`
 - `hosted_web_mode_is_not_labeled_e2ee`
+- `product_client_kinds_have_explicit_secret_locations`
+- `native_and_electron_modes_keep_device_secrets_on_user_device`
+- `runtime_device_keeps_device_secret_on_runtime_host`
+- `hosted_web_bridge_is_not_a_local_device_e2ee_surface`
 - `local_daemon_mode_keeps_device_secrets_local`
 - `old_plaintext_chats_render_as_read_only_archive`
+- `runtime_bridge_state_projection_is_scoped_by_room_source_device_and_key`
 
 The in-memory and SQLite stores now record delivery effects separately from
 opaque MLS payload bytes. This proves that Finite Chat can enforce
@@ -631,5 +637,10 @@ honest about trust boundaries:
 
 - `hosted_web_mode_uses_server_side_trusted_client`
 - `hosted_web_mode_is_not_labeled_e2ee`
+- `product_client_kinds_have_explicit_secret_locations`
+- `native_and_electron_modes_keep_device_secrets_on_user_device`
+- `runtime_device_keeps_device_secret_on_runtime_host`
+- `hosted_web_bridge_is_not_a_local_device_e2ee_surface`
 - `local_daemon_mode_keeps_device_secrets_local`
+- `runtime_bridge_state_projection_is_scoped_by_room_source_device_and_key`
 - `old_plaintext_chats_render_as_read_only_archive`
