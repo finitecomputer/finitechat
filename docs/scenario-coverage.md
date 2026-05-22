@@ -594,9 +594,6 @@ appropriate:
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
 - `archiving_topic_does_not_archive_sibling_topic`
-
-Still planned:
-
 - `reaction_edit_and_receipt_do_not_push_by_default`
 - `topic_activity_is_scoped_by_conversation_id`
 - `segment_boundary_is_projected_without_protocol_managed_prompt_state`

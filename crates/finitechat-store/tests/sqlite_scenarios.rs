@@ -2203,6 +2203,42 @@ fn sqlite_chat_receipt_is_durable_but_push_never_after_reopen() {
 }
 
 #[test]
+fn sqlite_reaction_edit_and_receipt_do_not_push_by_default_after_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let mut message_ids = Vec::with_capacity(3);
+    for (index, kind) in [
+        DurableAppEventKind::ChatEdit,
+        DurableAppEventKind::ChatReaction,
+        DurableAppEventKind::ChatReceipt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = world.application_event_request(
+            alice(),
+            0,
+            format!(r#"{{"message_id":"m1","event_index":{index}}}"#).as_bytes(),
+            &format!("sqlite_non_notifying_chat_event_{index}"),
+            kind.delivery_policy(),
+        );
+        let accepted = world.server.append_application_event(request).unwrap();
+        message_ids.push(accepted.message_id);
+    }
+    let reopened = world.reopen();
+
+    assert_eq!(room(&reopened, &world.room_id).last_seq, 3);
+    assert_eq!(reopened.push_outbox_len().unwrap(), 0);
+    assert_eq!(reopened.unread_len().unwrap(), 0);
+    assert_eq!(reopened.command_inbox_len().unwrap(), 0);
+    for message_id in message_ids {
+        let effect = reopened.application_effect(&message_id).unwrap().unwrap();
+        assert!(!effect.creates_push());
+        assert!(!effect.creates_unread());
+        assert!(!effect.creates_command_inbox_work());
+    }
+}
+
+#[test]
 fn sqlite_runtime_state_snapshot_does_not_create_unread_or_inbox_work() {
     let mut world = SqliteWorld::direct_room();
     let request = world.application_event_request(
@@ -2331,6 +2367,35 @@ fn sqlite_server_activity_cache_preserves_multiple_opaque_events_per_route() {
     );
     assert_eq!(world.server.push_outbox_len().unwrap(), 0);
     assert_eq!(world.server.unread_len().unwrap(), 0);
+}
+
+#[test]
+fn sqlite_topic_activity_is_scoped_by_conversation_id() {
+    let mut world = SqliteWorld::direct_room();
+    for topic in ["topic_1", "topic_2"] {
+        let mut activity = world.ephemeral_activity_request(alice(), 0, Some(topic), 1_000);
+        activity.payload = format!("opaque-activity-for-{topic}").into_bytes();
+        world.server.append_ephemeral_activity(activity).unwrap();
+    }
+
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        1
+    );
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_2"), &alice()),
+        1
+    );
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, None, &alice()),
+        0
+    );
 }
 
 #[test]

@@ -2005,6 +2005,42 @@ fn chat_receipt_is_durable_but_push_never() {
 }
 
 #[test]
+fn reaction_edit_and_receipt_do_not_push_by_default() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for (index, kind) in [
+        DurableAppEventKind::ChatEdit,
+        DurableAppEventKind::ChatReaction,
+        DurableAppEventKind::ChatReceipt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = application_event_request(
+            &world,
+            alice(),
+            0,
+            format!(r#"{{"message_id":"m1","event_index":{index}}}"#).as_bytes(),
+            &format!("non_notifying_chat_event_{index}"),
+            kind.delivery_policy(),
+        );
+        let accepted = world.server.append_application_event(request).unwrap();
+        let effect = world
+            .server
+            .application_effect(&accepted.message_id)
+            .unwrap();
+
+        assert!(!effect.creates_push());
+        assert!(!effect.creates_unread());
+        assert!(!effect.creates_command_inbox_work());
+    }
+
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 3);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
 fn runtime_state_snapshot_is_durable_but_push_never() {
     let mut world = SimWorld::direct_room().unwrap();
     let request = application_event_request(
@@ -2750,6 +2786,35 @@ fn server_activity_cache_preserves_multiple_opaque_events_per_route() {
     );
     assert_eq!(world.server.push_outbox_len(), 0);
     assert_eq!(world.server.unread_len(), 0);
+}
+
+#[test]
+fn topic_activity_is_scoped_by_conversation_id() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for topic in ["topic_1", "topic_2"] {
+        let mut activity = ephemeral_activity_request(&world, alice(), 0, Some(topic), 1_000);
+        activity.payload = format!("opaque-activity-for-{topic}").into_bytes();
+        world.server.append_ephemeral_activity(activity).unwrap();
+    }
+
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &alice()),
+        1
+    );
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_2"), &alice()),
+        1
+    );
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, None, &alice()),
+        0
+    );
 }
 
 #[test]

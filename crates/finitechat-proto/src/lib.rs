@@ -4817,6 +4817,47 @@ mod tests {
     }
 
     #[test]
+    fn segment_boundary_is_projected_without_protocol_managed_prompt_state() {
+        let mut projection = ConversationProjection::default();
+        projection
+            .apply_event(
+                conversation_context("room_1", 1, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_agent"),
+                    br#"{"title":"Agent"}"#,
+                ),
+            )
+            .unwrap();
+
+        let decision = projection
+            .apply_event(
+                conversation_context("room_1", 8, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationSegmentStart,
+                    Some("topic_agent"),
+                    br#"{"segment_id":"segment_2","reason":"slash_new","prompt":"ignored by protocol","messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_agent").unwrap();
+
+        assert_eq!(decision, ConversationProjectionDecision::SegmentStarted);
+        assert_eq!(topic.active_segment_id.as_deref(), Some("segment_2"));
+        assert_eq!(
+            topic.segments,
+            vec![ConversationSegmentProjectionRecord {
+                segment_id: "segment_2".to_string(),
+                started_seq: 8,
+            }]
+        );
+        assert_eq!(
+            topic.metadata.as_ref().unwrap().title.as_deref(),
+            Some("Agent")
+        );
+    }
+
+    #[test]
     fn conversation_metadata_rejects_missing_conversation_id_or_bad_payload() {
         let mut projection = ConversationProjection::default();
         assert!(matches!(
