@@ -3,8 +3,10 @@ use finitechat_engine::{
     ObserveDeviceLivenessRequest, RoomSyncProjection, envelope,
 };
 use finitechat_proto::{
-    ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
-    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeCommandErrorV1,
+    ApplicationDeliveryPolicy, DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind,
+    EphemeralActivityActionV1, EphemeralActivityIngressContext, EphemeralActivityProjection,
+    LogEntryKind, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+    MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeActivityClearV1, RuntimeCommandErrorV1,
     RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
     RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
     RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalContext,
@@ -413,6 +415,89 @@ fn daemon_publishes_inference_degraded_snapshot_without_agent_reply() {
     assert!(!snapshot_effect.creates_unread());
     assert!(!snapshot_effect.creates_command_inbox_work());
     assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn inference_timeout_preserves_user_message_and_clears_activity() {
+    let mut world = world_with_runtime();
+    let user_message = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: br#"{"type":"chat.message","body":"use the slow model"}"#.to_vec(),
+            idempotency_key: "slow_model_user_message".to_string(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+    let mut activity = EphemeralActivityProjection::default();
+    activity
+        .apply(
+            EphemeralActivityIngressContext {
+                room_id: &world.room_id,
+                conversation_id: None,
+                sender: &bob(),
+                received_at_ms: 1_000,
+                expires_at_ms: 1_000 + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+            },
+            &DecryptedEphemeralActivityV1 {
+                activity_kind: "thinking".to_string(),
+                activity_id: Some("reply_timeout_1".to_string()),
+                action: EphemeralActivityActionV1::Set,
+                payload: br#"{"phase":"inference"}"#.to_vec(),
+            },
+        )
+        .unwrap();
+    let timeout = RuntimeCommandResultV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Result,
+        request_id: "reply_timeout_1".to_string(),
+        status: RuntimeCommandTerminalStatusV1::Failed,
+        body: None,
+        error: Some(RuntimeCommandErrorV1 {
+            code: "inference_timeout".to_string(),
+            message: "inference timed out".to_string(),
+        }),
+        clears_activity: vec![RuntimeActivityClearV1 {
+            activity_kind: "thinking".to_string(),
+            activity_id: Some("reply_timeout_1".to_string()),
+            conversation_id: None,
+        }],
+    };
+
+    let terminal = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: bob(),
+            epoch: 1,
+            payload: runtime_command_result_payload(&timeout),
+            idempotency_key: "reply_timeout_terminal".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandResult.delivery_policy(),
+        },
+    );
+    let removed = activity
+        .clear_from_runtime_command_result(&world.room_id, None, &bob(), &timeout)
+        .unwrap();
+    let sync = world.server.sync_events(&world.room_id, &bob(), 1).unwrap();
+
+    assert_eq!(removed, 1);
+    assert!(activity.is_empty());
+    assert!(terminal.seq > user_message.seq);
+    assert!(
+        sync.entries
+            .iter()
+            .any(|entry| entry.message_id == user_message.message_id)
+    );
+    let terminal_effect = world
+        .server
+        .application_effect(&terminal.message_id)
+        .unwrap();
+    assert!(!terminal_effect.creates_push());
+    assert!(!terminal_effect.creates_unread());
+    assert!(!terminal_effect.creates_command_inbox_work());
 }
 
 #[test]
