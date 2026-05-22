@@ -27,6 +27,7 @@ struct FakeDaemon {
     group_id: String,
     after_seq: u64,
     gateway: GatewayState,
+    config_generation: u64,
     ledger: RuntimeCommandLedger,
     last_snapshot_message_id: Option<String>,
     crash_after_recording_first_request: bool,
@@ -40,6 +41,7 @@ impl FakeDaemon {
             group_id,
             after_seq: 0,
             gateway,
+            config_generation: 0,
             ledger: RuntimeCommandLedger::default(),
             last_snapshot_message_id: None,
             crash_after_recording_first_request: false,
@@ -58,7 +60,7 @@ impl FakeDaemon {
             .sync_events(&self.room_id, &self.device, self.after_seq)
             .unwrap();
         for entry in &page.entries {
-            if let Some(request) = parse_gateway_restart_request(&entry.envelope.payload) {
+            if let Some(request) = parse_runtime_command_request(&entry.envelope.payload) {
                 self.ledger
                     .record_request(
                         RuntimeCommandIngressContext {
@@ -96,38 +98,56 @@ impl FakeDaemon {
             .collect::<Vec<_>>();
         assert!(pending.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
         for record in pending {
-            if record.command == "finitecomputer.runtime.gateway.restart" {
-                self.gateway = GatewayState::Live;
-                let result = runtime_command_result(&record.request_id);
-                let accepted = append_application(
-                    server,
-                    ApplicationAppend {
-                        room_id: &self.room_id,
-                        group_id: &self.group_id,
-                        sender: self.device.clone(),
-                        epoch: current_epoch(server, &self.room_id),
-                        payload: runtime_command_result_payload(&result),
-                        idempotency_key: format!("result_{}", record.request_id),
-                        delivery_policy: DurableAppEventKind::RuntimeCommandResult
-                            .delivery_policy(),
-                    },
-                );
-                let decision = self
-                    .ledger
-                    .apply_result(
-                        RuntimeCommandTerminalContext {
-                            room_id: &self.room_id,
-                            conversation_id: record.conversation_id.as_deref(),
-                            request_sender: &record.sender,
-                            accepted_seq: accepted.seq,
-                            terminal_message_id: &accepted.message_id,
-                        },
-                        &result,
-                    )
-                    .unwrap();
-                assert_eq!(decision, RuntimeCommandTerminalDecision::Recorded);
+            match record.command.as_str() {
+                "finitecomputer.runtime.gateway.restart" => {
+                    self.gateway = GatewayState::Live;
+                    let result = runtime_command_result(&record.request_id);
+                    self.append_runtime_command_result(server, &record, &result);
+                }
+                "finitecomputer.runtime.config.update" => {
+                    self.config_generation += 1;
+                    let result =
+                        runtime_config_command_result(&record.request_id, self.config_generation);
+                    self.append_runtime_command_result(server, &record, &result);
+                    self.publish_config_snapshot(server);
+                }
+                _ => {}
             }
         }
+    }
+
+    fn append_runtime_command_result(
+        &mut self,
+        server: &mut DeliveryService,
+        record: &finitechat_proto::RuntimeCommandLedgerRecord,
+        result: &RuntimeCommandResultV1,
+    ) {
+        let accepted = append_application(
+            server,
+            ApplicationAppend {
+                room_id: &self.room_id,
+                group_id: &self.group_id,
+                sender: self.device.clone(),
+                epoch: current_epoch(server, &self.room_id),
+                payload: runtime_command_result_payload(result),
+                idempotency_key: format!("result_{}", record.request_id),
+                delivery_policy: DurableAppEventKind::RuntimeCommandResult.delivery_policy(),
+            },
+        );
+        let decision = self
+            .ledger
+            .apply_result(
+                RuntimeCommandTerminalContext {
+                    room_id: &self.room_id,
+                    conversation_id: record.conversation_id.as_deref(),
+                    request_sender: &record.sender,
+                    accepted_seq: accepted.seq,
+                    terminal_message_id: &accepted.message_id,
+                },
+                result,
+            )
+            .unwrap();
+        assert_eq!(decision, RuntimeCommandTerminalDecision::Recorded);
     }
 
     fn publish_gateway_snapshot(&mut self, server: &mut DeliveryService) {
@@ -146,6 +166,29 @@ impl FakeDaemon {
                 payload: runtime_gateway_snapshot_payload(server, &self.room_id, status),
                 idempotency_key: format!(
                     "gateway_state_{}",
+                    server.room(&self.room_id).unwrap().last_seq + 1
+                ),
+                delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+            },
+        );
+        self.last_snapshot_message_id = Some(accepted.message_id);
+    }
+
+    fn publish_config_snapshot(&mut self, server: &mut DeliveryService) {
+        let accepted = append_application(
+            server,
+            ApplicationAppend {
+                room_id: &self.room_id,
+                group_id: &self.group_id,
+                sender: self.device.clone(),
+                epoch: current_epoch(server, &self.room_id),
+                payload: runtime_config_snapshot_payload(
+                    server,
+                    &self.room_id,
+                    self.config_generation,
+                ),
+                idempotency_key: format!(
+                    "runtime_config_state_{}",
                     server.room(&self.room_id).unwrap().last_seq + 1
                 ),
                 delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
@@ -281,6 +324,59 @@ fn runtime_state_command_result_publishes_post_mutation_snapshot() {
     assert!(!snapshot_effect.creates_push());
     assert!(!snapshot_effect.creates_unread());
     assert!(!snapshot_effect.creates_command_inbox_work());
+}
+
+#[test]
+fn runtime_config_command_result_includes_post_mutation_status() {
+    let mut world = world_with_runtime();
+    append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_config_update_request_payload("config_update_1"),
+            idempotency_key: "config_update_1".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Live,
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    let result =
+        runtime_command_result_after(&world.server, &world.room_id, "config_update_1").unwrap();
+    let body = result.result.body.as_ref().unwrap();
+    let result_status: serde_json::Value = serde_json::from_slice(&body.json_payload).unwrap();
+    let snapshot =
+        runtime_state_snapshot_after(&world.server, &world.room_id, "runtime.config", result.seq)
+            .unwrap();
+    let snapshot_status: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.status_payload).unwrap();
+
+    assert_eq!(daemon.config_generation, 1);
+    assert_eq!(
+        body.schema,
+        "finitecomputer.runtime.config.update.result.v1"
+    );
+    assert_eq!(result_status, snapshot_status);
+    assert_eq!(result_status["status"], "applied");
+    assert_eq!(result_status["config_generation"], 1);
+    assert!(snapshot.seq > result.seq);
+    assert_eq!(
+        snapshot.snapshot.schema,
+        "finitecomputer.runtime.config.status.v1"
+    );
+    let result_effect = world.server.application_effect(&result.message_id).unwrap();
+    assert!(!result_effect.creates_push());
+    assert!(!result_effect.creates_unread());
+    assert!(!result_effect.creates_command_inbox_work());
 }
 
 #[test]
@@ -554,13 +650,15 @@ fn current_epoch(server: &DeliveryService, room_id: &str) -> u64 {
     server.room(room_id).unwrap().current_epoch
 }
 
-fn parse_gateway_restart_request(payload: &[u8]) -> Option<RuntimeCommandRequestV1> {
+fn parse_runtime_command_request(payload: &[u8]) -> Option<RuntimeCommandRequestV1> {
     let request: RuntimeCommandRequestV1 = serde_json::from_slice(payload).ok()?;
     request.validate_structure().ok()?;
-    if request.command != "finitecomputer.runtime.gateway.restart" {
-        return None;
+    match request.command.as_str() {
+        "finitecomputer.runtime.gateway.restart" | "finitecomputer.runtime.config.update" => {
+            Some(request)
+        }
+        _ => None,
     }
-    Some(request)
 }
 
 fn runtime_command_request_payload(request_id: &str) -> Vec<u8> {
@@ -582,6 +680,25 @@ fn runtime_command_request_payload(request_id: &str) -> Vec<u8> {
     serde_json::to_vec(&request).unwrap()
 }
 
+fn runtime_config_update_request_payload(request_id: &str) -> Vec<u8> {
+    let request = RuntimeCommandRequestV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Request,
+        request_id: request_id.to_string(),
+        command: "finitecomputer.runtime.config.update".to_string(),
+        target: RuntimeCommandTargetV1 {
+            account_id: bob().account_id,
+            device_id: Some(bob().device_id),
+        },
+        resource_key: Some("hermes.config".to_string()),
+        body: RuntimeCommandJsonPayloadV1 {
+            schema: "finitecomputer.runtime.config.update.v1".to_string(),
+            json_payload: br#"{"gateway_enabled":true}"#.to_vec(),
+        },
+    };
+    request.validate_structure().unwrap();
+    serde_json::to_vec(&request).unwrap()
+}
+
 fn runtime_command_result(request_id: &str) -> RuntimeCommandResultV1 {
     RuntimeCommandResultV1 {
         payload_kind: RuntimeCommandPayloadKindV1::Result,
@@ -590,6 +707,23 @@ fn runtime_command_result(request_id: &str) -> RuntimeCommandResultV1 {
         body: Some(RuntimeCommandJsonPayloadV1 {
             schema: "finitecomputer.runtime.gateway.restart.result.v1".to_string(),
             json_payload: br#"{"status":"live"}"#.to_vec(),
+        }),
+        error: None,
+        clears_activity: Vec::new(),
+    }
+}
+
+fn runtime_config_command_result(
+    request_id: &str,
+    config_generation: u64,
+) -> RuntimeCommandResultV1 {
+    RuntimeCommandResultV1 {
+        payload_kind: RuntimeCommandPayloadKindV1::Result,
+        request_id: request_id.to_string(),
+        status: RuntimeCommandTerminalStatusV1::Succeeded,
+        body: Some(RuntimeCommandJsonPayloadV1 {
+            schema: "finitecomputer.runtime.config.update.result.v1".to_string(),
+            json_payload: runtime_config_status_payload(config_generation),
         }),
         error: None,
         clears_activity: Vec::new(),
@@ -620,6 +754,35 @@ fn runtime_gateway_snapshot_payload(
     serde_json::to_vec(&snapshot).unwrap()
 }
 
+fn runtime_config_snapshot_payload(
+    server: &DeliveryService,
+    room_id: &str,
+    config_generation: u64,
+) -> Vec<u8> {
+    let revision = server.room(room_id).unwrap().last_seq + 1;
+    let observed_at_ms = revision * 1_000;
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.config".to_string(),
+        schema: "finitecomputer.runtime.config.status.v1".to_string(),
+        revision,
+        observed_at_ms,
+        expires_at_ms: observed_at_ms + 60_000,
+        status_payload: runtime_config_status_payload(config_generation),
+    };
+    snapshot.validate_limits().unwrap();
+    serde_json::to_vec(&snapshot).unwrap()
+}
+
+fn runtime_config_status_payload(config_generation: u64) -> Vec<u8> {
+    json!({
+        "config_generation": config_generation,
+        "gateway_enabled": true,
+        "status": "applied"
+    })
+    .to_string()
+    .into_bytes()
+}
+
 fn command_result_seq(server: &DeliveryService, room_id: &str, request_id: &str) -> Option<u64> {
     server
         .room(room_id)?
@@ -631,6 +794,36 @@ fn command_result_seq(server: &DeliveryService, room_id: &str, request_id: &str)
                 .unwrap_or(false)
         })
         .map(|entry| entry.seq)
+}
+
+struct CommandResultLogEntry {
+    seq: u64,
+    message_id: String,
+    result: RuntimeCommandResultV1,
+}
+
+fn runtime_command_result_after(
+    server: &DeliveryService,
+    room_id: &str,
+    request_id: &str,
+) -> Option<CommandResultLogEntry> {
+    server
+        .room(room_id)?
+        .log
+        .iter()
+        .filter_map(|entry| {
+            let result =
+                serde_json::from_slice::<RuntimeCommandResultV1>(&entry.envelope.payload).ok()?;
+            if result.request_id != request_id {
+                return None;
+            }
+            Some(CommandResultLogEntry {
+                seq: entry.seq,
+                message_id: entry.message_id.clone(),
+                result,
+            })
+        })
+        .next()
 }
 
 fn runtime_state_snapshot_seq_after(
