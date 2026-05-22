@@ -3320,6 +3320,80 @@ mod tests {
     }
 
     #[test]
+    fn runtime_bridge_commands_serialize_per_physical_resource() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: Some("runtime_box".to_string()),
+        };
+        let mut reconnect_telegram = runtime_command_request(
+            "reconnect_telegram",
+            "finitecomputer.runtime.connection.telegram.reconnect",
+            target.clone(),
+            br#"{}"#,
+        );
+        reconnect_telegram.resource_key = Some("connection.telegram".to_string());
+        let mut reconnect_matrix = runtime_command_request(
+            "reconnect_matrix",
+            "finitecomputer.runtime.connection.matrix.reconnect",
+            target.clone(),
+            br#"{}"#,
+        );
+        reconnect_matrix.resource_key = Some("connection.matrix".to_string());
+        let mut rotate_telegram = runtime_command_request(
+            "rotate_telegram",
+            "finitecomputer.runtime.connection.telegram.rotate",
+            target,
+            br#"{}"#,
+        );
+        rotate_telegram.resource_key = Some("connection.telegram".to_string());
+        let mut ledger = RuntimeCommandLedger::default();
+
+        for (seq, message_id, request) in [
+            (11, "message_reconnect_telegram", &reconnect_telegram),
+            (12, "message_reconnect_matrix", &reconnect_matrix),
+            (13, "message_rotate_telegram", &rotate_telegram),
+        ] {
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: seq,
+                        original_message_id: message_id,
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    request,
+                )
+                .unwrap();
+        }
+
+        let ready = ledger.ready_requests();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].request_id, "reconnect_telegram");
+        assert_eq!(ready[1].request_id, "reconnect_matrix");
+
+        ledger
+            .apply_result(
+                RuntimeCommandTerminalContext {
+                    room_id: "room_1",
+                    conversation_id: Some("topic_1"),
+                    request_sender: &sender,
+                    accepted_seq: 20,
+                    terminal_message_id: "result_reconnect_telegram",
+                },
+                &runtime_command_success_result("reconnect_telegram", br#"{"status":"ok"}"#),
+            )
+            .unwrap();
+        let ready = ledger.ready_requests();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].request_id, "reconnect_matrix");
+        assert_eq!(ready[1].request_id, "rotate_telegram");
+    }
+
+    #[test]
     fn unkeyed_runtime_commands_do_not_block_keyed_resources() {
         let sender = device("alice_npub", "dashboard");
         let local_runtime = device("runtime_npub", "runtime_box");

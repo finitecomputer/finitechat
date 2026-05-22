@@ -119,6 +119,14 @@ such as `hermes.config`. Command retries reuse the same encrypted envelope and
 idempotency key. Results include the post-mutation status snapshot but should
 use `push_policy = never` unless the user explicitly asked to be notified.
 
+Bridge and connection commands should use the same rule for physical isolation.
+Telegram, Matrix, and other bridge adapters get distinct resource keys such as
+`connection.telegram` or `connection.matrix`. Commands for one bridge serialize
+against that bridge's local resource, while a different bridge on the same
+runtime device can keep making progress. If a bridge later moves to a separate
+physical process or host, target it as a separate Finite Chat device instead of
+special-casing the UI.
+
 ## Runtime State Snapshots
 
 Finitecomputer should model bot-visible status like structured AIM status

@@ -537,6 +537,7 @@ application payload behavior:
 - `runtime_command_retry_reuses_message_id_and_idempotency_key`
 - `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
 - `runtime_config_commands_serialize_per_resource`
+- `runtime_bridge_commands_serialize_per_physical_resource`
 - `unkeyed_runtime_commands_do_not_block_keyed_resources`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `runtime_sync_persists_request_ledger_before_execution`
