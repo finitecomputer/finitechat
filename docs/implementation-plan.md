@@ -392,7 +392,9 @@ Good tests:
   refreshes, clears, durable terminal clears, and expiry are bounded and
   sender-scoped. Runtime command results validate their terminal payload before
   applying bounded activity clears, so dropped ephemeral clears do not leave
-  stale `working` or `thinking` state behind.
+  stale `working` or `thinking` state behind. Long-running agent work uses
+  command/run ids as activity ids and can refresh leases up to the v1 maximum
+  without creating new projection entries.
 - `finitechat-blob` now proves the Blossom-shaped HTTP seam without adding a
   networking dependency: upload requests contain ciphertext only, upload
   responses verify descriptor hash/size before references exist, failed server

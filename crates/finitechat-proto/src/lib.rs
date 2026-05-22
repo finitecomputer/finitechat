@@ -3478,6 +3478,55 @@ mod tests {
     }
 
     #[test]
+    fn long_running_agent_activity_survives_refresh_without_push() {
+        let runtime = device("runtime_npub", "box");
+        let run_id = "run_restart_gateway_1";
+        let mut projection = EphemeralActivityProjection::default();
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context(
+                        "room_1",
+                        Some("topic_1"),
+                        &runtime,
+                        1_000,
+                        1_000 + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+                    ),
+                    &activity_set("working", Some(run_id), br#"{"phase":"restart"}"#),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Set
+        );
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context(
+                        "room_1",
+                        Some("topic_1"),
+                        &runtime,
+                        20 * 60 * 1_000,
+                        50 * 60 * 1_000,
+                    ),
+                    &activity_set("working", Some(run_id), br#"{"phase":"waiting"}"#),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Refreshed
+        );
+        let current = projection
+            .get("room_1", Some("topic_1"), &runtime, "working", Some(run_id))
+            .unwrap();
+
+        assert_eq!(projection.len(), 1);
+        assert_eq!(current.activity_id, run_id);
+        assert_eq!(current.expires_at_ms, 50 * 60 * 1_000);
+        assert_eq!(current.payload, br#"{"phase":"waiting"}"#);
+        assert_eq!(projection.expire_at(50 * 60 * 1_000 - 1).unwrap(), 0);
+        assert_eq!(projection.expire_at(50 * 60 * 1_000).unwrap(), 1);
+        assert!(projection.is_empty());
+    }
+
+    #[test]
     fn durable_terminal_clear_is_sender_and_activity_scoped() {
         let runtime = device("runtime_npub", "box");
         let sibling = device("runtime_npub", "gpu");

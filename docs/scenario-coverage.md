@@ -167,6 +167,8 @@ kinds. Proven unit scenarios:
 - `runtime_command_ledger_records_after_decrypted_target_policy`
 - `activity_projection_keeps_devices_separate_and_clear_scoped`
 - `activity_refresh_extends_matching_device_expiry`
+- `long_running_agent_activity_uses_command_or_run_id`
+- `long_running_agent_activity_survives_refresh_without_push`
 - `durable_terminal_clear_is_sender_and_activity_scoped`
 - `runtime_command_result_clears_matching_activity`
 - `runtime_command_result_clear_rejects_invalid_result_before_mutation`
@@ -482,8 +484,6 @@ Still planned:
 - `activity_clear_does_not_remove_unrelated_kind`
 - `activity_clear_does_not_remove_different_activity_id`
 - `stale_agent_activity_clear_does_not_hide_newer_run`
-- `long_running_agent_activity_uses_command_or_run_id`
-- `long_running_agent_activity_survives_refresh_without_push`
 - `durable_chat_message_clears_matching_default_typing`
 - `durable_command_result_clears_matching_working_activity`
 - `dropped_ephemeral_clear_is_repaired_by_durable_terminal_event`
