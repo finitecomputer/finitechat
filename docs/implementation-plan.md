@@ -375,6 +375,10 @@ Good tests:
   body, resource key, and request id; the runtime ledger records only
   decrypted requests for the local device, rejects conflicting request-id reuse,
   and must be written before execution.
+- Ephemeral activity now has a decrypted client projection: activity is keyed
+  by room, conversation, account, device, kind, and normalized activity id;
+  refreshes, clears, durable terminal clears, and expiry are bounded and
+  sender-scoped.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

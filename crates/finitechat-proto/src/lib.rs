@@ -19,6 +19,8 @@ pub type RuntimeStateKey = String;
 pub type RuntimeCommandRequestId = String;
 pub type RuntimeCommandName = String;
 pub type RuntimeCommandResourceKey = String;
+pub type ActivityKind = String;
+pub type ActivityId = String;
 pub type AttachmentBlobUrl = String;
 pub type AttachmentHash = String;
 pub type Epoch = u64;
@@ -53,6 +55,8 @@ pub const MAX_RUNTIME_COMMAND_PAYLOAD_BYTES: u32 = 128 * 1024;
 pub const MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES: u32 = 2048;
 pub const MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS: u32 = 16;
 pub const MAX_RUNTIME_COMMAND_LEDGER_RECORDS: u32 = 1024;
+pub const MAX_EPHEMERAL_ACTIVITY_DECRYPTED_PAYLOAD_BYTES: u32 = 64 * 1024;
+pub const MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES: u32 = 4096;
 pub const MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30 * 60 * 1000;
 pub const MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE: u32 = 64;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: u32 = 128;
@@ -63,6 +67,7 @@ pub const MAX_MLS_GROUP_ID_BYTES: u32 = 128;
 pub const MAX_OBJECT_ID_BYTES: u32 = 128;
 pub const FINITECHAT_ATTACHMENT_BLOB_SCHEME_V1: &str = "finitechat.attachment.blob.v1";
 pub const FINITECHAT_ATTACHMENT_BLOB_ENCRYPTION_AES256_GCM_V1: &str = "aes-256-gcm.v1";
+pub const FINITECHAT_DEFAULT_ACTIVITY_ID: &str = "default";
 
 const _: () = {
     assert!(MAX_ENVELOPE_PAYLOAD_BYTES > 0);
@@ -96,6 +101,9 @@ const _: () = {
     assert!(MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES > 0);
     assert!(MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS > 0);
     assert!(MAX_RUNTIME_COMMAND_LEDGER_RECORDS > 0);
+    assert!(MAX_EPHEMERAL_ACTIVITY_DECRYPTED_PAYLOAD_BYTES > 0);
+    assert!(MAX_EPHEMERAL_ACTIVITY_DECRYPTED_PAYLOAD_BYTES < MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE > 0);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
@@ -596,6 +604,71 @@ pub struct RuntimeCommandIngressContext<'a> {
     pub local_device: &'a DeviceRef,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EphemeralActivityActionV1 {
+    Set,
+    Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecryptedEphemeralActivityV1 {
+    pub activity_kind: ActivityKind,
+    pub activity_id: Option<ActivityId>,
+    pub action: EphemeralActivityActionV1,
+    #[serde(with = "bytes_as_vec")]
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EphemeralActivityIngressContext<'a> {
+    pub room_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub sender: &'a DeviceRef,
+    pub received_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralActivityProjectionEntry {
+    pub room_id: RoomId,
+    pub conversation_id: Option<ConversationId>,
+    pub sender: DeviceRef,
+    pub activity_kind: ActivityKind,
+    pub activity_id: ActivityId,
+    #[serde(with = "bytes_as_vec")]
+    pub payload: Vec<u8>,
+    pub received_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralActivityProjection {
+    entries: BTreeMap<String, EphemeralActivityProjectionEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EphemeralActivityProjectionDecision {
+    Set,
+    Refreshed,
+    Cleared,
+    ClearMiss,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum EphemeralActivityProjectionError {
+    #[error("ephemeral activity expired before receipt")]
+    AlreadyExpired,
+    #[error("ephemeral activity expiry window {actual_millis}ms exceeds max {max_millis}ms")]
+    ExpiryTooLong { max_millis: u64, actual_millis: u64 },
+    #[error("ephemeral activity projection capacity exceeded: max {max_records}")]
+    CapacityExceeded { max_records: u32 },
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum RuntimeCommandPayloadError {
@@ -1067,6 +1140,182 @@ impl RuntimeCommandIngressContext<'_> {
     }
 }
 
+impl DecryptedEphemeralActivityV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("ephemeral_activity.kind", self.activity_kind.len())?;
+        validate_string_bytes(
+            "ephemeral_activity.kind",
+            &self.activity_kind,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(activity_id) = &self.activity_id {
+            validate_bytes_non_empty("ephemeral_activity.activity_id", activity_id.len())?;
+            validate_string_bytes(
+                "ephemeral_activity.activity_id",
+                activity_id,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        match self.action {
+            EphemeralActivityActionV1::Set => {
+                validate_bytes_non_empty("ephemeral_activity.payload", self.payload.len())?;
+                validate_bytes_len(
+                    "ephemeral_activity.payload",
+                    self.payload.len(),
+                    MAX_EPHEMERAL_ACTIVITY_DECRYPTED_PAYLOAD_BYTES,
+                )?;
+            }
+            EphemeralActivityActionV1::Clear => {
+                validate_bytes_len(
+                    "ephemeral_activity.payload",
+                    self.payload.len(),
+                    MAX_EPHEMERAL_ACTIVITY_DECRYPTED_PAYLOAD_BYTES,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn normalized_activity_id(&self) -> &str {
+        self.activity_id
+            .as_deref()
+            .unwrap_or(FINITECHAT_DEFAULT_ACTIVITY_ID)
+    }
+}
+
+impl EphemeralActivityIngressContext<'_> {
+    pub fn validate_limits(&self) -> Result<(), EphemeralActivityProjectionError> {
+        validate_room_id(self.room_id)?;
+        if let Some(conversation_id) = self.conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        self.sender.validate_limits()?;
+        validate_ephemeral_activity_expiry(self.received_at_ms, self.expires_at_ms)?;
+        Ok(())
+    }
+}
+
+impl EphemeralActivityProjection {
+    pub fn apply(
+        &mut self,
+        context: EphemeralActivityIngressContext<'_>,
+        activity: &DecryptedEphemeralActivityV1,
+    ) -> Result<EphemeralActivityProjectionDecision, EphemeralActivityProjectionError> {
+        context.validate_limits()?;
+        activity.validate_limits()?;
+        let key = ephemeral_activity_projection_key(
+            context.room_id,
+            context.conversation_id,
+            context.sender,
+            &activity.activity_kind,
+            activity.normalized_activity_id(),
+        )?;
+        match activity.action {
+            EphemeralActivityActionV1::Set => {
+                let existed = self.entries.contains_key(&key);
+                if !existed
+                    && self.entries.len() >= MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES as usize
+                {
+                    return Err(EphemeralActivityProjectionError::CapacityExceeded {
+                        max_records: MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES,
+                    });
+                }
+                self.entries.insert(
+                    key,
+                    EphemeralActivityProjectionEntry {
+                        room_id: context.room_id.to_string(),
+                        conversation_id: context.conversation_id.map(str::to_string),
+                        sender: context.sender.clone(),
+                        activity_kind: activity.activity_kind.clone(),
+                        activity_id: activity.normalized_activity_id().to_string(),
+                        payload: activity.payload.clone(),
+                        received_at_ms: context.received_at_ms,
+                        expires_at_ms: context.expires_at_ms,
+                    },
+                );
+                assert!(self.entries.len() <= MAX_EPHEMERAL_ACTIVITY_PROJECTION_ENTRIES as usize);
+                if existed {
+                    Ok(EphemeralActivityProjectionDecision::Refreshed)
+                } else {
+                    Ok(EphemeralActivityProjectionDecision::Set)
+                }
+            }
+            EphemeralActivityActionV1::Clear => {
+                if self.entries.remove(&key).is_some() {
+                    Ok(EphemeralActivityProjectionDecision::Cleared)
+                } else {
+                    Ok(EphemeralActivityProjectionDecision::ClearMiss)
+                }
+            }
+        }
+    }
+
+    pub fn clear_from_durable_terminal(
+        &mut self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+        clear: &RuntimeActivityClearV1,
+    ) -> Result<bool, EphemeralActivityProjectionError> {
+        validate_room_id(room_id)?;
+        if let Some(conversation_id) = conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        sender.validate_limits()?;
+        clear.validate_limits()?;
+        let activity_id = clear
+            .activity_id
+            .as_deref()
+            .unwrap_or(FINITECHAT_DEFAULT_ACTIVITY_ID);
+        let key = ephemeral_activity_projection_key(
+            room_id,
+            clear.conversation_id.as_deref().or(conversation_id),
+            sender,
+            &clear.activity_kind,
+            activity_id,
+        )?;
+        Ok(self.entries.remove(&key).is_some())
+    }
+
+    pub fn expire_at(&mut self, now_ms: u64) -> Result<u32, EphemeralActivityProjectionError> {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| entry.expires_at_ms > now_ms);
+        let expired = before.saturating_sub(self.entries.len());
+        u32::try_from(expired).map_err(|_| EphemeralActivityProjectionError::CapacityExceeded {
+            max_records: u32::MAX,
+        })
+    }
+
+    pub fn get(
+        &self,
+        room_id: &str,
+        conversation_id: Option<&str>,
+        sender: &DeviceRef,
+        activity_kind: &str,
+        activity_id: Option<&str>,
+    ) -> Option<&EphemeralActivityProjectionEntry> {
+        let key = ephemeral_activity_projection_key(
+            room_id,
+            conversation_id,
+            sender,
+            activity_kind,
+            activity_id.unwrap_or(FINITECHAT_DEFAULT_ACTIVITY_ID),
+        )
+        .ok()?;
+        self.entries.get(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 impl DecryptedApplicationEventV1 {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
         self.kind.validate_limits()?;
@@ -1439,6 +1688,56 @@ fn runtime_command_ledger_key(
         length_prefixed(&sender.device_id),
         length_prefixed(request_id)
     ))
+}
+
+fn ephemeral_activity_projection_key(
+    room_id: &str,
+    conversation_id: Option<&str>,
+    sender: &DeviceRef,
+    activity_kind: &str,
+    activity_id: &str,
+) -> Result<String, ProtocolLimitError> {
+    validate_room_id(room_id)?;
+    if let Some(conversation_id) = conversation_id {
+        validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+    }
+    sender.validate_limits()?;
+    validate_string_bytes(
+        "ephemeral_activity.kind",
+        activity_kind,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    validate_string_bytes(
+        "ephemeral_activity.activity_id",
+        activity_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    Ok(format!(
+        "{}|{}|{}|{}|{}|{}",
+        length_prefixed(room_id),
+        length_prefixed(conversation_id.unwrap_or("")),
+        length_prefixed(&sender.account_id),
+        length_prefixed(&sender.device_id),
+        length_prefixed(activity_kind),
+        length_prefixed(activity_id)
+    ))
+}
+
+fn validate_ephemeral_activity_expiry(
+    received_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<(), EphemeralActivityProjectionError> {
+    if expires_at_ms <= received_at_ms {
+        return Err(EphemeralActivityProjectionError::AlreadyExpired);
+    }
+    let window = expires_at_ms - received_at_ms;
+    if window > MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS {
+        return Err(EphemeralActivityProjectionError::ExpiryTooLong {
+            max_millis: MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+            actual_millis: window,
+        });
+    }
+    Ok(())
 }
 
 fn length_prefixed(value: &str) -> String {
@@ -2064,6 +2363,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activity_projection_keeps_devices_separate_and_clear_scoped() {
+        let phone = device("alice_npub", "phone");
+        let laptop = device("alice_npub", "laptop");
+        let mut projection = EphemeralActivityProjection::default();
+
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &phone, 1_000, 11_000),
+                &activity_set("typing", None, br#"{"chars":3}"#),
+            )
+            .unwrap();
+        projection
+            .apply(
+                activity_context("room_1", Some("topic_1"), &laptop, 1_000, 11_000),
+                &activity_set("typing", None, br#"{"chars":1}"#),
+            )
+            .unwrap();
+
+        assert_eq!(projection.len(), 2);
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &phone, 2_000, 12_000),
+                    &activity_clear("typing", None),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Cleared
+        );
+        assert!(
+            projection
+                .get("room_1", Some("topic_1"), &phone, "typing", None)
+                .is_none()
+        );
+        assert!(
+            projection
+                .get("room_1", Some("topic_1"), &laptop, "typing", None)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_refresh_extends_matching_device_expiry() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 1_000, 11_000),
+                    &activity_set("working", Some("run_1"), br#"{"pct":10}"#),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Set
+        );
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), &runtime, 2_000, 22_000),
+                    &activity_set("working", Some("run_1"), br#"{"pct":20}"#),
+                )
+                .unwrap(),
+            EphemeralActivityProjectionDecision::Refreshed
+        );
+        let current = projection
+            .get(
+                "room_1",
+                Some("topic_1"),
+                &runtime,
+                "working",
+                Some("run_1"),
+            )
+            .unwrap();
+        assert_eq!(current.expires_at_ms, 22_000);
+        assert_eq!(current.payload, br#"{"pct":20}"#);
+    }
+
+    #[test]
+    fn durable_terminal_clear_is_sender_and_activity_scoped() {
+        let runtime = device("runtime_npub", "box");
+        let sibling = device("runtime_npub", "gpu");
+        let mut projection = EphemeralActivityProjection::default();
+        for sender in [&runtime, &sibling] {
+            projection
+                .apply(
+                    activity_context("room_1", Some("topic_1"), sender, 1_000, 11_000),
+                    &activity_set("working", Some("restart_1"), br#"{}"#),
+                )
+                .unwrap();
+        }
+
+        let removed = projection
+            .clear_from_durable_terminal(
+                "room_1",
+                Some("topic_1"),
+                &runtime,
+                &RuntimeActivityClearV1 {
+                    activity_kind: "working".to_string(),
+                    activity_id: Some("restart_1".to_string()),
+                    conversation_id: None,
+                },
+            )
+            .unwrap();
+
+        assert!(removed);
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &runtime,
+                    "working",
+                    Some("restart_1"),
+                )
+                .is_none()
+        );
+        assert!(
+            projection
+                .get(
+                    "room_1",
+                    Some("topic_1"),
+                    &sibling,
+                    "working",
+                    Some("restart_1"),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_projection_expires_and_rejects_bad_lease_windows() {
+        let runtime = device("runtime_npub", "box");
+        let mut projection = EphemeralActivityProjection::default();
+        projection
+            .apply(
+                activity_context("room_1", None, &runtime, 1_000, 11_000),
+                &activity_set("finitecomputer.indexing", Some("job_1"), br#"{}"#),
+            )
+            .unwrap();
+
+        assert_eq!(projection.expire_at(10_999).unwrap(), 0);
+        assert_eq!(projection.expire_at(11_000).unwrap(), 1);
+        assert!(projection.is_empty());
+
+        assert_eq!(
+            projection
+                .apply(
+                    activity_context("room_1", None, &runtime, 1_000, 1_000),
+                    &activity_set("thinking", None, br#"{}"#),
+                )
+                .unwrap_err(),
+            EphemeralActivityProjectionError::AlreadyExpired
+        );
+        assert!(matches!(
+            projection
+                .apply(
+                    activity_context(
+                        "room_1",
+                        None,
+                        &runtime,
+                        1_000,
+                        1_001 + MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+                    ),
+                    &activity_set("thinking", None, br#"{}"#),
+                )
+                .unwrap_err(),
+            EphemeralActivityProjectionError::ExpiryTooLong { .. }
+        ));
+    }
+
     fn runtime_state_entry(
         room_id: &str,
         source: DeviceRef,
@@ -2108,6 +2577,47 @@ mod tests {
         RuntimeCommandJsonPayloadV1 {
             schema: "finitecomputer.runtime.command.body.v1".to_string(),
             json_payload: body.to_vec(),
+        }
+    }
+
+    fn activity_context<'a>(
+        room_id: &'a str,
+        conversation_id: Option<&'a str>,
+        sender: &'a DeviceRef,
+        received_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> EphemeralActivityIngressContext<'a> {
+        EphemeralActivityIngressContext {
+            room_id,
+            conversation_id,
+            sender,
+            received_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    fn activity_set(
+        activity_kind: &str,
+        activity_id: Option<&str>,
+        payload: &[u8],
+    ) -> DecryptedEphemeralActivityV1 {
+        DecryptedEphemeralActivityV1 {
+            activity_kind: activity_kind.to_string(),
+            activity_id: activity_id.map(str::to_string),
+            action: EphemeralActivityActionV1::Set,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn activity_clear(
+        activity_kind: &str,
+        activity_id: Option<&str>,
+    ) -> DecryptedEphemeralActivityV1 {
+        DecryptedEphemeralActivityV1 {
+            activity_kind: activity_kind.to_string(),
+            activity_id: activity_id.map(str::to_string),
+            action: EphemeralActivityActionV1::Clear,
+            payload: Vec::new(),
         }
     }
 }

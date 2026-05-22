@@ -165,6 +165,10 @@ kinds. Proven unit scenarios:
 - `runtime_command_request_validates_kind_body_and_target_policy`
 - `runtime_command_result_requires_terminal_shape_and_bounded_clears`
 - `runtime_command_ledger_records_after_decrypted_target_policy`
+- `activity_projection_keeps_devices_separate_and_clear_scoped`
+- `activity_refresh_extends_matching_device_expiry`
+- `durable_terminal_clear_is_sender_and_activity_scoped`
+- `activity_projection_expires_and_rejects_bad_lease_windows`
 
 The in-memory and SQLite stores now record delivery effects separately from
 opaque MLS payload bytes. This proves that Finite Chat can enforce
@@ -426,20 +430,28 @@ but `DeviceRevoked` in SQLite. The store now matches the reducer ordering.
 Push outbox rows are not implemented yet; when they land, this matrix should add
 a failure point after outbox enqueue and assert exactly one durable wake record.
 
-## Planned Activity Scenarios
+## Activity Scenarios
 
 The Pika typing-indicator behavior should become explicit Finite Chat protocol
 coverage before the room server owns push fanout:
+
+- `ephemeral_activity_never_enqueues_push_or_advances_sequence`
+- `ephemeral_activity_rejects_pending_unacked_device`
+- `ephemeral_activity_rejects_removed_or_revoked_device`
+- `ephemeral_activity_expiry_is_bounded`
+- `server_activity_cache_enforces_per_route_limit_without_seq_gap`
+- `activity_projection_keeps_devices_separate_and_clear_scoped`
+- `activity_refresh_extends_matching_device_expiry`
+- `durable_terminal_clear_is_sender_and_activity_scoped`
+- `activity_projection_expires_and_rejects_bad_lease_windows`
+
+Still planned:
 
 - `ephemeral_activity_rejects_non_member_device`
 - `ephemeral_activity_payload_is_opaque_to_server`
 - `ephemeral_activity_epoch_mismatch_drops_without_repair`
 - `conversation_id_does_not_authorize_cross_room_activity`
-- `activity_projection_keeps_devices_separate`
 - `activity_projection_rolls_up_identity_for_normal_ui`
-- `activity_projection_does_not_clear_sibling_device_activity`
-- `activity_refresh_extends_matching_device_expiry`
-- `activity_clear_removes_matching_device_kind_and_activity_id`
 - `activity_clear_does_not_remove_unrelated_kind`
 - `activity_clear_does_not_remove_different_activity_id`
 - `stale_agent_activity_clear_does_not_hide_newer_run`

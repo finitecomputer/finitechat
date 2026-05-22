@@ -200,6 +200,8 @@ These are protocol constants, not tuning hints:
 - runtime command JSON payload: `128 KiB`;
 - runtime command activity clears per result: `16`;
 - runtime command ledger records per daemon/client: `1024`;
+- decrypted ephemeral activity payload: `64 KiB`;
+- decrypted ephemeral activity projection entries per client: `4096`;
 - ephemeral activity expiry: `30 minutes` from server receipt;
 - ephemeral activity cache entries per room/conversation/device route: `64`;
 - idempotency key: `128` bytes;
@@ -507,6 +509,13 @@ roll this up to an identity-level display such as "Alice is typing" or
 "Runtime is working", but device and activity id remain the source of truth.
 Device-specific views can expose the exact active device when that matters,
 such as targeting a runtime device with GPU access.
+
+Clients normalize missing `activity_id` to the reserved `default` id. A set
+refreshes only the matching projection key, a clear removes only the matching
+projection key, and expiry removes entries whose lease has elapsed. Durable
+terminal events may clear activity for the durable event sender using the same
+sender-scoped key; this repairs dropped ephemeral clear events without granting
+cross-device clear authority.
 
 Finitecomputer dashboard/runtime RPC should live inside the encrypted
 application payload. The plaintext can be JSON because it is client-owned
