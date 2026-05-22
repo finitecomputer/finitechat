@@ -660,6 +660,14 @@ pub enum RuntimeCommandLedgerDecision {
     IgnoredTarget,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCommandTerminalDecision {
+    Recorded,
+    Replayed,
+    IgnoredAlreadyTerminal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCommandLedgerRecord {
     pub room_id: RoomId,
@@ -672,6 +680,8 @@ pub struct RuntimeCommandLedgerRecord {
     pub accepted_seq: Seq,
     pub resource_key: Option<RuntimeCommandResourceKey>,
     pub status: RuntimeCommandLedgerStatus,
+    pub terminal_seq: Option<Seq>,
+    pub terminal_message_id: Option<MessageId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,6 +697,15 @@ pub struct RuntimeCommandIngressContext<'a> {
     pub original_message_id: &'a str,
     pub sender: &'a DeviceRef,
     pub local_device: &'a DeviceRef,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeCommandTerminalContext<'a> {
+    pub room_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub request_sender: &'a DeviceRef,
+    pub accepted_seq: Seq,
+    pub terminal_message_id: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -777,6 +796,14 @@ pub enum RuntimeCommandLedgerError {
     ConflictingRequestId { request_id: RuntimeCommandRequestId },
     #[error("runtime command request not found for {request_id}")]
     RequestNotFound { request_id: RuntimeCommandRequestId },
+    #[error(
+        "runtime command terminal event for {request_id} at seq {terminal_seq} is not after request seq {request_seq}"
+    )]
+    TerminalBeforeRequest {
+        request_id: RuntimeCommandRequestId,
+        request_seq: Seq,
+        terminal_seq: Seq,
+    },
     #[error("runtime command status {status:?} is not terminal")]
     NonTerminalStatus { status: RuntimeCommandLedgerStatus },
     #[error("runtime command ledger capacity exceeded: max {max_records}")]
@@ -1355,43 +1382,41 @@ impl RuntimeCommandLedger {
                 accepted_seq: context.accepted_seq,
                 resource_key: request.resource_key.clone(),
                 status: RuntimeCommandLedgerStatus::Pending,
+                terminal_seq: None,
+                terminal_message_id: None,
             },
         );
         assert!(self.records.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
         Ok(RuntimeCommandLedgerDecision::Recorded)
     }
 
-    pub fn mark_terminal(
+    pub fn apply_result(
         &mut self,
-        room_id: &str,
-        conversation_id: Option<&str>,
-        sender: &DeviceRef,
-        request_id: &str,
-        status: RuntimeCommandLedgerStatus,
-    ) -> Result<(), RuntimeCommandLedgerError> {
-        validate_room_id(room_id)?;
-        if let Some(conversation_id) = conversation_id {
-            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
-            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
-        }
-        sender.validate_limits()?;
-        validate_bytes_non_empty("runtime_command.request_id", request_id.len())?;
-        validate_string_bytes(
-            "runtime_command.request_id",
-            request_id,
-            MAX_OBJECT_ID_BYTES,
-        )?;
-        if status == RuntimeCommandLedgerStatus::Pending {
-            return Err(RuntimeCommandLedgerError::NonTerminalStatus { status });
-        }
-        let key = runtime_command_ledger_key(room_id, conversation_id, sender, request_id)?;
-        let record = self.records.get_mut(&key).ok_or_else(|| {
-            RuntimeCommandLedgerError::RequestNotFound {
-                request_id: request_id.to_string(),
-            }
-        })?;
-        record.status = status;
-        Ok(())
+        context: RuntimeCommandTerminalContext<'_>,
+        result: &RuntimeCommandResultV1,
+    ) -> Result<RuntimeCommandTerminalDecision, RuntimeCommandLedgerError> {
+        context.validate_limits()?;
+        result.validate_structure()?;
+        let status = match result.status {
+            RuntimeCommandTerminalStatusV1::Succeeded => RuntimeCommandLedgerStatus::Succeeded,
+            RuntimeCommandTerminalStatusV1::Failed => RuntimeCommandLedgerStatus::Failed,
+            RuntimeCommandTerminalStatusV1::Cancelled => RuntimeCommandLedgerStatus::Cancelled,
+        };
+        self.record_terminal(context, &result.request_id, status)
+    }
+
+    pub fn apply_cancel(
+        &mut self,
+        context: RuntimeCommandTerminalContext<'_>,
+        cancel: &RuntimeCommandCancelV1,
+    ) -> Result<RuntimeCommandTerminalDecision, RuntimeCommandLedgerError> {
+        context.validate_limits()?;
+        cancel.validate_structure()?;
+        self.record_terminal(
+            context,
+            &cancel.request_id,
+            RuntimeCommandLedgerStatus::Cancelled,
+        )
     }
 
     pub fn pending_requests(&self) -> Vec<&RuntimeCommandLedgerRecord> {
@@ -1419,6 +1444,55 @@ impl RuntimeCommandLedger {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    fn record_terminal(
+        &mut self,
+        context: RuntimeCommandTerminalContext<'_>,
+        request_id: &str,
+        status: RuntimeCommandLedgerStatus,
+    ) -> Result<RuntimeCommandTerminalDecision, RuntimeCommandLedgerError> {
+        if status == RuntimeCommandLedgerStatus::Pending {
+            return Err(RuntimeCommandLedgerError::NonTerminalStatus { status });
+        }
+        let key = runtime_command_ledger_key(
+            context.room_id,
+            context.conversation_id,
+            context.request_sender,
+            request_id,
+        )?;
+        let record = self.records.get_mut(&key).ok_or_else(|| {
+            RuntimeCommandLedgerError::RequestNotFound {
+                request_id: request_id.to_string(),
+            }
+        })?;
+        if context.accepted_seq <= record.accepted_seq {
+            return Err(RuntimeCommandLedgerError::TerminalBeforeRequest {
+                request_id: request_id.to_string(),
+                request_seq: record.accepted_seq,
+                terminal_seq: context.accepted_seq,
+            });
+        }
+        if record.status == RuntimeCommandLedgerStatus::Pending {
+            record.status = status;
+            record.terminal_seq = Some(context.accepted_seq);
+            record.terminal_message_id = Some(context.terminal_message_id.to_string());
+            assert_ne!(record.status, RuntimeCommandLedgerStatus::Pending);
+            assert_eq!(record.terminal_seq, Some(context.accepted_seq));
+            assert_eq!(
+                record.terminal_message_id.as_deref(),
+                Some(context.terminal_message_id)
+            );
+            return Ok(RuntimeCommandTerminalDecision::Recorded);
+        }
+        if record.status == status
+            && record.terminal_seq == Some(context.accepted_seq)
+            && record.terminal_message_id.as_deref() == Some(context.terminal_message_id)
+        {
+            Ok(RuntimeCommandTerminalDecision::Replayed)
+        } else {
+            Ok(RuntimeCommandTerminalDecision::IgnoredAlreadyTerminal)
+        }
+    }
 }
 
 impl RuntimeCommandIngressContext<'_> {
@@ -1432,6 +1506,27 @@ impl RuntimeCommandIngressContext<'_> {
         validate_string_bytes("message_id", self.original_message_id, MAX_OBJECT_ID_BYTES)?;
         self.sender.validate_limits()?;
         self.local_device.validate_limits()?;
+        Ok(())
+    }
+}
+
+impl RuntimeCommandTerminalContext<'_> {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(self.room_id)?;
+        if let Some(conversation_id) = self.conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        self.request_sender.validate_limits()?;
+        validate_bytes_non_empty(
+            "runtime_command.terminal_message_id",
+            self.terminal_message_id.len(),
+        )?;
+        validate_string_bytes(
+            "runtime_command.terminal_message_id",
+            self.terminal_message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -2665,35 +2760,318 @@ mod tests {
         );
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.pending_requests().len(), 1);
+    }
+
+    #[test]
+    fn runtime_command_result_is_idempotent_terminal_event() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let mut ledger = RuntimeCommandLedger::default();
+        let request = runtime_command_request(
+            "restart_1",
+            "finitecomputer.runtime.gateway.restart",
+            RuntimeCommandTargetV1 {
+                account_id: "runtime_npub".to_string(),
+                device_id: Some("runtime_box".to_string()),
+            },
+            br#"{}"#,
+        );
+        ledger
+            .record_request(
+                RuntimeCommandIngressContext {
+                    room_id: "room_1",
+                    conversation_id: Some("topic_1"),
+                    accepted_seq: 12,
+                    original_message_id: "request_message_1",
+                    sender: &sender,
+                    local_device: &local_runtime,
+                },
+                &request,
+            )
+            .unwrap();
+        let result = runtime_command_success_result("restart_1", br#"{"status":"live"}"#);
+
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "result_message_1",
+                    },
+                    &result,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::Recorded
+        );
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "result_message_1",
+                    },
+                    &result,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::Replayed
+        );
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 21,
+                        terminal_message_id: "result_message_late",
+                    },
+                    &result,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::IgnoredAlreadyTerminal
+        );
+        assert!(ledger.pending_requests().is_empty());
+        let record = ledger
+            .get("room_1", Some("topic_1"), &sender, "restart_1")
+            .unwrap();
+        assert_eq!(record.status, RuntimeCommandLedgerStatus::Succeeded);
+        assert_eq!(record.terminal_seq, Some(20));
+        assert_eq!(
+            record.terminal_message_id.as_deref(),
+            Some("result_message_1")
+        );
+    }
+
+    #[test]
+    fn runtime_command_cancel_races_with_result_first_terminal_wins() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let mut ledger = RuntimeCommandLedger::default();
+
+        for request_id in ["restart_cancel_first", "restart_result_first"] {
+            let request = runtime_command_request(
+                request_id,
+                "finitecomputer.runtime.gateway.restart",
+                RuntimeCommandTargetV1 {
+                    account_id: "runtime_npub".to_string(),
+                    device_id: Some("runtime_box".to_string()),
+                },
+                br#"{}"#,
+            );
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: 12,
+                        original_message_id: request_id,
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    &request,
+                )
+                .unwrap();
+        }
+
+        let cancel = runtime_command_cancel("restart_cancel_first");
+        let result =
+            runtime_command_success_result("restart_cancel_first", br#"{"status":"live"}"#);
+        assert_eq!(
+            ledger
+                .apply_cancel(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "cancel_message_1",
+                    },
+                    &cancel,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::Recorded
+        );
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 21,
+                        terminal_message_id: "result_message_late",
+                    },
+                    &result,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::IgnoredAlreadyTerminal
+        );
+        assert_eq!(
+            ledger
+                .get("room_1", Some("topic_1"), &sender, "restart_cancel_first")
+                .unwrap()
+                .status,
+            RuntimeCommandLedgerStatus::Cancelled
+        );
+
+        let result =
+            runtime_command_success_result("restart_result_first", br#"{"status":"live"}"#);
+        let cancel = runtime_command_cancel("restart_result_first");
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 30,
+                        terminal_message_id: "result_message_1",
+                    },
+                    &result,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::Recorded
+        );
+        assert_eq!(
+            ledger
+                .apply_cancel(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 31,
+                        terminal_message_id: "cancel_message_late",
+                    },
+                    &cancel,
+                )
+                .unwrap(),
+            RuntimeCommandTerminalDecision::IgnoredAlreadyTerminal
+        );
+        let record = ledger
+            .get("room_1", Some("topic_1"), &sender, "restart_result_first")
+            .unwrap();
+        assert_eq!(record.status, RuntimeCommandLedgerStatus::Succeeded);
+        assert_eq!(record.terminal_seq, Some(30));
+        assert_eq!(
+            record.terminal_message_id.as_deref(),
+            Some("result_message_1")
+        );
+    }
+
+    #[test]
+    fn runtime_command_cancel_validates_kind_reason_and_known_request() {
+        let sender = device("alice_npub", "dashboard");
+        let mut ledger = RuntimeCommandLedger::default();
+        let mut wrong_kind = runtime_command_cancel("restart_1");
+        wrong_kind.payload_kind = RuntimeCommandPayloadKindV1::Result;
 
         assert!(matches!(
             ledger
-                .mark_terminal(
-                    "room_1",
-                    Some("topic_1"),
-                    &sender,
-                    "restart_1",
-                    RuntimeCommandLedgerStatus::Pending,
+                .apply_cancel(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "cancel_message_1",
+                    },
+                    &wrong_kind,
                 )
                 .unwrap_err(),
-            RuntimeCommandLedgerError::NonTerminalStatus { .. }
+            RuntimeCommandLedgerError::Payload(RuntimeCommandPayloadError::WrongPayloadKind { .. })
         ));
-        ledger
-            .mark_terminal(
-                "room_1",
-                Some("topic_1"),
-                &sender,
-                "restart_1",
-                RuntimeCommandLedgerStatus::Succeeded,
-            )
-            .unwrap();
-        assert!(ledger.pending_requests().is_empty());
+
+        let mut bad_reason = runtime_command_cancel("restart_1");
+        bad_reason.reason = Some(String::new());
+        assert!(matches!(
+            ledger
+                .apply_cancel(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "cancel_message_1",
+                    },
+                    &bad_reason,
+                )
+                .unwrap_err(),
+            RuntimeCommandLedgerError::Payload(RuntimeCommandPayloadError::Protocol(
+                ProtocolLimitError::BytesEmpty { .. }
+            ))
+        ));
+
         assert_eq!(
             ledger
-                .get("room_1", Some("topic_1"), &sender, "restart_1")
-                .unwrap()
-                .status,
-            RuntimeCommandLedgerStatus::Succeeded
+                .apply_cancel(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 20,
+                        terminal_message_id: "cancel_message_1",
+                    },
+                    &runtime_command_cancel("restart_1"),
+                )
+                .unwrap_err(),
+            RuntimeCommandLedgerError::RequestNotFound {
+                request_id: "restart_1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_command_terminal_event_must_follow_request_sequence() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let mut ledger = RuntimeCommandLedger::default();
+        let request = runtime_command_request(
+            "restart_1",
+            "finitecomputer.runtime.gateway.restart",
+            RuntimeCommandTargetV1 {
+                account_id: "runtime_npub".to_string(),
+                device_id: Some("runtime_box".to_string()),
+            },
+            br#"{}"#,
+        );
+        ledger
+            .record_request(
+                RuntimeCommandIngressContext {
+                    room_id: "room_1",
+                    conversation_id: Some("topic_1"),
+                    accepted_seq: 12,
+                    original_message_id: "request_message_1",
+                    sender: &sender,
+                    local_device: &local_runtime,
+                },
+                &request,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .apply_result(
+                    RuntimeCommandTerminalContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        request_sender: &sender,
+                        accepted_seq: 12,
+                        terminal_message_id: "result_message_1",
+                    },
+                    &runtime_command_success_result("restart_1", br#"{"status":"live"}"#),
+                )
+                .unwrap_err(),
+            RuntimeCommandLedgerError::TerminalBeforeRequest {
+                request_id: "restart_1".to_string(),
+                request_seq: 12,
+                terminal_seq: 12,
+            }
         );
     }
 
@@ -3100,6 +3478,25 @@ mod tests {
         RuntimeCommandJsonPayloadV1 {
             schema: "finitecomputer.runtime.command.body.v1".to_string(),
             json_payload: body.to_vec(),
+        }
+    }
+
+    fn runtime_command_success_result(request_id: &str, body: &[u8]) -> RuntimeCommandResultV1 {
+        RuntimeCommandResultV1 {
+            payload_kind: RuntimeCommandPayloadKindV1::Result,
+            request_id: request_id.to_string(),
+            status: RuntimeCommandTerminalStatusV1::Succeeded,
+            body: Some(runtime_command_body(body)),
+            error: None,
+            clears_activity: Vec::new(),
+        }
+    }
+
+    fn runtime_command_cancel(request_id: &str) -> RuntimeCommandCancelV1 {
+        RuntimeCommandCancelV1 {
+            payload_kind: RuntimeCommandPayloadKindV1::Cancel,
+            request_id: request_id.to_string(),
+            reason: Some("user_requested".to_string()),
         }
     }
 

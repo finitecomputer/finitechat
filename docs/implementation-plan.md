@@ -375,6 +375,11 @@ Good tests:
   body, resource key, and request id; the runtime ledger records only
   decrypted requests for the local device, rejects conflicting request-id reuse,
   and must be written before execution.
+- Runtime command terminal events now close ledger records through accepted
+  ordered-log result/cancel events. The ledger stores the first terminal
+  message id and sequence, replays the same terminal event idempotently,
+  ignores later competing terminals, and rejects terminal events that do not
+  follow the original request sequence.
 - Ephemeral activity now has a decrypted client projection: activity is keyed
   by room, conversation, account, device, kind, and normalized activity id;
   refreshes, clears, durable terminal clears, and expiry are bounded and

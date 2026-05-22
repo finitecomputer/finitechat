@@ -641,6 +641,14 @@ deduplicate replays by request id, sender, conversation, and original message
 id, reject conflicting reuse, and remain bounded. Execution workers read the
 ledger; live streams and push wakes only cause sync.
 
+Command terminal state is also ordered-log state. A result or cancel may close
+a pending ledger record only when its accepted sequence is after the request
+sequence. The ledger stores the first terminal event's message id and sequence;
+an exact replay of that terminal event is idempotent, and any later competing
+result or cancel is ignored. This gives result/cancel races a visible
+first-terminal-wins rule without asking the server to parse encrypted command
+payloads.
+
 Finite Chat only records ordered segment boundaries. The app/runtime owns what a
 segment means for its prompt context or local memory. A Hermes bridge can map
 `conversation.segment.start` to Hermes' existing `/new` session reset behavior,

@@ -201,6 +201,7 @@ Proven survival scenarios:
 
 - `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
+- `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `command_ledger_survives_restart_after_request_before_execution`
 - `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
@@ -208,7 +209,9 @@ The survival harness now uses the shared `RuntimeCommandLedger` and typed
 runtime command payloads instead of a test-local JSON parser. This keeps the
 recovery proof tied to the production protocol shape: target policy is
 decrypted, command bodies are schema-tagged and bounded, conflicting request id
-reuse fails, and workers execute only after a durable ledger record exists.
+reuse fails, workers execute only after a durable ledger record exists, and
+terminal results record the accepted result message id and sequence instead of
+flipping an untracked status flag.
 The deterministic survival fuzzer mixes user messages, restart commands,
 gateway state changes, daemon restarts, and crash-after-ledger-write points.
 It asserts cursor monotonicity, bounded command ledger state, non-notifying
@@ -499,14 +502,17 @@ application payload behavior:
 - `runtime_command_request_validates_kind_body_and_target_policy`
 - `runtime_command_result_requires_terminal_shape_and_bounded_clears`
 - `runtime_command_ledger_records_after_decrypted_target_policy`
+- `runtime_command_result_is_idempotent_terminal_event`
+- `runtime_command_cancel_races_with_result_first_terminal_wins`
+- `runtime_command_cancel_validates_kind_reason_and_known_request`
+- `runtime_command_terminal_event_must_follow_request_sequence`
+- `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
 Still planned:
 
-- `runtime_command_result_is_durable_terminal_event`
-- `runtime_command_cancel_is_durable_and_races_with_result`
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
 - `runtime_command_retry_reuses_message_id_and_idempotency_key`
@@ -517,7 +523,6 @@ Still planned:
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
 - `runtime_state_snapshot_unknown_schema_is_preserved`
-- `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `runtime_state_slow_refresh_cadence_is_bounded`
 - `runtime_liveness_heartbeat_is_not_encrypted_runtime_state`
 - `runtime_config_commands_serialize_per_resource`

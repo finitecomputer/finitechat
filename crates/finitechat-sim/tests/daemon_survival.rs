@@ -3,9 +3,11 @@ use finitechat_engine::{
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
-    RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
-    RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
-    RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalStatusV1,
+    MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1,
+    RuntimeCommandLedger, RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1,
+    RuntimeCommandRequestV1, RuntimeCommandResultV1, RuntimeCommandTargetV1,
+    RuntimeCommandTerminalContext, RuntimeCommandTerminalDecision, RuntimeCommandTerminalStatusV1,
+    RuntimeStateSnapshotV1,
 };
 use finitechat_sim::{SimWorld, alice, bob};
 use serde_json::json;
@@ -91,31 +93,38 @@ impl FakeDaemon {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        assert!(pending.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
         for record in pending {
             if record.command == "finitecomputer.runtime.gateway.restart" {
                 self.gateway = GatewayState::Live;
-                append_application(
+                let result = runtime_command_result(&record.request_id);
+                let accepted = append_application(
                     server,
                     ApplicationAppend {
                         room_id: &self.room_id,
                         group_id: &self.group_id,
                         sender: self.device.clone(),
                         epoch: current_epoch(server, &self.room_id),
-                        payload: runtime_command_result_payload(&record.request_id),
+                        payload: runtime_command_result_payload(&result),
                         idempotency_key: format!("result_{}", record.request_id),
                         delivery_policy: DurableAppEventKind::RuntimeCommandResult
                             .delivery_policy(),
                     },
                 );
-                self.ledger
-                    .mark_terminal(
-                        &self.room_id,
-                        record.conversation_id.as_deref(),
-                        &record.sender,
-                        &record.request_id,
-                        RuntimeCommandLedgerStatus::Succeeded,
+                let decision = self
+                    .ledger
+                    .apply_result(
+                        RuntimeCommandTerminalContext {
+                            room_id: &self.room_id,
+                            conversation_id: record.conversation_id.as_deref(),
+                            request_sender: &record.sender,
+                            accepted_seq: accepted.seq,
+                            terminal_message_id: &accepted.message_id,
+                        },
+                        &result,
                     )
                     .unwrap();
+                assert_eq!(decision, RuntimeCommandTerminalDecision::Recorded);
             }
         }
     }
@@ -133,14 +142,7 @@ impl FakeDaemon {
                 group_id: &self.group_id,
                 sender: self.device.clone(),
                 epoch: current_epoch(server, &self.room_id),
-                payload: json!({
-                    "type": "runtime.state.snapshot",
-                    "state_key": "runtime.gateway",
-                    "revision": server.room(&self.room_id).unwrap().last_seq + 1,
-                    "status": status
-                })
-                .to_string()
-                .into_bytes(),
+                payload: runtime_gateway_snapshot_payload(server, &self.room_id, status),
                 idempotency_key: format!(
                     "gateway_state_{}",
                     server.room(&self.room_id).unwrap().last_seq + 1
@@ -185,6 +187,15 @@ fn daemon_starts_when_hermes_is_absent_and_restarts_gateway() {
             .status,
         RuntimeCommandLedgerStatus::Succeeded
     );
+    let result_seq = command_result_seq(&world.server, &world.room_id, "restart_1").unwrap();
+    let snapshot_seq = runtime_state_snapshot_seq_after(
+        &world.server,
+        &world.room_id,
+        "runtime.gateway",
+        result_seq,
+    )
+    .unwrap();
+    assert!(snapshot_seq > result_seq);
     assert_eq!(world.server.command_inbox_len(), 1);
     let snapshot_effect = world
         .server
@@ -226,6 +237,49 @@ fn hermes_hang_does_not_block_room_sync_or_state_snapshot() {
         .unwrap();
     assert!(!snapshot_effect.creates_push());
     assert_eq!(daemon.gateway, GatewayState::Hung);
+}
+
+#[test]
+fn runtime_state_command_result_publishes_post_mutation_snapshot() {
+    let mut world = world_with_runtime();
+    append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_command_request_payload("restart_snapshot"),
+            idempotency_key: "restart_snapshot".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    let result_seq = command_result_seq(&world.server, &world.room_id, "restart_snapshot").unwrap();
+    let snapshot =
+        runtime_state_snapshot_after(&world.server, &world.room_id, "runtime.gateway", result_seq)
+            .unwrap();
+    assert!(snapshot.seq > result_seq);
+    assert_eq!(
+        snapshot.snapshot.schema,
+        "finitecomputer.runtime.gateway.status.v1"
+    );
+    assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"live"}"#);
+    let snapshot_effect = world
+        .server
+        .application_effect(&snapshot.message_id)
+        .unwrap();
+    assert!(!snapshot_effect.creates_push());
+    assert!(!snapshot_effect.creates_unread());
+    assert!(!snapshot_effect.creates_command_inbox_work());
 }
 
 #[test]
@@ -479,8 +533,8 @@ fn runtime_command_request_payload(request_id: &str) -> Vec<u8> {
     serde_json::to_vec(&request).unwrap()
 }
 
-fn runtime_command_result_payload(request_id: &str) -> Vec<u8> {
-    let result = RuntimeCommandResultV1 {
+fn runtime_command_result(request_id: &str) -> RuntimeCommandResultV1 {
+    RuntimeCommandResultV1 {
         payload_kind: RuntimeCommandPayloadKindV1::Result,
         request_id: request_id.to_string(),
         status: RuntimeCommandTerminalStatusV1::Succeeded,
@@ -490,7 +544,85 @@ fn runtime_command_result_payload(request_id: &str) -> Vec<u8> {
         }),
         error: None,
         clears_activity: Vec::new(),
-    };
+    }
+}
+
+fn runtime_command_result_payload(result: &RuntimeCommandResultV1) -> Vec<u8> {
     result.validate_structure().unwrap();
     serde_json::to_vec(&result).unwrap()
+}
+
+fn runtime_gateway_snapshot_payload(
+    server: &DeliveryService,
+    room_id: &str,
+    status: &str,
+) -> Vec<u8> {
+    let revision = server.room(room_id).unwrap().last_seq + 1;
+    let observed_at_ms = revision * 1_000;
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.gateway".to_string(),
+        schema: "finitecomputer.runtime.gateway.status.v1".to_string(),
+        revision,
+        observed_at_ms,
+        expires_at_ms: observed_at_ms + 60_000,
+        status_payload: json!({ "status": status }).to_string().into_bytes(),
+    };
+    snapshot.validate_limits().unwrap();
+    serde_json::to_vec(&snapshot).unwrap()
+}
+
+fn command_result_seq(server: &DeliveryService, room_id: &str, request_id: &str) -> Option<u64> {
+    server
+        .room(room_id)?
+        .log
+        .iter()
+        .find(|entry| {
+            serde_json::from_slice::<RuntimeCommandResultV1>(&entry.envelope.payload)
+                .map(|result| result.request_id == request_id)
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.seq)
+}
+
+fn runtime_state_snapshot_seq_after(
+    server: &DeliveryService,
+    room_id: &str,
+    state_key: &str,
+    after_seq: u64,
+) -> Option<u64> {
+    runtime_state_snapshot_after(server, room_id, state_key, after_seq).map(|entry| entry.seq)
+}
+
+struct SnapshotLogEntry {
+    seq: u64,
+    message_id: String,
+    snapshot: RuntimeStateSnapshotV1,
+}
+
+fn runtime_state_snapshot_after(
+    server: &DeliveryService,
+    room_id: &str,
+    state_key: &str,
+    after_seq: u64,
+) -> Option<SnapshotLogEntry> {
+    server
+        .room(room_id)?
+        .log
+        .iter()
+        .filter_map(|entry| {
+            if entry.seq <= after_seq {
+                return None;
+            }
+            let snapshot =
+                serde_json::from_slice::<RuntimeStateSnapshotV1>(&entry.envelope.payload).ok()?;
+            if snapshot.state_key != state_key {
+                return None;
+            }
+            Some(SnapshotLogEntry {
+                seq: entry.seq,
+                message_id: entry.message_id.clone(),
+                snapshot,
+            })
+        })
+        .next()
 }
