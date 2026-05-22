@@ -620,9 +620,12 @@ metadata inside encrypted app payloads:
 - `attachment_roundtrips_through_memory_blob_store`
 - `attachment_reference_rejects_uppercase_hex`
 - `blossom_http_upload_request_uses_ciphertext_only`
+- `blossom_http_upload_request_rejects_tampered_prepared_ciphertext`
 - `blossom_http_upload_response_verifies_descriptor_before_reference`
+- `blossom_http_upload_response_rejects_descriptor_size_mismatch`
 - `blossom_http_upload_retries_next_server_after_failure`
 - `blossom_http_download_verifies_ciphertext_before_decrypt`
+- `blossom_http_download_rejects_http_error_before_body_validation`
 
 These are currently proven in `finitechat-blob` with a local
 Blossom-compatible memory store plus a Blossom-shaped HTTP request/response

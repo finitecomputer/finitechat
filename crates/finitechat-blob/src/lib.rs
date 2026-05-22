@@ -807,6 +807,22 @@ mod tests {
     }
 
     #[test]
+    fn blossom_http_upload_request_rejects_tampered_prepared_ciphertext() {
+        let mut prepared =
+            prepare_attachment_upload_with_material(b"hello", metadata(), fixed_material())
+                .expect("prepare");
+        prepared.ciphertext[0] ^= 0x01;
+
+        let err = prepare_blossom_upload_http_request(&prepared)
+            .expect_err("prepared ciphertext hash mismatch");
+
+        assert!(matches!(
+            err,
+            AttachmentBlobError::CiphertextHashMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn blossom_http_upload_response_verifies_descriptor_before_reference() {
         let prepared =
             prepare_attachment_upload_with_material(b"hello", metadata(), fixed_material())
@@ -841,6 +857,31 @@ mod tests {
         )
         .expect_err("bad status");
         assert_eq!(err, AttachmentBlobError::HttpStatus { status: 503 });
+    }
+
+    #[test]
+    fn blossom_http_upload_response_rejects_descriptor_size_mismatch() {
+        let prepared =
+            prepare_attachment_upload_with_material(b"hello", metadata(), fixed_material())
+                .expect("prepare");
+
+        let err = finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: 201,
+                descriptor: BlobDescriptor {
+                    url: "https://blob.example/wrong-size".to_string(),
+                    sha256: prepared.ciphertext_sha256.clone(),
+                    size_bytes: prepared.ciphertext_size + 1,
+                },
+            },
+        )
+        .expect_err("descriptor size mismatch");
+
+        assert!(matches!(
+            err,
+            AttachmentBlobError::BlobDescriptorSizeMismatch { .. }
+        ));
     }
 
     #[test]
@@ -919,6 +960,23 @@ mod tests {
             AttachmentBlobError::CiphertextSizeMismatch { .. }
                 | AttachmentBlobError::CiphertextHashMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn blossom_http_download_rejects_http_error_before_body_validation() {
+        let mut store = MemoryBlobStore::default();
+        let uploaded = upload_attachment(&mut store, b"secret bytes", metadata()).expect("upload");
+
+        let err = finish_blossom_download_http_response(
+            &uploaded.reference,
+            BlossomDownloadHttpResponse {
+                status: 404,
+                body: b"not the ciphertext",
+            },
+        )
+        .expect_err("http status wins");
+
+        assert_eq!(err, AttachmentBlobError::HttpStatus { status: 404 });
     }
 
     #[test]
