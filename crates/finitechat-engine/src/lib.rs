@@ -10,7 +10,7 @@ use finitechat_proto::{
     MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
     ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
     WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
-    validate_mls_group_id, validate_room_id, validate_string_bytes,
+    validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -267,6 +267,152 @@ pub struct SyncEventsPage {
     pub entries: Vec<RoomLogEntry>,
     pub next_after_seq: Seq,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomSyncProjection {
+    room_id: Option<RoomId>,
+    server_cursor: Seq,
+    highest_stream_hint: Seq,
+    applied_message_ids: Vec<MessageId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncProjectionApplyResult {
+    pub applied_entries: u32,
+    pub server_cursor: Seq,
+    pub needs_more_pull: bool,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum SyncProjectionError {
+    #[error("sync projection room mismatch: expected {expected}, actual {actual}")]
+    RoomMismatch { expected: RoomId, actual: RoomId },
+    #[error("sync page cursor {next_after_seq} is behind projection cursor {server_cursor}")]
+    CursorRewind {
+        server_cursor: Seq,
+        next_after_seq: Seq,
+    },
+    #[error("sync page entry {entry_seq} is not after projection cursor {server_cursor}")]
+    EntryAtOrBeforeCursor { server_cursor: Seq, entry_seq: Seq },
+    #[error("sync page entry order regressed from {previous_seq} to {entry_seq}")]
+    EntryOrderRegression { previous_seq: Seq, entry_seq: Seq },
+    #[error("sync page entry {entry_seq} is beyond page cursor {next_after_seq}")]
+    EntryBeyondPageCursor { entry_seq: Seq, next_after_seq: Seq },
+    #[error("sync page entry room mismatch: expected {expected}, actual {actual}")]
+    EntryRoomMismatch { expected: RoomId, actual: RoomId },
+    #[error(transparent)]
+    ProtocolLimit(#[from] ProtocolLimitError),
+}
+
+impl RoomSyncProjection {
+    pub fn server_cursor(&self) -> Seq {
+        self.server_cursor
+    }
+
+    pub fn highest_stream_hint(&self) -> Seq {
+        self.highest_stream_hint
+    }
+
+    pub fn needs_pull(&self) -> bool {
+        self.highest_stream_hint > self.server_cursor
+    }
+
+    pub fn applied_message_ids(&self) -> &[MessageId] {
+        &self.applied_message_ids
+    }
+
+    pub fn observe_stream_hint(
+        &mut self,
+        room_id: &str,
+        seq: Seq,
+    ) -> Result<bool, SyncProjectionError> {
+        self.ensure_room(room_id)?;
+        if seq > self.highest_stream_hint {
+            self.highest_stream_hint = seq;
+        }
+        assert!(self.highest_stream_hint >= self.server_cursor);
+        Ok(self.needs_pull())
+    }
+
+    pub fn apply_page(
+        &mut self,
+        room_id: &str,
+        page: &SyncEventsPage,
+    ) -> Result<SyncProjectionApplyResult, SyncProjectionError> {
+        self.ensure_room(room_id)?;
+        validate_item_count(
+            "sync_page.entries",
+            page.entries.len(),
+            MAX_SYNC_PAGE_ENTRIES,
+        )?;
+        if page.next_after_seq < self.server_cursor {
+            return Err(SyncProjectionError::CursorRewind {
+                server_cursor: self.server_cursor,
+                next_after_seq: page.next_after_seq,
+            });
+        }
+
+        let mut previous_seq = self.server_cursor;
+        for entry in &page.entries {
+            entry.envelope.validate_limits()?;
+            if entry.room_id != room_id {
+                return Err(SyncProjectionError::EntryRoomMismatch {
+                    expected: room_id.to_string(),
+                    actual: entry.room_id.clone(),
+                });
+            }
+            if entry.seq <= self.server_cursor {
+                return Err(SyncProjectionError::EntryAtOrBeforeCursor {
+                    server_cursor: self.server_cursor,
+                    entry_seq: entry.seq,
+                });
+            }
+            if entry.seq <= previous_seq {
+                return Err(SyncProjectionError::EntryOrderRegression {
+                    previous_seq,
+                    entry_seq: entry.seq,
+                });
+            }
+            if entry.seq > page.next_after_seq {
+                return Err(SyncProjectionError::EntryBeyondPageCursor {
+                    entry_seq: entry.seq,
+                    next_after_seq: page.next_after_seq,
+                });
+            }
+            previous_seq = entry.seq;
+        }
+
+        for entry in &page.entries {
+            self.applied_message_ids.push(entry.message_id.clone());
+        }
+        self.server_cursor = page.next_after_seq;
+        if self.highest_stream_hint < self.server_cursor {
+            self.highest_stream_hint = self.server_cursor;
+        }
+        assert!(self.highest_stream_hint >= self.server_cursor);
+        Ok(SyncProjectionApplyResult {
+            applied_entries: page.entries.len() as u32,
+            server_cursor: self.server_cursor,
+            needs_more_pull: page.has_more || self.needs_pull(),
+        })
+    }
+
+    fn ensure_room(&mut self, room_id: &str) -> Result<(), SyncProjectionError> {
+        validate_room_id(room_id)?;
+        match &self.room_id {
+            Some(existing) if existing != room_id => Err(SyncProjectionError::RoomMismatch {
+                expected: existing.clone(),
+                actual: room_id.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.room_id = Some(room_id.to_string());
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2181,6 +2327,107 @@ mod tests {
                 staged_welcomes: vec![staged_welcome("welcome_bob")],
             })
             .unwrap()
+    }
+
+    fn append_application_message(
+        service: &mut DeliveryService,
+        idempotency_key: &str,
+        payload: &[u8],
+    ) -> EventAccepted {
+        let epoch = service.room("room_1").unwrap().current_epoch;
+        service
+            .append_event(AppendEventRequest {
+                room_id: "room_1".to_string(),
+                sender: device("alice", "phone"),
+                envelope: envelope(
+                    "room_1",
+                    "group_1",
+                    device("alice", "phone"),
+                    epoch,
+                    LogEntryKind::Application,
+                    payload.to_vec(),
+                ),
+                idempotency_key: idempotency_key.to_string(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn sync_projection_advances_only_from_pull_pages_not_stream_hints() {
+        let mut service = service_with_room();
+        append_application_message(&mut service, "msg_1", b"one");
+        append_application_message(&mut service, "msg_2", b"two");
+        append_application_message(&mut service, "msg_3", b"three");
+        let expected_ids = service
+            .room("room_1")
+            .unwrap()
+            .log
+            .iter()
+            .map(|entry| entry.message_id.clone())
+            .collect::<Vec<_>>();
+
+        let mut projection = RoomSyncProjection::default();
+        assert!(projection.observe_stream_hint("room_1", 3).unwrap());
+        assert_eq!(projection.server_cursor(), 0);
+        assert!(projection.applied_message_ids().is_empty());
+
+        let page = service
+            .sync_events("room_1", &device("alice", "phone"), 0)
+            .unwrap();
+        let applied = projection.apply_page("room_1", &page).unwrap();
+        assert_eq!(applied.applied_entries, 3);
+        assert_eq!(applied.server_cursor, 3);
+        assert!(!applied.needs_more_pull);
+        assert_eq!(projection.applied_message_ids(), expected_ids.as_slice());
+
+        assert!(!projection.observe_stream_hint("room_1", 2).unwrap());
+        assert_eq!(projection.server_cursor(), 3);
+    }
+
+    #[test]
+    fn sync_projection_rejects_replayed_or_wrong_room_pages() {
+        let mut service = service_with_room();
+        append_application_message(&mut service, "msg_1", b"one");
+        let page = service
+            .sync_events("room_1", &device("alice", "phone"), 0)
+            .unwrap();
+        let mut projection = RoomSyncProjection::default();
+        projection.apply_page("room_1", &page).unwrap();
+
+        assert!(matches!(
+            projection.apply_page("room_1", &page).unwrap_err(),
+            SyncProjectionError::CursorRewind { .. }
+                | SyncProjectionError::EntryAtOrBeforeCursor { .. }
+        ));
+        assert!(matches!(
+            projection
+                .observe_stream_hint("other_room", 10)
+                .unwrap_err(),
+            SyncProjectionError::RoomMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn sync_projection_rebuilds_same_view_after_restart() {
+        let mut service = service_with_room();
+        append_application_message(&mut service, "msg_1", b"one");
+        append_application_message(&mut service, "msg_2", b"two");
+        append_application_message(&mut service, "msg_3", b"three");
+
+        let mut first = RoomSyncProjection::default();
+        let first_page = service
+            .sync_events("room_1", &device("alice", "phone"), 0)
+            .unwrap();
+        first.apply_page("room_1", &first_page).unwrap();
+
+        let mut rebuilt = RoomSyncProjection::default();
+        let replay_page = service
+            .sync_events("room_1", &device("alice", "phone"), 0)
+            .unwrap();
+        rebuilt.apply_page("room_1", &replay_page).unwrap();
+
+        assert_eq!(rebuilt.server_cursor(), first.server_cursor());
+        assert_eq!(rebuilt.applied_message_ids(), first.applied_message_ids());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -399,12 +399,15 @@ impl AttachmentBlobReferenceV1 {
 
 impl RuntimeStateSnapshotV1 {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("runtime_state.state_key", self.state_key.len())?;
         validate_string_bytes(
             "runtime_state.state_key",
             &self.state_key,
             MAX_OBJECT_ID_BYTES,
         )?;
+        validate_bytes_non_empty("runtime_state.schema", self.schema.len())?;
         validate_string_bytes("runtime_state.schema", &self.schema, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_non_empty("runtime_state.status_payload", self.status_payload.len())?;
         validate_bytes_len(
             "runtime_state.status_payload",
             self.status_payload.len(),
@@ -416,6 +419,35 @@ impl RuntimeStateSnapshotV1 {
     pub fn is_expired_at(&self, now_ms: u64) -> bool {
         now_ms >= self.expires_at_ms
     }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RuntimeStateProjectionError {
+    #[error(
+        "runtime state snapshot is missing for room {room_id}, source {source_device:?}, key {state_key}"
+    )]
+    Missing {
+        room_id: RoomId,
+        source_device: DeviceRef,
+        state_key: RuntimeStateKey,
+    },
+    #[error("runtime state snapshot {state_key} has schema {actual:?}, expected {expected:?}")]
+    WrongSchema {
+        state_key: RuntimeStateKey,
+        expected: String,
+        actual: String,
+    },
+    #[error("runtime state snapshot {state_key} expired at {expires_at_ms}, now {now_ms}")]
+    Expired {
+        state_key: RuntimeStateKey,
+        now_ms: u64,
+        expires_at_ms: u64,
+    },
+    #[error("runtime state snapshot {state_key} has malformed payload")]
+    MalformedPayload { state_key: RuntimeStateKey },
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +493,59 @@ impl RuntimeStateProjection {
     ) -> Option<&RuntimeStateProjectionEntry> {
         let key = runtime_state_projection_key(room_id, source, state_key).ok()?;
         self.entries.get(&key)
+    }
+
+    pub fn require_fresh(
+        &self,
+        room_id: &str,
+        source: &DeviceRef,
+        state_key: &str,
+        expected_schema: &str,
+        now_ms: u64,
+    ) -> Result<&RuntimeStateProjectionEntry, RuntimeStateProjectionError> {
+        validate_room_id(room_id)?;
+        source.validate_limits()?;
+        validate_string_bytes("runtime_state.state_key", state_key, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_non_empty("runtime_state.schema", expected_schema.len())?;
+        validate_string_bytes("runtime_state.schema", expected_schema, MAX_OBJECT_ID_BYTES)?;
+        let entry = self.get(room_id, source, state_key).ok_or_else(|| {
+            RuntimeStateProjectionError::Missing {
+                room_id: room_id.to_string(),
+                source_device: source.clone(),
+                state_key: state_key.to_string(),
+            }
+        })?;
+        if entry.snapshot.schema != expected_schema {
+            return Err(RuntimeStateProjectionError::WrongSchema {
+                state_key: state_key.to_string(),
+                expected: expected_schema.to_string(),
+                actual: entry.snapshot.schema.clone(),
+            });
+        }
+        if entry.snapshot.is_expired_at(now_ms) {
+            return Err(RuntimeStateProjectionError::Expired {
+                state_key: state_key.to_string(),
+                now_ms,
+                expires_at_ms: entry.snapshot.expires_at_ms,
+            });
+        }
+        Ok(entry)
+    }
+
+    pub fn require_fresh_json<T: DeserializeOwned>(
+        &self,
+        room_id: &str,
+        source: &DeviceRef,
+        state_key: &str,
+        expected_schema: &str,
+        now_ms: u64,
+    ) -> Result<T, RuntimeStateProjectionError> {
+        let entry = self.require_fresh(room_id, source, state_key, expected_schema, now_ms)?;
+        serde_json::from_slice(&entry.snapshot.status_payload).map_err(|_| {
+            RuntimeStateProjectionError::MalformedPayload {
+                state_key: state_key.to_string(),
+            }
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -1059,6 +1144,166 @@ mod tests {
         assert_eq!(current.snapshot.status_payload, br#"{"unrecognized":true}"#);
         assert!(!current.snapshot.is_expired_at(1_999));
         assert!(current.snapshot.is_expired_at(2_000));
+    }
+
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct GatewayStatus {
+        status: String,
+    }
+
+    #[test]
+    fn runtime_state_projection_requires_fresh_matching_schema() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                1,
+                10,
+                br#"{"status":"down"}"#,
+            ))
+            .unwrap();
+
+        let status: GatewayStatus = projection
+            .require_fresh_json(
+                "room_1",
+                &source,
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                1_999,
+            )
+            .unwrap();
+
+        assert_eq!(
+            status,
+            GatewayStatus {
+                status: "down".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_state_projection_fails_loudly_for_missing_stale_wrong_or_malformed_status() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+        assert_eq!(
+            projection
+                .require_fresh(
+                    "room_1",
+                    &source,
+                    "runtime.gateway",
+                    "finitecomputer.runtime.gateway.status.v1",
+                    1_500,
+                )
+                .unwrap_err(),
+            RuntimeStateProjectionError::Missing {
+                room_id: "room_1".to_string(),
+                source_device: source.clone(),
+                state_key: "runtime.gateway".to_string(),
+            }
+        );
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                1,
+                10,
+                br#"{"status":"down"}"#,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            projection
+                .require_fresh(
+                    "room_1",
+                    &source,
+                    "runtime.gateway",
+                    "finitecomputer.runtime.gateway.status.v1",
+                    2_000,
+                )
+                .unwrap_err(),
+            RuntimeStateProjectionError::Expired { .. }
+        ));
+        assert!(matches!(
+            projection
+                .require_fresh(
+                    "room_1",
+                    &source,
+                    "runtime.gateway",
+                    "finitecomputer.runtime.gateway.status.v2",
+                    1_500,
+                )
+                .unwrap_err(),
+            RuntimeStateProjectionError::WrongSchema { .. }
+        ));
+
+        projection
+            .apply(runtime_state_entry(
+                "room_1",
+                source.clone(),
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                2,
+                11,
+                b"not json",
+            ))
+            .unwrap();
+        let err = projection
+            .require_fresh_json::<GatewayStatus>(
+                "room_1",
+                &source,
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                1_500,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RuntimeStateProjectionError::MalformedPayload {
+                state_key: "runtime.gateway".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_state_snapshot_rejects_empty_key_schema_or_payload() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+
+        for (state_key, schema, payload) in [
+            (
+                "",
+                "finitecomputer.runtime.gateway.status.v1",
+                b"{}".as_slice(),
+            ),
+            ("runtime.gateway", "", b"{}".as_slice()),
+            (
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                b"".as_slice(),
+            ),
+        ] {
+            assert!(matches!(
+                projection
+                    .apply(runtime_state_entry(
+                        "room_1",
+                        source.clone(),
+                        state_key,
+                        schema,
+                        1,
+                        10,
+                        payload,
+                    ))
+                    .unwrap_err(),
+                ProtocolLimitError::BytesEmpty { .. }
+            ));
+        }
     }
 
     fn runtime_state_entry(

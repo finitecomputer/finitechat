@@ -363,6 +363,13 @@ Good tests:
   activation-before-ack crashes as pending ack state, Welcome ack is
   idempotent, ordered room sync persists MLS state and cursor together, and
   replay does not reprocess applied entries.
+- `RoomSyncProjection` makes stream/push hints non-authoritative: hints can
+  request pull sync, but only bounded `sync_events` pages advance the cursor or
+  apply entries. Replayed or wrong-room pages fail closed.
+- Runtime state projection has a typed freshness gate for dashboard-style
+  reads: callers must name the state key, schema, and current time; missing,
+  stale, schema-mismatched, and malformed payloads are errors, not reasons to
+  create status command work.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

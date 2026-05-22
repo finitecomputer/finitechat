@@ -167,7 +167,8 @@ must use a namespaced value such as `finitecomputer.indexing` or
   should be optional by client or account policy.
 - V1 transport uses HTTP mutations, cursor-based pull sync, and SSE hints.
   Streams and push wakes are never authoritative; clients repair gaps through
-  bounded sync pages.
+  bounded sync pages. A stream hint can make a client pull; it must not advance
+  the applied cursor or directly execute command work.
 - Attachment blobs are encrypted before upload to a Blossom-compatible blob
   service. Blob encryption protects bytes stored outside MLS; the room message
   still uses MLS for the attachment reference and metadata.

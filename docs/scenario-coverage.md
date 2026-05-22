@@ -501,16 +501,35 @@ bridge adapters are unhealthy:
 - `broken_gateway_poll_does_not_block_welcome_ack`
 - `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
-## Planned Transport Scenarios
+## Transport Scenarios
 
 V1 transport should prove streams are hints and pull sync is authoritative:
 
 - `http_post_append_retries_are_idempotent`
-- `sse_hint_triggers_sync_without_advancing_cursor`
+- `sync_projection_advances_only_from_pull_pages_not_stream_hints`
 - `sse_drop_duplicate_reorder_repairs_by_pull_sync`
+- `sync_projection_rejects_replayed_or_wrong_room_pages`
+- `sync_projection_rebuilds_same_view_after_restart`
 - `stream_callback_never_executes_command_directly`
 - `websocket_transport_not_required_for_v1`
 - `push_wake_and_sse_share_hint_only_semantics`
+
+`RoomSyncProjection` now gives clients a small protocol-shaped state machine for
+this rule: stream/SSE/push hints only set `needs_pull`; only bounded
+`sync_events` pages can advance the cursor or apply room-log entries.
+
+## Runtime Status Snapshot Scenarios
+
+Runtime status is encrypted application state, not request/response RPC:
+
+- `runtime_state_projection_requires_fresh_matching_schema`
+- `runtime_state_projection_fails_loudly_for_missing_stale_wrong_or_malformed_status`
+- `runtime_state_snapshot_rejects_empty_key_schema_or_payload`
+- `runtime_state_snapshot_is_durable_but_push_never`
+
+The typed projection read path rejects missing, stale, schema-mismatched, and
+malformed payloads without issuing command work. Page loads should read this
+projection or fail loudly; an explicit refresh remains a command.
 
 ## Planned Chat Payload Scenarios
 
