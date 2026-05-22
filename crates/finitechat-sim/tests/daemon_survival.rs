@@ -43,6 +43,7 @@ struct FakeDaemon {
     ledger: RuntimeCommandLedger,
     last_snapshot_message_id: Option<String>,
     crash_after_recording_first_request: bool,
+    crash_after_gateway_execution_before_result: bool,
 }
 
 impl FakeDaemon {
@@ -58,6 +59,7 @@ impl FakeDaemon {
             ledger: RuntimeCommandLedger::default(),
             last_snapshot_message_id: None,
             crash_after_recording_first_request: false,
+            crash_after_gateway_execution_before_result: false,
         }
     }
 
@@ -122,7 +124,13 @@ impl FakeDaemon {
                     let result = if self.gateway == GatewayState::RestartFails {
                         runtime_command_failed_result(&record.request_id)
                     } else {
-                        self.gateway = GatewayState::Live;
+                        if self.gateway != GatewayState::Live {
+                            self.gateway = GatewayState::Live;
+                            if self.crash_after_gateway_execution_before_result {
+                                self.crash_after_gateway_execution_before_result = false;
+                                return;
+                            }
+                        }
                         runtime_command_result(&record.request_id)
                     };
                     self.append_runtime_command_result(server, &record, &result);
@@ -885,6 +893,88 @@ fn command_ledger_survives_restart_after_request_before_execution() {
             .unwrap()
             .status,
         RuntimeCommandLedgerStatus::Succeeded
+    );
+}
+
+#[test]
+fn command_ledger_survives_restart_after_execution_before_result() {
+    let mut world = world_with_runtime();
+    append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_command_request_payload("restart_after_execution_crash"),
+            idempotency_key: "restart_after_execution_crash".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+    daemon.crash_after_gateway_execution_before_result = true;
+
+    daemon.sync_tick(&mut world.server);
+
+    assert_eq!(daemon.gateway, GatewayState::Live);
+    assert_eq!(
+        daemon
+            .ledger
+            .get(
+                &world.room_id,
+                None,
+                &alice(),
+                "restart_after_execution_crash"
+            )
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Pending
+    );
+    assert_eq!(
+        runtime_command_result_count(
+            &world.server,
+            &world.room_id,
+            "restart_after_execution_crash"
+        ),
+        0
+    );
+
+    let mut restarted = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Live,
+    )
+    .with_persisted_ledger(daemon.ledger, daemon.after_seq);
+
+    restarted.sync_tick(&mut world.server);
+
+    assert_eq!(restarted.gateway, GatewayState::Live);
+    assert_eq!(
+        restarted
+            .ledger
+            .get(
+                &world.room_id,
+                None,
+                &alice(),
+                "restart_after_execution_crash"
+            )
+            .unwrap()
+            .status,
+        RuntimeCommandLedgerStatus::Succeeded
+    );
+    assert_eq!(
+        runtime_command_result_count(
+            &world.server,
+            &world.room_id,
+            "restart_after_execution_crash"
+        ),
+        1
     );
 }
 
