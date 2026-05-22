@@ -510,6 +510,8 @@ application payload behavior:
 - `runtime_command_terminal_event_must_follow_request_sequence`
 - `runtime_command_result_clears_matching_activity`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
+- `runtime_command_retry_reuses_message_id_and_idempotency_key`
+- `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
@@ -518,8 +520,6 @@ Still planned:
 
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
-- `runtime_command_retry_reuses_message_id_and_idempotency_key`
-- `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
 - `runtime_stream_callback_only_triggers_sync`
 - `dashboard_status_page_load_reads_projection_without_command`
 - `explicit_status_refresh_uses_runtime_command_without_push`

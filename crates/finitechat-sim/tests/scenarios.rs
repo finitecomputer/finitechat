@@ -2049,6 +2049,61 @@ fn runtime_command_request_creates_command_inbox_work() {
 }
 
 #[test]
+fn runtime_command_retry_reuses_message_id_and_idempotency_key() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1"}"#,
+        "command_request_retry_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+
+    let accepted = world
+        .server
+        .append_application_event(request.clone())
+        .unwrap();
+    let replayed = world.server.append_application_event(request).unwrap();
+
+    assert_eq!(replayed, accepted);
+    assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 1);
+    assert_eq!(world.server.command_inbox_len(), 1);
+}
+
+#[test]
+fn runtime_command_duplicate_message_with_new_idempotency_key_rejects() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let first = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1"}"#,
+        "command_request_original",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+    let duplicate = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1"}"#,
+        "command_request_duplicate",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+    let message_id = first.event.envelope.message_id().unwrap();
+
+    world.server.append_application_event(first).unwrap();
+    let err = world
+        .server
+        .append_application_event(duplicate)
+        .unwrap_err();
+
+    assert_eq!(err, EngineError::DuplicateMessageId(message_id));
+    assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 1);
+    assert_eq!(world.server.command_inbox_len(), 1);
+}
+
+#[test]
 fn conversation_segment_start_is_durable_but_push_never() {
     let mut world = SimWorld::direct_room().unwrap();
     let request = application_event_request(
