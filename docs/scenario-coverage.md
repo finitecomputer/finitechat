@@ -169,6 +169,11 @@ kinds. Proven unit scenarios:
 - `activity_refresh_extends_matching_device_expiry`
 - `durable_terminal_clear_is_sender_and_activity_scoped`
 - `activity_projection_expires_and_rejects_bad_lease_windows`
+- `topic_message_routes_by_conversation_id`
+- `first_message_lazily_materializes_missing_conversation`
+- `new_command_inside_topic_starts_segment_not_conversation`
+- `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
+- `archiving_topic_does_not_archive_sibling_topic`
 
 The in-memory and SQLite stores now record delivery effects separately from
 opaque MLS payload bytes. This proves that Finite Chat can enforce
@@ -568,21 +573,27 @@ The typed projection read path rejects missing, stale, schema-mismatched, and
 malformed payloads without issuing command work. Page loads should read this
 projection or fail loudly; an explicit refresh remains a command.
 
-## Planned Chat Payload Scenarios
+## Chat Payload Scenarios
 
 Generic chat payload semantics should stay small and non-notifying where
 appropriate:
 
 - `chat_receipt_is_encrypted_payload_semantics`
-- `conversation_create_is_explicit_durable_event`
+- `conversation_segment_start_is_durable_but_push_never`
+- `topic_message_routes_by_conversation_id`
 - `first_message_lazily_materializes_missing_conversation`
+- `new_command_inside_topic_starts_segment_not_conversation`
+- `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
+- `archiving_topic_does_not_archive_sibling_topic`
+
+Still planned:
+
+- `conversation_create_is_explicit_durable_event`
 - `reaction_edit_and_receipt_do_not_push_by_default`
 - `topic_create_is_conversation_create_with_topic_metadata`
-- `topic_message_routes_by_conversation_id`
 - `topic_activity_is_scoped_by_conversation_id`
 - `telegram_thread_id_imports_to_topic_conversation_id`
 - `topic_skill_binding_is_encrypted_conversation_metadata`
-- `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_is_projected_without_protocol_managed_prompt_state`
 
 ## Attachment Scenarios

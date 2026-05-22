@@ -65,6 +65,9 @@ or encryption boundary.
 
 A bounded context window inside a conversation. A `/new` command inside an
 existing topic starts a new segment, not a new conversation or room.
+Finite Chat records only the durable segment boundary and current active
+segment id. The app/runtime owns prompt trimming, memory selection, and any
+Hermes session reset mapped from that boundary.
 
 `Room Server`
 
@@ -197,6 +200,9 @@ These are protocol constants, not tuning hints:
 - attachment plaintext: `32 MiB`;
 - runtime state snapshot payload: `64 KiB`;
 - runtime state keys per room/device: `128`;
+- conversation projection entries per client: `4096`;
+- segments per conversation: `1024`;
+- conversation segment payload: `16 KiB`;
 - runtime command JSON payload: `128 KiB`;
 - runtime command activity clears per result: `16`;
 - runtime command ledger records per daemon/client: `1024`;
@@ -418,6 +424,13 @@ Conversation creation should be explicit when the sender can do so. A client may
 lazily materialize a conversation when it sees the first durable event for an
 unknown `conversation_id`, but explicit `conversation.create` is preferred for
 clear ordering and projection behavior.
+
+Clients project topics by `(room_id, conversation_id)`. A
+`conversation.create` explicitly creates the topic; a first `chat.message` with
+a new `conversation_id` may lazily materialize it for simple clients and
+imports. `conversation.archive` is scoped to that one topic. A
+`conversation.segment.start` requires `conversation_id`, adds a bounded segment
+record to that topic, and updates `active_segment_id`.
 
 `conversation.segment.start` is used when an app wants a fresh context inside an
 existing topic, for example Hermes `/new` in a Telegram topic. It is a durable

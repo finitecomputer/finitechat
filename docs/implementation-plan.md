@@ -388,6 +388,10 @@ Good tests:
   crash-after-ledger-write points. It keeps sync cursors monotonic, command
   ledgers bounded, snapshots non-notifying, and pending recovery work
   eventually empty.
+- Topic/segment projection is now executable: clients project conversations by
+  `(room_id, conversation_id)`, can lazily materialize a topic from the first
+  message, archive one topic without siblings, and apply `/new` as a bounded
+  segment boundary inside the existing topic.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

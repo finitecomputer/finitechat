@@ -15,6 +15,7 @@ pub type WelcomeId = String;
 pub type LeaseToken = String;
 pub type IdempotencyKey = String;
 pub type ConversationId = String;
+pub type ConversationSegmentId = String;
 pub type RuntimeStateKey = String;
 pub type RuntimeCommandRequestId = String;
 pub type RuntimeCommandName = String;
@@ -51,6 +52,9 @@ pub const MAX_ATTACHMENT_KEY_HEX_BYTES: u32 = 64;
 pub const MAX_ATTACHMENT_NONCE_HEX_BYTES: u32 = 24;
 pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
+pub const MAX_CONVERSATION_PROJECTION_ENTRIES: u32 = 4096;
+pub const MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION: u32 = 1024;
+pub const MAX_CONVERSATION_SEGMENT_PAYLOAD_BYTES: u32 = 16 * 1024;
 pub const MAX_RUNTIME_COMMAND_PAYLOAD_BYTES: u32 = 128 * 1024;
 pub const MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES: u32 = 2048;
 pub const MAX_RUNTIME_COMMAND_ACTIVITY_CLEARS: u32 = 16;
@@ -96,6 +100,9 @@ const _: () = {
     assert!(MAX_ATTACHMENT_NONCE_HEX_BYTES == 24);
     assert!(MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
+    assert!(MAX_CONVERSATION_PROJECTION_ENTRIES > 0);
+    assert!(MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION > 0);
+    assert!(MAX_CONVERSATION_SEGMENT_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES < MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES > 0);
@@ -483,6 +490,67 @@ pub struct RuntimeStateProjection {
     entries: BTreeMap<String, RuntimeStateProjectionEntry>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ConversationProjectionEventContext<'a> {
+    pub room_id: &'a str,
+    pub accepted_seq: Seq,
+    pub conversation_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSegmentStartV1 {
+    pub segment_id: ConversationSegmentId,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSegmentProjectionRecord {
+    pub segment_id: ConversationSegmentId,
+    pub started_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationProjectionEntry {
+    pub room_id: RoomId,
+    pub conversation_id: ConversationId,
+    pub created_seq: Seq,
+    pub updated_seq: Seq,
+    pub archived: bool,
+    pub active_segment_id: Option<ConversationSegmentId>,
+    pub segments: Vec<ConversationSegmentProjectionRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationProjection {
+    entries: BTreeMap<String, ConversationProjectionEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationProjectionDecision {
+    Ignored,
+    Created,
+    CreatedByMessage,
+    Updated,
+    Archived,
+    SegmentStarted,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ConversationProjectionError {
+    #[error("conversation event {kind:?} requires conversation_id")]
+    MissingConversationId { kind: DurableAppEventKind },
+    #[error("conversation segment payload is malformed")]
+    MalformedSegmentPayload,
+    #[error("conversation segment id already exists: {segment_id}")]
+    DuplicateSegment { segment_id: ConversationSegmentId },
+    #[error("conversation projection capacity exceeded: max {max_records}")]
+    CapacityExceeded { max_records: u32 },
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeCommandPayloadKindV1 {
     #[serde(rename = "runtime.command.request")]
@@ -793,6 +861,189 @@ impl RuntimeStateProjection {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+impl ConversationProjectionEventContext<'_> {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_room_id(self.room_id)?;
+        if let Some(conversation_id) = self.conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+            validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+impl ConversationSegmentStartV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("conversation_segment.segment_id", self.segment_id.len())?;
+        validate_string_bytes(
+            "conversation_segment.segment_id",
+            &self.segment_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(reason) = &self.reason {
+            validate_bytes_non_empty("conversation_segment.reason", reason.len())?;
+            validate_string_bytes("conversation_segment.reason", reason, MAX_OBJECT_ID_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+impl ConversationProjection {
+    pub fn apply_event(
+        &mut self,
+        context: ConversationProjectionEventContext<'_>,
+        event: &DecryptedApplicationEventV1,
+    ) -> Result<ConversationProjectionDecision, ConversationProjectionError> {
+        context.validate_limits()?;
+        event.validate_limits()?;
+        match event.kind {
+            DurableAppEventKind::ConversationCreate => {
+                let conversation_id = required_conversation_id(&context, &event.kind)?;
+                self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
+                let entry = self
+                    .entry_mut(context.room_id, conversation_id)
+                    .expect("conversation was ensured before update");
+                entry.updated_seq = context.accepted_seq;
+                entry.archived = false;
+                Ok(ConversationProjectionDecision::Created)
+            }
+            DurableAppEventKind::ConversationUpdate => {
+                let conversation_id = required_conversation_id(&context, &event.kind)?;
+                self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
+                let entry = self
+                    .entry_mut(context.room_id, conversation_id)
+                    .expect("conversation was ensured before update");
+                entry.updated_seq = context.accepted_seq;
+                Ok(ConversationProjectionDecision::Updated)
+            }
+            DurableAppEventKind::ConversationArchive => {
+                let conversation_id = required_conversation_id(&context, &event.kind)?;
+                self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
+                let entry = self
+                    .entry_mut(context.room_id, conversation_id)
+                    .expect("conversation was ensured before archive");
+                entry.updated_seq = context.accepted_seq;
+                entry.archived = true;
+                Ok(ConversationProjectionDecision::Archived)
+            }
+            DurableAppEventKind::ConversationSegmentStart => {
+                let conversation_id = required_conversation_id(&context, &event.kind)?;
+                let segment = parse_segment_start(&event.payload)?;
+                self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
+                let entry = self
+                    .entry_mut(context.room_id, conversation_id)
+                    .expect("conversation was ensured before segment");
+                validate_item_count(
+                    "conversation.segments",
+                    entry.segments.len() + 1,
+                    MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION,
+                )?;
+                if entry
+                    .segments
+                    .iter()
+                    .any(|record| record.segment_id == segment.segment_id)
+                {
+                    return Err(ConversationProjectionError::DuplicateSegment {
+                        segment_id: segment.segment_id,
+                    });
+                }
+                entry.segments.push(ConversationSegmentProjectionRecord {
+                    segment_id: segment.segment_id.clone(),
+                    started_seq: context.accepted_seq,
+                });
+                entry.active_segment_id = Some(segment.segment_id);
+                entry.updated_seq = context.accepted_seq;
+                assert!(
+                    entry.segments.len() <= MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION as usize
+                );
+                Ok(ConversationProjectionDecision::SegmentStarted)
+            }
+            DurableAppEventKind::ChatMessage => {
+                if let Some(conversation_id) = context.conversation_id {
+                    let existed = self.get(context.room_id, conversation_id).is_some();
+                    self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
+                    let entry = self
+                        .entry_mut(context.room_id, conversation_id)
+                        .expect("conversation was ensured before message");
+                    entry.updated_seq = context.accepted_seq;
+                    if existed {
+                        Ok(ConversationProjectionDecision::Updated)
+                    } else {
+                        Ok(ConversationProjectionDecision::CreatedByMessage)
+                    }
+                } else {
+                    Ok(ConversationProjectionDecision::Ignored)
+                }
+            }
+            DurableAppEventKind::ChatEdit
+            | DurableAppEventKind::ChatReaction
+            | DurableAppEventKind::ChatReceipt
+            | DurableAppEventKind::RuntimeStateSnapshot
+            | DurableAppEventKind::RuntimeCommandRequest
+            | DurableAppEventKind::RuntimeCommandResult
+            | DurableAppEventKind::RuntimeCommandCancel
+            | DurableAppEventKind::Namespaced { .. } => Ok(ConversationProjectionDecision::Ignored),
+        }
+    }
+
+    pub fn get(
+        &self,
+        room_id: &str,
+        conversation_id: &str,
+    ) -> Option<&ConversationProjectionEntry> {
+        let key = conversation_projection_key(room_id, conversation_id).ok()?;
+        self.entries.get(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn ensure_entry(
+        &mut self,
+        room_id: &str,
+        conversation_id: &str,
+        accepted_seq: Seq,
+    ) -> Result<(), ConversationProjectionError> {
+        let key = conversation_projection_key(room_id, conversation_id)?;
+        if self.entries.contains_key(&key) {
+            return Ok(());
+        }
+        if self.entries.len() >= MAX_CONVERSATION_PROJECTION_ENTRIES as usize {
+            return Err(ConversationProjectionError::CapacityExceeded {
+                max_records: MAX_CONVERSATION_PROJECTION_ENTRIES,
+            });
+        }
+        self.entries.insert(
+            key,
+            ConversationProjectionEntry {
+                room_id: room_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                created_seq: accepted_seq,
+                updated_seq: accepted_seq,
+                archived: false,
+                active_segment_id: None,
+                segments: Vec::new(),
+            },
+        );
+        assert!(self.entries.len() <= MAX_CONVERSATION_PROJECTION_ENTRIES as usize);
+        Ok(())
+    }
+
+    fn entry_mut(
+        &mut self,
+        room_id: &str,
+        conversation_id: &str,
+    ) -> Option<&mut ConversationProjectionEntry> {
+        let key = conversation_projection_key(room_id, conversation_id).ok()?;
+        self.entries.get_mut(&key)
     }
 }
 
@@ -1664,6 +1915,44 @@ fn runtime_state_projection_key(
     ))
 }
 
+fn conversation_projection_key(
+    room_id: &str,
+    conversation_id: &str,
+) -> Result<String, ProtocolLimitError> {
+    validate_room_id(room_id)?;
+    validate_bytes_non_empty("conversation_id", conversation_id.len())?;
+    validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
+    Ok(format!(
+        "{}|{}",
+        length_prefixed(room_id),
+        length_prefixed(conversation_id)
+    ))
+}
+
+fn required_conversation_id<'a>(
+    context: &'a ConversationProjectionEventContext<'_>,
+    kind: &DurableAppEventKind,
+) -> Result<&'a str, ConversationProjectionError> {
+    context
+        .conversation_id
+        .ok_or_else(|| ConversationProjectionError::MissingConversationId { kind: kind.clone() })
+}
+
+fn parse_segment_start(
+    payload: &[u8],
+) -> Result<ConversationSegmentStartV1, ConversationProjectionError> {
+    validate_bytes_non_empty("conversation_segment.payload", payload.len())?;
+    validate_bytes_len(
+        "conversation_segment.payload",
+        payload.len(),
+        MAX_CONVERSATION_SEGMENT_PAYLOAD_BYTES,
+    )?;
+    let segment = serde_json::from_slice::<ConversationSegmentStartV1>(payload)
+        .map_err(|_| ConversationProjectionError::MalformedSegmentPayload)?;
+    segment.validate_limits()?;
+    Ok(segment)
+}
+
 fn runtime_command_ledger_key(
     room_id: &str,
     conversation_id: Option<&str>,
@@ -2533,6 +2822,150 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn topic_message_routes_by_conversation_id() {
+        let mut projection = ConversationProjection::default();
+        projection
+            .apply_event(
+                conversation_context("room_1", 1, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_agent"),
+                    b"{}",
+                ),
+            )
+            .unwrap();
+
+        let decision = projection
+            .apply_event(
+                conversation_context("room_1", 2, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ChatMessage,
+                    Some("topic_agent"),
+                    b"hello",
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_agent").unwrap();
+
+        assert_eq!(decision, ConversationProjectionDecision::Updated);
+        assert_eq!(topic.created_seq, 1);
+        assert_eq!(topic.updated_seq, 2);
+        assert!(!topic.archived);
+    }
+
+    #[test]
+    fn first_message_lazily_materializes_missing_conversation() {
+        let mut projection = ConversationProjection::default();
+
+        let decision = projection
+            .apply_event(
+                conversation_context("room_1", 7, Some("topic_new")),
+                &application_event(
+                    DurableAppEventKind::ChatMessage,
+                    Some("topic_new"),
+                    b"hello",
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_new").unwrap();
+
+        assert_eq!(decision, ConversationProjectionDecision::CreatedByMessage);
+        assert_eq!(projection.len(), 1);
+        assert_eq!(topic.created_seq, 7);
+        assert_eq!(topic.updated_seq, 7);
+    }
+
+    #[test]
+    fn new_command_inside_topic_starts_segment_not_conversation() {
+        let mut projection = ConversationProjection::default();
+        projection
+            .apply_event(
+                conversation_context("room_1", 1, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_agent"),
+                    b"{}",
+                ),
+            )
+            .unwrap();
+
+        let decision = projection
+            .apply_event(
+                conversation_context("room_1", 4, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationSegmentStart,
+                    Some("topic_agent"),
+                    br#"{"segment_id":"segment_2","reason":"slash_new"}"#,
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_agent").unwrap();
+
+        assert_eq!(decision, ConversationProjectionDecision::SegmentStarted);
+        assert_eq!(projection.len(), 1);
+        assert_eq!(topic.active_segment_id.as_deref(), Some("segment_2"));
+        assert_eq!(topic.segments.len(), 1);
+        assert_eq!(topic.segments[0].started_seq, 4);
+    }
+
+    #[test]
+    fn segment_boundary_rejects_missing_conversation_id_or_bad_payload() {
+        let mut projection = ConversationProjection::default();
+        assert!(matches!(
+            projection
+                .apply_event(
+                    conversation_context("room_1", 4, None),
+                    &application_event(
+                        DurableAppEventKind::ConversationSegmentStart,
+                        None,
+                        br#"{"segment_id":"segment_2"}"#,
+                    ),
+                )
+                .unwrap_err(),
+            ConversationProjectionError::MissingConversationId { .. }
+        ));
+        assert_eq!(
+            projection
+                .apply_event(
+                    conversation_context("room_1", 4, Some("topic_agent")),
+                    &application_event(
+                        DurableAppEventKind::ConversationSegmentStart,
+                        Some("topic_agent"),
+                        b"not-json",
+                    ),
+                )
+                .unwrap_err(),
+            ConversationProjectionError::MalformedSegmentPayload
+        );
+    }
+
+    #[test]
+    fn archiving_topic_does_not_archive_sibling_topic() {
+        let mut projection = ConversationProjection::default();
+        for (seq, topic) in [(1, "topic_agent"), (2, "topic_human")] {
+            projection
+                .apply_event(
+                    conversation_context("room_1", seq, Some(topic)),
+                    &application_event(DurableAppEventKind::ChatMessage, Some(topic), b"hello"),
+                )
+                .unwrap();
+        }
+        projection
+            .apply_event(
+                conversation_context("room_1", 3, Some("topic_agent")),
+                &application_event(
+                    DurableAppEventKind::ConversationArchive,
+                    Some("topic_agent"),
+                    b"{}",
+                ),
+            )
+            .unwrap();
+
+        assert!(projection.get("room_1", "topic_agent").unwrap().archived);
+        assert!(!projection.get("room_1", "topic_human").unwrap().archived);
+    }
+
     fn runtime_state_entry(
         room_id: &str,
         source: DeviceRef,
@@ -2618,6 +3051,30 @@ mod tests {
             activity_id: activity_id.map(str::to_string),
             action: EphemeralActivityActionV1::Clear,
             payload: Vec::new(),
+        }
+    }
+
+    fn conversation_context<'a>(
+        room_id: &'a str,
+        accepted_seq: Seq,
+        conversation_id: Option<&'a str>,
+    ) -> ConversationProjectionEventContext<'a> {
+        ConversationProjectionEventContext {
+            room_id,
+            accepted_seq,
+            conversation_id,
+        }
+    }
+
+    fn application_event(
+        kind: DurableAppEventKind,
+        conversation_id: Option<&str>,
+        payload: &[u8],
+    ) -> DecryptedApplicationEventV1 {
+        DecryptedApplicationEventV1 {
+            kind,
+            conversation_id: conversation_id.map(str::to_string),
+            payload: payload.to_vec(),
         }
     }
 }
