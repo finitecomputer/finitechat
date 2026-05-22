@@ -2146,6 +2146,50 @@ fn explicit_status_refresh_uses_runtime_command_without_push() {
 }
 
 #[test]
+fn runtime_command_progress_uses_ephemeral_activity_without_inbox_work() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+    let request = application_event_request(
+        &world,
+        alice(),
+        1,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","command":"finitecomputer.runtime.gateway.restart"}"#,
+        "command_request_with_progress_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+
+    let command = world.server.append_application_event(request).unwrap();
+    let command_push_count = world.server.push_outbox_len();
+    let command_inbox_count = world.server.command_inbox_len();
+    let mut activity = ephemeral_activity_request(&world, bob(), 1, Some("topic_1"), 1_000);
+    activity.payload =
+        br#"{"activity":"working","request_id":"restart_1","phase":"restarting"}"#.to_vec();
+
+    let accepted = world.server.append_ephemeral_activity(activity).unwrap();
+
+    assert_eq!(accepted.cached_events_for_route, 1);
+    assert_eq!(
+        world
+            .server
+            .ephemeral_activity_len_for_route(&world.room_id, Some("topic_1"), &bob()),
+        1
+    );
+    assert_eq!(
+        world.server.room(&world.room_id).unwrap().last_seq,
+        command.seq
+    );
+    assert_eq!(world.server.push_outbox_len(), command_push_count);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), command_inbox_count);
+    let sync = world
+        .server
+        .sync_events(&world.room_id, &alice(), command.seq)
+        .unwrap();
+    assert!(sync.entries.is_empty());
+    assert_eq!(sync.next_after_seq, command.seq);
+}
+
+#[test]
 fn runtime_command_retry_reuses_message_id_and_idempotency_key() {
     let mut world = SimWorld::direct_room().unwrap();
     let request = application_event_request(

@@ -523,12 +523,12 @@ application payload behavior:
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_stream_callback_only_triggers_sync`
 - `explicit_status_refresh_uses_runtime_command_without_push`
+- `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
 Still planned:
 
-- `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
 - `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
 - `runtime_state_snapshot_unknown_schema_is_preserved`
