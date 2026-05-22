@@ -426,10 +426,11 @@ Good tests:
 Deliverables:
 
 - import/vendored crates under `finitecomputer`;
-- `finitec chat-v2` or feature-flagged `chat.encrypted.*` command set;
+- typed Finite Chat command set behind an explicit canary flag;
 - local room server mode in `finited` or a companion process;
-- dashboard route keeps current UI contract while encrypted messages shadow
-  plaintext transcript records;
+- dashboard route renders its existing DTO contract from Finite Chat
+  projections; old plaintext transcript records are import/archive input, not a
+  live mirror;
 - hosted web decrypts through a server-side Rust Finite Chat client and must be
   described as trusted-server-client mode, not true E2EE;
 - standalone CLI/daemon owns the true local-device E2EE path first;
@@ -452,8 +453,9 @@ Deliverables:
 
 - WorkOS Project creates hidden web Chat Identity and runtime Chat Identity.
 - Project direct room created during runtime pairing.
-- encrypted chat enabled for new canary Projects.
-- plaintext path remains for fallback until canary is stable.
+- Finite Chat enabled for new canary Projects as a hard cut for the live
+  transcript.
+- old plaintext chats import into a read-only archive or archived-chats list.
 
 Good tests:
 

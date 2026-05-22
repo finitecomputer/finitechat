@@ -17,7 +17,10 @@ Dashboard route
 ```
 
 Finite Chat should first replace the semantics behind "chat event" and "chat
-message", not the dashboard shell.
+message", not the dashboard shell. For the canary path, this should be a hard
+cut to Finite Chat as the live transcript: the legacy `ChatRuntime` transcript
+can be imported or rendered as read-only archive, but should not be dual-written
+as another live source of truth.
 
 The long-term product boundary is not the host control plane. A `finite` or
 `finitec` daemon should be deployable inside any agent, hosted anywhere, and
@@ -149,7 +152,7 @@ extra read command.
 
 ## Daemon Survival Requirement
 
-Finite Chat is the fallback control surface when the agent stack is unhealthy.
+Finite Chat is the recovery control surface when the agent stack is unhealthy.
 Hermes can be absent, hung, misconfigured, or unable to reach inference.
 Finite Chat still needs to sync rooms, publish runtime state, and accept
 allowlisted recovery commands while the host and daemon are online.
@@ -236,8 +239,8 @@ same Rust core when the local true-E2EE clients are ready.
 
 `crates/finite-core/src/chat_runtime.rs`
 
-- Keep as the plaintext fallback.
-- Add an encrypted runtime store instead of mutating `messages` in place.
+- Treat as read-only archive/import input for canary Projects.
+- Add a Finite Chat runtime store instead of mutating `messages` in place.
 - The gateway inbox can be fed from decrypted application messages after the
   runtime device processes room sync.
 - Drive encrypted device maintenance through `finitechat_client::run_runtime_sync_tick`:
@@ -300,7 +303,7 @@ Start with new canary rooms only.
 Suggested runtime directories:
 
 ```text
-$HOME/.finite/chat/plaintext/       # current fallback
+$HOME/.finite/chat/plaintext-archive/ # read-only imported legacy chats
 $HOME/.finite/chat/encrypted/
   device.json                       # account/device identity metadata
   client.sqlite3                    # local MLS and sync state, encrypted at rest
