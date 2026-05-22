@@ -517,6 +517,48 @@ fn runtime_state_command_result_publishes_post_mutation_snapshot() {
 }
 
 #[test]
+fn gateway_restart_success_publishes_result_and_snapshot() {
+    let mut world = world_with_runtime();
+    append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: runtime_command_request_payload("restart_success_1"),
+            idempotency_key: "restart_success_1".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    let result =
+        runtime_command_result_after(&world.server, &world.room_id, "restart_success_1").unwrap();
+    let snapshot =
+        runtime_state_snapshot_after(&world.server, &world.room_id, "runtime.gateway", result.seq)
+            .unwrap();
+    assert_eq!(daemon.gateway, GatewayState::Live);
+    assert_eq!(
+        result.result.status,
+        RuntimeCommandTerminalStatusV1::Succeeded
+    );
+    assert_eq!(
+        result.result.body.as_ref().unwrap().schema,
+        "finitecomputer.runtime.gateway.restart.result.v1"
+    );
+    assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"live"}"#);
+    assert!(snapshot.seq > result.seq);
+}
+
+#[test]
 fn runtime_config_command_result_includes_post_mutation_status() {
     let mut world = world_with_runtime();
     append_application(
