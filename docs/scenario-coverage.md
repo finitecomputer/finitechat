@@ -196,6 +196,7 @@ SQLite parity scenarios:
 - `sqlite_chat_receipt_is_durable_but_push_never_after_reopen`
 - `sqlite_runtime_state_snapshot_does_not_create_unread_or_inbox_work`
 - `sqlite_runtime_command_request_creates_command_inbox_work_after_reopen`
+- `sqlite_push_outbox_rows_are_durable_and_idempotent_after_reopen`
 - `sqlite_ephemeral_activity_does_not_persist_or_advance_sequence`
 - `sqlite_ephemeral_activity_rejects_pending_and_removed_devices`
 
@@ -470,8 +471,9 @@ first version caught a real reducer/store drift: explicit claim of a leased
 KeyPackage owned by a revoked device returned `KeyPackageUnavailable` in memory
 but `DeviceRevoked` in SQLite. The store now matches the reducer ordering.
 
-Push outbox rows are not implemented yet; when they land, this matrix should add
-a failure point after outbox enqueue and assert exactly one durable wake record.
+Push outbox rows now have their own durable SQLite table and idempotent replay
+coverage. The next crash-matrix expansion should add a failure point after
+outbox enqueue and assert exactly one durable wake record.
 
 ## Activity Scenarios
 

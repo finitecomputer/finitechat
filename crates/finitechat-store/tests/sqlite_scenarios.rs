@@ -2295,6 +2295,64 @@ fn sqlite_runtime_command_request_creates_command_inbox_work_after_reopen() {
 }
 
 #[test]
+fn sqlite_push_outbox_rows_are_durable_and_idempotent_after_reopen() {
+    let mut world = SqliteWorld::direct_room();
+    let request = world.application_event_request(
+        alice(),
+        0,
+        br#"{"type":"chat.message","text":"hello"}"#,
+        "sqlite_push_chat_message",
+        DurableAppEventKind::ChatMessage.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+    let replay = world
+        .server
+        .append_application_event(world.application_event_request(
+            alice(),
+            0,
+            br#"{"type":"chat.message","text":"hello"}"#,
+            "sqlite_push_chat_message",
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        ));
+    assert_eq!(replay.unwrap(), accepted);
+    world
+        .server
+        .append_application_event(world.application_event_request(
+            alice(),
+            0,
+            br#"{"type":"chat.receipt","message_id":"m1"}"#,
+            "sqlite_non_push_receipt_after_push",
+            DurableAppEventKind::ChatReceipt.delivery_policy(),
+        ))
+        .unwrap();
+    Connection::open(&world.db_path)
+        .unwrap()
+        .execute("DELETE FROM push_outbox_entries", [])
+        .unwrap();
+
+    let reopened = world.reopen();
+    let conn = Connection::open(&world.db_path).unwrap();
+    let push_effect_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM application_delivery_effects WHERE creates_push = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let push_outbox_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM push_outbox_entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(room(&reopened, &world.room_id).last_seq, 2);
+    assert_eq!(reopened.push_outbox_len().unwrap(), 1);
+    assert_eq!(push_effect_count, 1);
+    assert_eq!(push_outbox_count, 1);
+}
+
+#[test]
 fn sqlite_ephemeral_activity_does_not_persist_or_advance_sequence() {
     let mut world = SqliteWorld::direct_room();
     let activity = world.ephemeral_activity_request(alice(), 0, Some("topic_1"), 1_000);

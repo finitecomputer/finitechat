@@ -460,7 +460,7 @@ impl SqliteDeliveryStore {
     }
 
     pub fn push_outbox_len(&self) -> Result<usize, StoreError> {
-        count_application_effects(&self.connect()?, "creates_push")
+        count_push_outbox_entries(&self.connect()?)
     }
 
     pub fn unread_len(&self) -> Result<usize, StoreError> {
@@ -977,6 +977,23 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
           creates_command_inbox_work INTEGER NOT NULL CHECK (creates_command_inbox_work IN (0, 1)),
           FOREIGN KEY (room_id, seq) REFERENCES room_log_entries(room_id, seq) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS push_outbox_entries (
+          message_id TEXT PRIMARY KEY REFERENCES application_delivery_effects(message_id) ON DELETE CASCADE,
+          room_id TEXT NOT NULL,
+          seq INTEGER NOT NULL CHECK (seq > 0),
+          sender_account_id TEXT NOT NULL,
+          sender_device_id TEXT NOT NULL,
+          FOREIGN KEY (room_id, seq) REFERENCES room_log_entries(room_id, seq) ON DELETE CASCADE
+        );
+
+        INSERT INTO push_outbox_entries (
+          message_id, room_id, seq, sender_account_id, sender_device_id
+        )
+        SELECT message_id, room_id, seq, sender_account_id, sender_device_id
+        FROM application_delivery_effects
+        WHERE creates_push = 1
+        ON CONFLICT(message_id) DO NOTHING;
 
         CREATE TABLE IF NOT EXISTS room_membership_intervals (
           room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
@@ -1678,6 +1695,35 @@ fn insert_application_delivery_effect(
             bool_to_i64(delivery_policy.creates_command_inbox_work()),
         ],
     )?;
+    if delivery_policy.creates_push() {
+        insert_push_outbox_entry(tx, room_id, seq, message_id, sender)?;
+    }
+    Ok(())
+}
+
+fn insert_push_outbox_entry(
+    tx: &Transaction<'_>,
+    room_id: &str,
+    seq: Seq,
+    message_id: &str,
+    sender: &DeviceRef,
+) -> Result<(), StoreError> {
+    let rows_changed = tx.execute(
+        r#"
+        INSERT INTO push_outbox_entries (
+          message_id, room_id, seq, sender_account_id, sender_device_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(message_id) DO NOTHING
+        "#,
+        params![
+            message_id,
+            room_id,
+            to_i64("push_outbox.seq", seq)?,
+            sender.account_id,
+            sender.device_id,
+        ],
+    )?;
+    assert!(rows_changed <= 1);
     Ok(())
 }
 
@@ -2022,6 +2068,14 @@ fn count_application_effects(conn: &Connection, column: &'static str) -> Result<
     usize::try_from(count).map_err(|_| {
         StoreError::CorruptState(format!("application effect count is negative: {count}"))
     })
+}
+
+fn count_push_outbox_entries(conn: &Connection) -> Result<usize, StoreError> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM push_outbox_entries", [], |row| {
+        row.get(0)
+    })?;
+    usize::try_from(count)
+        .map_err(|_| StoreError::CorruptState(format!("push outbox count is negative: {count}")))
 }
 
 fn load_room_membership(
