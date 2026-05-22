@@ -1,14 +1,15 @@
 use finitechat_engine::{
     AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted,
-    RoomSyncProjection, envelope,
+    ObserveDeviceLivenessRequest, RoomSyncProjection, envelope,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, LogEntryKind,
-    MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1,
-    RuntimeCommandLedger, RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1,
-    RuntimeCommandRequestV1, RuntimeCommandResultV1, RuntimeCommandTargetV1,
-    RuntimeCommandTerminalContext, RuntimeCommandTerminalDecision, RuntimeCommandTerminalStatusV1,
-    RuntimeStateSnapshotV1,
+    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_RUNTIME_COMMAND_LEDGER_RECORDS,
+    RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
+    RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
+    RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalContext,
+    RuntimeCommandTerminalDecision, RuntimeCommandTerminalStatusV1, RuntimeStateProjection,
+    RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
 };
 use finitechat_sim::{SimWorld, alice, bob};
 use serde_json::json;
@@ -404,6 +405,72 @@ fn daemon_publishes_inference_degraded_snapshot_without_agent_reply() {
     assert!(!snapshot_effect.creates_unread());
     assert!(!snapshot_effect.creates_command_inbox_work());
     assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn dashboard_reads_stale_snapshot_while_heartbeat_is_fresh() {
+    let mut world = world_with_runtime();
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.gateway".to_string(),
+        schema: "finitecomputer.runtime.gateway.status.v1".to_string(),
+        revision: 1,
+        observed_at_ms: 1_000,
+        expires_at_ms: 2_000,
+        status_payload: br#"{"status":"live"}"#.to_vec(),
+    };
+    snapshot.validate_limits().unwrap();
+    let accepted = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: bob(),
+            epoch: 1,
+            payload: serde_json::to_vec(&snapshot).unwrap(),
+            idempotency_key: "gateway_snapshot_for_stale_dashboard".to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+        },
+    );
+    world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 1_500,
+            expires_at_ms: 1_500 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        })
+        .unwrap();
+    let mut projection = RuntimeStateProjection::default();
+    let entry = world
+        .server
+        .room(&world.room_id)
+        .unwrap()
+        .log
+        .iter()
+        .find(|entry| entry.seq == accepted.seq)
+        .unwrap();
+    projection
+        .apply(RuntimeStateProjectionEntry {
+            room_id: world.room_id.clone(),
+            source: entry.sender.clone(),
+            accepted_seq: entry.seq,
+            snapshot: serde_json::from_slice(&entry.envelope.payload).unwrap(),
+        })
+        .unwrap();
+
+    let err = projection
+        .require_fresh(
+            &world.room_id,
+            &bob(),
+            "runtime.gateway",
+            "finitecomputer.runtime.gateway.status.v1",
+            2_000,
+        )
+        .unwrap_err();
+
+    assert!(world.server.device_is_live_at(&bob(), 2_000));
+    assert!(matches!(err, RuntimeStateProjectionError::Expired { .. }));
+    assert_eq!(world.server.command_inbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
 }
 
 #[test]
