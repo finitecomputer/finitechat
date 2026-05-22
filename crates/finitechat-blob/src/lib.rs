@@ -844,6 +844,50 @@ mod tests {
     }
 
     #[test]
+    fn blossom_http_upload_retries_next_server_after_failure() {
+        let plaintext = b"retry this encrypted payload on another blossom server";
+        let prepared =
+            prepare_attachment_upload_with_material(plaintext, metadata(), fixed_material())
+                .expect("prepare");
+        let first_request = prepare_blossom_upload_http_request(&prepared).expect("first request");
+        let second_request =
+            prepare_blossom_upload_http_request(&prepared).expect("second request");
+
+        let first_err = finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: 503,
+                descriptor: BlobDescriptor {
+                    url: "https://blob-a.example/unavailable".to_string(),
+                    sha256: prepared.ciphertext_sha256.clone(),
+                    size_bytes: prepared.ciphertext_size,
+                },
+            },
+        )
+        .expect_err("first server down");
+        let reference = finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: 201,
+                descriptor: BlobDescriptor {
+                    url: format!("https://blob-b.example/{}", prepared.ciphertext_sha256),
+                    sha256: prepared.ciphertext_sha256.clone(),
+                    size_bytes: prepared.ciphertext_size,
+                },
+            },
+        )
+        .expect("second server accepts");
+
+        assert_eq!(first_err, AttachmentBlobError::HttpStatus { status: 503 });
+        assert_eq!(first_request.body, second_request.body);
+        assert_eq!(first_request.content_type, BLOB_CIPHERTEXT_CONTENT_TYPE);
+        assert_eq!(second_request.content_type, BLOB_CIPHERTEXT_CONTENT_TYPE);
+        assert!(!contains_subsequence(first_request.body, plaintext));
+        assert!(reference.url.starts_with("https://blob-b.example/"));
+        assert_eq!(reference.ciphertext_sha256, prepared.ciphertext_sha256);
+    }
+
+    #[test]
     fn blossom_http_download_verifies_ciphertext_before_decrypt() {
         let mut store = MemoryBlobStore::default();
         let uploaded = upload_attachment(&mut store, b"secret bytes", metadata()).expect("upload");

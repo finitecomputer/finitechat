@@ -395,8 +395,9 @@ Good tests:
   stale `working` or `thinking` state behind.
 - `finitechat-blob` now proves the Blossom-shaped HTTP seam without adding a
   networking dependency: upload requests contain ciphertext only, upload
-  responses verify descriptor hash/size before references exist, and download
-  responses verify ciphertext before decrypt.
+  responses verify descriptor hash/size before references exist, failed server
+  responses can be retried against another Blossom server with the same
+  ciphertext body, and download responses verify ciphertext before decrypt.
 - The daemon survival harness now includes a deterministic fuzzer for chat
   messages, recovery commands, gateway health changes, restarts, and
   crash-after-ledger-write points. It keeps sync cursors monotonic, command
