@@ -220,6 +220,8 @@ Proven survival scenarios:
 - `runtime_stream_callback_only_triggers_sync`
 - `sse_hint_during_hermes_down_only_triggers_pull_sync`
 - `daemon_restart_while_gateway_down_preserves_mls_and_cursors`
+- `broken_gateway_poll_does_not_block_keypackage_replenishment`
+- `broken_gateway_poll_does_not_block_welcome_ack`
 - `command_ledger_survives_restart_after_request_before_execution`
 - `command_ledger_survives_restart_after_execution_before_result`
 - `runtime_state_snapshot_after_command_result_retries_idempotently`
@@ -547,14 +549,6 @@ application payload behavior:
 - `chat_payloads_do_not_travel_over_generic_management_queue`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
-
-## Planned Daemon Survival Scenarios
-
-Finite Chat should remain the runtime control surface when Hermes, inference, or
-bridge adapters are unhealthy:
-
-- `broken_gateway_poll_does_not_block_keypackage_replenishment`
-- `broken_gateway_poll_does_not_block_welcome_ack`
 
 ## Transport Scenarios
 

@@ -1,6 +1,6 @@
 use finitechat_engine::{
     AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted,
-    ObserveDeviceLivenessRequest, RoomSyncProjection, envelope,
+    ObserveDeviceLivenessRequest, RoomSyncProjection, UploadKeyPackageRequest, envelope,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind,
@@ -13,7 +13,7 @@ use finitechat_proto::{
     RuntimeCommandTerminalDecision, RuntimeCommandTerminalStatusV1, RuntimeStateProjection,
     RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
 };
-use finitechat_sim::{SimWorld, alice, bob};
+use finitechat_sim::{SimWorld, alice, bob, charlie, fake_key_package_payload};
 use serde_json::json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,6 +990,70 @@ fn daemon_restart_while_gateway_down_preserves_mls_and_cursors() {
     assert_eq!(
         runtime_state_snapshot_count(&world.server, &world.room_id, "runtime.gateway"),
         snapshot_count + 1
+    );
+}
+
+#[test]
+fn broken_gateway_poll_does_not_block_keypackage_replenishment() {
+    let mut world = world_with_runtime();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::InvalidOutput,
+    );
+
+    daemon.sync_tick(&mut world.server);
+    world
+        .server
+        .upload_key_package(UploadKeyPackageRequest {
+            key_package_id: "kp_bob_gateway_broken".to_string(),
+            owner: bob(),
+            key_package_ref: "ref_kp_bob_gateway_broken".to_string(),
+            key_package_hash: "hash_kp_bob_gateway_broken".to_string(),
+            key_package_payload: fake_key_package_payload("kp_bob_gateway_broken"),
+        })
+        .unwrap();
+
+    let inventory = world.server.key_package_inventory(&bob()).unwrap();
+    assert_eq!(daemon.gateway, GatewayState::InvalidOutput);
+    assert_eq!(inventory.available, 1);
+    assert_eq!(inventory.leased, 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn broken_gateway_poll_does_not_block_welcome_ack() {
+    let mut world = world_with_runtime();
+    world
+        .add_device_commit(
+            alice(),
+            charlie(),
+            "kp_charlie_gateway_broken",
+            "welcome_charlie_gateway_broken",
+            1,
+            "add_charlie_gateway_broken",
+        )
+        .unwrap();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::InvalidOutput,
+    );
+
+    daemon.sync_tick(&mut world.server);
+    world
+        .activate_device("welcome_charlie_gateway_broken", charlie())
+        .unwrap();
+
+    assert_eq!(daemon.gateway, GatewayState::InvalidOutput);
+    assert!(
+        world
+            .server
+            .room(&world.room_id)
+            .unwrap()
+            .device_active_at_head(&charlie())
     );
 }
 
