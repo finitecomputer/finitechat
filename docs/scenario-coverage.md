@@ -525,13 +525,13 @@ application payload behavior:
 - `explicit_status_refresh_uses_runtime_command_without_push`
 - `runtime_command_progress_uses_ephemeral_activity_without_inbox_work`
 - `runtime_command_request_id_is_opaque_to_server`
+- `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
+- `runtime_state_snapshot_unknown_schema_is_preserved`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
 Still planned:
 
-- `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
-- `runtime_state_snapshot_unknown_schema_is_preserved`
 - `runtime_state_slow_refresh_cadence_is_bounded`
 - `runtime_liveness_heartbeat_is_not_encrypted_runtime_state`
 - `runtime_config_command_result_includes_post_mutation_status`
@@ -586,6 +586,8 @@ Runtime status is encrypted application state, not request/response RPC:
 - `runtime_state_snapshot_rejects_empty_key_schema_or_payload`
 - `runtime_state_snapshot_is_durable_but_push_never`
 - `dashboard_status_page_load_reads_projection_without_command`
+- `runtime_state_snapshot_expires_to_stale_without_liveness_confusion`
+- `runtime_state_snapshot_unknown_schema_is_preserved`
 
 The typed projection read path rejects missing, stale, schema-mismatched, and
 malformed payloads without issuing command work. Page loads should read this
