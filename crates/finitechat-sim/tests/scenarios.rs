@@ -2707,6 +2707,52 @@ fn ephemeral_activity_payload_is_opaque_to_server() {
 }
 
 #[test]
+fn server_activity_cache_keeps_kind_and_activity_id_opaque() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for nonce in ["one", "two"] {
+        let mut activity =
+            ephemeral_activity_request(&world, alice(), 0, Some("topic_opaque"), 1_000);
+        activity.payload =
+            format!(r#"{{"activity_kind":"typing","activity_id":"default","nonce":"{nonce}"}}"#)
+                .into_bytes();
+        world.server.append_ephemeral_activity(activity).unwrap();
+    }
+
+    assert_eq!(
+        world.server.ephemeral_activity_len_for_route(
+            &world.room_id,
+            Some("topic_opaque"),
+            &alice()
+        ),
+        2
+    );
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 0);
+}
+
+#[test]
+fn server_activity_cache_preserves_multiple_opaque_events_per_route() {
+    let mut world = SimWorld::direct_room().unwrap();
+    for index in 0..3 {
+        let mut activity =
+            ephemeral_activity_request(&world, alice(), 0, Some("topic_route"), 1_000);
+        activity.payload = format!("opaque-ciphertext-{index}").into_bytes();
+        let accepted = world.server.append_ephemeral_activity(activity).unwrap();
+        assert_eq!(accepted.cached_events_for_route, index + 1);
+    }
+
+    assert_eq!(
+        world.server.ephemeral_activity_len_for_route(
+            &world.room_id,
+            Some("topic_route"),
+            &alice()
+        ),
+        3
+    );
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+}
+
+#[test]
 fn ephemeral_activity_epoch_mismatch_drops_without_repair() {
     let mut world = SimWorld::direct_room().unwrap();
     let activity = ephemeral_activity_request(&world, alice(), 99, Some("topic_1"), 1_000);

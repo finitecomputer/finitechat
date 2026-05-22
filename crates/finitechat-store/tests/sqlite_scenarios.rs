@@ -2289,6 +2289,51 @@ fn sqlite_ephemeral_activity_does_not_persist_or_advance_sequence() {
 }
 
 #[test]
+fn sqlite_server_activity_cache_keeps_kind_and_activity_id_opaque() {
+    let mut world = SqliteWorld::direct_room();
+    for nonce in ["one", "two"] {
+        let mut activity =
+            world.ephemeral_activity_request(alice(), 0, Some("topic_opaque"), 1_000);
+        activity.payload =
+            format!(r#"{{"activity_kind":"typing","activity_id":"default","nonce":"{nonce}"}}"#)
+                .into_bytes();
+        world.server.append_ephemeral_activity(activity).unwrap();
+    }
+
+    assert_eq!(
+        world.server.ephemeral_activity_len_for_route(
+            &world.room_id,
+            Some("topic_opaque"),
+            &alice()
+        ),
+        2
+    );
+    assert_eq!(room(&world.server, &world.room_id).last_seq, 0);
+}
+
+#[test]
+fn sqlite_server_activity_cache_preserves_multiple_opaque_events_per_route() {
+    let mut world = SqliteWorld::direct_room();
+    for index in 0..3 {
+        let mut activity = world.ephemeral_activity_request(alice(), 0, Some("topic_route"), 1_000);
+        activity.payload = format!("opaque-ciphertext-{index}").into_bytes();
+        let accepted = world.server.append_ephemeral_activity(activity).unwrap();
+        assert_eq!(accepted.cached_events_for_route, index + 1);
+    }
+
+    assert_eq!(
+        world.server.ephemeral_activity_len_for_route(
+            &world.room_id,
+            Some("topic_route"),
+            &alice()
+        ),
+        3
+    );
+    assert_eq!(world.server.push_outbox_len().unwrap(), 0);
+    assert_eq!(world.server.unread_len().unwrap(), 0);
+}
+
+#[test]
 fn sqlite_ephemeral_activity_rejects_pending_and_removed_devices() {
     let mut world = SqliteWorld::direct_room();
     world.upload_and_claim(bob(), "kp_sqlite_ephemeral_bob");
