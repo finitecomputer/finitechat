@@ -407,8 +407,10 @@ Good tests:
 - new Project can chat through encrypted room;
 - MicroSandbox runtime only connects outward;
 - loss/retry of relay results does not duplicate messages;
-- attachments use encrypted Blossom-compatible blob references and verify both
-  ciphertext hash and plaintext hash.
+- `finitechat-blob` attachment references remain the finitecomputer integration
+  boundary: upload only ciphertext, verify the Blossom descriptor ciphertext
+  hash, verify ciphertext before decrypt, and verify plaintext hash after
+  decrypt.
 
 ### Phase 5: Hardening
 

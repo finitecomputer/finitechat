@@ -635,6 +635,11 @@ metadata; they must not receive plaintext bytes, plaintext filename, or
 plaintext MIME type unless a future product decision explicitly accepts that
 metadata leak.
 
+The first implementation proof lives in `finitechat-blob`. It defines the v1
+encrypted reference shape, encrypts bytes with per-attachment AES-256-GCM key
+material, and uses a local content-addressed blob-store abstraction so the HTTP
+Blossom adapter can be added without changing encrypted chat payload semantics.
+
 This blob-encryption layer is for bytes stored outside the MLS room log. It does
 not add another encryption layer to ordinary room messages.
 

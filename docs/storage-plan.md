@@ -53,6 +53,21 @@ policy that decides whether the Nostr key comes from OS keychain, user
 passphrase, hardware-backed storage, or an already-unlocked finitecomputer
 runtime.
 
+`finitechat-blob` owns the first attachment/blob boundary. It does not add a
+new database yet. Clients encrypt attachment bytes with per-attachment
+AES-256-GCM key material, upload only ciphertext to a Blossom-compatible
+content-addressed store, and put the blob reference, hashes, key, nonce,
+filename, MIME type, and dimensions inside the encrypted application payload.
+The blob store sees ciphertext bytes, a ciphertext content type, ciphertext
+hash, object size, URL, timing, and requester metadata. It does not receive the
+plaintext filename or MIME type in the Finite Chat abstraction.
+
+The current proof uses an in-memory content-addressed store so the cryptographic
+and metadata invariants are tested without committing to HTTP client/server
+plumbing. The finitecomputer integration should replace runtime-local
+attachment bytes by adapting this boundary to real Blossom-compatible storage,
+not by changing the encrypted reference shape.
+
 `finitechat-store` now uses normalized SQLite tables that mirror the intended
 Postgres shape:
 

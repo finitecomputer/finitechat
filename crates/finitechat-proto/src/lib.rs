@@ -16,6 +16,8 @@ pub type LeaseToken = String;
 pub type IdempotencyKey = String;
 pub type ConversationId = String;
 pub type RuntimeStateKey = String;
+pub type AttachmentBlobUrl = String;
+pub type AttachmentHash = String;
 pub type Epoch = u64;
 pub type Seq = u64;
 
@@ -34,6 +36,14 @@ pub const MAX_WELCOME_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_RATCHET_TREE_PAYLOAD_BYTES: u32 = 1024 * 1024;
 pub const MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE: u32 = 4096;
 pub const MAX_LINK_SESSION_PAYLOAD_BYTES: u32 = 1024 * 1024;
+pub const MAX_ATTACHMENT_PLAINTEXT_BYTES: u32 = 32 * 1024 * 1024;
+pub const MAX_ATTACHMENT_CIPHERTEXT_BYTES: u32 = MAX_ATTACHMENT_PLAINTEXT_BYTES + 16;
+pub const MAX_ATTACHMENT_BLOB_URL_BYTES: u32 = 2048;
+pub const MAX_ATTACHMENT_FILENAME_BYTES: u32 = 255;
+pub const MAX_ATTACHMENT_MIME_TYPE_BYTES: u32 = 128;
+pub const MAX_ATTACHMENT_HASH_HEX_BYTES: u32 = 64;
+pub const MAX_ATTACHMENT_KEY_HEX_BYTES: u32 = 64;
+pub const MAX_ATTACHMENT_NONCE_HEX_BYTES: u32 = 24;
 pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
 pub const MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30 * 60 * 1000;
@@ -44,6 +54,8 @@ pub const MAX_DEVICE_ID_BYTES: u32 = 128;
 pub const MAX_ROOM_ID_BYTES: u32 = 128;
 pub const MAX_MLS_GROUP_ID_BYTES: u32 = 128;
 pub const MAX_OBJECT_ID_BYTES: u32 = 128;
+pub const FINITECHAT_ATTACHMENT_BLOB_SCHEME_V1: &str = "finitechat.attachment.blob.v1";
+pub const FINITECHAT_ATTACHMENT_BLOB_ENCRYPTION_AES256_GCM_V1: &str = "aes-256-gcm.v1";
 
 const _: () = {
     assert!(MAX_ENVELOPE_PAYLOAD_BYTES > 0);
@@ -62,6 +74,14 @@ const _: () = {
     assert!(MAX_RATCHET_TREE_PAYLOAD_BYTES > 0);
     assert!(MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE > 0);
     assert!(MAX_LINK_SESSION_PAYLOAD_BYTES > 0);
+    assert!(MAX_ATTACHMENT_PLAINTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_ATTACHMENT_CIPHERTEXT_BYTES > MAX_ATTACHMENT_PLAINTEXT_BYTES);
+    assert!(MAX_ATTACHMENT_BLOB_URL_BYTES >= MAX_OBJECT_ID_BYTES);
+    assert!(MAX_ATTACHMENT_FILENAME_BYTES > 0);
+    assert!(MAX_ATTACHMENT_MIME_TYPE_BYTES > 0);
+    assert!(MAX_ATTACHMENT_HASH_HEX_BYTES == 64);
+    assert!(MAX_ATTACHMENT_KEY_HEX_BYTES == 64);
+    assert!(MAX_ATTACHMENT_NONCE_HEX_BYTES == 24);
     assert!(MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
     assert!(MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS > 0);
@@ -252,6 +272,129 @@ pub struct RuntimeStateSnapshotV1 {
     pub expires_at_ms: u64,
     #[serde(with = "bytes_as_vec")]
     pub status_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentDimensionsV1 {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentBlobMetadataV1 {
+    pub mime_type: String,
+    pub filename: String,
+    pub dimensions: Option<AttachmentDimensionsV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentBlobEncryptionV1 {
+    pub algorithm: String,
+    pub key_hex: String,
+    pub nonce_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentBlobReferenceV1 {
+    pub scheme: String,
+    pub url: AttachmentBlobUrl,
+    pub ciphertext_sha256: AttachmentHash,
+    pub plaintext_sha256: AttachmentHash,
+    pub plaintext_size: u64,
+    pub ciphertext_size: u64,
+    pub encryption: AttachmentBlobEncryptionV1,
+    pub metadata: AttachmentBlobMetadataV1,
+}
+
+impl AttachmentBlobMetadataV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("attachment.mime_type", self.mime_type.len())?;
+        validate_string_bytes(
+            "attachment.mime_type",
+            &self.mime_type,
+            MAX_ATTACHMENT_MIME_TYPE_BYTES,
+        )?;
+        validate_bytes_non_empty("attachment.filename", self.filename.len())?;
+        validate_string_bytes(
+            "attachment.filename",
+            &self.filename,
+            MAX_ATTACHMENT_FILENAME_BYTES,
+        )?;
+        if let Some(dimensions) = &self.dimensions {
+            dimensions.validate_limits()?;
+        }
+        Ok(())
+    }
+}
+
+impl AttachmentDimensionsV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        if self.width == 0 {
+            return Err(ProtocolLimitError::BytesEmpty {
+                field: "attachment.dimensions.width".to_string(),
+            });
+        }
+        if self.height == 0 {
+            return Err(ProtocolLimitError::BytesEmpty {
+                field: "attachment.dimensions.height".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AttachmentBlobEncryptionV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("attachment.encryption.algorithm", self.algorithm.len())?;
+        validate_string_bytes(
+            "attachment.encryption.algorithm",
+            &self.algorithm,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_string_bytes(
+            "attachment.encryption.key_hex",
+            &self.key_hex,
+            MAX_ATTACHMENT_KEY_HEX_BYTES,
+        )?;
+        validate_string_bytes(
+            "attachment.encryption.nonce_hex",
+            &self.nonce_hex,
+            MAX_ATTACHMENT_NONCE_HEX_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl AttachmentBlobReferenceV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("attachment.scheme", self.scheme.len())?;
+        validate_string_bytes("attachment.scheme", &self.scheme, MAX_OBJECT_ID_BYTES)?;
+        validate_bytes_non_empty("attachment.url", self.url.len())?;
+        validate_string_bytes("attachment.url", &self.url, MAX_ATTACHMENT_BLOB_URL_BYTES)?;
+        validate_string_bytes(
+            "attachment.ciphertext_sha256",
+            &self.ciphertext_sha256,
+            MAX_ATTACHMENT_HASH_HEX_BYTES,
+        )?;
+        validate_string_bytes(
+            "attachment.plaintext_sha256",
+            &self.plaintext_sha256,
+            MAX_ATTACHMENT_HASH_HEX_BYTES,
+        )?;
+        validate_size_limit(
+            "attachment.plaintext",
+            self.plaintext_size,
+            MAX_ATTACHMENT_PLAINTEXT_BYTES,
+        )?;
+        validate_size_limit(
+            "attachment.ciphertext",
+            self.ciphertext_size,
+            MAX_ATTACHMENT_CIPHERTEXT_BYTES,
+        )?;
+        self.encryption.validate_limits()?;
+        self.metadata.validate_limits()?;
+        Ok(())
+    }
 }
 
 impl RuntimeStateSnapshotV1 {
@@ -635,6 +778,27 @@ pub fn validate_item_count(
             field: field.to_string(),
             max_items: u64::from(max_items),
             actual_items: actual_items as u64,
+        })
+    }
+}
+
+pub fn validate_size_limit(
+    field: &str,
+    actual_bytes: u64,
+    max_bytes: u32,
+) -> Result<(), ProtocolLimitError> {
+    if actual_bytes == 0 {
+        return Err(ProtocolLimitError::BytesEmpty {
+            field: field.to_string(),
+        });
+    }
+    if actual_bytes <= u64::from(max_bytes) {
+        Ok(())
+    } else {
+        Err(ProtocolLimitError::BytesTooLong {
+            field: field.to_string(),
+            max_bytes: u64::from(max_bytes),
+            actual_bytes,
         })
     }
 }

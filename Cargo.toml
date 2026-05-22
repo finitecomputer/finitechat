@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/finitechat-blob",
   "crates/finitechat-proto",
   "crates/finitechat-engine",
   "crates/finitechat-store",

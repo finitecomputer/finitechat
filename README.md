@@ -27,6 +27,8 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 
 - `crates/finitechat-proto`: DTOs, message ids, membership deltas, and wire
   validation helpers.
+- `crates/finitechat-blob`: encrypted attachment references and
+  Blossom-compatible content-addressed blob-store proof.
 - `crates/finitechat-engine`: deterministic in-memory Delivery Service model.
 - `crates/finitechat-store`: SQLite-backed server parity store.
 - `crates/finitechat-client`: OpenMLS/Nostr client state machine.

@@ -529,18 +529,24 @@ appropriate:
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_is_projected_without_protocol_managed_prompt_state`
 
-## Planned Attachment Scenarios
+## Attachment Scenarios
 
 Finite Chat attachments should copy the useful Pika/Blossom shape while keeping
 metadata inside encrypted app payloads:
 
-- `attachment_encrypts_before_blob_upload`
+- `attachment_encrypts_before_blob_upload_and_hides_plaintext_metadata_from_store`
 - `attachment_upload_verifies_ciphertext_hash`
-- `attachment_download_verifies_ciphertext_before_decrypt`
+- `attachment_download_verifies_ciphertext_hash_before_decrypt`
 - `attachment_download_verifies_plaintext_hash_after_decrypt`
-- `attachment_reference_metadata_is_encrypted_payload`
+- `attachment_reference_metadata_lives_inside_encrypted_application_payload`
 - `attachment_rejects_plaintext_over_v1_size_limit`
-- `attachment_blob_server_does_not_receive_plaintext_filename_or_mime`
+- `attachment_roundtrips_through_memory_blob_store`
+- `attachment_reference_rejects_uppercase_hex`
+
+These are currently proven in `finitechat-blob` with a local
+Blossom-compatible memory store. The HTTP Blossom adapter and finitecomputer
+route migration remain integration work; the encrypted reference and hash
+verification shape should not change for that adapter.
 
 ## Planned Product Mode Scenarios
 
