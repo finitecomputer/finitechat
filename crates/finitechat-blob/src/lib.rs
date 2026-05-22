@@ -17,6 +17,9 @@ pub const ATTACHMENT_KEY_BYTES: usize = 32;
 pub const ATTACHMENT_NONCE_BYTES: usize = 12;
 pub const ATTACHMENT_AES_GCM_TAG_BYTES: usize = 16;
 pub const BLOB_CIPHERTEXT_CONTENT_TYPE: &str = "application/octet-stream";
+pub const BLOSSOM_UPLOAD_METHOD: &str = "PUT";
+pub const BLOSSOM_UPLOAD_PATH: &str = "/upload";
+pub const BLOSSOM_DOWNLOAD_METHOD: &str = "GET";
 
 const ATTACHMENT_AAD_DOMAIN: &[u8] = b"finitechat.attachment-blob.aad.v1";
 
@@ -63,6 +66,8 @@ pub enum AttachmentBlobError {
     PlaintextSizeMismatch { expected: u64, actual: u64 },
     #[error("attachment AAD length overflow")]
     AadLengthOverflow,
+    #[error("blob HTTP response status {status} is not success")]
+    HttpStatus { status: u16 },
     #[error(transparent)]
     Store(#[from] BlobStoreError),
 }
@@ -127,6 +132,32 @@ pub struct DownloadedAttachment {
 pub struct BlobPutRequest<'a> {
     pub ciphertext: &'a [u8],
     pub content_type: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlossomUploadHttpRequest<'a> {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub content_type: &'static str,
+    pub body: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlossomUploadHttpResponse {
+    pub status: u16,
+    pub descriptor: BlobDescriptor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlossomDownloadHttpRequest<'a> {
+    pub method: &'static str,
+    pub url: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlossomDownloadHttpResponse<'a> {
+    pub status: u16,
+    pub body: &'a [u8],
 }
 
 impl<'a> BlobPutRequest<'a> {
@@ -336,6 +367,38 @@ pub fn finish_attachment_upload(
     Ok(reference)
 }
 
+pub fn prepare_blossom_upload_http_request(
+    prepared: &PreparedAttachmentUpload,
+) -> Result<BlossomUploadHttpRequest<'_>, AttachmentBlobError> {
+    validate_bytes_non_empty("attachment.ciphertext", prepared.ciphertext.len())?;
+    validate_bytes_len(
+        "attachment.ciphertext",
+        prepared.ciphertext.len(),
+        MAX_ATTACHMENT_CIPHERTEXT_BYTES,
+    )?;
+    let actual_hash = sha256_hex(&prepared.ciphertext);
+    if actual_hash != prepared.ciphertext_sha256 {
+        return Err(AttachmentBlobError::CiphertextHashMismatch {
+            expected: prepared.ciphertext_sha256.clone(),
+            actual: actual_hash,
+        });
+    }
+    Ok(BlossomUploadHttpRequest {
+        method: BLOSSOM_UPLOAD_METHOD,
+        path: BLOSSOM_UPLOAD_PATH,
+        content_type: BLOB_CIPHERTEXT_CONTENT_TYPE,
+        body: &prepared.ciphertext,
+    })
+}
+
+pub fn finish_blossom_upload_http_response(
+    prepared: &PreparedAttachmentUpload,
+    response: BlossomUploadHttpResponse,
+) -> Result<AttachmentBlobReferenceV1, AttachmentBlobError> {
+    validate_http_success(response.status)?;
+    finish_attachment_upload(prepared, response.descriptor)
+}
+
 pub fn upload_attachment<S: BlobStore>(
     store: &mut S,
     plaintext: &[u8],
@@ -357,8 +420,33 @@ pub fn download_attachment<S: BlobStore>(
     store: &S,
     reference: &AttachmentBlobReferenceV1,
 ) -> Result<DownloadedAttachment, AttachmentBlobError> {
-    let decoded = validate_reference_exact(reference)?;
     let ciphertext = store.get_blob(&reference.url)?;
+    decrypt_attachment_ciphertext(reference, &ciphertext)
+}
+
+pub fn prepare_blossom_download_http_request(
+    reference: &AttachmentBlobReferenceV1,
+) -> Result<BlossomDownloadHttpRequest<'_>, AttachmentBlobError> {
+    validate_reference_exact(reference)?;
+    Ok(BlossomDownloadHttpRequest {
+        method: BLOSSOM_DOWNLOAD_METHOD,
+        url: &reference.url,
+    })
+}
+
+pub fn finish_blossom_download_http_response(
+    reference: &AttachmentBlobReferenceV1,
+    response: BlossomDownloadHttpResponse<'_>,
+) -> Result<DownloadedAttachment, AttachmentBlobError> {
+    validate_http_success(response.status)?;
+    decrypt_attachment_ciphertext(reference, response.body)
+}
+
+pub fn decrypt_attachment_ciphertext(
+    reference: &AttachmentBlobReferenceV1,
+    ciphertext: &[u8],
+) -> Result<DownloadedAttachment, AttachmentBlobError> {
+    let decoded = validate_reference_exact(reference)?;
     validate_bytes_non_empty("attachment.ciphertext", ciphertext.len())?;
     validate_bytes_len(
         "attachment.ciphertext",
@@ -372,7 +460,7 @@ pub fn download_attachment<S: BlobStore>(
             actual: actual_ciphertext_size,
         });
     }
-    let actual_ciphertext_hash = sha256_hex(&ciphertext);
+    let actual_ciphertext_hash = sha256_hex(ciphertext);
     if actual_ciphertext_hash != reference.ciphertext_sha256 {
         return Err(AttachmentBlobError::CiphertextHashMismatch {
             expected: reference.ciphertext_sha256.clone(),
@@ -387,7 +475,7 @@ pub fn download_attachment<S: BlobStore>(
         .aead_decrypt(
             AeadType::Aes256Gcm,
             &decoded.key,
-            &ciphertext,
+            ciphertext,
             &decoded.nonce,
             &aad,
         )
@@ -410,6 +498,14 @@ pub fn download_attachment<S: BlobStore>(
         reference: reference.clone(),
         plaintext,
     })
+}
+
+fn validate_http_success(status: u16) -> Result<(), AttachmentBlobError> {
+    if (200..=299).contains(&status) {
+        Ok(())
+    } else {
+        Err(AttachmentBlobError::HttpStatus { status })
+    }
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -690,6 +786,95 @@ mod tests {
 
         assert_eq!(downloaded.plaintext, b"secret bytes");
         assert_eq!(downloaded.reference, uploaded.reference);
+    }
+
+    #[test]
+    fn blossom_http_upload_request_uses_ciphertext_only() {
+        let plaintext = b"do not leak this plaintext over the descriptor boundary";
+        let prepared =
+            prepare_attachment_upload_with_material(plaintext, metadata(), fixed_material())
+                .expect("prepare");
+
+        let request = prepare_blossom_upload_http_request(&prepared).expect("http request");
+
+        assert_eq!(request.method, BLOSSOM_UPLOAD_METHOD);
+        assert_eq!(request.path, BLOSSOM_UPLOAD_PATH);
+        assert_eq!(request.content_type, BLOB_CIPHERTEXT_CONTENT_TYPE);
+        assert_eq!(request.body, prepared.ciphertext.as_slice());
+        assert!(!contains_subsequence(request.body, plaintext));
+        assert!(!contains_subsequence(request.body, b"cat.png"));
+        assert!(!contains_subsequence(request.body, b"image/png"));
+    }
+
+    #[test]
+    fn blossom_http_upload_response_verifies_descriptor_before_reference() {
+        let prepared =
+            prepare_attachment_upload_with_material(b"hello", metadata(), fixed_material())
+                .expect("prepare");
+        let descriptor = BlobDescriptor {
+            url: format!("https://blob.example/{}", prepared.ciphertext_sha256),
+            sha256: prepared.ciphertext_sha256.clone(),
+            size_bytes: prepared.ciphertext_size,
+        };
+        let reference = finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: 201,
+                descriptor,
+            },
+        )
+        .expect("finish");
+
+        assert_eq!(reference.ciphertext_sha256, prepared.ciphertext_sha256);
+        assert_eq!(reference.ciphertext_size, prepared.ciphertext_size);
+
+        let err = finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: 503,
+                descriptor: BlobDescriptor {
+                    url: "https://blob.example/down".to_string(),
+                    sha256: prepared.ciphertext_sha256.clone(),
+                    size_bytes: prepared.ciphertext_size,
+                },
+            },
+        )
+        .expect_err("bad status");
+        assert_eq!(err, AttachmentBlobError::HttpStatus { status: 503 });
+    }
+
+    #[test]
+    fn blossom_http_download_verifies_ciphertext_before_decrypt() {
+        let mut store = MemoryBlobStore::default();
+        let uploaded = upload_attachment(&mut store, b"secret bytes", metadata()).expect("upload");
+        let request =
+            prepare_blossom_download_http_request(&uploaded.reference).expect("download request");
+        assert_eq!(request.method, BLOSSOM_DOWNLOAD_METHOD);
+        assert_eq!(request.url, uploaded.reference.url);
+
+        let downloaded = finish_blossom_download_http_response(
+            &uploaded.reference,
+            BlossomDownloadHttpResponse {
+                status: 200,
+                body: &uploaded.ciphertext,
+            },
+        )
+        .expect("download");
+        assert_eq!(downloaded.plaintext, b"secret bytes");
+
+        let err = finish_blossom_download_http_response(
+            &uploaded.reference,
+            BlossomDownloadHttpResponse {
+                status: 200,
+                body: b"not the ciphertext",
+            },
+        )
+        .expect_err("hash mismatch");
+        assert!(matches!(
+            err,
+            AttachmentBlobError::CiphertextSizeMismatch { .. }
+                | AttachmentBlobError::CiphertextHashMismatch { .. }
+        ));
     }
 
     #[test]

@@ -379,6 +379,10 @@ Good tests:
   by room, conversation, account, device, kind, and normalized activity id;
   refreshes, clears, durable terminal clears, and expiry are bounded and
   sender-scoped.
+- `finitechat-blob` now proves the Blossom-shaped HTTP seam without adding a
+  networking dependency: upload requests contain ciphertext only, upload
+  responses verify descriptor hash/size before references exist, and download
+  responses verify ciphertext before decrypt.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

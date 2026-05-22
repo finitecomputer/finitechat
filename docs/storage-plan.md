@@ -62,11 +62,12 @@ The blob store sees ciphertext bytes, a ciphertext content type, ciphertext
 hash, object size, URL, timing, and requester metadata. It does not receive the
 plaintext filename or MIME type in the Finite Chat abstraction.
 
-The current proof uses an in-memory content-addressed store so the cryptographic
-and metadata invariants are tested without committing to HTTP client/server
-plumbing. The finitecomputer integration should replace runtime-local
-attachment bytes by adapting this boundary to real Blossom-compatible storage,
-not by changing the encrypted reference shape.
+The current proof uses an in-memory content-addressed store plus a
+Blossom-shaped HTTP request/response boundary so the cryptographic and metadata
+invariants are tested without adding a networking dependency. The
+finitecomputer integration should replace runtime-local attachment bytes by
+executing that boundary against real Blossom-compatible storage, not by
+changing the encrypted reference shape.
 
 `finitechat-store` now uses normalized SQLite tables that mirror the intended
 Postgres shape:

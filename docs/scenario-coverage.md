@@ -589,11 +589,15 @@ metadata inside encrypted app payloads:
 - `attachment_rejects_plaintext_over_v1_size_limit`
 - `attachment_roundtrips_through_memory_blob_store`
 - `attachment_reference_rejects_uppercase_hex`
+- `blossom_http_upload_request_uses_ciphertext_only`
+- `blossom_http_upload_response_verifies_descriptor_before_reference`
+- `blossom_http_download_verifies_ciphertext_before_decrypt`
 
 These are currently proven in `finitechat-blob` with a local
-Blossom-compatible memory store. The HTTP Blossom adapter and finitecomputer
-route migration remain integration work; the encrypted reference and hash
-verification shape should not change for that adapter.
+Blossom-compatible memory store plus a Blossom-shaped HTTP request/response
+boundary. The actual network executor and finitecomputer route migration remain
+integration work; the encrypted reference and hash verification shape should
+not change for that adapter.
 
 ## Planned Product Mode Scenarios
 

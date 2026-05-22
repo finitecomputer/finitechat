@@ -655,8 +655,12 @@ metadata leak.
 
 The first implementation proof lives in `finitechat-blob`. It defines the v1
 encrypted reference shape, encrypts bytes with per-attachment AES-256-GCM key
-material, and uses a local content-addressed blob-store abstraction so the HTTP
-Blossom adapter can be added without changing encrypted chat payload semantics.
+material, uses a local content-addressed blob-store abstraction, and exposes a
+small Blossom-shaped HTTP upload/download boundary. That boundary carries only
+ciphertext bytes and verifies the returned descriptor before producing an
+attachment reference. The HTTP executor itself stays outside the protocol crate
+so finitecomputer can reuse its existing networking stack without changing
+encrypted chat payload semantics.
 
 This blob-encryption layer is for bytes stored outside the MLS room log. It does
 not add another encryption layer to ordinary room messages.
