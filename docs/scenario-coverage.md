@@ -194,12 +194,17 @@ Proven survival scenarios:
 - `daemon_starts_when_hermes_is_absent_and_restarts_gateway`
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
 - `command_ledger_survives_restart_after_request_before_execution`
+- `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
 The survival harness now uses the shared `RuntimeCommandLedger` and typed
 runtime command payloads instead of a test-local JSON parser. This keeps the
 recovery proof tied to the production protocol shape: target policy is
 decrypted, command bodies are schema-tagged and bounded, conflicting request id
 reuse fails, and workers execute only after a durable ledger record exists.
+The deterministic survival fuzzer mixes user messages, restart commands,
+gateway state changes, daemon restarts, and crash-after-ledger-write points.
+It asserts cursor monotonicity, bounded command ledger state, non-notifying
+snapshots, and eventual recovery to no pending commands.
 
 Checkpoint test signal:
 
@@ -370,6 +375,11 @@ Checkpoint test signal:
   `DirectRoomThirdAccount` failed the scenario before it could become false
   confidence. The proof now uses a group room while direct-room limits remain
   covered separately.
+- The survival fuzzer found a bug in the fake daemon harness itself: the crash
+  path advanced the cursor to the whole page after recording one command,
+  which could skip later commands in the same sync page. The harness now
+  advances after each interpreted entry, matching the production state-machine
+  invariant we want.
 
 ## SQLite Follow-Up
 
@@ -527,7 +537,6 @@ bridge adapters are unhealthy:
 - `daemon_restart_while_gateway_down_preserves_mls_and_cursors`
 - `broken_gateway_poll_does_not_block_keypackage_replenishment`
 - `broken_gateway_poll_does_not_block_welcome_ack`
-- `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
 
 ## Transport Scenarios
 

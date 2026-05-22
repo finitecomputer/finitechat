@@ -2,6 +2,13 @@
 
 Status: planned strategy.
 
+First implementation checkpoint: `crates/finitechat-sim/tests/daemon_survival.rs`
+now proves the pure daemon state machine with a fake runtime adapter. It covers
+Hermes absent at startup, Hermes hung during sync, restart-after-ledger-write,
+and a deterministic bounded fuzzer for user messages, restart commands, gateway
+state changes, daemon restarts, and crash points. The broader layers below
+remain the production hardening plan.
+
 Finite Chat is the last-resort control surface for an agent runtime. Hermes can
 crash, hang, misconfigure itself, or lose inference access. Finite Chat must
 still let the user observe runtime state, sync ordered room events, receive

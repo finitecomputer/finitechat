@@ -69,14 +69,17 @@ impl FakeDaemon {
                         &request,
                     )
                     .unwrap();
+                self.after_seq = entry.seq;
                 if self.crash_after_recording_first_request {
-                    self.after_seq = page.next_after_seq;
                     self.crash_after_recording_first_request = false;
                     return;
                 }
             }
+            self.after_seq = entry.seq;
         }
-        self.after_seq = page.next_after_seq;
+        if page.entries.is_empty() {
+            self.after_seq = page.next_after_seq;
+        }
         self.execute_pending(server);
         self.publish_gateway_snapshot(server);
     }
@@ -279,6 +282,82 @@ fn command_ledger_survives_restart_after_request_before_execution() {
     );
 }
 
+#[test]
+fn survival_fuzzer_keeps_sync_status_and_command_ledger_bounded() {
+    let mut world = world_with_runtime();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+    let mut appended_restart_commands = 0usize;
+    let mut last_after_seq = 0u64;
+
+    for step in 0..96u32 {
+        match step % 8 {
+            0 => {
+                append_chat_message(&mut world.server, &world.room_id, &world.group_id, step);
+            }
+            1 => {
+                append_restart_command(
+                    &mut world.server,
+                    &world.room_id,
+                    &world.group_id,
+                    &format!("restart_fuzz_{step}"),
+                );
+                appended_restart_commands += 1;
+            }
+            2 => daemon.gateway = GatewayState::Hung,
+            3 => daemon.sync_tick(&mut world.server),
+            4 => {
+                append_restart_command(
+                    &mut world.server,
+                    &world.room_id,
+                    &world.group_id,
+                    &format!("restart_crash_{step}"),
+                );
+                appended_restart_commands += 1;
+                daemon.crash_after_recording_first_request = true;
+                daemon.sync_tick(&mut world.server);
+            }
+            5 => {
+                daemon = FakeDaemon::new(
+                    bob(),
+                    world.room_id.clone(),
+                    world.group_id.clone(),
+                    daemon.gateway,
+                )
+                .with_persisted_ledger(daemon.ledger, daemon.after_seq);
+            }
+            6 => daemon.gateway = GatewayState::Down,
+            7 => daemon.sync_tick(&mut world.server),
+            _ => unreachable!("modulo keeps action bounded"),
+        }
+
+        assert!(daemon.after_seq >= last_after_seq);
+        assert!(daemon.after_seq <= world.server.room(&world.room_id).unwrap().last_seq);
+        assert!(daemon.ledger.len() <= appended_restart_commands);
+        assert!(world.server.command_inbox_len() <= appended_restart_commands);
+        last_after_seq = daemon.after_seq;
+
+        if let Some(message_id) = daemon.last_snapshot_message_id.as_ref() {
+            let effect = world.server.application_effect(message_id).unwrap();
+            assert!(!effect.creates_push());
+            assert!(!effect.creates_unread());
+            assert!(!effect.creates_command_inbox_work());
+        }
+    }
+
+    for _ in 0..8 {
+        daemon.sync_tick(&mut world.server);
+    }
+
+    assert!(daemon.ledger.pending_requests().is_empty());
+    assert_eq!(daemon.gateway, GatewayState::Live);
+    assert!(world.server.command_inbox_len() <= appended_restart_commands);
+}
+
 fn world_with_runtime() -> SimWorld {
     let mut world = SimWorld::direct_room().unwrap();
     world
@@ -295,6 +374,46 @@ fn world_with_runtime() -> SimWorld {
         .activate_device("welcome_bob_survival", bob())
         .unwrap();
     world
+}
+
+fn append_chat_message(server: &mut DeliveryService, room_id: &str, group_id: &str, step: u32) {
+    append_application(
+        server,
+        ApplicationAppend {
+            room_id,
+            group_id,
+            sender: alice(),
+            epoch: current_epoch(server, room_id),
+            payload: json!({
+                "type": "chat.message",
+                "body": format!("survival fuzz {step}")
+            })
+            .to_string()
+            .into_bytes(),
+            idempotency_key: format!("survival_chat_{step}"),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+}
+
+fn append_restart_command(
+    server: &mut DeliveryService,
+    room_id: &str,
+    group_id: &str,
+    request_id: &str,
+) {
+    append_application(
+        server,
+        ApplicationAppend {
+            room_id,
+            group_id,
+            sender: alice(),
+            epoch: current_epoch(server, room_id),
+            payload: runtime_command_request_payload(request_id),
+            idempotency_key: request_id.to_string(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    );
 }
 
 struct ApplicationAppend<'a> {
