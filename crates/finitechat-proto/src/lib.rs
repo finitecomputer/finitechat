@@ -1429,10 +1429,35 @@ impl RuntimeCommandLedger {
     }
 
     pub fn pending_requests(&self) -> Vec<&RuntimeCommandLedgerRecord> {
-        self.records
+        let mut pending = self
+            .records
             .values()
             .filter(|record| record.status == RuntimeCommandLedgerStatus::Pending)
-            .collect()
+            .collect::<Vec<_>>();
+        sort_runtime_command_records(&mut pending);
+        assert!(pending.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
+        pending
+    }
+
+    pub fn ready_requests(&self) -> Vec<&RuntimeCommandLedgerRecord> {
+        let pending = self.pending_requests();
+        let mut locked_resources = BTreeSet::new();
+        let mut ready = Vec::new();
+        // `pending_requests` is ordered by accepted sequence and bounded by
+        // `MAX_RUNTIME_COMMAND_LEDGER_RECORDS`.
+        for record in pending {
+            if let Some(resource_key) = &record.resource_key {
+                debug_assert!(!resource_key.is_empty());
+                let resource_scope = runtime_command_resource_scope_key(record);
+                if locked_resources.contains(&resource_scope) {
+                    continue;
+                }
+                locked_resources.insert(resource_scope);
+            }
+            ready.push(record);
+        }
+        assert!(ready.len() <= MAX_RUNTIME_COMMAND_LEDGER_RECORDS as usize);
+        ready
     }
 
     pub fn get(
@@ -2148,6 +2173,31 @@ fn runtime_command_ledger_key(
     ))
 }
 
+fn runtime_command_resource_scope_key(record: &RuntimeCommandLedgerRecord) -> String {
+    let resource_key = record
+        .resource_key
+        .as_deref()
+        .expect("resource scope is only built for keyed commands");
+    // Conversation id is intentionally not part of this scope. A command in
+    // topic A that mutates `hermes.config` must block a command in topic B that
+    // mutates the same runtime resource.
+    format!(
+        "{}|{}|{}|{}",
+        length_prefixed(&record.room_id),
+        length_prefixed(&record.target.account_id),
+        length_prefixed(record.target.device_id.as_deref().unwrap_or("")),
+        length_prefixed(resource_key)
+    )
+}
+
+fn sort_runtime_command_records(records: &mut [&RuntimeCommandLedgerRecord]) {
+    records.sort_by(|left, right| {
+        left.accepted_seq
+            .cmp(&right.accepted_seq)
+            .then_with(|| left.original_message_id.cmp(&right.original_message_id))
+    });
+}
+
 fn ephemeral_activity_projection_key(
     room_id: &str,
     conversation_id: Option<&str>,
@@ -2789,6 +2839,128 @@ mod tests {
         );
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.pending_requests().len(), 1);
+    }
+
+    #[test]
+    fn runtime_config_commands_serialize_per_resource() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let mut ledger = RuntimeCommandLedger::default();
+        let target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: Some("runtime_box".to_string()),
+        };
+        let mut apply_config = runtime_command_request(
+            "apply_config",
+            "finitecomputer.runtime.inference.apply",
+            target.clone(),
+            br#"{}"#,
+        );
+        apply_config.resource_key = Some("hermes.config".to_string());
+        let mut rollback_config = runtime_command_request(
+            "rollback_config",
+            "finitecomputer.runtime.inference.rollback",
+            target.clone(),
+            br#"{}"#,
+        );
+        rollback_config.resource_key = Some("hermes.config".to_string());
+        let mut restart_gateway = runtime_command_request(
+            "restart_gateway",
+            "finitecomputer.runtime.gateway.restart",
+            target,
+            br#"{}"#,
+        );
+        restart_gateway.resource_key = Some("gateway.process".to_string());
+
+        for (seq, message_id, request) in [
+            (11, "message_apply_config", &apply_config),
+            (12, "message_restart_gateway", &restart_gateway),
+            (13, "message_rollback_config", &rollback_config),
+        ] {
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: seq,
+                        original_message_id: message_id,
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    request,
+                )
+                .unwrap();
+        }
+
+        let ready = ledger.ready_requests();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].request_id, "apply_config");
+        assert_eq!(ready[1].request_id, "restart_gateway");
+
+        ledger
+            .apply_result(
+                RuntimeCommandTerminalContext {
+                    room_id: "room_1",
+                    conversation_id: Some("topic_1"),
+                    request_sender: &sender,
+                    accepted_seq: 20,
+                    terminal_message_id: "result_apply_config",
+                },
+                &runtime_command_success_result("apply_config", br#"{"status":"ok"}"#),
+            )
+            .unwrap();
+        let ready = ledger.ready_requests();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].request_id, "restart_gateway");
+        assert_eq!(ready[1].request_id, "rollback_config");
+    }
+
+    #[test]
+    fn unkeyed_runtime_commands_do_not_block_keyed_resources() {
+        let sender = device("alice_npub", "dashboard");
+        let local_runtime = device("runtime_npub", "runtime_box");
+        let target = RuntimeCommandTargetV1 {
+            account_id: "runtime_npub".to_string(),
+            device_id: Some("runtime_box".to_string()),
+        };
+        let mut unkeyed = runtime_command_request(
+            "read_status",
+            "finitecomputer.runtime.status.refresh",
+            target.clone(),
+            br#"{}"#,
+        );
+        unkeyed.resource_key = None;
+        let keyed = runtime_command_request(
+            "restart_gateway",
+            "finitecomputer.runtime.gateway.restart",
+            target,
+            br#"{}"#,
+        );
+        let mut ledger = RuntimeCommandLedger::default();
+
+        for (seq, message_id, request) in [
+            (11, "message_read_status", &unkeyed),
+            (12, "message_restart_gateway", &keyed),
+        ] {
+            ledger
+                .record_request(
+                    RuntimeCommandIngressContext {
+                        room_id: "room_1",
+                        conversation_id: Some("topic_1"),
+                        accepted_seq: seq,
+                        original_message_id: message_id,
+                        sender: &sender,
+                        local_device: &local_runtime,
+                    },
+                    request,
+                )
+                .unwrap();
+        }
+
+        let ready = ledger.ready_requests();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].request_id, "read_status");
+        assert_eq!(ready[1].request_id, "restart_gateway");
     }
 
     #[test]

@@ -380,6 +380,10 @@ Good tests:
   message id and sequence, replays the same terminal event idempotently,
   ignores later competing terminals, and rejects terminal events that do not
   follow the original request sequence.
+- Runtime command scheduling now serializes keyed resources without dropping
+  durable requests: only the oldest pending command for a `(room, target,
+  resource_key)` is ready, while unkeyed commands and different resources can
+  proceed independently.
 - Ephemeral activity now has a decrypted client projection: activity is keyed
   by room, conversation, account, device, kind, and normalized activity id;
   refreshes, clears, durable terminal clears, and expiry are bounded and

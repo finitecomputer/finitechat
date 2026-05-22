@@ -645,6 +645,14 @@ deduplicate replays by request id, sender, conversation, and original message
 id, reject conflicting reuse, and remain bounded. Execution workers read the
 ledger; live streams and push wakes only cause sync.
 
+Commands that name an encrypted `resource_key` are scheduler-serialized per
+room, target account/device, and resource key. The runtime still records every
+durable request in sequence order, but it exposes only the oldest pending
+command for a keyed resource as ready work until that command reaches terminal
+state. Conversation id is intentionally not part of the resource lock:
+`hermes.config` updates from different topics still mutate the same runtime
+resource.
+
 Command terminal state is also ordered-log state. A result or cancel may close
 a pending ledger record only when its accepted sequence is after the request
 sequence. The ledger stores the first terminal event's message id and sequence;

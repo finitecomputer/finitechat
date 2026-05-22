@@ -512,6 +512,8 @@ application payload behavior:
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `runtime_command_retry_reuses_message_id_and_idempotency_key`
 - `runtime_command_duplicate_message_with_new_idempotency_key_rejects`
+- `runtime_config_commands_serialize_per_resource`
+- `unkeyed_runtime_commands_do_not_block_keyed_resources`
 - `runtime_sync_persists_request_ledger_before_execution`
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
@@ -527,7 +529,6 @@ Still planned:
 - `runtime_state_snapshot_unknown_schema_is_preserved`
 - `runtime_state_slow_refresh_cadence_is_bounded`
 - `runtime_liveness_heartbeat_is_not_encrypted_runtime_state`
-- `runtime_config_commands_serialize_per_resource`
 - `runtime_config_command_result_includes_post_mutation_status`
 - `portable_agent_command_does_not_assume_hosted_runner`
 - `hosted_runner_admin_operation_stays_out_of_generic_chat_command`
