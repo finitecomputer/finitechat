@@ -527,6 +527,23 @@ pub struct ConversationProjection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ProductTrustModeV1 {
+    LocalDeviceE2ee,
+    HostedTrustedServerClient,
+    PlaintextArchive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductTrustDisclosureV1 {
+    pub mode: ProductTrustModeV1,
+    pub label: String,
+    pub may_claim_e2ee: bool,
+    pub stores_device_secrets_on_user_device: bool,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConversationProjectionDecision {
     Ignored,
     Created,
@@ -872,6 +889,34 @@ impl ConversationProjectionEventContext<'_> {
             validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
         }
         Ok(())
+    }
+}
+
+impl ProductTrustDisclosureV1 {
+    pub fn for_mode(mode: ProductTrustModeV1) -> Self {
+        match mode {
+            ProductTrustModeV1::LocalDeviceE2ee => Self {
+                mode,
+                label: "end-to-end encrypted chat".to_string(),
+                may_claim_e2ee: true,
+                stores_device_secrets_on_user_device: true,
+                read_only: false,
+            },
+            ProductTrustModeV1::HostedTrustedServerClient => Self {
+                mode,
+                label: "web chat".to_string(),
+                may_claim_e2ee: false,
+                stores_device_secrets_on_user_device: false,
+                read_only: false,
+            },
+            ProductTrustModeV1::PlaintextArchive => Self {
+                mode,
+                label: "archived chat".to_string(),
+                may_claim_e2ee: false,
+                stores_device_secrets_on_user_device: false,
+                read_only: true,
+            },
+        }
     }
 }
 
@@ -2964,6 +3009,51 @@ mod tests {
 
         assert!(projection.get("room_1", "topic_agent").unwrap().archived);
         assert!(!projection.get("room_1", "topic_human").unwrap().archived);
+    }
+
+    #[test]
+    fn hosted_web_mode_is_not_labeled_e2ee() {
+        let disclosure =
+            ProductTrustDisclosureV1::for_mode(ProductTrustModeV1::HostedTrustedServerClient);
+
+        assert!(!disclosure.may_claim_e2ee);
+        assert!(!disclosure.stores_device_secrets_on_user_device);
+        assert!(!disclosure.label.to_ascii_lowercase().contains("e2ee"));
+        assert!(!disclosure.label.to_ascii_lowercase().contains("end-to-end"));
+        assert!(!disclosure.read_only);
+    }
+
+    #[test]
+    fn hosted_web_mode_uses_server_side_trusted_client() {
+        let disclosure =
+            ProductTrustDisclosureV1::for_mode(ProductTrustModeV1::HostedTrustedServerClient);
+
+        assert_eq!(
+            disclosure.mode,
+            ProductTrustModeV1::HostedTrustedServerClient
+        );
+        assert_eq!(disclosure.label, "web chat");
+        assert!(!disclosure.stores_device_secrets_on_user_device);
+    }
+
+    #[test]
+    fn local_daemon_mode_keeps_device_secrets_local() {
+        let disclosure = ProductTrustDisclosureV1::for_mode(ProductTrustModeV1::LocalDeviceE2ee);
+
+        assert!(disclosure.may_claim_e2ee);
+        assert!(disclosure.stores_device_secrets_on_user_device);
+        assert!(disclosure.label.to_ascii_lowercase().contains("end-to-end"));
+        assert!(!disclosure.read_only);
+    }
+
+    #[test]
+    fn old_plaintext_chats_render_as_read_only_archive() {
+        let disclosure = ProductTrustDisclosureV1::for_mode(ProductTrustModeV1::PlaintextArchive);
+
+        assert!(!disclosure.may_claim_e2ee);
+        assert!(!disclosure.stores_device_secrets_on_user_device);
+        assert!(disclosure.read_only);
+        assert!(disclosure.label.to_ascii_lowercase().contains("archive"));
     }
 
     fn runtime_state_entry(

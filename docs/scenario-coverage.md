@@ -174,6 +174,9 @@ kinds. Proven unit scenarios:
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
 - `archiving_topic_does_not_archive_sibling_topic`
+- `hosted_web_mode_is_not_labeled_e2ee`
+- `local_daemon_mode_keeps_device_secrets_local`
+- `old_plaintext_chats_render_as_read_only_archive`
 
 The in-memory and SQLite stores now record delivery effects separately from
 opaque MLS payload bytes. This proves that Finite Chat can enforce
@@ -619,7 +622,7 @@ boundary. The actual network executor and finitecomputer route migration remain
 integration work; the encrypted reference and hash verification shape should
 not change for that adapter.
 
-## Planned Product Mode Scenarios
+## Product Mode Scenarios
 
 Finitecomputer hosted web mode and standalone Finite Chat clients should stay
 honest about trust boundaries:

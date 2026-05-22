@@ -392,6 +392,9 @@ Good tests:
   `(room_id, conversation_id)`, can lazily materialize a topic from the first
   message, archive one topic without siblings, and apply `/new` as a bounded
   segment boundary inside the existing topic.
+- Product trust modes are typed so hosted finitecomputer web chat is disclosed
+  as a trusted-server client, true E2EE language is reserved for local-device
+  clients, and imported plaintext chats can be rendered as read-only archives.
 - newly added devices sync from the accepted add Commit forward and cannot see
   pre-membership room log history unless a future explicit history mechanism
   provides it.

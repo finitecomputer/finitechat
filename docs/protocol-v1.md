@@ -218,6 +218,23 @@ The numbers are intentionally small for v1. They keep WASM memory behavior
 predictable, bound retry/fanout work, and make accidental full-room reads show
 up as test failures.
 
+## Product Trust Modes
+
+Finite Chat distinguishes protocol capability from product disclosure.
+
+- `local_device_e2ee`: device secrets stay on the user's device, so the client
+  may describe the chat as end-to-end encrypted.
+- `hosted_trusted_server_client`: a hosted server-side Rust client decrypts on
+  behalf of the web UI. This is useful web chat, but it must not be labeled
+  E2EE.
+- `plaintext_archive`: imported legacy finitecomputer chats are read-only
+  archive material. They must not be labeled E2EE or treated as writable
+  Finite Chat room state.
+
+These modes do not change MLS semantics. They keep product copy and migration
+behavior honest while finitecomputer moves from trusted-server web chat toward
+true local-device clients.
+
 ## Server API Sketch
 
 Session:
