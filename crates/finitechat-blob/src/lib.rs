@@ -963,6 +963,41 @@ mod tests {
     }
 
     #[test]
+    fn blossom_http_download_retries_same_reference_after_failure() {
+        let plaintext = b"download retry must not change encrypted reference";
+        let mut store = MemoryBlobStore::default();
+        let uploaded = upload_attachment(&mut store, plaintext, metadata()).expect("upload");
+        let first_request =
+            prepare_blossom_download_http_request(&uploaded.reference).expect("first request");
+        let second_request =
+            prepare_blossom_download_http_request(&uploaded.reference).expect("second request");
+
+        let first_err = finish_blossom_download_http_response(
+            &uploaded.reference,
+            BlossomDownloadHttpResponse {
+                status: 503,
+                body: b"temporary failure",
+            },
+        )
+        .expect_err("first download fails");
+        let downloaded = finish_blossom_download_http_response(
+            &uploaded.reference,
+            BlossomDownloadHttpResponse {
+                status: 200,
+                body: &uploaded.ciphertext,
+            },
+        )
+        .expect("retry succeeds");
+
+        assert_eq!(first_err, AttachmentBlobError::HttpStatus { status: 503 });
+        assert_eq!(first_request.method, BLOSSOM_DOWNLOAD_METHOD);
+        assert_eq!(second_request.method, BLOSSOM_DOWNLOAD_METHOD);
+        assert_eq!(first_request.url, second_request.url);
+        assert_eq!(second_request.url, uploaded.reference.url);
+        assert_eq!(downloaded.plaintext, plaintext);
+    }
+
+    #[test]
     fn blossom_http_download_rejects_http_error_before_body_validation() {
         let mut store = MemoryBlobStore::default();
         let uploaded = upload_attachment(&mut store, b"secret bytes", metadata()).expect("upload");
@@ -977,6 +1012,22 @@ mod tests {
         .expect_err("http status wins");
 
         assert_eq!(err, AttachmentBlobError::HttpStatus { status: 404 });
+    }
+
+    #[test]
+    fn blossom_http_download_request_rejects_unsupported_reference_scheme() {
+        let mut store = MemoryBlobStore::default();
+        let uploaded = upload_attachment(&mut store, b"secret bytes", metadata()).expect("upload");
+        let mut reference = uploaded.reference;
+        reference.scheme = "finitechat.attachment.unknown.v9".to_string();
+
+        let err = prepare_blossom_download_http_request(&reference)
+            .expect_err("unsupported scheme fails before network");
+
+        assert_eq!(
+            err,
+            AttachmentBlobError::UnsupportedScheme("finitechat.attachment.unknown.v9".to_string())
+        );
     }
 
     #[test]
