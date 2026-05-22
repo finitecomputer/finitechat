@@ -5,13 +5,14 @@ use finitechat_engine::{
     device, envelope,
 };
 use finitechat_proto::{
-    ApplicationDeliveryPolicy, DeviceRef, DurableAppEventKind, KeyPackageState, LogEntryKind,
-    MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE, MAX_SYNC_PAGE_ENTRIES,
-    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
-    ProtocolLimitError, RoomStatus, RuntimeStateProjection, RuntimeStateProjectionEntry,
-    RuntimeStateSnapshotV1, WelcomeState,
+    ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, KeyPackageState,
+    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaError,
+    MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, PushPolicy, RoomStatus,
+    RuntimeStateProjection, RuntimeStateProjectionEntry, RuntimeStateSnapshotV1, UnreadPolicy,
+    WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -2111,6 +2112,37 @@ fn runtime_command_request_creates_command_inbox_work() {
             .unwrap()
             .creates_command_inbox_work()
     );
+}
+
+#[test]
+fn explicit_status_refresh_uses_runtime_command_without_push() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let request = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","command":"finitecomputer.runtime.status.refresh"}"#,
+        "status_refresh_1",
+        ApplicationDeliveryPolicy {
+            push: PushPolicy::Never,
+            unread: UnreadPolicy::Never,
+            command_inbox: CommandInboxPolicy::Create,
+        },
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 1);
+    let effect = world
+        .server
+        .application_effect(&accepted.message_id)
+        .unwrap();
+    assert!(!effect.creates_push());
+    assert!(!effect.creates_unread());
+    assert!(effect.creates_command_inbox_work());
 }
 
 #[test]

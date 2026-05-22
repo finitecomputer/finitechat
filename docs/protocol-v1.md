@@ -468,6 +468,8 @@ kind. V1 defaults are:
 - `runtime.state.snapshot`: `push_policy = never`;
 - `runtime.command.request`: may wake the encrypted target runtime device, but
   should not create a user notification by default;
+- explicit runtime status refresh commands use `push_policy = never` and still
+  create command inbox work for the target runtime;
 - `runtime.command.result`: push-eligible only when the receiving app maps it to
   user-visible output or a user-requested alert;
 - `ephemeral`: always `push_policy = never`.
