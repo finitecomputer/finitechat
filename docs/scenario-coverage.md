@@ -211,6 +211,7 @@ Proven survival scenarios:
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `daemon_publishes_gateway_down_snapshot_without_hermes`
+- `daemon_publishes_inference_degraded_snapshot_without_agent_reply`
 - `runtime_stream_callback_only_triggers_sync`
 - `command_ledger_survives_restart_after_request_before_execution`
 - `survival_fuzzer_keeps_sync_status_and_command_ledger_bounded`
@@ -543,7 +544,6 @@ application payload behavior:
 Finite Chat should remain the runtime control surface when Hermes, inference, or
 bridge adapters are unhealthy:
 
-- `daemon_publishes_inference_degraded_snapshot_without_agent_reply`
 - `dashboard_reads_stale_snapshot_while_heartbeat_is_fresh`
 - `gateway_restart_success_publishes_result_and_snapshot`
 - `gateway_restart_failure_publishes_terminal_result_without_retry_storm`

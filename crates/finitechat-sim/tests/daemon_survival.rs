@@ -20,6 +20,12 @@ enum GatewayState {
     Hung,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferenceState {
+    Healthy,
+    DegradedNoReply,
+}
+
 #[derive(Debug)]
 struct FakeDaemon {
     device: DeviceRef,
@@ -27,6 +33,7 @@ struct FakeDaemon {
     group_id: String,
     after_seq: u64,
     gateway: GatewayState,
+    inference: InferenceState,
     config_generation: u64,
     ledger: RuntimeCommandLedger,
     last_snapshot_message_id: Option<String>,
@@ -41,11 +48,17 @@ impl FakeDaemon {
             group_id,
             after_seq: 0,
             gateway,
+            inference: InferenceState::Healthy,
             config_generation: 0,
             ledger: RuntimeCommandLedger::default(),
             last_snapshot_message_id: None,
             crash_after_recording_first_request: false,
         }
+    }
+
+    fn with_inference(mut self, inference: InferenceState) -> Self {
+        self.inference = inference;
+        self
     }
 
     fn with_persisted_ledger(mut self, ledger: RuntimeCommandLedger, after_seq: u64) -> Self {
@@ -87,6 +100,7 @@ impl FakeDaemon {
         }
         self.execute_pending(server);
         self.publish_gateway_snapshot(server);
+        self.publish_inference_snapshot_if_degraded(server);
     }
 
     fn execute_pending(&mut self, server: &mut DeliveryService) {
@@ -189,6 +203,28 @@ impl FakeDaemon {
                 ),
                 idempotency_key: format!(
                     "runtime_config_state_{}",
+                    server.room(&self.room_id).unwrap().last_seq + 1
+                ),
+                delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+            },
+        );
+        self.last_snapshot_message_id = Some(accepted.message_id);
+    }
+
+    fn publish_inference_snapshot_if_degraded(&mut self, server: &mut DeliveryService) {
+        if self.inference == InferenceState::Healthy {
+            return;
+        }
+        let accepted = append_application(
+            server,
+            ApplicationAppend {
+                room_id: &self.room_id,
+                group_id: &self.group_id,
+                sender: self.device.clone(),
+                epoch: current_epoch(server, &self.room_id),
+                payload: runtime_inference_snapshot_payload(server, &self.room_id, self.inference),
+                idempotency_key: format!(
+                    "runtime_inference_state_{}",
                     server.room(&self.room_id).unwrap().last_seq + 1
                 ),
                 delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
@@ -303,6 +339,63 @@ fn daemon_publishes_gateway_down_snapshot_without_hermes() {
         "finitecomputer.runtime.gateway.status.v1"
     );
     assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"down"}"#);
+    let snapshot_effect = world
+        .server
+        .application_effect(&snapshot.message_id)
+        .unwrap();
+    assert!(!snapshot_effect.creates_push());
+    assert!(!snapshot_effect.creates_unread());
+    assert!(!snapshot_effect.creates_command_inbox_work());
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn daemon_publishes_inference_degraded_snapshot_without_agent_reply() {
+    let mut world = world_with_runtime();
+    let message = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: br#"{"type":"chat.message","body":"please summarize logs"}"#.to_vec(),
+            idempotency_key: "user_message_without_agent_reply".to_string(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Live,
+    )
+    .with_inference(InferenceState::DegradedNoReply);
+
+    daemon.sync_tick(&mut world.server);
+
+    let snapshot = runtime_state_snapshot_after(
+        &world.server,
+        &world.room_id,
+        "runtime.inference",
+        message.seq,
+    )
+    .unwrap();
+    let status: serde_json::Value =
+        serde_json::from_slice(&snapshot.snapshot.status_payload).unwrap();
+
+    assert!(daemon.after_seq >= message.seq);
+    assert_eq!(daemon.inference, InferenceState::DegradedNoReply);
+    assert_eq!(
+        snapshot.snapshot.schema,
+        "finitecomputer.runtime.inference.status.v1"
+    );
+    assert_eq!(status["status"], "degraded");
+    assert_eq!(status["reason"], "agent_no_reply");
+    assert_eq!(
+        runtime_chat_message_count_from(&world.server, &world.room_id, &bob()),
+        0
+    );
     let snapshot_effect = world
         .server
         .application_effect(&snapshot.message_id)
@@ -803,6 +896,31 @@ fn runtime_config_snapshot_payload(
     serde_json::to_vec(&snapshot).unwrap()
 }
 
+fn runtime_inference_snapshot_payload(
+    server: &DeliveryService,
+    room_id: &str,
+    inference: InferenceState,
+) -> Vec<u8> {
+    let revision = server.room(room_id).unwrap().last_seq + 1;
+    let observed_at_ms = revision * 1_000;
+    let status_payload = match inference {
+        InferenceState::Healthy => br#"{"status":"healthy"}"#.to_vec(),
+        InferenceState::DegradedNoReply => {
+            br#"{"status":"degraded","reason":"agent_no_reply"}"#.to_vec()
+        }
+    };
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.inference".to_string(),
+        schema: "finitecomputer.runtime.inference.status.v1".to_string(),
+        revision,
+        observed_at_ms,
+        expires_at_ms: observed_at_ms + 60_000,
+        status_payload,
+    };
+    snapshot.validate_limits().unwrap();
+    serde_json::to_vec(&snapshot).unwrap()
+}
+
 fn runtime_config_status_payload(config_generation: u64) -> Vec<u8> {
     json!({
         "config_generation": config_generation,
@@ -824,6 +942,26 @@ fn command_result_seq(server: &DeliveryService, room_id: &str, request_id: &str)
                 .unwrap_or(false)
         })
         .map(|entry| entry.seq)
+}
+
+fn runtime_chat_message_count_from(
+    server: &DeliveryService,
+    room_id: &str,
+    sender: &DeviceRef,
+) -> usize {
+    server
+        .room(room_id)
+        .unwrap()
+        .log
+        .iter()
+        .filter(|entry| entry.sender == *sender)
+        .filter(|entry| {
+            serde_json::from_slice::<serde_json::Value>(&entry.envelope.payload)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(str::to_string))
+                .is_some_and(|kind| kind == "chat.message")
+        })
+        .count()
 }
 
 struct CommandResultLogEntry {
