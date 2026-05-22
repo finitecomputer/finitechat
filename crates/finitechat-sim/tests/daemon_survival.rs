@@ -946,6 +946,54 @@ fn sse_hint_during_hermes_down_only_triggers_pull_sync() {
 }
 
 #[test]
+fn daemon_restart_while_gateway_down_preserves_mls_and_cursors() {
+    let mut world = world_with_runtime();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    daemon.sync_tick(&mut world.server);
+    let persisted_after_seq = daemon.after_seq;
+    let snapshot_count =
+        runtime_state_snapshot_count(&world.server, &world.room_id, "runtime.gateway");
+
+    let message = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: br#"{"type":"chat.message","body":"still there?"}"#.to_vec(),
+            idempotency_key: "message_after_gateway_down_restart".to_string(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+    let mut restarted = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    )
+    .with_persisted_ledger(daemon.ledger, persisted_after_seq);
+
+    restarted.sync_tick(&mut world.server);
+
+    assert_eq!(restarted.room_id, world.room_id);
+    assert_eq!(restarted.group_id, world.group_id);
+    assert_eq!(restarted.gateway, GatewayState::Down);
+    assert!(restarted.after_seq >= message.seq);
+    assert!(restarted.after_seq >= persisted_after_seq);
+    assert_eq!(
+        runtime_state_snapshot_count(&world.server, &world.room_id, "runtime.gateway"),
+        snapshot_count + 1
+    );
+}
+
+#[test]
 fn command_ledger_survives_restart_after_request_before_execution() {
     let mut world = world_with_runtime();
     append_application(
