@@ -2,15 +2,16 @@ use finitechat_proto::{
     AccountId, ApplicationDeliveryPolicy, ConversationId, DeviceId, DeviceRef, Epoch,
     FiniteEnvelope, IdempotencyKey, KeyPackageHash, KeyPackageId, KeyPackageRef, KeyPackageState,
     LeaseToken, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES, MAX_SYNC_PAGE_ENTRIES,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
-    ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
-    WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
-    validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
+    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, MAX_SYNC_PAGE_BYTES,
+    MAX_SYNC_PAGE_ENTRIES, MAX_WELCOME_CLAIMS_PER_REQUEST, MembershipDeltaError, MembershipDeltaV1,
+    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq,
+    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
+    validate_idempotency_key, validate_item_count, validate_mls_group_id, validate_room_id,
+    validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,8 @@ pub struct DeliveryService {
     direct_rooms: BTreeMap<String, RoomId>,
     #[serde(default)]
     devices: BTreeMap<String, DeviceRecord>,
+    #[serde(default)]
+    device_liveness: BTreeMap<String, DeviceLivenessRecord>,
     key_packages: BTreeMap<KeyPackageId, KeyPackageRecord>,
     welcomes: BTreeMap<WelcomeId, WelcomeRecord>,
     link_sessions: BTreeMap<LinkSessionId, LinkSessionRecord>,
@@ -74,6 +77,26 @@ pub enum DeviceStatus {
 pub struct DeviceRecord {
     pub device: DeviceRef,
     pub status: DeviceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveDeviceLivenessRequest {
+    pub device: DeviceRef,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLivenessRecord {
+    pub device: DeviceRef,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+impl DeviceLivenessRecord {
+    pub fn is_live_at(&self, now_ms: u64) -> bool {
+        now_ms < self.expires_at_ms
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +610,13 @@ impl AppendEphemeralActivityRequest {
     }
 }
 
+impl ObserveDeviceLivenessRequest {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        self.device.validate_limits()?;
+        validate_device_liveness_expiry(self.observed_at_ms, self.expires_at_ms)
+    }
+}
+
 impl SubmitCommitRequest {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
         validate_room_id(&self.room_id)?;
@@ -647,6 +677,52 @@ impl DeliveryService {
 
     pub fn device(&self, device: &DeviceRef) -> Option<&DeviceRecord> {
         self.devices.get(&device_registry_key(device))
+    }
+
+    pub fn device_liveness(&self, device: &DeviceRef) -> Option<&DeviceLivenessRecord> {
+        self.device_liveness.get(&device_registry_key(device))
+    }
+
+    pub fn device_is_live_at(&self, device: &DeviceRef, now_ms: u64) -> bool {
+        let active = self
+            .device(device)
+            .is_some_and(|record| record.status == DeviceStatus::Active);
+        if !active {
+            return false;
+        }
+        self.device_liveness(device)
+            .is_some_and(|record| record.is_live_at(now_ms))
+    }
+
+    pub fn observe_device_liveness(
+        &mut self,
+        request: ObserveDeviceLivenessRequest,
+    ) -> Result<DeviceLivenessRecord, EngineError> {
+        request.validate_limits()?;
+        let key = device_registry_key(&request.device);
+        let record = self
+            .devices
+            .get(&key)
+            .ok_or_else(|| EngineError::DeviceNotFound(request.device.clone()))?;
+        if record.status == DeviceStatus::Revoked {
+            return Err(EngineError::DeviceRevoked(request.device));
+        }
+        match self.device_liveness.get(&key) {
+            Some(current) if request.observed_at_ms <= current.observed_at_ms => {
+                return Ok(current.clone());
+            }
+            Some(_) | None => {}
+        }
+
+        let liveness = DeviceLivenessRecord {
+            device: request.device,
+            observed_at_ms: request.observed_at_ms,
+            expires_at_ms: request.expires_at_ms,
+        };
+        assert!(liveness.expires_at_ms > liveness.observed_at_ms);
+        assert!(liveness.is_live_at(liveness.observed_at_ms));
+        self.device_liveness.insert(key, liveness.clone());
+        Ok(liveness)
     }
 
     pub fn welcome(&self, welcome_id: &str) -> Option<&WelcomeRecord> {
@@ -1845,6 +1921,8 @@ pub enum EngineError {
     DuplicateKeyPackage(KeyPackageId),
     #[error("device is already current or pending in room: {0:?}")]
     DeviceAlreadyInRoom(DeviceRef),
+    #[error("device not found: {0:?}")]
+    DeviceNotFound(DeviceRef),
     #[error("device is revoked: {0:?}")]
     DeviceRevoked(DeviceRef),
     #[error("duplicate message id in room log: {0}")]
@@ -2143,6 +2221,27 @@ pub fn validate_activity_expiry(
     if window > MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS {
         return Err(EngineError::EphemeralActivityExpiryTooLong {
             max_millis: MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+            actual_millis: window,
+        });
+    }
+    Ok(())
+}
+
+fn validate_device_liveness_expiry(
+    observed_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<(), ProtocolLimitError> {
+    if expires_at_ms <= observed_at_ms {
+        return Err(ProtocolLimitError::InvalidTimeRange {
+            start_field: "device_liveness.observed_at_ms".to_string(),
+            end_field: "device_liveness.expires_at_ms".to_string(),
+        });
+    }
+    let window = expires_at_ms - observed_at_ms;
+    if window > MAX_DEVICE_LIVENESS_EXPIRY_MILLIS {
+        return Err(ProtocolLimitError::DurationTooLong {
+            field: "device_liveness.expiry_window_millis".to_string(),
+            max_millis: MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
             actual_millis: window,
         });
     }

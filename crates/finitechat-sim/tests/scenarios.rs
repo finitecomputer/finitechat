@@ -1,19 +1,19 @@
 use finitechat_engine::{
     AppendApplicationEventRequest, AppendEphemeralActivityRequest, AppendEventRequest,
     CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, DeviceStatus, EngineError,
-    LinkSessionState, ListAccountRoomsRequest, SubmitCommitRequest, UploadKeyPackageRequest,
-    device, envelope,
+    LinkSessionState, ListAccountRoomsRequest, ObserveDeviceLivenessRequest, SubmitCommitRequest,
+    UploadKeyPackageRequest, device, envelope,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, KeyPackageState,
-    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS, MAX_SYNC_PAGE_ENTRIES,
-    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
-    ProtocolLimitError, PushPolicy, RoomStatus, RuntimeStateProjection,
-    RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1, UnreadPolicy,
-    WelcomeState,
+    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1,
+    MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, PushPolicy,
+    RoomStatus, RuntimeStateProjection, RuntimeStateProjectionEntry, RuntimeStateProjectionError,
+    RuntimeStateSnapshotV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -2243,6 +2243,111 @@ fn runtime_state_slow_refresh_cadence_is_bounded() {
     assert_eq!(world.server.push_outbox_len(), 0);
     assert_eq!(world.server.unread_len(), 0);
     assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn runtime_liveness_heartbeat_is_not_encrypted_runtime_state() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+
+    let heartbeat = world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        })
+        .unwrap();
+    let stale_replay = world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_500,
+        })
+        .unwrap();
+
+    assert_eq!(heartbeat.device, bob());
+    assert_eq!(stale_replay, heartbeat);
+    assert!(world.server.device_is_live_at(&bob(), 1_000));
+    assert!(world.server.device_is_live_at(&bob(), 60_999));
+    assert!(!world.server.device_is_live_at(&bob(), 61_000));
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 1);
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+    assert_eq!(
+        RuntimeStateProjection::default()
+            .require_fresh(
+                &world.room_id,
+                &bob(),
+                "runtime.gateway",
+                "finitecomputer.runtime.gateway.status.v1",
+                1_000,
+            )
+            .unwrap_err(),
+        RuntimeStateProjectionError::Missing {
+            room_id: world.room_id,
+            source_device: bob(),
+            state_key: "runtime.gateway".to_string(),
+        }
+    );
+}
+
+#[test]
+fn runtime_liveness_rejects_bad_heartbeat_without_room_side_effects() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+    world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        })
+        .unwrap();
+
+    let too_long = world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS + 1,
+        })
+        .unwrap_err();
+    let unknown = world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: charlie(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        })
+        .unwrap_err();
+    world.server.revoke_device(bob()).unwrap();
+    let revoked = world
+        .server
+        .observe_device_liveness(ObserveDeviceLivenessRequest {
+            device: bob(),
+            observed_at_ms: 2_000,
+            expires_at_ms: 2_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        too_long,
+        EngineError::ProtocolLimit(ProtocolLimitError::DurationTooLong { .. })
+    ));
+    assert_eq!(unknown, EngineError::DeviceNotFound(charlie()));
+    assert_eq!(revoked, EngineError::DeviceRevoked(bob()));
+    assert_eq!(world.server.room(&world.room_id).unwrap().last_seq, 1);
+    assert_eq!(
+        world.server.device(&bob()).unwrap().status,
+        DeviceStatus::Revoked
+    );
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+    assert!(!world.server.device_is_live_at(&bob(), 2_000));
 }
 
 #[test]

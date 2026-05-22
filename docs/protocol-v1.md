@@ -198,6 +198,7 @@ These are protocol constants, not tuning hints:
 - idempotency records per room/device: `4096`;
 - link-session payload: `1 MiB`;
 - attachment plaintext: `32 MiB`;
+- device liveness heartbeat freshness window: `60 seconds`;
 - runtime state snapshot payload: `64 KiB`;
 - runtime state snapshot freshness window: `5 minutes`;
 - runtime state keys per room/device: `128`;
@@ -613,6 +614,11 @@ not a heartbeat substitute. Liveness remains a small server-visible heartbeat,
 while `runtime.state.snapshot` carries encrypted application state. A command
 result may include or be immediately followed by a snapshot for the state it
 changed.
+
+Device liveness is server-visible delivery state, not encrypted runtime status.
+It says a registered, non-revoked device has checked in recently enough to be
+woken or shown as reachable. It does not advance the room log, produce push or
+unread work, or satisfy a typed `runtime.state.snapshot` read.
 
 Finite Chat reserves generic durable command kinds:
 
