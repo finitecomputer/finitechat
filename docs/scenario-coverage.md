@@ -599,6 +599,7 @@ appropriate:
 - `chat_receipt_is_encrypted_payload_semantics`
 - `conversation_segment_start_is_durable_but_push_never`
 - `topic_message_routes_by_conversation_id`
+- `decrypted_application_event_rejects_empty_conversation_id`
 - `first_message_lazily_materializes_missing_conversation`
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_rejects_missing_conversation_id_or_bad_payload`

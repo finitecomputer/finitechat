@@ -2077,6 +2077,7 @@ impl DecryptedApplicationEventV1 {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
         self.kind.validate_limits()?;
         if let Some(conversation_id) = &self.conversation_id {
+            validate_bytes_non_empty("conversation_id", conversation_id.len())?;
             validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
         }
         let max_payload = if self.kind == DurableAppEventKind::RuntimeStateSnapshot {
@@ -2744,6 +2745,22 @@ mod tests {
             !DurableAppEventKind::RuntimeCommandResult
                 .delivery_policy()
                 .creates_push()
+        );
+    }
+
+    #[test]
+    fn decrypted_application_event_rejects_empty_conversation_id() {
+        let event = DecryptedApplicationEventV1 {
+            kind: DurableAppEventKind::ChatMessage,
+            conversation_id: Some(String::new()),
+            payload: b"hello".to_vec(),
+        };
+
+        assert_eq!(
+            event.validate_limits().unwrap_err(),
+            ProtocolLimitError::BytesEmpty {
+                field: "conversation_id".to_string()
+            }
         );
     }
 
