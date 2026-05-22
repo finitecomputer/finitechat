@@ -54,6 +54,7 @@ pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
 pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
 pub const MAX_CONVERSATION_PROJECTION_ENTRIES: u32 = 4096;
 pub const MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION: u32 = 1024;
+pub const MAX_CONVERSATION_METADATA_PAYLOAD_BYTES: u32 = 16 * 1024;
 pub const MAX_CONVERSATION_SEGMENT_PAYLOAD_BYTES: u32 = 16 * 1024;
 pub const MAX_RUNTIME_COMMAND_PAYLOAD_BYTES: u32 = 128 * 1024;
 pub const MAX_RUNTIME_COMMAND_ERROR_MESSAGE_BYTES: u32 = 2048;
@@ -102,6 +103,8 @@ const _: () = {
     assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
     assert!(MAX_CONVERSATION_PROJECTION_ENTRIES > 0);
     assert!(MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION > 0);
+    assert!(MAX_CONVERSATION_METADATA_PAYLOAD_BYTES > 0);
+    assert!(MAX_CONVERSATION_METADATA_PAYLOAD_BYTES <= MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_CONVERSATION_SEGMENT_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES > 0);
     assert!(MAX_RUNTIME_COMMAND_PAYLOAD_BYTES < MAX_ENVELOPE_PAYLOAD_BYTES);
@@ -504,6 +507,28 @@ pub struct ConversationSegmentStartV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationExternalTopicV1 {
+    pub platform: String,
+    pub chat_id: String,
+    pub thread_id: Option<String>,
+    pub topic_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationSkillBindingV1 {
+    pub namespace: String,
+    pub skill_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationMetadataV1 {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub external_topic: Option<ConversationExternalTopicV1>,
+    pub skill_binding: Option<ConversationSkillBindingV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationSegmentProjectionRecord {
     pub segment_id: ConversationSegmentId,
     pub started_seq: Seq,
@@ -516,6 +541,7 @@ pub struct ConversationProjectionEntry {
     pub created_seq: Seq,
     pub updated_seq: Seq,
     pub archived: bool,
+    pub metadata: Option<ConversationMetadataV1>,
     pub active_segment_id: Option<ConversationSegmentId>,
     pub segments: Vec<ConversationSegmentProjectionRecord>,
 }
@@ -558,6 +584,8 @@ pub enum ConversationProjectionDecision {
 pub enum ConversationProjectionError {
     #[error("conversation event {kind:?} requires conversation_id")]
     MissingConversationId { kind: DurableAppEventKind },
+    #[error("conversation metadata payload is malformed")]
+    MalformedMetadataPayload,
     #[error("conversation segment payload is malformed")]
     MalformedSegmentPayload,
     #[error("conversation segment id already exists: {segment_id}")]
@@ -972,6 +1000,82 @@ impl ConversationSegmentStartV1 {
     }
 }
 
+impl ConversationExternalTopicV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("conversation.external_topic.platform", self.platform.len())?;
+        validate_string_bytes(
+            "conversation.external_topic.platform",
+            &self.platform,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("conversation.external_topic.chat_id", self.chat_id.len())?;
+        validate_string_bytes(
+            "conversation.external_topic.chat_id",
+            &self.chat_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if let Some(thread_id) = &self.thread_id {
+            validate_bytes_non_empty("conversation.external_topic.thread_id", thread_id.len())?;
+            validate_string_bytes(
+                "conversation.external_topic.thread_id",
+                thread_id,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        if let Some(topic_name) = &self.topic_name {
+            validate_bytes_non_empty("conversation.external_topic.topic_name", topic_name.len())?;
+            validate_string_bytes(
+                "conversation.external_topic.topic_name",
+                topic_name,
+                MAX_OBJECT_ID_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl ConversationSkillBindingV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty("conversation.skill_binding.namespace", self.namespace.len())?;
+        validate_string_bytes(
+            "conversation.skill_binding.namespace",
+            &self.namespace,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        validate_bytes_non_empty("conversation.skill_binding.skill_id", self.skill_id.len())?;
+        validate_string_bytes(
+            "conversation.skill_binding.skill_id",
+            &self.skill_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+impl ConversationMetadataV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        if let Some(title) = &self.title {
+            validate_bytes_non_empty("conversation.metadata.title", title.len())?;
+            validate_string_bytes("conversation.metadata.title", title, MAX_OBJECT_ID_BYTES)?;
+        }
+        if let Some(description) = &self.description {
+            validate_bytes_non_empty("conversation.metadata.description", description.len())?;
+            validate_string_bytes(
+                "conversation.metadata.description",
+                description,
+                MAX_CONVERSATION_METADATA_PAYLOAD_BYTES,
+            )?;
+        }
+        if let Some(external_topic) = &self.external_topic {
+            external_topic.validate_limits()?;
+        }
+        if let Some(skill_binding) = &self.skill_binding {
+            skill_binding.validate_limits()?;
+        }
+        Ok(())
+    }
+}
+
 impl ConversationProjection {
     pub fn apply_event(
         &mut self,
@@ -983,21 +1087,25 @@ impl ConversationProjection {
         match event.kind {
             DurableAppEventKind::ConversationCreate => {
                 let conversation_id = required_conversation_id(&context, &event.kind)?;
+                let metadata = parse_conversation_metadata(&event.payload)?;
                 self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
                 let entry = self
                     .entry_mut(context.room_id, conversation_id)
                     .expect("conversation was ensured before update");
                 entry.updated_seq = context.accepted_seq;
                 entry.archived = false;
+                entry.metadata = Some(metadata);
                 Ok(ConversationProjectionDecision::Created)
             }
             DurableAppEventKind::ConversationUpdate => {
                 let conversation_id = required_conversation_id(&context, &event.kind)?;
+                let metadata = parse_conversation_metadata(&event.payload)?;
                 self.ensure_entry(context.room_id, conversation_id, context.accepted_seq)?;
                 let entry = self
                     .entry_mut(context.room_id, conversation_id)
                     .expect("conversation was ensured before update");
                 entry.updated_seq = context.accepted_seq;
+                entry.metadata = Some(metadata);
                 Ok(ConversationProjectionDecision::Updated)
             }
             DurableAppEventKind::ConversationArchive => {
@@ -1110,6 +1218,7 @@ impl ConversationProjection {
                 created_seq: accepted_seq,
                 updated_seq: accepted_seq,
                 archived: false,
+                metadata: None,
                 active_segment_id: None,
                 segments: Vec::new(),
             },
@@ -2145,6 +2254,21 @@ fn parse_segment_start(
         .map_err(|_| ConversationProjectionError::MalformedSegmentPayload)?;
     segment.validate_limits()?;
     Ok(segment)
+}
+
+fn parse_conversation_metadata(
+    payload: &[u8],
+) -> Result<ConversationMetadataV1, ConversationProjectionError> {
+    validate_bytes_non_empty("conversation.metadata.payload", payload.len())?;
+    validate_bytes_len(
+        "conversation.metadata.payload",
+        payload.len(),
+        MAX_CONVERSATION_METADATA_PAYLOAD_BYTES,
+    )?;
+    let metadata = serde_json::from_slice::<ConversationMetadataV1>(payload)
+        .map_err(|_| ConversationProjectionError::MalformedMetadataPayload)?;
+    metadata.validate_limits()?;
+    Ok(metadata)
 }
 
 fn runtime_command_ledger_key(
@@ -3605,6 +3729,156 @@ mod tests {
     }
 
     #[test]
+    fn topic_create_is_conversation_create_with_topic_metadata() {
+        let mut projection = ConversationProjection::default();
+        let metadata = conversation_metadata_payload(ConversationMetadataV1 {
+            title: Some("Ops".to_string()),
+            description: Some("Runtime operations".to_string()),
+            external_topic: Some(ConversationExternalTopicV1 {
+                platform: "telegram".to_string(),
+                chat_id: "-100123".to_string(),
+                thread_id: Some("42".to_string()),
+                topic_name: Some("Ops".to_string()),
+            }),
+            skill_binding: Some(ConversationSkillBindingV1 {
+                namespace: "finitecomputer".to_string(),
+                skill_id: "runtime-admin".to_string(),
+            }),
+        });
+
+        let decision = projection
+            .apply_event(
+                conversation_context("room_1", 3, Some("topic_imported_telegram")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_imported_telegram"),
+                    &metadata,
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_imported_telegram").unwrap();
+        let metadata = topic.metadata.as_ref().unwrap();
+
+        assert_eq!(decision, ConversationProjectionDecision::Created);
+        assert_eq!(topic.created_seq, 3);
+        assert_eq!(topic.updated_seq, 3);
+        assert_eq!(metadata.title.as_deref(), Some("Ops"));
+        assert_eq!(
+            metadata.external_topic.as_ref().unwrap().platform,
+            "telegram"
+        );
+        assert_eq!(
+            metadata.skill_binding.as_ref().unwrap().skill_id,
+            "runtime-admin"
+        );
+    }
+
+    #[test]
+    fn telegram_thread_id_imports_to_topic_conversation_id() {
+        let mut projection = ConversationProjection::default();
+        let metadata = conversation_metadata_payload(ConversationMetadataV1 {
+            title: Some("Telegram Topic".to_string()),
+            description: None,
+            external_topic: Some(ConversationExternalTopicV1 {
+                platform: "telegram".to_string(),
+                chat_id: "-100123".to_string(),
+                thread_id: Some("31337".to_string()),
+                topic_name: Some("Deploys".to_string()),
+            }),
+            skill_binding: None,
+        });
+
+        projection
+            .apply_event(
+                conversation_context("room_1", 5, Some("topic_finite_31337")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_finite_31337"),
+                    &metadata,
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_finite_31337").unwrap();
+        let external = topic
+            .metadata
+            .as_ref()
+            .unwrap()
+            .external_topic
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(topic.conversation_id, "topic_finite_31337");
+        assert_ne!(
+            topic.conversation_id,
+            external.thread_id.as_deref().unwrap()
+        );
+        assert_eq!(external.platform, "telegram");
+        assert_eq!(external.chat_id, "-100123");
+        assert_eq!(external.thread_id.as_deref(), Some("31337"));
+        assert_eq!(external.topic_name.as_deref(), Some("Deploys"));
+    }
+
+    #[test]
+    fn topic_skill_binding_is_encrypted_conversation_metadata() {
+        let mut projection = ConversationProjection::default();
+        let create = conversation_metadata_payload(ConversationMetadataV1 {
+            title: Some("Coding".to_string()),
+            description: None,
+            external_topic: None,
+            skill_binding: Some(ConversationSkillBindingV1 {
+                namespace: "finitecomputer".to_string(),
+                skill_id: "code-review".to_string(),
+            }),
+        });
+        let update = conversation_metadata_payload(ConversationMetadataV1 {
+            title: Some("Coding".to_string()),
+            description: Some("Use implementation mode".to_string()),
+            external_topic: None,
+            skill_binding: Some(ConversationSkillBindingV1 {
+                namespace: "finitecomputer".to_string(),
+                skill_id: "implementation".to_string(),
+            }),
+        });
+
+        projection
+            .apply_event(
+                conversation_context("room_1", 6, Some("topic_code")),
+                &application_event(
+                    DurableAppEventKind::ConversationCreate,
+                    Some("topic_code"),
+                    &create,
+                ),
+            )
+            .unwrap();
+        projection
+            .apply_event(
+                conversation_context("room_1", 7, Some("topic_code")),
+                &application_event(
+                    DurableAppEventKind::ConversationUpdate,
+                    Some("topic_code"),
+                    &update,
+                ),
+            )
+            .unwrap();
+        let topic = projection.get("room_1", "topic_code").unwrap();
+        let binding = topic
+            .metadata
+            .as_ref()
+            .unwrap()
+            .skill_binding
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(topic.updated_seq, 7);
+        assert_eq!(binding.namespace, "finitecomputer");
+        assert_eq!(binding.skill_id, "implementation");
+        assert_eq!(
+            topic.metadata.as_ref().unwrap().description.as_deref(),
+            Some("Use implementation mode")
+        );
+    }
+
+    #[test]
     fn new_command_inside_topic_starts_segment_not_conversation() {
         let mut projection = ConversationProjection::default();
         projection
@@ -3666,6 +3940,34 @@ mod tests {
                 .unwrap_err(),
             ConversationProjectionError::MalformedSegmentPayload
         );
+    }
+
+    #[test]
+    fn conversation_metadata_rejects_missing_conversation_id_or_bad_payload() {
+        let mut projection = ConversationProjection::default();
+        assert!(matches!(
+            projection
+                .apply_event(
+                    conversation_context("room_1", 4, None),
+                    &application_event(DurableAppEventKind::ConversationCreate, None, b"{}"),
+                )
+                .unwrap_err(),
+            ConversationProjectionError::MissingConversationId { .. }
+        ));
+        assert_eq!(
+            projection
+                .apply_event(
+                    conversation_context("room_1", 5, Some("topic_agent")),
+                    &application_event(
+                        DurableAppEventKind::ConversationCreate,
+                        Some("topic_agent"),
+                        b"not-json",
+                    ),
+                )
+                .unwrap_err(),
+            ConversationProjectionError::MalformedMetadataPayload
+        );
+        assert!(projection.is_empty());
     }
 
     #[test]
@@ -3856,6 +4158,11 @@ mod tests {
             accepted_seq,
             conversation_id,
         }
+    }
+
+    fn conversation_metadata_payload(metadata: ConversationMetadataV1) -> Vec<u8> {
+        metadata.validate_limits().unwrap();
+        serde_json::to_vec(&metadata).unwrap()
     }
 
     fn application_event(

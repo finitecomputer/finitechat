@@ -201,6 +201,7 @@ These are protocol constants, not tuning hints:
 - runtime state snapshot payload: `64 KiB`;
 - runtime state keys per room/device: `128`;
 - conversation projection entries per client: `4096`;
+- conversation metadata payload: `16 KiB`;
 - segments per conversation: `1024`;
 - conversation segment payload: `16 KiB`;
 - runtime command JSON payload: `128 KiB`;
@@ -443,9 +444,11 @@ unknown `conversation_id`, but explicit `conversation.create` is preferred for
 clear ordering and projection behavior.
 
 Clients project topics by `(room_id, conversation_id)`. A
-`conversation.create` explicitly creates the topic; a first `chat.message` with
-a new `conversation_id` may lazily materialize it for simple clients and
-imports. `conversation.archive` is scoped to that one topic. A
+`conversation.create` explicitly creates the topic and carries bounded encrypted
+metadata such as title, description, external topic reference, and skill
+binding. A `conversation.update` replaces that encrypted metadata. A first
+`chat.message` with a new `conversation_id` may lazily materialize it for simple
+clients and imports. `conversation.archive` is scoped to that one topic. A
 `conversation.segment.start` requires `conversation_id`, adds a bounded segment
 record to that topic, and updates `active_segment_id`.
 

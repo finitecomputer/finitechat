@@ -173,6 +173,10 @@ kinds. Proven unit scenarios:
 - `activity_projection_expires_and_rejects_bad_lease_windows`
 - `topic_message_routes_by_conversation_id`
 - `first_message_lazily_materializes_missing_conversation`
+- `topic_create_is_conversation_create_with_topic_metadata`
+- `telegram_thread_id_imports_to_topic_conversation_id`
+- `topic_skill_binding_is_encrypted_conversation_metadata`
+- `conversation_metadata_rejects_missing_conversation_id_or_bad_payload`
 - `new_command_inside_topic_starts_segment_not_conversation`
 - `segment_boundary_rejects_missing_conversation_id_or_bad_payload`
 - `archiving_topic_does_not_archive_sibling_topic`
@@ -600,12 +604,8 @@ appropriate:
 
 Still planned:
 
-- `conversation_create_is_explicit_durable_event`
 - `reaction_edit_and_receipt_do_not_push_by_default`
-- `topic_create_is_conversation_create_with_topic_metadata`
 - `topic_activity_is_scoped_by_conversation_id`
-- `telegram_thread_id_imports_to_topic_conversation_id`
-- `topic_skill_binding_is_encrypted_conversation_metadata`
 - `segment_boundary_is_projected_without_protocol_managed_prompt_state`
 
 ## Attachment Scenarios

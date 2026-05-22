@@ -406,7 +406,10 @@ Good tests:
 - Topic/segment projection is now executable: clients project conversations by
   `(room_id, conversation_id)`, can lazily materialize a topic from the first
   message, archive one topic without siblings, and apply `/new` as a bounded
-  segment boundary inside the existing topic.
+  segment boundary inside the existing topic. Explicit topic create/update
+  events now carry bounded decrypted metadata for titles, external
+  Telegram/Hermes topic references, and skill bindings without putting those
+  external identifiers into the cleartext routing id.
 - Product trust modes are typed so hosted finitecomputer web chat is disclosed
   as a trusted-server client, true E2EE language is reserved for local-device
   clients, and imported plaintext chats can be rendered as read-only archives.
