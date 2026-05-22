@@ -2245,6 +2245,36 @@ fn runtime_command_duplicate_message_with_new_idempotency_key_rejects() {
 }
 
 #[test]
+fn runtime_command_request_id_is_opaque_to_server() {
+    let mut world = SimWorld::direct_room().unwrap();
+    let first = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","body":{"attempt":1}}"#,
+        "command_request_visible_id_1",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+    let second = application_event_request(
+        &world,
+        alice(),
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","body":{"attempt":2}}"#,
+        "command_request_visible_id_2",
+        DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+    );
+
+    let first_accepted = world.server.append_application_event(first).unwrap();
+    let second_accepted = world.server.append_application_event(second).unwrap();
+
+    assert_ne!(first_accepted.message_id, second_accepted.message_id);
+    assert_eq!(first_accepted.seq, 1);
+    assert_eq!(second_accepted.seq, 2);
+    assert_eq!(world.server.room(&world.room_id).unwrap().log.len(), 2);
+    assert_eq!(world.server.command_inbox_len(), 2);
+}
+
+#[test]
 fn conversation_segment_start_is_durable_but_push_never() {
     let mut world = SimWorld::direct_room().unwrap();
     let request = application_event_request(
