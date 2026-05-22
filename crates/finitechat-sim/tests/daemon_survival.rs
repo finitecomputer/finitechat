@@ -284,6 +284,36 @@ fn hermes_hang_does_not_block_room_sync_or_state_snapshot() {
 }
 
 #[test]
+fn daemon_publishes_gateway_down_snapshot_without_hermes() {
+    let mut world = world_with_runtime();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    let snapshot =
+        runtime_state_snapshot_after(&world.server, &world.room_id, "runtime.gateway", 1).unwrap();
+    assert_eq!(daemon.gateway, GatewayState::Down);
+    assert_eq!(
+        snapshot.snapshot.schema,
+        "finitecomputer.runtime.gateway.status.v1"
+    );
+    assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"down"}"#);
+    let snapshot_effect = world
+        .server
+        .application_effect(&snapshot.message_id)
+        .unwrap();
+    assert!(!snapshot_effect.creates_push());
+    assert!(!snapshot_effect.creates_unread());
+    assert!(!snapshot_effect.creates_command_inbox_work());
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
 fn runtime_state_command_result_publishes_post_mutation_snapshot() {
     let mut world = world_with_runtime();
     append_application(
