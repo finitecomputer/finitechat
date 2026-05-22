@@ -51,6 +51,7 @@ pub const MAX_ATTACHMENT_HASH_HEX_BYTES: u32 = 64;
 pub const MAX_ATTACHMENT_KEY_HEX_BYTES: u32 = 64;
 pub const MAX_ATTACHMENT_NONCE_HEX_BYTES: u32 = 24;
 pub const MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES: u32 = 64 * 1024;
+pub const MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS: u64 = 5 * 60 * 1000;
 pub const MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE: u32 = 128;
 pub const MAX_CONVERSATION_PROJECTION_ENTRIES: u32 = 4096;
 pub const MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION: u32 = 1024;
@@ -100,6 +101,8 @@ const _: () = {
     assert!(MAX_ATTACHMENT_KEY_HEX_BYTES == 64);
     assert!(MAX_ATTACHMENT_NONCE_HEX_BYTES == 24);
     assert!(MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES > 0);
+    assert!(MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS > 0);
+    assert!(MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
     assert!(MAX_RUNTIME_STATE_KEYS_PER_ROOM_DEVICE > 0);
     assert!(MAX_CONVERSATION_PROJECTION_ENTRIES > 0);
     assert!(MAX_CONVERSATION_SEGMENTS_PER_CONVERSATION > 0);
@@ -437,6 +440,7 @@ impl RuntimeStateSnapshotV1 {
         )?;
         validate_bytes_non_empty("runtime_state.schema", self.schema.len())?;
         validate_string_bytes("runtime_state.schema", &self.schema, MAX_OBJECT_ID_BYTES)?;
+        validate_runtime_state_snapshot_expiry(self.observed_at_ms, self.expires_at_ms)?;
         validate_bytes_non_empty("runtime_state.status_payload", self.status_payload.len())?;
         validate_bytes_len(
             "runtime_state.status_payload",
@@ -2113,6 +2117,17 @@ pub enum ProtocolLimitError {
         max_items: u64,
         actual_items: u64,
     },
+    #[error("{end_field} must be after {start_field}")]
+    InvalidTimeRange {
+        start_field: String,
+        end_field: String,
+    },
+    #[error("{field} has duration {actual_millis}ms, max {max_millis}ms")]
+    DurationTooLong {
+        field: String,
+        max_millis: u64,
+        actual_millis: u64,
+    },
 }
 
 pub fn validate_room_id(room_id: &str) -> Result<(), ProtocolLimitError> {
@@ -2366,6 +2381,27 @@ fn validate_ephemeral_activity_expiry(
     if window > MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS {
         return Err(EphemeralActivityProjectionError::ExpiryTooLong {
             max_millis: MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+            actual_millis: window,
+        });
+    }
+    Ok(())
+}
+
+fn validate_runtime_state_snapshot_expiry(
+    observed_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<(), ProtocolLimitError> {
+    if expires_at_ms <= observed_at_ms {
+        return Err(ProtocolLimitError::InvalidTimeRange {
+            start_field: "runtime_state.observed_at_ms".to_string(),
+            end_field: "runtime_state.expires_at_ms".to_string(),
+        });
+    }
+    let window = expires_at_ms - observed_at_ms;
+    if window > MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS {
+        return Err(ProtocolLimitError::DurationTooLong {
+            field: "runtime_state.expiry_window_millis".to_string(),
+            max_millis: MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS,
             actual_millis: window,
         });
     }
@@ -2771,6 +2807,34 @@ mod tests {
                 ProtocolLimitError::BytesEmpty { .. }
             ));
         }
+    }
+
+    #[test]
+    fn runtime_state_snapshot_refresh_cadence_is_bounded() {
+        let source = device("runtime_npub", "runtime_box");
+        let mut projection = RuntimeStateProjection::default();
+        let expired_at_observation =
+            runtime_state_entry_with_expiry("room_1", source.clone(), 1_000, 1_000);
+        let too_slow = runtime_state_entry_with_expiry(
+            "room_1",
+            source,
+            1_000,
+            1_000 + MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS + 1,
+        );
+
+        assert!(matches!(
+            projection.apply(expired_at_observation).unwrap_err(),
+            ProtocolLimitError::InvalidTimeRange { .. }
+        ));
+        assert!(matches!(
+            projection.apply(too_slow).unwrap_err(),
+            ProtocolLimitError::DurationTooLong {
+                max_millis: MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS,
+                actual_millis,
+                ..
+            } if actual_millis == MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS + 1
+        ));
+        assert!(projection.is_empty());
     }
 
     #[test]
@@ -4110,6 +4174,27 @@ mod tests {
                 observed_at_ms: 1_000,
                 expires_at_ms: 2_000,
                 status_payload: payload.to_vec(),
+            },
+        }
+    }
+
+    fn runtime_state_entry_with_expiry(
+        room_id: &str,
+        source: DeviceRef,
+        observed_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> RuntimeStateProjectionEntry {
+        RuntimeStateProjectionEntry {
+            room_id: room_id.to_string(),
+            source,
+            accepted_seq: 10,
+            snapshot: RuntimeStateSnapshotV1 {
+                state_key: "runtime.gateway".to_string(),
+                schema: "finitecomputer.runtime.gateway.status.v1".to_string(),
+                revision: 1,
+                observed_at_ms,
+                expires_at_ms,
+                status_payload: br#"{"status":"live"}"#.to_vec(),
             },
         }
     }

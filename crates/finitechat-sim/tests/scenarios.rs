@@ -9,10 +9,11 @@ use finitechat_proto::{
     LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
     MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_SYNC_PAGE_ENTRIES, MembershipAddV1, MembershipDeltaError,
-    MembershipDeltaV1, MembershipRemoveV1, ProtocolLimitError, PushPolicy, RoomStatus,
-    RuntimeStateProjection, RuntimeStateProjectionEntry, RuntimeStateProjectionError,
-    RuntimeStateSnapshotV1, UnreadPolicy, WelcomeState,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS, MAX_SYNC_PAGE_ENTRIES,
+    MembershipAddV1, MembershipDeltaError, MembershipDeltaV1, MembershipRemoveV1,
+    ProtocolLimitError, PushPolicy, RoomStatus, RuntimeStateProjection,
+    RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1, UnreadPolicy,
+    WelcomeState,
 };
 use finitechat_sim::{
     SimWorld, alice, bob, charlie, dana, fake_key_package_payload, staged_welcome,
@@ -2185,6 +2186,60 @@ fn runtime_state_snapshot_unknown_schema_is_preserved() {
         err,
         RuntimeStateProjectionError::WrongSchema { .. }
     ));
+    assert_eq!(world.server.push_outbox_len(), 0);
+    assert_eq!(world.server.unread_len(), 0);
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn runtime_state_slow_refresh_cadence_is_bounded() {
+    let mut world = SimWorld::direct_room().unwrap();
+    provision_bob(&mut world);
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.gateway".to_string(),
+        schema: "finitecomputer.runtime.gateway.status.v1".to_string(),
+        revision: 1,
+        observed_at_ms: 1_000,
+        expires_at_ms: 1_000 + MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS + 1,
+        status_payload: br#"{"status":"live"}"#.to_vec(),
+    };
+    let request = application_event_request(
+        &world,
+        bob(),
+        world.server.room(&world.room_id).unwrap().current_epoch,
+        &serde_json::to_vec(&snapshot).unwrap(),
+        "runtime_gateway_snapshot_too_slow_1",
+        DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+    );
+
+    let accepted = world.server.append_application_event(request).unwrap();
+    let entry = world
+        .server
+        .room(&world.room_id)
+        .unwrap()
+        .log
+        .iter()
+        .find(|entry| entry.seq == accepted.seq)
+        .unwrap();
+    let mut projection = RuntimeStateProjection::default();
+    let err = projection
+        .apply(RuntimeStateProjectionEntry {
+            room_id: world.room_id.clone(),
+            source: entry.sender.clone(),
+            accepted_seq: entry.seq,
+            snapshot: serde_json::from_slice(&entry.envelope.payload).unwrap(),
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ProtocolLimitError::DurationTooLong {
+            max_millis: MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS,
+            actual_millis,
+            ..
+        } if actual_millis == MAX_RUNTIME_STATE_SNAPSHOT_EXPIRY_MILLIS + 1
+    ));
+    assert_eq!(projection.len(), 0);
     assert_eq!(world.server.push_outbox_len(), 0);
     assert_eq!(world.server.unread_len(), 0);
     assert_eq!(world.server.command_inbox_len(), 0);

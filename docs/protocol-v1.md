@@ -199,6 +199,7 @@ These are protocol constants, not tuning hints:
 - link-session payload: `1 MiB`;
 - attachment plaintext: `32 MiB`;
 - runtime state snapshot payload: `64 KiB`;
+- runtime state snapshot freshness window: `5 minutes`;
 - runtime state keys per room/device: `128`;
 - conversation projection entries per client: `4096`;
 - conversation metadata payload: `16 KiB`;
@@ -607,10 +608,11 @@ with the later accepted room sequence. Unknown schemas are preserved for
 specialized clients and ignored by generic UI.
 
 Runtime daemons should publish snapshots on meaningful changes and on a slow
-refresh cadence. The cadence must be bounded by product policy; it is not a
-heartbeat substitute. Liveness remains a small server-visible heartbeat, while
-`runtime.state.snapshot` carries encrypted application state. A command result
-may include or be immediately followed by a snapshot for the state it changed.
+refresh cadence. The snapshot freshness window is bounded to `5 minutes`; it is
+not a heartbeat substitute. Liveness remains a small server-visible heartbeat,
+while `runtime.state.snapshot` carries encrypted application state. A command
+result may include or be immediately followed by a snapshot for the state it
+changed.
 
 Finite Chat reserves generic durable command kinds:
 
