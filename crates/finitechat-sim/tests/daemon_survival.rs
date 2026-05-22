@@ -898,6 +898,54 @@ fn runtime_stream_callback_only_triggers_sync() {
 }
 
 #[test]
+fn sse_hint_during_hermes_down_only_triggers_pull_sync() {
+    let mut world = world_with_runtime();
+    let accepted = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: br#"{"type":"chat.message","body":"gateway still down?"}"#.to_vec(),
+            idempotency_key: "sse_hint_while_down_message".to_string(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+    let mut projection = RoomSyncProjection::default();
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    projection
+        .observe_stream_hint(&world.room_id, accepted.seq)
+        .unwrap();
+
+    assert!(projection.needs_pull());
+    assert_eq!(daemon.gateway, GatewayState::Down);
+    assert_eq!(
+        runtime_state_snapshot_count(&world.server, &world.room_id, "runtime.gateway"),
+        0
+    );
+
+    daemon.sync_tick(&mut world.server);
+
+    assert!(daemon.after_seq >= accepted.seq);
+    assert_eq!(daemon.gateway, GatewayState::Down);
+    let snapshot = runtime_state_snapshot_after(
+        &world.server,
+        &world.room_id,
+        "runtime.gateway",
+        accepted.seq,
+    )
+    .unwrap();
+    assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"down"}"#);
+}
+
+#[test]
 fn command_ledger_survives_restart_after_request_before_execution() {
     let mut world = world_with_runtime();
     append_application(
