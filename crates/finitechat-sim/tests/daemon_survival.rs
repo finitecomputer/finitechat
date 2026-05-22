@@ -1,17 +1,19 @@
+use finitechat_blob::{MemoryBlobStore, download_attachment, upload_attachment};
 use finitechat_engine::{
     AppendApplicationEventRequest, AppendEventRequest, DeliveryService, EventAccepted,
     ObserveDeviceLivenessRequest, RoomSyncProjection, UploadKeyPackageRequest, envelope,
 };
 use finitechat_proto::{
-    ApplicationDeliveryPolicy, DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind,
-    EphemeralActivityActionV1, EphemeralActivityIngressContext, EphemeralActivityProjection,
-    LogEntryKind, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
-    MAX_RUNTIME_COMMAND_LEDGER_RECORDS, RuntimeActivityClearV1, RuntimeCommandErrorV1,
-    RuntimeCommandIngressContext, RuntimeCommandJsonPayloadV1, RuntimeCommandLedger,
-    RuntimeCommandLedgerStatus, RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1,
-    RuntimeCommandResultV1, RuntimeCommandTargetV1, RuntimeCommandTerminalContext,
-    RuntimeCommandTerminalDecision, RuntimeCommandTerminalStatusV1, RuntimeStateProjection,
-    RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
+    ApplicationDeliveryPolicy, AttachmentBlobMetadataV1, DecryptedEphemeralActivityV1, DeviceRef,
+    DurableAppEventKind, EphemeralActivityActionV1, EphemeralActivityIngressContext,
+    EphemeralActivityProjection, LogEntryKind, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+    MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS, MAX_RUNTIME_COMMAND_LEDGER_RECORDS,
+    RuntimeActivityClearV1, RuntimeCommandErrorV1, RuntimeCommandIngressContext,
+    RuntimeCommandJsonPayloadV1, RuntimeCommandLedger, RuntimeCommandLedgerStatus,
+    RuntimeCommandPayloadKindV1, RuntimeCommandRequestV1, RuntimeCommandResultV1,
+    RuntimeCommandTargetV1, RuntimeCommandTerminalContext, RuntimeCommandTerminalDecision,
+    RuntimeCommandTerminalStatusV1, RuntimeStateProjection, RuntimeStateProjectionEntry,
+    RuntimeStateProjectionError, RuntimeStateSnapshotV1,
 };
 use finitechat_sim::{SimWorld, alice, bob, charlie, fake_key_package_payload};
 use serde_json::json;
@@ -365,6 +367,52 @@ fn daemon_publishes_gateway_down_snapshot_without_hermes() {
     assert!(!snapshot_effect.creates_push());
     assert!(!snapshot_effect.creates_unread());
     assert!(!snapshot_effect.creates_command_inbox_work());
+    assert_eq!(world.server.command_inbox_len(), 0);
+}
+
+#[test]
+fn attachment_download_does_not_depend_on_hermes_gateway() {
+    let mut world = world_with_runtime();
+    let mut blob_store = MemoryBlobStore::default();
+    let uploaded = upload_attachment(
+        &mut blob_store,
+        b"diagnostic bundle bytes",
+        attachment_metadata(),
+    )
+    .unwrap();
+    let attachment_message = append_application(
+        &mut world.server,
+        ApplicationAppend {
+            room_id: &world.room_id,
+            group_id: &world.group_id,
+            sender: alice(),
+            epoch: 1,
+            payload: serde_json::to_vec(&uploaded.reference).unwrap(),
+            idempotency_key: "attachment_message_gateway_down".to_string(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    );
+    let mut daemon = FakeDaemon::new(
+        bob(),
+        world.room_id.clone(),
+        world.group_id.clone(),
+        GatewayState::Down,
+    );
+
+    daemon.sync_tick(&mut world.server);
+    let downloaded = download_attachment(&blob_store, &uploaded.reference).unwrap();
+    let snapshot = runtime_state_snapshot_after(
+        &world.server,
+        &world.room_id,
+        "runtime.gateway",
+        attachment_message.seq,
+    )
+    .unwrap();
+
+    assert!(daemon.after_seq >= attachment_message.seq);
+    assert_eq!(daemon.gateway, GatewayState::Down);
+    assert_eq!(downloaded.plaintext, b"diagnostic bundle bytes");
+    assert_eq!(snapshot.snapshot.status_payload, br#"{"status":"down"}"#);
     assert_eq!(world.server.command_inbox_len(), 0);
 }
 
@@ -1636,6 +1684,14 @@ fn runtime_state_snapshot_count(server: &DeliveryService, room_id: &str, state_k
                 .unwrap_or(false)
         })
         .count()
+}
+
+fn attachment_metadata() -> AttachmentBlobMetadataV1 {
+    AttachmentBlobMetadataV1 {
+        mime_type: "application/octet-stream".to_string(),
+        filename: "diagnostics.bin".to_string(),
+        dimensions: None,
+    }
 }
 
 struct SnapshotLogEntry {

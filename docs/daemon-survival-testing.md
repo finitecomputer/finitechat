@@ -4,10 +4,10 @@ Status: planned strategy.
 
 First implementation checkpoint: `crates/finitechat-sim/tests/daemon_survival.rs`
 now proves the pure daemon state machine with a fake runtime adapter. It covers
-Hermes absent at startup, Hermes hung during sync, restart-after-ledger-write,
-and a deterministic bounded fuzzer for user messages, restart commands, gateway
-state changes, daemon restarts, and crash points. The broader layers below
-remain the production hardening plan.
+Hermes absent at startup, Hermes hung during sync, attachment download while the
+gateway is down, restart-after-ledger-write, and a deterministic bounded fuzzer
+for user messages, restart commands, gateway state changes, daemon restarts, and
+crash points. The broader layers below remain the production hardening plan.
 
 Finite Chat is the last-resort control surface for an agent runtime. Hermes can
 crash, hang, misconfigure itself, or lose inference access. Finite Chat must
@@ -124,6 +124,7 @@ Run the same command/status scenarios under a bounded matrix:
 | Inference rate-limited | runtime state publishes degraded provider status; no restart loop |
 | Gateway restart succeeds | command result and post-mutation `runtime.gateway` snapshot converge |
 | Gateway restart fails | command result is terminal failure; state snapshot remains down/degraded |
+| Attachment download while gateway is down | blob retrieval and hash verification succeed without Hermes or gateway health |
 | Room server temporarily unreachable | daemon keeps local state, retries bounded sync, heartbeat/status reflect relay trouble |
 | SQLite busy or interrupted | no partial command execution before durable ledger write; retry converges |
 
@@ -164,6 +165,8 @@ Acceptance checks:
   assistant replied;
 - "restart gateway" sends a typed command, not an ad hoc dashboard action;
 - restart result is visible without push notification;
+- attachment preview/download works through the blob store while the gateway is
+  down;
 - after Hermes stub becomes healthy, the daemon resumes ordinary gateway flow
   without resetting room/device state.
 
@@ -204,6 +207,7 @@ survival cases should pass:
 - room server SSE drops while Hermes is down and pull sync repairs state;
 - stale runtime state snapshot is shown as stale while heartbeat remains fresh;
 - broken Hermes output cannot corrupt the encrypted chat projection;
+- attachment download does not require Hermes or the gateway to be healthy;
 - all recovery commands are allowlisted and idempotent.
 
 ## Debt Trigger

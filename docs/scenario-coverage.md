@@ -218,6 +218,7 @@ Proven survival scenarios:
 - `hermes_hang_does_not_block_room_sync_or_state_snapshot`
 - `runtime_state_command_result_publishes_post_mutation_snapshot`
 - `daemon_publishes_gateway_down_snapshot_without_hermes`
+- `attachment_download_does_not_depend_on_hermes_gateway`
 - `daemon_publishes_inference_degraded_snapshot_without_agent_reply`
 - `inference_timeout_preserves_user_message_and_clears_activity`
 - `dashboard_reads_stale_snapshot_while_heartbeat_is_fresh`

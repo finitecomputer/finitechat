@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+finitechat-blob = { path = "../finitechat-blob" }
 finitechat-engine = { path = "../finitechat-engine" }
 finitechat-proto = { path = "../finitechat-proto" }
 serde_json.workspace = true

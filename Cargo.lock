@@ -455,6 +455,7 @@ dependencies = [
 name = "finitechat-sim"
 version = "0.1.0"
 dependencies = [
+ "finitechat-blob",
  "finitechat-engine",
  "finitechat-proto",
  "serde_json",
