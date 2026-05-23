@@ -1,4 +1,6 @@
 /target/
+__pycache__/
+*.py[cod]
 /.state/
 /.direnv/
 /.env
@@ -10,4 +12,3 @@
 **/*.sqlite3-wal
 **/*.db
 **/*.key
-

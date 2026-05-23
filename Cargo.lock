@@ -428,6 +428,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "finitechat-hermes"
+version = "0.1.0"
+dependencies = [
+ "finitechat-proto",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "finitechat-mls"
 version = "0.1.0"
 dependencies = [

@@ -33,8 +33,14 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 - `crates/finitechat-store`: SQLite-backed server parity store.
 - `crates/finitechat-client`: OpenMLS/Nostr client state machine.
 - `crates/finitechat-sim`: executable scenario tests for protocol invariants.
+- `crates/finitechat-hermes`: typed JSON bridge contract for the Hermes
+  platform plugin.
+- `integrations/hermes/finite-platform`: thin Hermes plugin over the Finite
+  Chat bridge.
 - `docs/implementation-plan.md`: concrete ship plan.
 - `docs/finitecomputer-integration.md`: how this lands in `../finitecomputer`.
+- `docs/hermes-integration.md`: Hermes plugin ownership, bridge commands, and
+  test contract.
 - `docs/source-notes.md`: source-of-truth notes from Justin's planning repo,
   Pika/Marmot, and finitecomputer.
 - `docs/scenario-coverage.md`: named simulator scenarios proven so far.
@@ -49,6 +55,7 @@ Build a new Rust workspace, not a fork of Pika or Marmot.
 
 ```sh
 cargo test
+python3 -m unittest discover -s tests -p '*test*.py'
 ```
 
 The fake simulator tests prove the server-side ordering and persistence

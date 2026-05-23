@@ -217,17 +217,20 @@ be extracted later. Do not require a separate `finitechatd` process for the
 first canary; that would add a deployment, auth, logging, and upgrade surface
 before the protocol boundary has proved itself in the product.
 
-Add a Finite Chat-backed mode in finitecomputer with four immediate layers:
+Add a Finite Chat-backed mode in finitecomputer with five immediate layers:
 
 1. `finitechat-proto`: shared DTOs used by dashboard server routes, finited,
    finitec, and tests.
 2. `finitechat-engine`: reducer/store used by `finited` in local/dev and by a
    future canary room server.
-3. `finite`/`finitec` agent daemon: the portable process installed inside any
+3. `finitechat-hermes`: shared JSON bridge contract for the Hermes platform
+   plugin. finitecomputer should import this contract instead of defining its
+   own gateway event shape.
+4. `finite`/`finitec` agent daemon: the portable process installed inside any
    agent runtime. It owns the outbound connection, runtime device state,
    management command handlers, Hermes/agent adapters, heartbeat, and local
    capability reporting.
-4. `finitec encrypted-chat`: runtime/client commands that manage device state,
+5. `finitec encrypted-chat`: runtime/client commands that manage device state,
    KeyPackages, Welcome claim/ack, room sync, and Hermes gateway bridge.
 
 Later, extract `finitechatd` as the local user daemon that owns device secrets,
