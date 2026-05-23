@@ -198,6 +198,17 @@ topic names in encrypted conversation metadata. The cleartext `conversation_id`
 exists for routing and indexing only; it does not authorize access and it does
 not need to expose the external platform's raw identifier.
 
+Topic names are mutable display metadata, not identity. A future Finite Chat
+client may render them like Signal group names: editable by members with admin
+permission, stored in encrypted conversation metadata, and resolved by the
+ordered room log when concurrent renames happen. The stable link between
+Hermes, Telegram topics, and Finite Chat remains `conversation_id`.
+
+Existing plaintext chats do not need an indefinite compatibility path. The
+finitecomputer hard cut may import them once as archived/read-only
+conversations, then require new work to happen in explicit Finite Chat topics or
+untopic'd conversations.
+
 ## Proposed Landing Shape
 
 The first finitecomputer canary should embed Finite Chat Rust crates directly in

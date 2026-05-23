@@ -464,6 +464,15 @@ clients and imports. `conversation.archive` is scoped to that one topic. A
 `conversation.segment.start` requires `conversation_id`, adds a bounded segment
 record to that topic, and updates `active_segment_id`.
 
+Topic display names work like group chat names. The stable identifier is the
+non-human `conversation_id`; the visible title is encrypted conversation
+metadata. Any member with the app's admin permission may append
+`conversation.update` to rename the topic. The server orders the update but does
+not decide whether the sender was allowed to rename it; clients verify the
+sender against decrypted room/conversation role state and ignore unauthorized
+metadata updates in their projection. Concurrent valid renames are resolved by
+room order: the later accepted update is the visible title.
+
 `conversation.segment.start` is used when an app wants a fresh context inside an
 existing topic, for example Hermes `/new` in a Telegram topic. It is a durable
 encrypted event so every device agrees on the boundary, but it does not create a
