@@ -2300,6 +2300,166 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_link_retry");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_link_retry");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_link_retry");
+    let mut source_server = DeliveryService::new();
+    let room_id = "room_http_link_retry";
+    let group_id = "mls_http_link_retry";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut source_server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_bob_http_link_retry",
+            welcome_id: "welcome_bob_http_link_retry",
+            idempotency_key: "add_bob_http_link_retry",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::with_submit_response_loss_from_sqlite_path(&server_db);
+    let initial_page = source_server
+        .sync_events(room_id, alice_browser.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_page.entries.len(), 1);
+    delivery
+        .publish_room_log_entry(&initial_page.entries[0])
+        .unwrap();
+    let account_id = alice_browser.device_ref().account_id.clone();
+    let account_rooms = source_server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: account_id.clone(),
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    delivery
+        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
+        .unwrap();
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 1,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 1);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_http_retry_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let options = RuntimeLinkFanoutOptions {
+        max_discovery_pages_per_tick: 2,
+        max_commit_rooms_per_tick: 1,
+        max_completion_sync_pages_per_room: 2,
+    };
+    let err = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_retry_phone",
+        &options,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::InjectedSubmitAfterAccept)
+    ));
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_http_retry_phone", room_id)
+            .unwrap(),
+        LinkFanoutRoomStatus::Prepared { .. }
+    ));
+    let after_failure = delivery
+        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(after_failure.entries.len(), 1);
+    assert_eq!(after_failure.entries[0].seq, bob_join_seq + 1);
+    assert_eq!(after_failure.entries[0].kind, LogEntryKind::Commit);
+
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_retry_phone",
+        &options,
+    )
+    .unwrap();
+    assert_eq!(report.discovery_pages, 0);
+    assert_eq!(report.claimed_key_packages, 0);
+    assert_eq!(report.prepared_commits, 0);
+    assert_eq!(report.submitted_commits, 1);
+    assert_eq!(report.completed_rooms, 1);
+    assert!(report.complete);
+
+    let after_retry = delivery
+        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(after_retry.entries.len(), 1);
+    assert_eq!(after_retry.entries[0].seq, bob_join_seq + 1);
+    assert_eq!(
+        bob.apply_log_entry(room_id, &after_retry.entries[0])
+            .unwrap(),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 1);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 1);
+    assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 2);
+    let replay = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(replay.claimed_welcomes, 0);
+    assert_eq!(replay.activated_welcome_acks_sent, 0);
+}
+
+#[test]
 fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let dir = tempfile::tempdir().unwrap();
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
@@ -4041,11 +4201,13 @@ enum HttpRuntimeDeliveryError {
         actual: String,
     },
     CommitValidation(String),
+    InjectedSubmitAfterAccept,
 }
 
 struct HttpRuntimeDelivery {
     app: Router,
     runtime: tokio::runtime::Runtime,
+    fail_next_submit_after_accept: bool,
 }
 
 impl HttpRuntimeDelivery {
@@ -4053,6 +4215,14 @@ impl HttpRuntimeDelivery {
         Self {
             app: http_router(HttpServerState::from_sqlite_path(path).unwrap()),
             runtime: tokio::runtime::Runtime::new().unwrap(),
+            fail_next_submit_after_accept: false,
+        }
+    }
+
+    fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self {
+        Self {
+            fail_next_submit_after_accept: true,
+            ..Self::from_sqlite_path(path)
         }
     }
 
@@ -4310,6 +4480,10 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
             .collect::<Vec<_>>();
         for welcome in released_welcome_records_for_commit(&request, receipt.seq)? {
             self.publish_welcome_record(&welcome)?;
+        }
+        if self.fail_next_submit_after_accept {
+            self.fail_next_submit_after_accept = false;
+            return Err(HttpRuntimeDeliveryError::InjectedSubmitAfterAccept);
         }
         Ok(CommitAccepted {
             seq: receipt.seq,
