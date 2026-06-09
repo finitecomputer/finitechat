@@ -1,43 +1,29 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use cgka_traits::MessageId as DarkmatterMessageId;
-use cgka_traits::engine::KeyPackage as DarkmatterKeyPackage;
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::{EpochId, GroupId, MemberId};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions,
-    RuntimeSyncOptions, RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions,
-    run_link_fanout_tick, run_runtime_sync_tick,
+    HttpRuntimeDelivery, HttpRuntimeDeliveryError, HttpRuntimeTransport, LinkFanoutRoomPlan,
+    LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions, RuntimeSyncOptions,
+    RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick,
+    run_runtime_sync_tick,
 };
 use finitechat_engine::{
-    AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
-    CreateRoomRequest, DeliveryService, EngineError, EventAccepted, KeyPackageInventory,
-    ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage,
-    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
+    AppendEventRequest, CommitAccepted, CreateRoomRequest, DeliveryService, EngineError,
+    EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
+    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
+    lease_token_for,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE,
-    MAX_WELCOME_CLAIMS_PER_REQUEST, ProtocolLimitError, RoomLogEntry, WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
+    WelcomeState,
 };
-use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
-    HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, PublishKeyPackageResponse,
-    PublishMessageRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, http_router,
-};
+use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
-use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpCommitAdmission, HttpKeyPackageId, HttpKeyPackagePublication,
-    HttpPublishReceipt, HttpPublishTarget, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
-};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -2138,7 +2124,10 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let err = delivery.append_event(&pending_send).unwrap_err();
     assert!(matches!(
         err,
-        HttpRuntimeDeliveryError::HttpStatus(StatusCode::FORBIDDEN, body)
+        HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
+            StatusCode::FORBIDDEN,
+            body,
+        ))
             if body.contains("sender_not_active")
     ));
 
@@ -2613,7 +2602,9 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     .unwrap_err();
     assert!(matches!(
         err,
-        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::InjectedSubmitAfterAccept)
+        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::Transport(
+            InProcessHttpTransportError::InjectedSubmitAfterAccept
+        ))
     ));
 
     let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
@@ -2968,7 +2959,9 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     .unwrap_err();
     assert!(matches!(
         err,
-        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::InjectedSubmitBeforeAccept)
+        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::Transport(
+            InProcessHttpTransportError::InjectedSubmitBeforeAccept
+        ))
     ));
     let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
     assert!(alice_browser.has_pending_commit(room_id).unwrap());
@@ -4775,43 +4768,38 @@ impl RuntimeDelivery for UploadFailureDelivery {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum HttpRuntimeDeliveryError {
+enum InProcessHttpTransportError {
     Json(String),
     HttpStatus(StatusCode, String),
     Router(String),
-    WelcomeIdMismatch {
-        message_id: Vec<u8>,
-        welcome_id: String,
-    },
-    WelcomeRecipientMismatch {
-        expected: DeviceRef,
-        actual: DeviceRef,
-    },
-    KeyPackageIdMismatch {
-        envelope_id: Vec<u8>,
-        body_id: String,
-    },
-    KeyPackageOwnerMismatch {
-        expected: DeviceRef,
-        actual: DeviceRef,
-    },
-    RoomEntryMismatch {
-        expected: String,
-        actual: String,
-    },
-    CommitValidation(String),
     InjectedSubmitBeforeAccept,
     InjectedSubmitAfterAccept,
 }
 
-struct HttpRuntimeDelivery {
+impl std::fmt::Display for InProcessHttpTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(error) => write!(formatter, "JSON error: {error}"),
+            Self::HttpStatus(status, body) => {
+                write!(formatter, "HTTP status {status}: {body}")
+            }
+            Self::Router(error) => write!(formatter, "router error: {error}"),
+            Self::InjectedSubmitBeforeAccept => write!(formatter, "injected submit before accept"),
+            Self::InjectedSubmitAfterAccept => write!(formatter, "injected submit after accept"),
+        }
+    }
+}
+
+type TestHttpRuntimeDelivery = HttpRuntimeDelivery<InProcessHttpTransport>;
+
+struct InProcessHttpTransport {
     app: Router,
     runtime: tokio::runtime::Runtime,
     fail_next_submit_before_accept: bool,
     fail_next_submit_after_accept: bool,
 }
 
-impl HttpRuntimeDelivery {
+impl InProcessHttpTransport {
     fn from_sqlite_path(path: &std::path::Path) -> Self {
         Self {
             app: http_router(HttpServerState::from_sqlite_path(path).unwrap()),
@@ -4820,388 +4808,79 @@ impl HttpRuntimeDelivery {
             fail_next_submit_after_accept: false,
         }
     }
+}
 
-    fn with_submit_before_accept_failure_from_sqlite_path(path: &std::path::Path) -> Self {
-        Self {
-            fail_next_submit_before_accept: true,
-            ..Self::from_sqlite_path(path)
-        }
-    }
+impl HttpRuntimeTransport for InProcessHttpTransport {
+    type Error = InProcessHttpTransportError;
 
-    fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self {
-        Self {
-            fail_next_submit_after_accept: true,
-            ..Self::from_sqlite_path(path)
-        }
-    }
-
-    fn post_json<T, R>(&self, uri: &str, body: &T) -> Result<R, HttpRuntimeDeliveryError>
+    fn post_json<T, R>(&mut self, uri: &str, body: &T) -> Result<R, Self::Error>
     where
         T: Serialize,
         R: DeserializeOwned,
     {
-        self.runtime.block_on(async {
+        if uri == "/commits" && self.fail_next_submit_before_accept {
+            self.fail_next_submit_before_accept = false;
+            return Err(InProcessHttpTransportError::InjectedSubmitBeforeAccept);
+        }
+        let result = self.runtime.block_on(async {
             let request = Request::builder()
                 .method(Method::POST)
                 .uri(uri)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(body).map_err(|error| {
-                    HttpRuntimeDeliveryError::Json(error.to_string())
+                    InProcessHttpTransportError::Json(error.to_string())
                 })?))
-                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+                .map_err(|error| InProcessHttpTransportError::Router(error.to_string()))?;
             let response = self
                 .app
                 .clone()
                 .oneshot(request)
                 .await
-                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+                .map_err(|error| InProcessHttpTransportError::Router(error.to_string()))?;
             let status = response.status();
             let bytes = to_bytes(response.into_body(), usize::MAX)
                 .await
-                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+                .map_err(|error| InProcessHttpTransportError::Router(error.to_string()))?;
             if status != StatusCode::OK {
-                return Err(HttpRuntimeDeliveryError::HttpStatus(
+                return Err(InProcessHttpTransportError::HttpStatus(
                     status,
                     String::from_utf8_lossy(&bytes).into_owned(),
                 ));
             }
             serde_json::from_slice(&bytes)
-                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
-        })
-    }
-
-    fn publish_welcome_record(
-        &self,
-        welcome: &WelcomeRecord,
-    ) -> Result<(), HttpRuntimeDeliveryError> {
-        let recipient = member_id_for_device(&welcome.recipient)?;
-        let request = PublishMessageRequest {
-            target: HttpPublishTarget::Inbox {
-                recipient: recipient.clone(),
-            },
-            message: TransportMessage {
-                id: DarkmatterMessageId::new(welcome.welcome_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(welcome)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::Welcome { recipient },
-            },
-            idempotency_key: Some(format!("welcome:{}", welcome.welcome_id)),
-        };
-        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
-        Ok(())
-    }
-
-    fn publish_room_log_entry(&self, entry: &RoomLogEntry) -> Result<(), HttpRuntimeDeliveryError> {
-        let transport_group_id = transport_group_id_for_room(&entry.room_id);
-        let request = PublishMessageRequest {
-            target: HttpPublishTarget::Group {
-                group_id: group_id_for_room(&entry.room_id),
-                transport_group_id: transport_group_id.clone(),
-                commit_admission: (entry.kind == LogEntryKind::Commit).then_some(
-                    HttpCommitAdmission {
-                        source_epoch: EpochId(entry.epoch),
-                    },
-                ),
-            },
-            message: TransportMessage {
-                id: DarkmatterMessageId::new(entry.message_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(entry)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::GroupMessage { transport_group_id },
-            },
-            idempotency_key: Some(format!("room:{}:{}", entry.room_id, entry.message_id)),
-        };
-        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
-        Ok(())
-    }
-
-    fn publish_account_room_record(
-        &self,
-        account_id: &str,
-        record: &AccountRoomRecord,
-    ) -> Result<(), HttpRuntimeDeliveryError> {
-        let request = SaveAccountRoomRequest {
-            account_id: account_id.to_owned(),
-            room_id: record.room_id.clone(),
-            record: serde_json::to_value(record)
-                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-        };
-        let _: SaveAccountRoomResponse = self.post_json("/account-rooms", &request)?;
-        Ok(())
-    }
-
-    fn bootstrap_account_room(
-        &self,
-        request: &CreateRoomRequest,
-    ) -> Result<(), HttpRuntimeDeliveryError> {
-        let request = BootstrapAccountRoomRequest {
-            room_id: request.room_id.clone(),
-            mls_group_id: request.mls_group_id.clone(),
-            creator: request.creator.clone(),
-        };
-        let _: BootstrapAccountRoomResponse =
-            self.post_json("/account-rooms/bootstrap", &request)?;
-        Ok(())
-    }
-
-    fn append_event(
-        &self,
-        request: &AppendEventRequest,
-    ) -> Result<EventAccepted, HttpRuntimeDeliveryError> {
-        self.post_json("/events", request)
-    }
-}
-
-impl RuntimeDelivery for HttpRuntimeDelivery {
-    type Error = HttpRuntimeDeliveryError;
-
-    fn key_package_inventory(
-        &mut self,
-        owner: &DeviceRef,
-    ) -> Result<KeyPackageInventory, Self::Error> {
-        let owner_id = member_id_for_device(owner)?;
-        let inventory: HttpKeyPackageInventory = self.post_json(
-            "/key-packages/inventory",
-            &KeyPackageInventoryRequest { owner: owner_id },
-        )?;
-        Ok(KeyPackageInventory {
-            owner: owner.clone(),
-            available: inventory.available,
-            leased: 0,
-        })
-    }
-
-    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
-        let publication = HttpKeyPackagePublication {
-            key_package_id: HttpKeyPackageId::new(request.key_package_id.as_bytes().to_vec()),
-            owner: member_id_for_device(&request.owner)?,
-            key_package: DarkmatterKeyPackage::new(
-                serde_json::to_vec(&request)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-            ),
-        };
-        let _: PublishKeyPackageResponse = self.post_json("/key-packages", &publication)?;
-        Ok(())
-    }
-
-    fn claim_key_package_for_device(
-        &mut self,
-        owner: &DeviceRef,
-    ) -> Result<Option<finitechat_engine::ClaimKeyPackageResult>, Self::Error> {
-        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = self.post_json(
-            "/key-packages/claim",
-            &ClaimKeyPackageRequest {
-                owner: member_id_for_device(owner)?,
-            },
-        )?;
-        claimed
-            .map(|claimed| {
-                let request: UploadKeyPackageRequest =
-                    serde_json::from_slice(claimed.key_package.bytes())
-                        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-                if claimed.key_package_id.as_slice() != request.key_package_id.as_bytes() {
-                    return Err(HttpRuntimeDeliveryError::KeyPackageIdMismatch {
-                        envelope_id: claimed.key_package_id.as_slice().to_vec(),
-                        body_id: request.key_package_id,
-                    });
-                }
-                if request.owner != *owner {
-                    return Err(HttpRuntimeDeliveryError::KeyPackageOwnerMismatch {
-                        expected: owner.clone(),
-                        actual: request.owner,
-                    });
-                }
-                Ok(ClaimKeyPackageResult {
-                    lease_token: lease_token_for(&request.key_package_id, &request.owner),
-                    key_package_id: request.key_package_id,
-                    owner: request.owner,
-                    key_package_ref: request.key_package_ref,
-                    key_package_hash: request.key_package_hash,
-                    key_package_payload: request.key_package_payload,
-                })
-            })
-            .transpose()
-    }
-
-    fn submit_commit(
-        &mut self,
-        request: SubmitCommitRequest,
-    ) -> Result<CommitAccepted, Self::Error> {
-        request
-            .validate_limits()
-            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
-        let message_id = request
-            .envelope
-            .message_id()
-            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-        if request.envelope.kind != LogEntryKind::Commit {
-            return Err(HttpRuntimeDeliveryError::CommitValidation(
-                "commit request envelope must be a commit".to_owned(),
-            ));
-        }
-        if request.envelope.epoch != request.expected_epoch {
-            return Err(HttpRuntimeDeliveryError::CommitValidation(format!(
-                "commit envelope epoch {} does not match expected epoch {}",
-                request.envelope.epoch, request.expected_epoch
-            )));
-        }
-        if request.envelope.sender != request.sender {
-            return Err(HttpRuntimeDeliveryError::CommitValidation(
-                "commit envelope sender does not match request sender".to_owned(),
-            ));
-        }
-        request
-            .membership_delta
-            .validate_structure(request.expected_epoch, &message_id)
-            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
-        if self.fail_next_submit_before_accept {
-            self.fail_next_submit_before_accept = false;
-            return Err(HttpRuntimeDeliveryError::InjectedSubmitBeforeAccept);
-        }
-        let accepted: CommitAccepted = self.post_json("/commits", &request)?;
-        if self.fail_next_submit_after_accept {
+                .map_err(|error| InProcessHttpTransportError::Json(error.to_string()))
+        });
+        if uri == "/commits" && self.fail_next_submit_after_accept {
             self.fail_next_submit_after_accept = false;
-            return Err(HttpRuntimeDeliveryError::InjectedSubmitAfterAccept);
+            result?;
+            return Err(InProcessHttpTransportError::InjectedSubmitAfterAccept);
         }
-        Ok(accepted)
-    }
-
-    fn list_account_rooms(
-        &mut self,
-        request: ListAccountRoomsRequest,
-    ) -> Result<ListAccountRoomsPage, Self::Error> {
-        let response: ListAccountRoomDirectoryResponse = self.post_json(
-            "/account-rooms/list",
-            &ListAccountRoomDirectoryRequest {
-                account_id: request.account_id.clone(),
-                after_room_id: request.after_room_id.clone(),
-                limit: request.limit as usize,
-            },
-        )?;
-        let rooms = response
-            .rooms
-            .into_iter()
-            .map(|record| {
-                serde_json::from_value(record)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
-            })
-            .collect::<Result<Vec<AccountRoomRecord>, _>>()?;
-        let page = ListAccountRoomsPage {
-            rooms,
-            next_after_room_id: response.next_after_room_id,
-            has_more: response.has_more,
-        };
-        page.validate_limits()
-            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-        Ok(page)
-    }
-
-    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
-        let claimed: Vec<HttpClaimedWelcome> = self.post_json(
-            "/welcomes/claim",
-            &ClaimWelcomesRequest {
-                recipient: member_id_for_device(device)?,
-                limit: MAX_WELCOME_CLAIMS_PER_REQUEST as usize,
-            },
-        )?;
-        claimed
-            .into_iter()
-            .map(|claim| {
-                let mut welcome: WelcomeRecord = serde_json::from_slice(&claim.message.payload)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-                if claim.message.id.as_slice() != welcome.welcome_id.as_bytes() {
-                    return Err(HttpRuntimeDeliveryError::WelcomeIdMismatch {
-                        message_id: claim.message.id.as_slice().to_vec(),
-                        welcome_id: welcome.welcome_id,
-                    });
-                }
-                if welcome.recipient != *device {
-                    return Err(HttpRuntimeDeliveryError::WelcomeRecipientMismatch {
-                        expected: device.clone(),
-                        actual: welcome.recipient,
-                    });
-                }
-                welcome.state = WelcomeState::Claimed;
-                Ok(welcome)
-            })
-            .collect()
-    }
-
-    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
-        let _: AckWelcomeResponse = self.post_json(
-            "/welcomes/ack",
-            &AckWelcomeRequest {
-                message_id: DarkmatterMessageId::new(welcome_id.as_bytes().to_vec()),
-                activated,
-            },
-        )?;
-        Ok(())
-    }
-
-    fn sync_events(
-        &mut self,
-        room_id: &str,
-        requester: &DeviceRef,
-        after_seq: u64,
-    ) -> Result<SyncEventsPage, Self::Error> {
-        let page: HttpSyncPage = self.post_json(
-            "/sync/group",
-            &GroupSyncRequest {
-                group_id: group_id_for_room(room_id),
-                after_seq,
-                limit: MAX_HTTP_SYNC_PAGE_ENTRIES,
-                requester: Some(member_id_for_device(requester)?),
-            },
-        )?;
-        let entries = page
-            .entries
-            .into_iter()
-            .map(|queued| {
-                let mut entry = decode_http_room_log_entry(&queued.message.payload)?;
-                if entry.room_id != room_id {
-                    return Err(HttpRuntimeDeliveryError::RoomEntryMismatch {
-                        expected: room_id.to_owned(),
-                        actual: entry.room_id,
-                    });
-                }
-                entry.seq = queued.seq;
-                Ok(entry)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(SyncEventsPage {
-            entries,
-            next_after_seq: page.next_after_seq,
-            has_more: page.has_more,
-        })
+        result
     }
 }
 
-fn decode_http_room_log_entry(payload: &[u8]) -> Result<RoomLogEntry, HttpRuntimeDeliveryError> {
-    if let Ok(projection) = serde_json::from_slice::<FiniteAccountRoomCommitProjection>(payload) {
-        return Ok(projection.entry);
+trait TestHttpRuntimeDeliveryExt {
+    fn from_sqlite_path(path: &std::path::Path) -> Self;
+    fn with_submit_before_accept_failure_from_sqlite_path(path: &std::path::Path) -> Self;
+    fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self;
+}
+
+impl TestHttpRuntimeDeliveryExt for TestHttpRuntimeDelivery {
+    fn from_sqlite_path(path: &std::path::Path) -> Self {
+        Self::new(InProcessHttpTransport::from_sqlite_path(path))
     }
-    serde_json::from_slice(payload)
-        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
-}
 
-fn member_id_for_device(owner: &DeviceRef) -> Result<MemberId, HttpRuntimeDeliveryError> {
-    serde_json::to_vec(owner)
-        .map(MemberId::new)
-        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
-}
+    fn with_submit_before_accept_failure_from_sqlite_path(path: &std::path::Path) -> Self {
+        let mut transport = InProcessHttpTransport::from_sqlite_path(path);
+        transport.fail_next_submit_before_accept = true;
+        Self::new(transport)
+    }
 
-fn group_id_for_room(room_id: &str) -> GroupId {
-    GroupId::new(room_id.as_bytes().to_vec())
-}
-
-fn transport_group_id_for_room(room_id: &str) -> Vec<u8> {
-    room_id.as_bytes().to_vec()
+    fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self {
+        let mut transport = InProcessHttpTransport::from_sqlite_path(path);
+        transport.fail_next_submit_after_accept = true;
+        Self::new(transport)
+    }
 }
 
 fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[SentPlaintext]) {

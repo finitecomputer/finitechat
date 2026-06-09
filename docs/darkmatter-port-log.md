@@ -122,6 +122,11 @@ Python test distribution:
   the pending member can still pull the add Commit, pending application sends
   are rejected, activated Welcome ack promotes the device, and a post-ack
   application event decrypts for the existing member.
+- `finitechat-client` now owns a generic `HttpRuntimeDelivery<T>` adapter over
+  a small `HttpRuntimeTransport` trait. The adapter maps runtime KeyPackage,
+  Welcome, account-room, typed commit, typed event, and ordered room-sync calls
+  onto the HTTP DTOs; the client-state tests now provide only an in-process
+  transport harness and failure injection.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -151,6 +156,10 @@ Python test distribution:
   opaque transport messages; the client adapter can decode product-level
   `RoomLogEntry` payloads and reuse the existing encrypted application apply
   path.
+- Runtime HTTP delivery adapter boundary. The production client can own the DTO
+  mapping, envelope/body consistency checks, commit request validation, and
+  ordered room-sync decoding independently from the test transport used to
+  exercise the Axum routes.
 - Runtime KeyPackage metadata mapping. The Darkmatter HTTP KeyPackage store
   carries opaque bytes; the client adapter can encode the original
   `UploadKeyPackageRequest` so a later claim reconstructs Finite's package
@@ -486,8 +495,13 @@ Runtime delivery checkpoint:
   same-epoch reprepare. Typed bootstrap/commit/event flows now have
   server-owned room-membership projection; raw plain `RoomLogEntry` history
   remains an incomplete compatibility mode because it lacks membership deltas.
+- The test-local HTTP runtime adapter has been reduced to a transport harness:
+  it serializes JSON into the in-process Axum router, exposes HTTP status
+  errors to assertions, and injects before-accept or after-accept `/commits`
+  failures. The runtime DTO mapping and validation it used to duplicate now
+  live in `finitechat-client::HttpRuntimeDelivery`.
 
-Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from test-only adapters into production client/server boundaries, or close the
-raw-history compatibility caveat by ensuring imported commits carry membership
-deltas before strict member authorization is enabled for every room.
+Next meaningful gate: add a concrete network transport for
+`HttpRuntimeDelivery`, move route DTOs into a shared protocol crate, or close
+the raw-history compatibility caveat by ensuring imported commits carry
+membership deltas before strict member authorization is enabled for every room.

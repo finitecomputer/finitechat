@@ -96,6 +96,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client RuntimeDelivery claims Darkmatter HTTP KeyPackages with Finite metadata preserved in opaque package bytes and deterministic lease tokens reconstructed",
         },
         PortFinding {
+            area: "http_runtime_delivery_adapter",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client exposes generic HttpRuntimeDelivery over HttpRuntimeTransport; tests now reuse that production adapter and keep only in-process routing plus failure injection in the harness",
+        },
+        PortFinding {
             area: "http_fanout_plan_checkpoint",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",

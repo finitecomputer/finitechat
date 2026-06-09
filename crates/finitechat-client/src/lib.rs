@@ -1,8 +1,14 @@
+use cgka_traits::engine::KeyPackage as HttpKeyPackage;
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::{
+    EpochId as HttpEpochId, GroupId as HttpGroupId, MemberId as HttpMemberId,
+    MessageId as HttpMessageId,
+};
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateDirectRoomRequest,
-    DeliveryService, EngineError, KeyPackageInventory, ListAccountRoomsPage,
-    ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest,
-    WelcomeRecord, envelope,
+    AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
+    CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
+    KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
+    SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -16,9 +22,17 @@ use finitechat_proto::{
     MAX_MLS_GROUP_ID_BYTES, MAX_OBJECT_ID_BYTES, MAX_RATCHET_TREE_PAYLOAD_BYTES, MAX_ROOM_ID_BYTES,
     MAX_STAGED_WELCOMES_PER_COMMIT, MAX_WELCOME_CLAIMS_PER_REQUEST, MAX_WELCOME_PAYLOAD_BYTES,
     MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, MlsGroupId, ProtocolLimitError, RoomId,
-    RoomLogEntry, StagedWelcomeV1, WelcomeId, validate_bytes_len, validate_bytes_non_empty,
-    validate_idempotency_key, validate_item_count, validate_mls_group_id, validate_room_id,
-    validate_string_bytes,
+    RoomLogEntry, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
+    validate_bytes_non_empty, validate_idempotency_key, validate_item_count, validate_mls_group_id,
+    validate_room_id, validate_string_bytes,
+};
+use finitechat_server::{
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
+    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
+    HttpKeyPackageInventory, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse, PublishMessageRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
@@ -30,10 +44,17 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use transport_http_server::{
+    HTTP_SERVER_SOURCE, HttpCommitAdmission, HttpKeyPackageId, HttpKeyPackagePublication,
+    HttpPublishReceipt, HttpPublishTarget, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
+};
 
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -2657,6 +2678,468 @@ pub trait RuntimeDelivery {
         requester: &DeviceRef,
         after_seq: u64,
     ) -> Result<SyncEventsPage, Self::Error>;
+}
+
+pub trait HttpRuntimeTransport {
+    type Error;
+
+    fn post_json<T, R>(&mut self, uri: &str, body: &T) -> Result<R, Self::Error>
+    where
+        T: Serialize,
+        R: DeserializeOwned;
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpRuntimeDelivery<T> {
+    transport: T,
+}
+
+impl<T> HttpRuntimeDelivery<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
+    pub fn publish_welcome_record(
+        &mut self,
+        welcome: &WelcomeRecord,
+    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
+        let recipient = http_member_id_for_device(&welcome.recipient)?;
+        let request = PublishMessageRequest {
+            target: HttpPublishTarget::Inbox {
+                recipient: recipient.clone(),
+            },
+            message: TransportMessage {
+                id: HttpMessageId::new(welcome.welcome_id.as_bytes().to_vec()),
+                payload: serde_json::to_vec(welcome)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+                timestamp: Timestamp(0),
+                causal_deps: Vec::new(),
+                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+                envelope: TransportEnvelope::Welcome { recipient },
+            },
+            idempotency_key: Some(format!("welcome:{}", welcome.welcome_id)),
+        };
+        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
+        Ok(())
+    }
+
+    pub fn publish_room_log_entry(
+        &mut self,
+        entry: &RoomLogEntry,
+    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
+        let transport_group_id = http_transport_group_id_for_room(&entry.room_id);
+        let request = PublishMessageRequest {
+            target: HttpPublishTarget::Group {
+                group_id: http_group_id_for_room(&entry.room_id),
+                transport_group_id: transport_group_id.clone(),
+                commit_admission: (entry.kind == LogEntryKind::Commit).then_some(
+                    HttpCommitAdmission {
+                        source_epoch: HttpEpochId(entry.epoch),
+                    },
+                ),
+            },
+            message: TransportMessage {
+                id: HttpMessageId::new(entry.message_id.as_bytes().to_vec()),
+                payload: serde_json::to_vec(entry)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+                timestamp: Timestamp(0),
+                causal_deps: Vec::new(),
+                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+                envelope: TransportEnvelope::GroupMessage { transport_group_id },
+            },
+            idempotency_key: Some(format!("room:{}:{}", entry.room_id, entry.message_id)),
+        };
+        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
+        Ok(())
+    }
+
+    pub fn publish_account_room_record(
+        &mut self,
+        account_id: &str,
+        record: &AccountRoomRecord,
+    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
+        let request = SaveAccountRoomRequest {
+            account_id: account_id.to_owned(),
+            room_id: record.room_id.clone(),
+            record: serde_json::to_value(record)
+                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+        };
+        let _: SaveAccountRoomResponse = self.post_json("/account-rooms", &request)?;
+        Ok(())
+    }
+
+    pub fn bootstrap_account_room(
+        &mut self,
+        request: &CreateRoomRequest,
+    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
+        let request = BootstrapAccountRoomRequest {
+            room_id: request.room_id.clone(),
+            mls_group_id: request.mls_group_id.clone(),
+            creator: request.creator.clone(),
+        };
+        let _: BootstrapAccountRoomResponse =
+            self.post_json("/account-rooms/bootstrap", &request)?;
+        Ok(())
+    }
+
+    pub fn append_event(
+        &mut self,
+        request: &AppendEventRequest,
+    ) -> Result<EventAccepted, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json("/events", request)
+    }
+
+    fn post_json<B, R>(
+        &mut self,
+        uri: &str,
+        body: &B,
+    ) -> Result<R, HttpRuntimeDeliveryError<T::Error>>
+    where
+        B: Serialize,
+        R: DeserializeOwned,
+    {
+        self.transport
+            .post_json(uri, body)
+            .map_err(HttpRuntimeDeliveryError::Transport)
+    }
+}
+
+impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
+    type Error = HttpRuntimeDeliveryError<T::Error>;
+
+    fn key_package_inventory(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, Self::Error> {
+        let owner_id = http_member_id_for_device(owner)?;
+        let inventory: HttpKeyPackageInventory = self.post_json(
+            "/key-packages/inventory",
+            &KeyPackageInventoryRequest { owner: owner_id },
+        )?;
+        Ok(KeyPackageInventory {
+            owner: owner.clone(),
+            available: inventory.available,
+            leased: 0,
+        })
+    }
+
+    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
+        let publication = HttpKeyPackagePublication {
+            key_package_id: HttpKeyPackageId::new(request.key_package_id.as_bytes().to_vec()),
+            owner: http_member_id_for_device(&request.owner)?,
+            key_package: HttpKeyPackage::new(
+                serde_json::to_vec(&request)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+            ),
+        };
+        let _: PublishKeyPackageResponse = self.post_json("/key-packages", &publication)?;
+        Ok(())
+    }
+
+    fn claim_key_package_for_device(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error> {
+        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = self.post_json(
+            "/key-packages/claim",
+            &ClaimKeyPackageRequest {
+                owner: http_member_id_for_device(owner)?,
+            },
+        )?;
+        claimed
+            .map(|claimed| {
+                let request: UploadKeyPackageRequest =
+                    serde_json::from_slice(claimed.key_package.bytes())
+                        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+                if claimed.key_package_id.as_slice() != request.key_package_id.as_bytes() {
+                    return Err(HttpRuntimeDeliveryError::KeyPackageIdMismatch {
+                        envelope_id: claimed.key_package_id.as_slice().to_vec(),
+                        body_id: request.key_package_id,
+                    });
+                }
+                if request.owner != *owner {
+                    return Err(HttpRuntimeDeliveryError::KeyPackageOwnerMismatch {
+                        expected: owner.clone(),
+                        actual: request.owner,
+                    });
+                }
+                Ok(ClaimKeyPackageResult {
+                    lease_token: lease_token_for(&request.key_package_id, &request.owner),
+                    key_package_id: request.key_package_id,
+                    owner: request.owner,
+                    key_package_ref: request.key_package_ref,
+                    key_package_hash: request.key_package_hash,
+                    key_package_payload: request.key_package_payload,
+                })
+            })
+            .transpose()
+    }
+
+    fn submit_commit(
+        &mut self,
+        request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, Self::Error> {
+        request
+            .validate_limits()
+            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
+        let message_id = request
+            .envelope
+            .message_id()
+            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+        if request.envelope.kind != LogEntryKind::Commit {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(
+                "commit request envelope must be a commit".to_owned(),
+            ));
+        }
+        if request.envelope.epoch != request.expected_epoch {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(format!(
+                "commit envelope epoch {} does not match expected epoch {}",
+                request.envelope.epoch, request.expected_epoch
+            )));
+        }
+        if request.envelope.sender != request.sender {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(
+                "commit envelope sender does not match request sender".to_owned(),
+            ));
+        }
+        request
+            .membership_delta
+            .validate_structure(request.expected_epoch, &message_id)
+            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
+        self.post_json("/commits", &request)
+    }
+
+    fn list_account_rooms(
+        &mut self,
+        request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, Self::Error> {
+        let response: ListAccountRoomDirectoryResponse = self.post_json(
+            "/account-rooms/list",
+            &ListAccountRoomDirectoryRequest {
+                account_id: request.account_id.clone(),
+                after_room_id: request.after_room_id.clone(),
+                limit: request.limit as usize,
+            },
+        )?;
+        let rooms = response
+            .rooms
+            .into_iter()
+            .map(|record| {
+                serde_json::from_value(record)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+            })
+            .collect::<Result<Vec<AccountRoomRecord>, _>>()?;
+        let page = ListAccountRoomsPage {
+            rooms,
+            next_after_room_id: response.next_after_room_id,
+            has_more: response.has_more,
+        };
+        page.validate_limits()
+            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+        Ok(page)
+    }
+
+    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
+        let claimed: Vec<HttpClaimedWelcome> = self.post_json(
+            "/welcomes/claim",
+            &ClaimWelcomesRequest {
+                recipient: http_member_id_for_device(device)?,
+                limit: MAX_WELCOME_CLAIMS_PER_REQUEST as usize,
+            },
+        )?;
+        claimed
+            .into_iter()
+            .map(|claim| {
+                let mut welcome: WelcomeRecord = serde_json::from_slice(&claim.message.payload)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+                if claim.message.id.as_slice() != welcome.welcome_id.as_bytes() {
+                    return Err(HttpRuntimeDeliveryError::WelcomeIdMismatch {
+                        message_id: claim.message.id.as_slice().to_vec(),
+                        welcome_id: welcome.welcome_id,
+                    });
+                }
+                if welcome.recipient != *device {
+                    return Err(HttpRuntimeDeliveryError::WelcomeRecipientMismatch {
+                        expected: device.clone(),
+                        actual: welcome.recipient,
+                    });
+                }
+                welcome.state = WelcomeState::Claimed;
+                Ok(welcome)
+            })
+            .collect()
+    }
+
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
+        let _: AckWelcomeResponse = self.post_json(
+            "/welcomes/ack",
+            &AckWelcomeRequest {
+                message_id: HttpMessageId::new(welcome_id.as_bytes().to_vec()),
+                activated,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn sync_events(
+        &mut self,
+        room_id: &str,
+        requester: &DeviceRef,
+        after_seq: u64,
+    ) -> Result<SyncEventsPage, Self::Error> {
+        let page: HttpSyncPage = self.post_json(
+            "/sync/group",
+            &GroupSyncRequest {
+                group_id: http_group_id_for_room(room_id),
+                after_seq,
+                limit: MAX_HTTP_SYNC_PAGE_ENTRIES,
+                requester: Some(http_member_id_for_device(requester)?),
+            },
+        )?;
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|queued| {
+                let mut entry = decode_http_room_log_entry(&queued.message.payload)?;
+                if entry.room_id != room_id {
+                    return Err(HttpRuntimeDeliveryError::RoomEntryMismatch {
+                        expected: room_id.to_owned(),
+                        actual: entry.room_id,
+                    });
+                }
+                entry.seq = queued.seq;
+                Ok(entry)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SyncEventsPage {
+            entries,
+            next_after_seq: page.next_after_seq,
+            has_more: page.has_more,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HttpRuntimeDeliveryError<E> {
+    Transport(E),
+    Json(String),
+    WelcomeIdMismatch {
+        message_id: Vec<u8>,
+        welcome_id: String,
+    },
+    WelcomeRecipientMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
+    KeyPackageIdMismatch {
+        envelope_id: Vec<u8>,
+        body_id: String,
+    },
+    KeyPackageOwnerMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
+    RoomEntryMismatch {
+        expected: String,
+        actual: String,
+    },
+    CommitValidation(String),
+}
+
+impl<E: fmt::Display> fmt::Display for HttpRuntimeDeliveryError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "HTTP runtime transport failed: {error}"),
+            Self::Json(error) => write!(formatter, "HTTP runtime JSON error: {error}"),
+            Self::WelcomeIdMismatch {
+                message_id,
+                welcome_id,
+            } => write!(
+                formatter,
+                "Welcome id mismatch: envelope {message_id:?}, payload {welcome_id}"
+            ),
+            Self::WelcomeRecipientMismatch { expected, actual } => write!(
+                formatter,
+                "Welcome recipient mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::KeyPackageIdMismatch {
+                envelope_id,
+                body_id,
+            } => write!(
+                formatter,
+                "KeyPackage id mismatch: envelope {envelope_id:?}, payload {body_id}"
+            ),
+            Self::KeyPackageOwnerMismatch { expected, actual } => write!(
+                formatter,
+                "KeyPackage owner mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::RoomEntryMismatch { expected, actual } => write!(
+                formatter,
+                "room log entry mismatch: expected {expected}, actual {actual}"
+            ),
+            Self::CommitValidation(error) => {
+                write!(formatter, "HTTP runtime commit validation failed: {error}")
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for HttpRuntimeDeliveryError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Json(_)
+            | Self::WelcomeIdMismatch { .. }
+            | Self::WelcomeRecipientMismatch { .. }
+            | Self::KeyPackageIdMismatch { .. }
+            | Self::KeyPackageOwnerMismatch { .. }
+            | Self::RoomEntryMismatch { .. }
+            | Self::CommitValidation(_) => None,
+        }
+    }
+}
+
+fn decode_http_room_log_entry<E>(
+    payload: &[u8],
+) -> Result<RoomLogEntry, HttpRuntimeDeliveryError<E>> {
+    if let Ok(projection) = serde_json::from_slice::<FiniteAccountRoomCommitProjection>(payload) {
+        return Ok(projection.entry);
+    }
+    serde_json::from_slice(payload)
+        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+}
+
+fn http_member_id_for_device<E>(
+    device: &DeviceRef,
+) -> Result<HttpMemberId, HttpRuntimeDeliveryError<E>> {
+    serde_json::to_vec(device)
+        .map(HttpMemberId::new)
+        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+}
+
+fn http_group_id_for_room(room_id: &str) -> HttpGroupId {
+    HttpGroupId::new(room_id.as_bytes().to_vec())
+}
+
+fn http_transport_group_id_for_room(room_id: &str) -> Vec<u8> {
+    room_id.as_bytes().to_vec()
 }
 
 impl RuntimeDelivery for DeliveryService {
