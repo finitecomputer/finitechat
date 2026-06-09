@@ -50,10 +50,12 @@ async fn group_publish_syncs_pages_and_replays_exact_duplicates() {
             }),
         ),
         message: group_message("commit-1", transport_group_id.clone(), b"commit"),
+        idempotency_key: None,
     };
     let second = PublishMessageRequest {
         target: group_target(group_id.clone(), transport_group_id.clone(), None),
         message: group_message("app-1", transport_group_id, b"app"),
+        idempotency_key: None,
     };
 
     let response = post_json(app.clone(), "/messages", &first).await;
@@ -125,6 +127,7 @@ async fn same_epoch_second_commit_is_http_conflict() {
             }),
         ),
         message: group_message("commit-epoch-7-a", transport_group_id.clone(), b"commit-a"),
+        idempotency_key: None,
     };
     let second = PublishMessageRequest {
         target: group_target(
@@ -135,6 +138,7 @@ async fn same_epoch_second_commit_is_http_conflict() {
             }),
         ),
         message: group_message("commit-epoch-7-b", transport_group_id, b"commit-b"),
+        idempotency_key: None,
     };
 
     let response = post_json(app.clone(), "/messages", &first).await;
@@ -156,6 +160,7 @@ async fn inbox_publish_and_sync_round_trips_welcome() {
             recipient: recipient.clone(),
         },
         message: welcome_message("welcome-1", recipient.clone()),
+        idempotency_key: None,
     };
 
     let response = post_json(app.clone(), "/messages", &request).await;

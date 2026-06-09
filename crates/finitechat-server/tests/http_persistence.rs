@@ -32,10 +32,12 @@ async fn sqlite_log_rebuilds_group_queue_and_duplicate_index_after_restart() {
             }),
         ),
         message: group_message("commit-1", transport_group_id.clone(), b"commit"),
+        idempotency_key: None,
     };
     let second = PublishMessageRequest {
         target: group_target(group_id.clone(), transport_group_id.clone(), None),
         message: group_message("app-1", transport_group_id, b"app"),
+        idempotency_key: None,
     };
 
     let app = persistent_app(&db_path);
@@ -74,6 +76,98 @@ async fn sqlite_log_rebuilds_group_queue_and_duplicate_index_after_restart() {
 }
 
 #[tokio::test]
+async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let group_id = group_id("idempotent-group");
+    let transport_group_id = b"idempotent-transport".to_vec();
+    let request = PublishMessageRequest {
+        target: group_target(group_id.clone(), transport_group_id.clone(), None),
+        message: group_message("idempotent-message", transport_group_id, b"first body"),
+        idempotency_key: Some("idem-message-1".to_owned()),
+    };
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app, "/messages", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: HttpPublishReceipt = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert!(!accepted.duplicate);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/messages", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: HttpPublishReceipt = read_json(response).await;
+    assert_eq!(replayed, accepted);
+    assert!(!replayed.duplicate);
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id,
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].message.id, id("idempotent-message"));
+}
+
+#[tokio::test]
+async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let group_id = group_id("idempotency-conflict-group");
+    let transport_group_id = b"idempotency-conflict-transport".to_vec();
+    let first = PublishMessageRequest {
+        target: group_target(group_id.clone(), transport_group_id.clone(), None),
+        message: group_message(
+            "idempotency-conflict-a",
+            transport_group_id.clone(),
+            b"first",
+        ),
+        idempotency_key: Some("idem-conflict".to_owned()),
+    };
+    let conflicting = PublishMessageRequest {
+        target: group_target(group_id.clone(), transport_group_id.clone(), None),
+        message: group_message("idempotency-conflict-b", transport_group_id, b"second"),
+        idempotency_key: Some("idem-conflict".to_owned()),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app, "/messages", &first).await.status(),
+        StatusCode::OK
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/messages", &conflicting).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "idempotency_conflict");
+    assert!(error.error.contains("idem-conflict"));
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id,
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].message.id, id("idempotency-conflict-a"));
+}
+
+#[tokio::test]
 async fn sqlite_log_rebuilds_commit_admission_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -88,6 +182,7 @@ async fn sqlite_log_rebuilds_commit_admission_after_restart() {
             }),
         ),
         message: group_message("commit-epoch-9-a", transport_group_id.clone(), b"commit-a"),
+        idempotency_key: None,
     };
     let second = PublishMessageRequest {
         target: group_target(
@@ -98,6 +193,7 @@ async fn sqlite_log_rebuilds_commit_admission_after_restart() {
             }),
         ),
         message: group_message("commit-epoch-9-b", transport_group_id, b"commit-b"),
+        idempotency_key: None,
     };
 
     let app = persistent_app(&db_path);

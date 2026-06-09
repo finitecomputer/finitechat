@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,7 @@ use transport_http_server::{
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerState {
     service: Arc<Mutex<HttpDeliveryService>>,
+    publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
 
@@ -25,6 +27,7 @@ impl HttpServerState {
     pub fn new(service: HttpDeliveryService) -> Self {
         Self {
             service: Arc::new(Mutex::new(service)),
+            publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
     }
@@ -35,8 +38,10 @@ impl HttpServerState {
         for operation in store.load_operations()? {
             replay_operation(&mut service, operation)?;
         }
+        let publish_idempotency = store.load_publish_idempotency()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
+            publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
             store: Some(store),
         })
     }
@@ -61,6 +66,59 @@ impl HttpServerState {
         *service = candidate;
         Ok(result)
     }
+
+    fn publish_message(
+        &self,
+        request: PublishMessageRequest,
+    ) -> Result<HttpPublishReceipt, ServerHttpError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.apply_mutation(|service| {
+                let receipt = service.publish(request.target.clone(), request.message.clone())?;
+                let operation =
+                    (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
+                        target: request.target,
+                        message: request.message,
+                        idempotency_key: None,
+                    });
+                Ok((receipt, operation))
+            });
+        };
+
+        if idempotency_key.is_empty() {
+            return Err(ServerHttpError::InvalidIdempotencyKey);
+        }
+
+        let fingerprint = PublishMessageFingerprint::from_request(&request);
+        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut idempotency = self
+            .publish_idempotency
+            .lock()
+            .expect("HTTP publish idempotency mutex");
+        if let Some(record) = idempotency.get(&idempotency_key) {
+            if record.fingerprint == fingerprint {
+                return Ok(record.receipt.clone());
+            }
+            return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
+        }
+
+        let mut candidate = service.clone();
+        let receipt = candidate.publish(request.target.clone(), request.message.clone())?;
+        let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
+            target: request.target,
+            message: request.message,
+            idempotency_key: Some(idempotency_key.clone()),
+        });
+        let record = PublishIdempotencyRecord {
+            fingerprint,
+            receipt: receipt.clone(),
+        };
+        if let Some(store) = &self.store {
+            store.append_publish_mutation(operation.as_ref(), Some((&idempotency_key, &record)))?;
+        }
+        *service = candidate;
+        idempotency.insert(idempotency_key, record);
+        Ok(receipt)
+    }
 }
 
 pub fn http_router(state: HttpServerState) -> Router {
@@ -83,6 +141,8 @@ pub struct HealthResponse {
 pub struct PublishMessageRequest {
     pub target: HttpPublishTarget,
     pub message: cgka_traits::transport::TransportMessage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,14 +185,7 @@ async fn publish_message(
     State(state): State<HttpServerState>,
     Json(request): Json<PublishMessageRequest>,
 ) -> Result<Json<HttpPublishReceipt>, ServerHttpError> {
-    let receipt = state.apply_mutation(|service| {
-        let receipt = service.publish(request.target.clone(), request.message.clone())?;
-        let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
-            target: request.target,
-            message: request.message,
-        });
-        Ok((receipt, operation))
-    })?;
+    let receipt = state.publish_message(request)?;
     Ok(Json(receipt))
 }
 
@@ -189,6 +242,8 @@ enum PersistedOperation {
     PublishMessage {
         target: HttpPublishTarget,
         message: cgka_traits::transport::TransportMessage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     PublishKeyPackage {
         publication: HttpKeyPackagePublication,
@@ -208,6 +263,27 @@ impl PersistedOperation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PublishMessageFingerprint {
+    target: HttpPublishTarget,
+    message: cgka_traits::transport::TransportMessage,
+}
+
+impl PublishMessageFingerprint {
+    fn from_request(request: &PublishMessageRequest) -> Self {
+        Self {
+            target: request.target.clone(),
+            message: request.message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PublishIdempotencyRecord {
+    fingerprint: PublishMessageFingerprint,
+    receipt: HttpPublishReceipt,
+}
+
 #[derive(Clone, Debug)]
 struct SqliteHttpDeliveryStore {
     path: Arc<PathBuf>,
@@ -224,6 +300,11 @@ impl SqliteHttpDeliveryStore {
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
                 body_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_publish_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                fingerprint_json TEXT NOT NULL,
+                receipt_json TEXT NOT NULL
             );",
         )?;
         Ok(store)
@@ -239,6 +320,37 @@ impl SqliteHttpDeliveryStore {
         Ok(())
     }
 
+    fn append_publish_mutation(
+        &self,
+        operation: Option<&PersistedOperation>,
+        idempotency: Option<(&str, &PublishIdempotencyRecord)>,
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if let Some(operation) = operation {
+            transaction.execute(
+                "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+                params![operation.kind(), serde_json::to_string(operation)?],
+            )?;
+        }
+        if let Some((idempotency_key, record)) = idempotency {
+            transaction.execute(
+                "INSERT INTO http_publish_idempotency (
+                    idempotency_key,
+                    fingerprint_json,
+                    receipt_json
+                ) VALUES (?1, ?2, ?3)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&record.fingerprint)?,
+                    serde_json::to_string(&record.receipt)?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn load_operations(&self) -> Result<Vec<PersistedOperation>, DurableStoreError> {
         let conn = self.connection()?;
         let mut statement =
@@ -251,6 +363,34 @@ impl SqliteHttpDeliveryStore {
         Ok(operations)
     }
 
+    fn load_publish_idempotency(
+        &self,
+    ) -> Result<HashMap<String, PublishIdempotencyRecord>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT idempotency_key, fingerprint_json, receipt_json FROM http_publish_idempotency",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut idempotency = HashMap::new();
+        for row in rows {
+            let (key, fingerprint_json, receipt_json) = row?;
+            idempotency.insert(
+                key,
+                PublishIdempotencyRecord {
+                    fingerprint: serde_json::from_str(&fingerprint_json)?,
+                    receipt: serde_json::from_str(&receipt_json)?,
+                },
+            );
+        }
+        Ok(idempotency)
+    }
+
     fn connection(&self) -> Result<Connection, rusqlite::Error> {
         Connection::open(&*self.path)
     }
@@ -261,7 +401,9 @@ fn replay_operation(
     operation: PersistedOperation,
 ) -> Result<(), DurableStoreError> {
     match operation {
-        PersistedOperation::PublishMessage { target, message } => {
+        PersistedOperation::PublishMessage {
+            target, message, ..
+        } => {
             service.publish(target, message)?;
         }
         PersistedOperation::PublishKeyPackage { publication } => {
@@ -287,6 +429,8 @@ pub enum DurableStoreError {
 #[derive(Debug)]
 pub enum ServerHttpError {
     Delivery(HttpServerError),
+    IdempotencyConflict { idempotency_key: String },
+    InvalidIdempotencyKey,
     Store(DurableStoreError),
 }
 
@@ -314,6 +458,16 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "delivery_store".to_owned(),
                 error.to_string(),
+            ),
+            Self::IdempotencyConflict { idempotency_key } => (
+                StatusCode::CONFLICT,
+                "idempotency_conflict".to_owned(),
+                format!("conflicting request for idempotency key '{idempotency_key}'"),
+            ),
+            Self::InvalidIdempotencyKey => (
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key".to_owned(),
+                "idempotency key must not be empty".to_owned(),
             ),
         };
         let body = ErrorResponse { kind, error };

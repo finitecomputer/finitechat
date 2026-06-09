@@ -54,6 +54,9 @@ Python test distribution:
   fresh Darkmatter service core after restart. The current persistence tests
   prove group queue order, duplicate replay, same-epoch commit admission, and
   consumed KeyPackage state survive restart.
+- The HTTP `/messages` route now accepts an optional idempotency key. Matching
+  retries replay the original receipt after restart, and same-key retries with
+  a different target/message conflict without appending a second delivery.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -70,9 +73,9 @@ Python test distribution:
   state, and Hermes bridge JSON.
 - CLI/daemon command surfaces that call into the Darkmatter-backed client.
 - Push/unread/command-inbox projections from decrypted application events.
-- Public server DTO polish, auth, rate limits, deployment concerns, and
-  idempotency wrappers around the HTTP delivery service core, as long as the
-  underlying state transition already exists.
+- Public server DTO polish, auth, rate limits, and additional idempotency
+  wrappers around the HTTP delivery service core, as long as the underlying
+  state transition already exists.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the spike cannot drift, but that is not the
   right long-term crate boundary.
@@ -86,10 +89,11 @@ Python test distribution:
 - Later-device fanout into existing rooms. Finite tests require distinct
   KeyPackages per room, persistent fanout plans, response-loss retry, and
   reprepare after same-epoch loss.
-- Mapping Finite's server cursor, idempotency records, repair states, and
-  crash-atomic response replay onto Darkmatter's engine/storage model without
-  duplicating protocol state. The SQLite operation log only proves basic
-  restart replay for accepted Darkmatter HTTP operations.
+- Mapping Finite's server cursor, repair states, and full crash-atomic
+  transaction model onto Darkmatter's engine/storage model without duplicating
+  protocol state. The SQLite operation log now proves basic restart replay for
+  accepted Darkmatter HTTP operations and `/messages` idempotency, but not the
+  full copied reducer matrix.
 - Replacing the current fake-MLS reducer tests while preserving their
   transaction and replay assertions.
 
@@ -132,7 +136,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- New tests added: `5`
+- Route/store/engine tests added so far: `11`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -144,6 +148,9 @@ Additional HTTP route checkpoint:
   - group queue and duplicate-message index rebuild after restart
   - same-epoch commit admission rebuilds after restart
   - consumed KeyPackage state rebuilds after restart
+  - idempotent `/messages` retry replays the original receipt after restart
+  - same idempotency key with a different target/message conflicts without a
+    second append
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -152,6 +159,13 @@ Additional HTTP route checkpoint:
   `127.0.0.1:18788`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18788 health`
   - `finitechat-darkmatter http --server http://127.0.0.1:18788 publish-group --group-id sqlite-live-room --transport-group-id sqlite-live-transport --message-id sqlite-live-commit --payload commit --commit-epoch 1`
+- Live idempotency smoke verified with a temporary SQLite file on
+  `127.0.0.1:18789`:
+  - publishing the same `/messages` request twice with
+    `--idempotency-key idem-live-key` returned the same `seq:1` receipt with
+    `duplicate:false`
+  - publishing a different target/message with the same key returned
+    `409 idempotency_conflict`
 
 Important test caveat:
 
@@ -167,6 +181,7 @@ Additional CLI checkpoint:
 - New CLI tests added: `5`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
+    and optional idempotency key
   - inbox publish builds a Welcome envelope
   - group sync defaults to `after_seq = 0` and `limit = 50`
   - KeyPackage claim builds the route DTO
@@ -189,5 +204,5 @@ Dependency note:
   in Darkmatter proper.
 
 Next meaningful gate: move selected copied server reducer scenarios onto the
-Darkmatter HTTP route/store boundary, starting with idempotent response replay
-and Welcome claim/ack recovery.
+Darkmatter HTTP route/store boundary, starting with Welcome claim/ack recovery
+and later-device fanout.

@@ -61,6 +61,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can replay accepted Darkmatter HTTP delivery operations from SQLite after restart",
         },
         PortFinding {
+            area: "http_publish_idempotency_replay",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server replays stored /messages receipts for matching idempotency keys and rejects conflicting retries",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
             evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",

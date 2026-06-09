@@ -121,7 +121,11 @@ async fn publish_drained_bus_messages_to_routes(
         let response = post_json(
             app.clone(),
             "/messages",
-            &PublishMessageRequest { target, message },
+            &PublishMessageRequest {
+                target,
+                message,
+                idempotency_key: None,
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);

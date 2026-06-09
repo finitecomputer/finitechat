@@ -125,6 +125,7 @@ fn publish_group_request(
     let transport_group_id = required_option(&mut args, "--transport-group-id")?;
     let message_id = required_option(&mut args, "--message-id")?;
     let payload = required_option(&mut args, "--payload")?;
+    let idempotency_key = take_option(&mut args, "--idempotency-key")?;
     let commit_epoch = take_option(&mut args, "--commit-epoch")?
         .map(|epoch| parse_u64("--commit-epoch", &epoch))
         .transpose()?;
@@ -147,6 +148,7 @@ fn publish_group_request(
             source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
             envelope: TransportEnvelope::GroupMessage { transport_group_id },
         },
+        idempotency_key,
     };
     post_json_request(server, "/messages", &request)
 }
@@ -158,6 +160,7 @@ fn publish_inbox_request(
     let recipient = required_option(&mut args, "--recipient")?;
     let message_id = required_option(&mut args, "--message-id")?;
     let payload = required_option(&mut args, "--payload")?;
+    let idempotency_key = take_option(&mut args, "--idempotency-key")?;
     reject_extra_args(&args)?;
 
     let recipient = MemberId::new(recipient.into_bytes());
@@ -173,6 +176,7 @@ fn publish_inbox_request(
             source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
             envelope: TransportEnvelope::Welcome { recipient },
         },
+        idempotency_key,
     };
     post_json_request(server, "/messages", &request)
 }
@@ -355,7 +359,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID".to_owned()
 }
 
 #[cfg(test)]
@@ -379,6 +383,8 @@ mod tests {
             "commit-bytes",
             "--commit-epoch",
             "4",
+            "--idempotency-key",
+            "idem-commit-a",
         ])
         .expect("prepared request");
 
@@ -404,6 +410,7 @@ mod tests {
         assert_eq!(body.message.id.as_slice(), b"commit-a");
         assert_eq!(body.message.payload, b"commit-bytes");
         assert_eq!(body.message.source.0, HTTP_SERVER_SOURCE);
+        assert_eq!(body.idempotency_key.as_deref(), Some("idem-commit-a"));
     }
 
     #[test]
