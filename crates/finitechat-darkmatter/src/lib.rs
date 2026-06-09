@@ -46,6 +46,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "Finite app event push/unread/command policy can stay above opaque Marmot application payloads",
         },
         PortFinding {
+            area: "http_cli_route_client",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, and KeyPackage operations",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
             evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",

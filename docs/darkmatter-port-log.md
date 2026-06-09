@@ -66,6 +66,11 @@ Python test distribution:
 - Public server DTO polish, auth, rate limits, deployment concerns, and
   idempotency wrappers around the HTTP delivery service core, as long as the
   underlying state transition already exists.
+- Moving route DTOs into a shared protocol crate. The current CLI imports the
+  server crate's DTOs directly so the spike cannot drift, but that is not the
+  right long-term crate boundary.
+- Public byte encoding for opaque IDs and payloads. The current CLI maps string
+  arguments directly to bytes for local testing.
 
 ## Thick Or Wonky Logic
 
@@ -100,6 +105,8 @@ workspace members:
 - `finitechat-server` exposes in-process HTTP routes over the in-memory
   Darkmatter delivery core and keeps `serve` as an explicit binary mode.
   Auth, durable persistence, and production server behavior remain unported.
+- `finitechat-cli` can now call the HTTP delivery routes for health, group
+  publish/sync, inbox publish/sync, KeyPackage publish, and KeyPackage claim.
 
 Verified after adding the Darkmatter dependency graph:
 
@@ -108,6 +115,7 @@ Verified after adding the Darkmatter dependency graph:
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass
 - `cargo run -p finitechat-cli -- compat-report`: pass
 - `cargo run -p finitechat-server -- smoke`: pass
+- `cargo run -p finitechat-cli -- http-smoke`: pass
 
 Additional HTTP route checkpoint:
 
@@ -127,6 +135,21 @@ Important test caveat:
   Chat implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
   adapter smoke test plus the HTTP route tests above.
+
+Additional CLI checkpoint:
+
+- `cargo test -p finitechat-cli`: pass
+- New CLI tests added: `5`
+- Request construction coverage proven:
+  - group publish builds the `/messages` DTO with optional commit admission
+  - inbox publish builds a Welcome envelope
+  - group sync defaults to `after_seq = 0` and `limit = 50`
+  - KeyPackage claim builds the route DTO
+  - unknown CLI flags fail as usage errors
+- Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
+  - `finitechat-darkmatter http --server http://127.0.0.1:18787 health`
+  - `finitechat-darkmatter http --server http://127.0.0.1:18787 publish-group --group-id cli-room --transport-group-id cli-transport --message-id cli-commit-1 --payload commit-bytes --commit-epoch 1`
+  - `finitechat-darkmatter http --server http://127.0.0.1:18787 sync-group --group-id cli-room --limit 10`
 
 Dependency note:
 
