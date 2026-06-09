@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -126,14 +126,19 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can decode a claimed Finite WelcomeRecord on activated ack, mark the pending account-room device active, and reload that active projection after restart",
         },
         PortFinding {
+            area: "http_submit_commit_route",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes the ordered group commit projection, releases derived Welcome inbox messages, and replays idempotently after restart",
+        },
+        PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through Darkmatter HTTP, sync completion, release a Welcome, and promote the later device from pending to active after ack",
+            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through the typed HTTP /commits route, sync completion, claim a server-released Welcome, and promote the later device from pending to active after ack",
         },
         PortFinding {
             area: "http_later_device_fanout_submit_retry",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick retries a lost HTTP submit response from typed bootstrap discovery and prepared local state, replays the idempotent commit and Welcome publishes, and does not duplicate the group log entry",
+            evidence: "finitechat-client run_link_fanout_tick retries a lost HTTP /commits response from typed bootstrap discovery and prepared local state, replays the idempotent server-side commit and Welcome publishes, and does not duplicate the group log entry",
         },
         PortFinding {
             area: "http_later_device_fanout_multi_room",
@@ -148,7 +153,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-authored commit/member truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates; Welcome ack activation is now server-derived",
+            evidence: "Remaining Finite parity requires server-authored commit/member truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates; typed submit side effects and Welcome ack activation are now server-derived",
         },
         PortFinding {
             area: "ordered_delivery_profile",

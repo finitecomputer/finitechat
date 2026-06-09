@@ -7,18 +7,23 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cgka_traits::transport::{TransportEnvelope, TransportMessage};
-use cgka_traits::{GroupId, MemberId, MessageId};
-use finitechat_engine::{AccountRoomDevice, AccountRoomRecord, WelcomeRecord};
-use finitechat_proto::{DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus};
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use finitechat_engine::{
+    AccountRoomDevice, AccountRoomRecord, CommitAccepted, SubmitCommitRequest, WelcomeRecord,
+    lease_token_for, staged_welcomes_by_id,
+};
+use finitechat_proto::{
+    DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use transport_http_server::{
-    HttpClaimedKeyPackage, HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication,
-    HttpPublishReceipt, HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
-    MAX_HTTP_SYNC_PAGE_ENTRIES,
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryService,
+    HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
+    HttpSequence, HttpServerError, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
 const MAX_HTTP_FANOUT_ROOMS: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
@@ -822,6 +827,35 @@ impl HttpServerState {
         Ok(())
     }
 
+    fn submit_commit(
+        &self,
+        request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, ServerHttpError> {
+        validate_submit_commit_request(&request)?;
+        let message_id = request.envelope.message_id().map_err(|error| {
+            ServerHttpError::InvalidCommitRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let commit_publish = commit_publish_request(&request, &message_id)?;
+        let receipt = self.publish_message(commit_publish.clone())?;
+        self.record_finite_commit_projection(&commit_publish, receipt.seq)?;
+
+        let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
+        for welcome in &welcomes {
+            self.publish_message(welcome_publish_request(welcome)?)?;
+        }
+
+        Ok(CommitAccepted {
+            seq: receipt.seq,
+            message_id,
+            released_welcomes: welcomes
+                .into_iter()
+                .map(|welcome| welcome.welcome_id)
+                .collect(),
+        })
+    }
+
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -991,6 +1025,7 @@ pub fn http_router(state: HttpServerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/messages", post(publish_message))
+        .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
         .route("/key-packages", post(publish_key_package))
@@ -1221,6 +1256,13 @@ async fn publish_message(
     let receipt = state.publish_message(request.clone())?;
     state.record_finite_commit_projection(&request, receipt.seq)?;
     Ok(Json(receipt))
+}
+
+async fn submit_commit(
+    State(state): State<HttpServerState>,
+    Json(request): Json<SubmitCommitRequest>,
+) -> Result<Json<CommitAccepted>, ServerHttpError> {
+    Ok(Json(state.submit_commit(request)?))
 }
 
 async fn sync_group(
@@ -1921,6 +1963,171 @@ fn mark_next_key_package_claimed(
     }
 }
 
+fn validate_submit_commit_request(request: &SubmitCommitRequest) -> Result<(), ServerHttpError> {
+    request
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidCommitRequest {
+            reason: error.to_string(),
+        })?;
+    let message_id =
+        request
+            .envelope
+            .message_id()
+            .map_err(|error| ServerHttpError::InvalidCommitRequest {
+                reason: error.to_string(),
+            })?;
+    if request.envelope.kind != LogEntryKind::Commit {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: "commit request envelope must be a commit".to_owned(),
+        });
+    }
+    if request.envelope.room_id != request.room_id {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "commit envelope room_id {} does not match request room_id {}",
+                request.envelope.room_id, request.room_id
+            ),
+        });
+    }
+    if request.envelope.epoch != request.expected_epoch {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "commit envelope epoch {} does not match expected epoch {}",
+                request.envelope.epoch, request.expected_epoch
+            ),
+        });
+    }
+    if request.envelope.sender != request.sender {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: "commit envelope sender does not match request sender".to_owned(),
+        });
+    }
+    request
+        .membership_delta
+        .validate_structure(request.expected_epoch, &message_id)
+        .map_err(|error| ServerHttpError::InvalidCommitRequest {
+            reason: error.to_string(),
+        })?;
+    staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes).map_err(
+        |error| ServerHttpError::InvalidCommitRequest {
+            reason: error.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn commit_publish_request(
+    request: &SubmitCommitRequest,
+    message_id: &str,
+) -> Result<PublishMessageRequest, ServerHttpError> {
+    let transport_group_id = transport_group_id_for_room(&request.room_id);
+    let placeholder_entry = RoomLogEntry {
+        room_id: request.room_id.clone(),
+        seq: 0,
+        message_id: message_id.to_owned(),
+        sender: request.sender.clone(),
+        kind: LogEntryKind::Commit,
+        epoch: request.expected_epoch,
+        envelope: request.envelope.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+    };
+    Ok(PublishMessageRequest {
+        target: HttpPublishTarget::Group {
+            group_id: group_id_for_room(&request.room_id),
+            transport_group_id: transport_group_id.clone(),
+            commit_admission: Some(HttpCommitAdmission {
+                source_epoch: EpochId(request.expected_epoch),
+            }),
+        },
+        message: TransportMessage {
+            id: MessageId::new(message_id.as_bytes().to_vec()),
+            payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
+                entry: placeholder_entry,
+                membership_delta: request.membership_delta.clone(),
+            })
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+            timestamp: Timestamp(0),
+            causal_deps: Vec::new(),
+            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage { transport_group_id },
+        },
+        idempotency_key: Some(format!(
+            "commit:{}:{}",
+            request.room_id, request.idempotency_key
+        )),
+    })
+}
+
+fn released_welcome_records_for_commit(
+    request: &SubmitCommitRequest,
+    commit_seq: u64,
+) -> Result<Vec<WelcomeRecord>, ServerHttpError> {
+    let staged = staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes)
+        .map_err(|error| ServerHttpError::InvalidCommitRequest {
+            reason: error.to_string(),
+        })?;
+    request
+        .membership_delta
+        .adds
+        .iter()
+        .map(|add| {
+            let staged = staged
+                .get(&add.welcome_id)
+                .expect("validated staged welcome must exist");
+            Ok(WelcomeRecord {
+                welcome_id: add.welcome_id.clone(),
+                room_id: request.room_id.clone(),
+                commit_seq,
+                recipient: add.device.clone(),
+                sender: request.sender.clone(),
+                key_package_id: add.key_package_id.clone(),
+                join_epoch: request.membership_delta.post_commit_epoch,
+                state: WelcomeState::Released,
+                lease_token: Some(lease_token_for(&add.welcome_id, &add.device)),
+                welcome_payload: staged.welcome_payload.clone(),
+                ratchet_tree_payload: staged.ratchet_tree_payload.clone(),
+            })
+        })
+        .collect()
+}
+
+fn welcome_publish_request(
+    welcome: &WelcomeRecord,
+) -> Result<PublishMessageRequest, ServerHttpError> {
+    let recipient = member_id_for_device(&welcome.recipient)?;
+    Ok(PublishMessageRequest {
+        target: HttpPublishTarget::Inbox {
+            recipient: recipient.clone(),
+        },
+        message: TransportMessage {
+            id: MessageId::new(welcome.welcome_id.as_bytes().to_vec()),
+            payload: serde_json::to_vec(welcome)
+                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+            timestamp: Timestamp(0),
+            causal_deps: Vec::new(),
+            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+            envelope: TransportEnvelope::Welcome { recipient },
+        },
+        idempotency_key: Some(format!("welcome:{}", welcome.welcome_id)),
+    })
+}
+
+fn member_id_for_device(device: &DeviceRef) -> Result<MemberId, ServerHttpError> {
+    serde_json::to_vec(device)
+        .map(MemberId::new)
+        .map_err(|error| ServerHttpError::InvalidCommitRequest {
+            reason: error.to_string(),
+        })
+}
+
+fn group_id_for_room(room_id: &str) -> GroupId {
+    GroupId::new(room_id.as_bytes().to_vec())
+}
+
+fn transport_group_id_for_room(room_id: &str) -> Vec<u8> {
+    room_id.as_bytes().to_vec()
+}
+
 fn validate_fanout_id(fanout_id: &str) -> Result<(), ServerHttpError> {
     validate_string_id("fanout_id", fanout_id, MAX_HTTP_FANOUT_ID_BYTES)
 }
@@ -2071,6 +2278,9 @@ pub enum ServerHttpError {
         field: &'static str,
         value: usize,
     },
+    InvalidCommitRequest {
+        reason: String,
+    },
     InvalidFanoutRequest {
         reason: String,
     },
@@ -2174,6 +2384,11 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "key_package_inventory_count_overflow".to_owned(),
                 format!("KeyPackage inventory field {field} does not fit in u32: {value}"),
+            ),
+            Self::InvalidCommitRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_commit_request".to_owned(),
+                reason,
             ),
             Self::InvalidFanoutRequest { reason } => (
                 StatusCode::BAD_REQUEST,

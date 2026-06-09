@@ -4,16 +4,22 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_engine::{AccountRoomDevice, AccountRoomRecord, WelcomeRecord};
-use finitechat_proto::{DeviceRef, RoomStatus, WelcomeState};
+use finitechat_engine::{
+    AccountRoomDevice, AccountRoomRecord, CommitAccepted, SubmitCommitRequest, WelcomeRecord,
+};
+use finitechat_proto::{
+    DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomStatus,
+    StagedWelcomeV1, WelcomeState,
+};
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
-    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpServerState,
-    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
-    MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
-    SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest, http_router,
+    ClaimWelcomesRequest, ErrorResponse, FiniteAccountRoomCommitProjection, GroupSyncRequest,
+    HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest, http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -856,6 +862,158 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
 }
 
 #[tokio::test]
+async fn sqlite_submit_commit_route_publishes_commit_projection_and_welcome_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let room_id = "room-submit-commit-route".to_owned();
+    let mls_group_id = "mls-submit-commit-route".to_owned();
+    let welcome_id = "welcome-submit-commit-route".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        &welcome_id,
+        "commit-route-idempotency",
+    );
+    let expected_message_id = request
+        .envelope
+        .message_id()
+        .expect("commit envelope message id");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(app, "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(accepted.message_id, expected_message_id);
+    assert_eq!(accepted.released_welcomes, vec![welcome_id.clone()]);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: CommitAccepted = read_json(response).await;
+    assert_eq!(replayed, accepted);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let group_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(group_page.entries.len(), 1);
+    assert_eq!(group_page.entries[0].seq, accepted.seq);
+    assert_eq!(group_page.entries[0].message.id, id(&accepted.message_id));
+    let projection: FiniteAccountRoomCommitProjection =
+        serde_json::from_slice(&group_page.entries[0].message.payload)
+            .expect("commit projection payload");
+    assert_eq!(projection.entry.message_id, accepted.message_id);
+    assert_eq!(projection.membership_delta.adds[0].device, phone);
+
+    let recipient = member_for_device(&DeviceRef::new("alice", "alice-phone"));
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &finitechat_server::InboxSyncRequest {
+            recipient: recipient.clone(),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inbox_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(inbox_page.entries.len(), 1);
+    assert_eq!(inbox_page.entries[0].seq, 1);
+    assert_eq!(inbox_page.entries[0].message.id, id(&welcome_id));
+    let welcome: WelcomeRecord =
+        serde_json::from_slice(&inbox_page.entries[0].message.payload).expect("welcome payload");
+    assert_eq!(welcome.welcome_id, welcome_id);
+    assert_eq!(welcome.commit_seq, accepted.seq);
+    assert_eq!(welcome.recipient, DeviceRef::new("alice", "alice-phone"));
+    assert_eq!(welcome.state, WelcomeState::Released);
+
+    let response = post_json(
+        app,
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["current_epoch"], 1);
+    assert_eq!(page.rooms[0]["last_seq"], accepted.seq);
+    assert_eq!(page.rooms[0]["devices"][0]["active"], true);
+    assert_eq!(
+        page.rooms[0]["devices"][1]["device"]["device_id"],
+        "alice-phone"
+    );
+    assert_eq!(page.rooms[0]["devices"][1]["active"], false);
+}
+
+#[tokio::test]
+async fn submit_commit_route_rejects_missing_staged_welcome_before_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-submit-missing-welcome".to_owned();
+    let mut request = submit_add_device_request(
+        &room_id,
+        "mls-submit-missing-welcome",
+        &DeviceRef::new("alice", "alice-laptop"),
+        &DeviceRef::new("alice", "alice-phone"),
+        "welcome-submit-missing-welcome",
+        "missing-welcome-idempotency",
+    );
+    request.staged_welcomes.clear();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+}
+
+#[tokio::test]
 async fn sqlite_welcome_activation_marks_account_room_device_active_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -1205,6 +1363,50 @@ fn member(label: &str) -> MemberId {
 
 fn member_for_device(device: &DeviceRef) -> MemberId {
     MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+}
+
+fn submit_add_device_request(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    added: &DeviceRef,
+    welcome_id: &str,
+    idempotency_key: &str,
+) -> SubmitCommitRequest {
+    let envelope = FiniteEnvelope {
+        room_id: room_id.to_owned(),
+        mls_group_id: mls_group_id.to_owned(),
+        epoch: 0,
+        sender: sender.clone(),
+        kind: LogEntryKind::Commit,
+        payload: b"commit-add-device".to_vec(),
+    };
+    let commit_message_id = envelope.message_id().expect("commit message id");
+    SubmitCommitRequest {
+        room_id: room_id.to_owned(),
+        sender: sender.clone(),
+        expected_epoch: 0,
+        envelope,
+        membership_delta: MembershipDeltaV1 {
+            base_epoch: 0,
+            post_commit_epoch: 1,
+            commit_message_id,
+            adds: vec![MembershipAddV1 {
+                device: added.clone(),
+                key_package_id: "key-package-add-device".to_owned(),
+                key_package_ref: "key-package-ref-add-device".to_owned(),
+                key_package_hash: "key-package-hash-add-device".to_owned(),
+                welcome_id: welcome_id.to_owned(),
+            }],
+            removes: Vec::new(),
+        },
+        staged_welcomes: vec![StagedWelcomeV1 {
+            welcome_id: welcome_id.to_owned(),
+            welcome_payload: b"welcome-add-device".to_vec(),
+            ratchet_tree_payload: b"ratchet-tree-add-device".to_vec(),
+        }],
+        idempotency_key: idempotency_key.to_owned(),
+    }
 }
 
 fn key_package_publication(

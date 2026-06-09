@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `297`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `332`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `335`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -93,13 +93,13 @@ Python test distribution:
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log is published and
   account-room discovery starts from typed bootstrap projection: discover the
-  room, claim the target device's KeyPackage, publish the add-device Commit
-  through Darkmatter HTTP, sync the Commit back, and let the later device claim
-  and activate the released Welcome.
+  room, claim the target device's KeyPackage, submit the add-device Commit
+  through the typed HTTP `/commits` route, sync the Commit back, and let the
+  later device claim and activate the server-released Welcome.
 - The same one-room HTTP fanout path can retry a lost submit response from the
-  persisted prepared state. The commit publish and Welcome publish are
-  idempotent, so retry completes without appending a duplicate group entry or
-  delivering duplicate Welcomes.
+  persisted prepared state. The typed submit route replays the idempotent
+  commit and Welcome publishes, so retry completes without appending a
+  duplicate group entry or delivering duplicate Welcomes.
 - The HTTP fanout path also handles the worker's multi-room shape from typed
   bootstrap discovery: paged account-room discovery across two rooms, two
   distinct target KeyPackage claims, two submitted commits, two completion
@@ -170,10 +170,12 @@ Python test distribution:
   server can decode a claimed Finite `WelcomeRecord` on activated ack and flip
   the matching pending account-room device to active, matching the original
   Finite store's Welcome activation rule.
-- Runtime submit-commit mapping for the HTTP delivery surface. The adapter can
-  serialize a Finite `RoomLogEntry` into a Darkmatter HTTP group message,
-  publish derived `WelcomeRecord`s to recipient inboxes, and reconstruct
-  `CommitAccepted` from the HTTP receipt.
+- Typed submit-commit route for the HTTP delivery surface. The route accepts a
+  Finite `SubmitCommitRequest`, validates its structural commit metadata,
+  publishes the commit projection into the ordered Darkmatter group queue,
+  publishes derived `WelcomeRecord`s to recipient inboxes, and returns
+  `CommitAccepted` from the accepted HTTP sequence. Malformed staged Welcome
+  inputs are rejected before the route appends delivery side effects.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the route client cannot drift, but that is
   not the right long-term crate boundary.
@@ -187,9 +189,10 @@ Python test distribution:
   reprepare after same-epoch loss. The HTTP batch claim wrapper now covers the
   server-side package response-loss piece, the HTTP fanout wrapper now covers
   opaque room-plan checkpointing, and the account-room directory covers
-  discovery over HTTP. The HTTP runtime adapter now covers a one-room
-  happy-path commit submission and Welcome release, including response-loss
-  retry after the submit publish is accepted, plus a two-room fanout tick.
+  discovery over HTTP. The HTTP server now covers a typed submit-commit route
+  that publishes the group commit projection and releases derived Welcomes,
+  including response-loss retry after the typed submit is accepted; the
+  runtime adapter covers that path across one-room and two-room fanout ticks.
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
   initial active device, account-room save/list now normalizes records to the
@@ -242,7 +245,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `21`
+- Route/store/engine tests added so far: `23`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -335,11 +338,12 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `12`
+- New CLI tests added: `13`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
+  - typed submit-commit posts caller-provided JSON to `/commits`
   - group sync defaults to `after_seq = 0` and `limit = 50`
   - KeyPackage inventory builds the route DTO
   - KeyPackage claim builds the route DTO
@@ -376,6 +380,8 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_route_publishes_commit_projection_and_welcome_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
@@ -399,9 +405,9 @@ Runtime delivery checkpoint:
 - The link-fanout worker can also complete a one-room later-device happy path
   over the HTTP adapter: it discovers a room from a typed bootstrap
   account-room projection, claims the later device's KeyPackage, prepares and
-  submits the add-device Commit through `/messages`, syncs that Commit back
-  through `/sync/group`, and the later device claims and activates the released
-  Welcome through the HTTP inbox routes.
+  submits the add-device Commit through `/commits`, syncs that Commit back
+  through `/sync/group`, and the later device claims and activates the
+  server-released Welcome through the HTTP inbox routes.
 - The same HTTP happy path now proves the accepted add-device Commit updates
   the persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery lists the new device in that room as pending
@@ -413,11 +419,11 @@ Runtime delivery checkpoint:
   a persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery for the removed account no longer lists that
   room.
-- When the HTTP submit response is lost after the commit and Welcome publishes
-  have been accepted, the worker starts from typed bootstrap discovery, reloads
-  the prepared commit from durable local state, retries the same HTTP
-  idempotency keys, completes the room, and leaves exactly one new group Commit
-  and one claimed Welcome.
+- When the HTTP submit response is lost after `/commits` has accepted the
+  commit and Welcome publishes, the worker starts from typed bootstrap
+  discovery, reloads the prepared commit from durable local state, retries the
+  same HTTP idempotency keys through the typed route, completes the room, and
+  leaves exactly one new group Commit and one claimed Welcome.
 - With two existing rooms, the same worker pages typed bootstrap account-room
   discovery one room at a time, claims two distinct target-device KeyPackages,
   submits and completes both room commits, and the later device activates both
@@ -427,13 +433,14 @@ Runtime delivery checkpoint:
   that winning commit clears the local pending commit, and the next worker tick
   reprepares/submits the fanout commit at the next epoch.
 - This proves the current client runtime harness can be reused above a
-  Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
-  claim/ack, ordered room pull, account-room discovery, commit-derived
-  account-room updates for add/remove commits, and later-device fanout from
-  typed bootstrap across the happy path, submit response-loss retry, multi-room
-  fanout, and same-epoch reprepare. It does not yet prove server-authored
-  commit/member truth beyond typed product projection payloads, but Welcome ack
-  activation is now server-derived.
+  Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, typed
+  submit-commit, Welcome claim/ack, ordered room pull, account-room discovery,
+  commit-derived account-room updates for add/remove commits, and later-device
+  fanout from typed bootstrap across the happy path, submit response-loss
+  retry, multi-room fanout, and same-epoch reprepare. It does not yet prove
+  server-authored commit/member truth beyond typed product projection payloads,
+  but typed submit side effects and Welcome ack activation are now
+  server-derived.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
 from product-wrapper account-room projections into server-authored commit/member

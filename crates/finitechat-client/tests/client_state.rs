@@ -15,7 +15,7 @@ use finitechat_engine::{
     AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
     CreateRoomRequest, DeliveryService, EngineError, EventAccepted, KeyPackageInventory,
     ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage,
-    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for, staged_welcomes_by_id,
+    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -4831,50 +4831,6 @@ impl HttpRuntimeDelivery {
             self.post_json("/account-rooms/bootstrap", &request)?;
         Ok(())
     }
-
-    fn publish_commit_request(
-        &self,
-        request: &SubmitCommitRequest,
-        message_id: &str,
-    ) -> Result<HttpPublishReceipt, HttpRuntimeDeliveryError> {
-        let transport_group_id = transport_group_id_for_room(&request.room_id);
-        let placeholder_entry = RoomLogEntry {
-            room_id: request.room_id.clone(),
-            seq: 0,
-            message_id: message_id.to_owned(),
-            sender: request.sender.clone(),
-            kind: LogEntryKind::Commit,
-            epoch: request.expected_epoch,
-            envelope: request.envelope.clone(),
-            idempotency_key: request.idempotency_key.clone(),
-        };
-        let publish = PublishMessageRequest {
-            target: HttpPublishTarget::Group {
-                group_id: group_id_for_room(&request.room_id),
-                transport_group_id: transport_group_id.clone(),
-                commit_admission: Some(HttpCommitAdmission {
-                    source_epoch: EpochId(request.expected_epoch),
-                }),
-            },
-            message: TransportMessage {
-                id: DarkmatterMessageId::new(message_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
-                    entry: placeholder_entry,
-                    membership_delta: request.membership_delta.clone(),
-                })
-                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::GroupMessage { transport_group_id },
-            },
-            idempotency_key: Some(format!(
-                "commit:{}:{}",
-                request.room_id, request.idempotency_key
-            )),
-        };
-        self.post_json("/messages", &publish)
-    }
 }
 
 impl RuntimeDelivery for HttpRuntimeDelivery {
@@ -4983,25 +4939,12 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
             self.fail_next_submit_before_accept = false;
             return Err(HttpRuntimeDeliveryError::InjectedSubmitBeforeAccept);
         }
-        let receipt = self.publish_commit_request(&request, &message_id)?;
-        let released_welcomes = request
-            .membership_delta
-            .adds
-            .iter()
-            .map(|add| add.welcome_id.clone())
-            .collect::<Vec<_>>();
-        for welcome in released_welcome_records_for_commit(&request, receipt.seq)? {
-            self.publish_welcome_record(&welcome)?;
-        }
+        let accepted: CommitAccepted = self.post_json("/commits", &request)?;
         if self.fail_next_submit_after_accept {
             self.fail_next_submit_after_accept = false;
             return Err(HttpRuntimeDeliveryError::InjectedSubmitAfterAccept);
         }
-        Ok(CommitAccepted {
-            seq: receipt.seq,
-            message_id,
-            released_welcomes,
-        })
+        Ok(accepted)
     }
 
     fn list_account_rooms(
@@ -5133,37 +5076,6 @@ fn group_id_for_room(room_id: &str) -> GroupId {
 
 fn transport_group_id_for_room(room_id: &str) -> Vec<u8> {
     room_id.as_bytes().to_vec()
-}
-
-fn released_welcome_records_for_commit(
-    request: &SubmitCommitRequest,
-    commit_seq: u64,
-) -> Result<Vec<WelcomeRecord>, HttpRuntimeDeliveryError> {
-    let staged = staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes)
-        .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
-    request
-        .membership_delta
-        .adds
-        .iter()
-        .map(|add| {
-            let staged = staged
-                .get(&add.welcome_id)
-                .expect("validated staged welcome must exist");
-            Ok(WelcomeRecord {
-                welcome_id: add.welcome_id.clone(),
-                room_id: request.room_id.clone(),
-                commit_seq,
-                recipient: add.device.clone(),
-                sender: request.sender.clone(),
-                key_package_id: add.key_package_id.clone(),
-                join_epoch: request.membership_delta.post_commit_epoch,
-                state: WelcomeState::Released,
-                lease_token: Some(lease_token_for(&add.welcome_id, &add.device)),
-                welcome_payload: staged.welcome_payload.clone(),
-                ratchet_tree_payload: staged.ratchet_tree_payload.clone(),
-            })
-        })
-        .collect()
 }
 
 fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[SentPlaintext]) {
