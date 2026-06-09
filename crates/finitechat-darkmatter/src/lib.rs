@@ -108,7 +108,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_account_room_commit_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server can project accepted Finite add-device commits into persisted account-room records and reload the new pending device after restart",
+            evidence: "finitechat-server can project accepted Finite add/remove commits into persisted account-room records and reload the updated discovery state after restart",
         },
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
@@ -133,7 +133,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-side membership validation/filtering and canonical room bootstrap/removal projection instead of seeded product wrapper state",
+            evidence: "Remaining Finite parity requires server-side membership validation/filtering and canonical room bootstrap projection instead of seeded product wrapper state",
         },
         PortFinding {
             area: "ordered_delivery_profile",

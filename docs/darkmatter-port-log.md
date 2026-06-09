@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `296`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `329`
+  `297`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `330`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -26,7 +26,7 @@ Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 40 |
+| `crates/finitechat-client/tests/client_state.rs` | 41 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -77,11 +77,12 @@ Python test distribution:
   records, page them by room id, and reload them from SQLite. This gives the
   runtime link-fanout discovery loop a Darkmatter HTTP boundary, as long as a
   product-owned membership projection writes the directory.
-- The HTTP route layer can also project accepted Finite add-device commit
+- The HTTP route layer can also project accepted Finite add/remove commit
   payloads into the account-room directory. The later-device HTTP fanout test
-  now proves the accepted commit updates and persists the room record so a
-  restarted server lists the new device as pending without a second manual
-  `/account-rooms` write.
+  proves an accepted add commit persists the new device as pending after
+  restart, and a remove-commit HTTP runtime test proves the removed account no
+  longer lists the room after restart without a second manual `/account-rooms`
+  write.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log and account-room
   directory are seeded: discover the room, claim the target device's KeyPackage,
@@ -149,7 +150,7 @@ Python test distribution:
 - Commit-derived account-room projection for the HTTP delivery surface. The
   route layer can decode an explicit product commit projection payload, apply
   adds/removes to persisted `AccountRoomRecord`s, and keep discovery state in
-  step with accepted add-device commits. This is still product wrapper logic,
+  step with accepted add/remove commits. This is still product wrapper logic,
   not Darkmatter becoming the MLS membership authority.
 - Runtime submit-commit mapping for the HTTP delivery surface. The adapter can
   serialize a Finite `RoomLogEntry` into a Darkmatter HTTP group message,
@@ -171,10 +172,10 @@ Python test distribution:
   discovery over HTTP. The HTTP runtime adapter now covers a one-room
   happy-path commit submission and Welcome release, including response-loss
   retry after the submit publish is accepted, plus a two-room fanout tick.
-  Commit-derived account-room updates are now proven for add-device commits.
-  Server-side membership validation/filtering and replacing initial seeded
-  wrapper state with a canonical server-derived room projection remain
-  unported.
+  Commit-derived account-room updates are now proven for add-device and
+  remove-device commits. Server-side membership validation/filtering and
+  replacing initial seeded wrapper state with a canonical server-derived room
+  projection remain unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -348,6 +349,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
@@ -378,6 +380,10 @@ Runtime delivery checkpoint:
   the persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery lists the new device in that room as pending
   without a second manual `/account-rooms` write.
+- A remove-commit runtime test now proves the same projection path can remove
+  a persisted account-room record. After reopening the HTTP server from the
+  same SQLite file, discovery for the removed account no longer lists that
+  room.
 - When the HTTP submit response is lost after the commit and Welcome publishes
   have been accepted, the worker reloads the prepared commit from durable local
   state, retries the same HTTP idempotency keys, completes the room, and leaves
@@ -393,13 +399,12 @@ Runtime delivery checkpoint:
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
   claim/ack, ordered room pull, account-room discovery, commit-derived
-  account-room updates for add-device commits, and a one-room later-device
+  account-room updates for add/remove commits, and a one-room later-device
   fanout happy path with submit response-loss retry and multi-room fanout,
   including same-epoch reprepare. It does not yet prove server membership
-  filtering or canonical room bootstrap/removal projection over the same
-  adapter.
+  filtering or canonical room bootstrap projection over the same adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from commit-derived account-room add projections into server membership
-filtering and canonical room bootstrap/removal projection, or start moving the
-test-only HTTP runtime adapter into production client/server boundaries.
+from commit-derived account-room projections into server membership filtering
+and canonical room bootstrap projection, or start moving the test-only HTTP
+runtime adapter into production client/server boundaries.

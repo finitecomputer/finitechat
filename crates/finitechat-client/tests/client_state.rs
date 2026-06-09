@@ -2320,6 +2320,69 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_submit_commit_removes_account_room_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let mut world = active_alice_bob_charlie_room();
+    let charlie_ref = world.charlie.device_ref().clone();
+    let charlie_account_id = charlie_ref.account_id.clone();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let initial_page = world
+        .server
+        .sync_events(ROOM_ID, world.alice.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_page.entries.len(), 2);
+    for entry in &initial_page.entries {
+        delivery.publish_room_log_entry(entry).unwrap();
+    }
+    let account_rooms = world
+        .server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: charlie_account_id.clone(),
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(account_rooms.rooms.len(), 1);
+    assert!(
+        account_rooms.rooms[0]
+            .devices
+            .iter()
+            .any(|device| device.device == charlie_ref && device.active)
+    );
+    delivery
+        .publish_account_room_record(&charlie_account_id, &account_rooms.rooms[0])
+        .unwrap();
+
+    let prepared = world
+        .bob
+        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "bob_http_remove_charlie")
+        .unwrap();
+    let accepted = delivery.submit_commit(prepared.request).unwrap();
+    assert_eq!(accepted.seq, world.last_seq + 1);
+    assert_eq!(accepted.message_id, prepared.message_id);
+    let bob_page = delivery
+        .sync_events(ROOM_ID, world.bob.device_ref(), world.last_seq)
+        .unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(bob_page.entries[0].seq, accepted.seq);
+    assert_eq!(bob_page.entries[0].kind, LogEntryKind::Commit);
+
+    delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let projected_rooms = delivery
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: charlie_account_id,
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert!(projected_rooms.rooms.is_empty());
+    assert_eq!(projected_rooms.next_after_room_id, None);
+    assert!(!projected_rooms.has_more);
+}
+
+#[test]
 fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
