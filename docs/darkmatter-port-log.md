@@ -128,10 +128,22 @@ than prove an existing one.
 Darkmatter source state:
 
 - Branch: `/Users/futurepaul/dev/finite/darkmatter`,
-  `codex/http-delivery-service-spike` at `8449fee`
-- Base: `origin/master` at `add4fc7`
+  `codex/http-delivery-service-spike` at `5b17774`
+- Base: `origin/master` at `89ece10`
 - Delta: `7` commits, `12` files, about `1,557` insertions over upstream
   master.
+
+Refresh result:
+
+- `origin/master` advanced from `add4fc7` to `89ece10`.
+- The HTTP delivery spike rebased cleanly from `8449fee` to `5b17774`.
+- Focused Darkmatter verification passed for `transport-http-server`,
+  `cgka-engine`, and `cgka-conformance-simulator --test
+  http_delivery_compatibility`.
+- The port compatibility report still has exactly one
+  `RequiresDarkmatterFork` item: `ordered_delivery_profile`.
+- The port lockfile picked up upstream Darkmatter's new `hex` dependency edge
+  for `storage-sqlite`.
 
 Upstreamable HTTP transport work:
 
@@ -693,6 +705,12 @@ Runtime delivery checkpoint:
 - [x] Split the Darkmatter-facing delta into maintainable buckets: upstreamable
   HTTP transport work, upstreamable ordered-delivery profile work, Finite-owned
   adapter/application logic, and fork-only requirements.
-- [ ] Refresh the compatibility report after the next Darkmatter branch update
+- [x] Refresh the compatibility report after the next Darkmatter branch update
   and verify that `RequiresDarkmatterFork` still only names the ordered
   delivery profile.
+- [ ] Audit which preserved baseline tests still prove behavior only through
+  the original fake/in-memory Finite delivery service instead of a Darkmatter
+  engine or HTTP route path, then classify them by risk and owner.
+- [ ] Port the highest-risk remaining fake/in-memory reducer proofs to
+  Darkmatter-backed engine, HTTP route, or runtime-delivery tests, starting
+  with crash-atomic commit/replay and repair-state paths.
