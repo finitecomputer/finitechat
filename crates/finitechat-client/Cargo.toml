@@ -18,4 +18,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+cgka-traits.workspace = true
+finitechat-server = { path = "../finitechat-server" }
+serde.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
+tower.workspace = true
+transport-http-server.workspace = true

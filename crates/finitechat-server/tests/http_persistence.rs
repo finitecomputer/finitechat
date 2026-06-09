@@ -7,8 +7,9 @@ use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
-    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpServerState, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, SaveFanoutRoomRequest, http_router,
+    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpServerState,
+    KeyPackageInventoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
+    PublishMessageRequest, SaveFanoutRoomRequest, http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -258,6 +259,61 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
     assert_eq!(response.status(), StatusCode::OK);
     let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
     assert_eq!(claimed, None);
+}
+
+#[tokio::test]
+async fn sqlite_key_package_inventory_tracks_available_and_claimed_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let owner = member("inventory-owner");
+    let first = key_package_publication("kp-inventory-a", owner.clone(), b"inventory-a");
+    let second = key_package_publication("kp-inventory-b", owner.clone(), b"inventory-b");
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &first)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &second)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_inventory(app.clone(), owner.clone(), 2, 0).await;
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        claimed
+            .as_ref()
+            .expect("first package claimed")
+            .key_package_id
+            .as_slice(),
+        b"kp-inventory-a"
+    );
+    assert_inventory(app, owner.clone(), 1, 1).await;
+
+    let app = persistent_app(&db_path);
+    assert_inventory(app.clone(), owner.clone(), 1, 1).await;
+
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &first)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_inventory(app, owner, 1, 1).await;
 }
 
 #[tokio::test]
@@ -764,6 +820,22 @@ async fn read_json<T: DeserializeOwned>(response: Response<Body>) -> T {
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json response")
+}
+
+async fn assert_inventory(app: Router, owner: MemberId, available: u32, claimed: u32) {
+    let response = post_json(
+        app,
+        "/key-packages/inventory",
+        &KeyPackageInventoryRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inventory: HttpKeyPackageInventory = read_json(response).await;
+    assert_eq!(inventory.owner, owner);
+    assert_eq!(inventory.available, available);
+    assert_eq!(inventory.claimed, claimed);
 }
 
 fn id(label: &str) -> MessageId {

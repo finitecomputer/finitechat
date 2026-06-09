@@ -1,3 +1,8 @@
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode};
+use cgka_traits::MemberId;
+use cgka_traits::engine::KeyPackage as DarkmatterKeyPackage;
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
     LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions,
@@ -14,7 +19,15 @@ use finitechat_proto::{
     DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
     WelcomeState,
 };
+use finitechat_server::{
+    HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
+    PublishKeyPackageResponse, http_router,
+};
 use rusqlite::{Connection, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tower::ServiceExt;
+use transport_http_server::{HttpKeyPackageId, HttpKeyPackagePublication};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -1805,6 +1818,40 @@ fn runtime_sync_tick_replenishes_welcomes_acks_and_syncs_after_restart() {
 }
 
 #[test]
+fn runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_runtime_worker");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 2,
+        max_sync_pages_per_room: 4,
+    };
+    alice_store.save_device_state(&alice).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(report.uploaded_key_packages, 2);
+    assert_eq!(report.claimed_welcomes, 0);
+    assert_eq!(report.activated_welcome_acks_sent, 0);
+    assert!(report.applied_entries.is_empty());
+    let inventory = delivery.key_package_inventory(alice.device_ref()).unwrap();
+    assert_eq!(inventory.available, 2);
+    assert_eq!(inventory.leased, 0);
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(replay.uploaded_key_packages, 0);
+    let inventory = delivery.key_package_inventory(alice.device_ref()).unwrap();
+    assert_eq!(inventory.available, 2);
+    assert_eq!(inventory.leased, 0);
+}
+
+#[test]
 fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let dir = tempfile::tempdir().unwrap();
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
@@ -3518,6 +3565,143 @@ impl RuntimeDelivery for UploadFailureDelivery {
             .sync_events(room_id, requester, after_seq)
             .map_err(TestDeliveryError::Engine)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HttpRuntimeDeliveryError {
+    Json(String),
+    HttpStatus(StatusCode, String),
+    Router(String),
+    Unsupported(&'static str),
+}
+
+struct HttpRuntimeDelivery {
+    app: Router,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl HttpRuntimeDelivery {
+    fn from_sqlite_path(path: &std::path::Path) -> Self {
+        Self {
+            app: http_router(HttpServerState::from_sqlite_path(path).unwrap()),
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+        }
+    }
+
+    fn post_json<T, R>(&self, uri: &str, body: &T) -> Result<R, HttpRuntimeDeliveryError>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        self.runtime.block_on(async {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(body).map_err(|error| {
+                    HttpRuntimeDeliveryError::Json(error.to_string())
+                })?))
+                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+            let response = self
+                .app
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .map_err(|error| HttpRuntimeDeliveryError::Router(error.to_string()))?;
+            if status != StatusCode::OK {
+                return Err(HttpRuntimeDeliveryError::HttpStatus(
+                    status,
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ));
+            }
+            serde_json::from_slice(&bytes)
+                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+        })
+    }
+}
+
+impl RuntimeDelivery for HttpRuntimeDelivery {
+    type Error = HttpRuntimeDeliveryError;
+
+    fn key_package_inventory(
+        &mut self,
+        owner: &DeviceRef,
+    ) -> Result<KeyPackageInventory, Self::Error> {
+        let owner_id = member_id_for_device(owner)?;
+        let inventory: HttpKeyPackageInventory = self.post_json(
+            "/key-packages/inventory",
+            &KeyPackageInventoryRequest { owner: owner_id },
+        )?;
+        Ok(KeyPackageInventory {
+            owner: owner.clone(),
+            available: inventory.available,
+            leased: 0,
+        })
+    }
+
+    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
+        let publication = HttpKeyPackagePublication {
+            key_package_id: HttpKeyPackageId::new(request.key_package_id.into_bytes()),
+            owner: member_id_for_device(&request.owner)?,
+            key_package: DarkmatterKeyPackage::new(request.key_package_payload),
+        };
+        let _: PublishKeyPackageResponse = self.post_json("/key-packages", &publication)?;
+        Ok(())
+    }
+
+    fn claim_key_package_for_device(
+        &mut self,
+        _owner: &DeviceRef,
+    ) -> Result<Option<finitechat_engine::ClaimKeyPackageResult>, Self::Error> {
+        Err(HttpRuntimeDeliveryError::Unsupported(
+            "claim_key_package_for_device",
+        ))
+    }
+
+    fn submit_commit(
+        &mut self,
+        _request: SubmitCommitRequest,
+    ) -> Result<CommitAccepted, Self::Error> {
+        Err(HttpRuntimeDeliveryError::Unsupported("submit_commit"))
+    }
+
+    fn list_account_rooms(
+        &mut self,
+        _request: ListAccountRoomsRequest,
+    ) -> Result<ListAccountRoomsPage, Self::Error> {
+        Err(HttpRuntimeDeliveryError::Unsupported("list_account_rooms"))
+    }
+
+    fn claim_welcomes(&mut self, _device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    fn ack_welcome(&mut self, _welcome_id: &str, _activated: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn sync_events(
+        &mut self,
+        _room_id: &str,
+        _requester: &DeviceRef,
+        after_seq: u64,
+    ) -> Result<SyncEventsPage, Self::Error> {
+        Ok(SyncEventsPage {
+            entries: Vec::new(),
+            next_after_seq: after_seq,
+            has_more: false,
+        })
+    }
+}
+
+fn member_id_for_device(owner: &DeviceRef) -> Result<MemberId, HttpRuntimeDeliveryError> {
+    serde_json::to_vec(owner)
+        .map(MemberId::new)
+        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
 }
 
 fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[SentPlaintext]) {

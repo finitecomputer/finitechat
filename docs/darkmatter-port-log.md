@@ -9,14 +9,14 @@ Marmot/Darkmatter.
 - New repo: `/Users/futurepaul/dev/finite/finite-chat-darkmatter`
 - Baseline source: `/Users/futurepaul/dev/finite/finitechat`
 - Darkmatter source: `/Users/futurepaul/dev/finite/darkmatter`
-- Darkmatter branch used for initial compatibility work:
-  `codex/http-delivery-service-spike`
+- Darkmatter HTTP delivery branch checked out locally in the source tree above.
 
 ## Test Inventory To Port
 
 Current copied acceptance surface:
 
-- Rust tests: `287`
+- Copied Rust tests at repo creation: `287`
+- Current Rust tests after Darkmatter HTTP harness additions: `290`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -53,7 +53,8 @@ Python test distribution:
 - A SQLite operation log can replay accepted HTTP delivery operations into a
   fresh Darkmatter service core after restart. The current persistence tests
   prove group queue order, duplicate replay, same-epoch commit admission, and
-  consumed KeyPackage state survive restart.
+  consumed KeyPackage state survive restart. KeyPackage inventory is rebuilt
+  from that operation log and checkpointed as a query-side table.
 - The HTTP `/messages` route now accepts an optional idempotency key. Matching
   retries replay the original receipt after restart, and same-key retries with
   a different target/message conflict without appending a second delivery.
@@ -63,6 +64,10 @@ Python test distribution:
 - The HTTP KeyPackage wrapper can claim one package per explicit device owner
   in a batch and replay the exact batch response by idempotency key after
   restart.
+- The HTTP KeyPackage wrapper can also expose available/claimed inventory for
+  an owner. This lets the runtime KeyPackage replenishment worker run over the
+  Darkmatter HTTP boundary without teaching the server Finite-specific device
+  structure.
 - The HTTP fanout wrapper can persist opaque later-device fanout room plans,
   prepared message ids, reprepare checkpoints, and accepted sequence markers
   across restart without teaching the server MLS semantics.
@@ -90,13 +95,16 @@ Python test distribution:
 - Batch KeyPackage claim replay for the HTTP delivery surface. This wraps
   Darkmatter's owner-scoped `claim_key_package` primitive so fanout callers can
   ask for one package per device owner and safely retry after response loss.
+- KeyPackage inventory projection for the HTTP delivery surface. This mirrors
+  Darkmatter's available/consumed package state as available/claimed counts, so
+  runtime clients can replenish toward a target without listing package bytes.
 - Opaque fanout plan checkpointing for the HTTP delivery surface. This stores
   the coordination fields a client worker needs to resume after restart or
   response loss, while leaving MLS validation and local pending Commit state on
   the client.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
-  server crate's DTOs directly so the spike cannot drift, but that is not the
-  right long-term crate boundary.
+  server crate's DTOs directly so the route client cannot drift, but that is
+  not the right long-term crate boundary.
 - Public byte encoding for opaque IDs and payloads. The current CLI maps string
   arguments directly to bytes for local testing.
 
@@ -155,13 +163,14 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `17`
+- Route/store/engine tests added so far: `18`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
   - `POST /sync/group`
   - `POST /sync/inbox`
   - `POST /key-packages`
+  - `POST /key-packages/inventory`
   - `POST /key-packages/claim`
   - `POST /key-packages/claims`
   - `POST /fanouts/get`
@@ -172,6 +181,8 @@ Additional HTTP route checkpoint:
   - group queue and duplicate-message index rebuild after restart
   - same-epoch commit admission rebuilds after restart
   - consumed KeyPackage state rebuilds after restart
+  - KeyPackage available/claimed inventory survives restart and idempotent
+    publish replay does not resurrect claimed inventory
   - idempotent `/messages` retry replays the original receipt after restart
   - same idempotency key with a different target/message conflicts without a
     second append
@@ -229,18 +240,19 @@ Important test caveat:
 - The copied Rust and Python suites still mostly exercise the original Finite
   Chat implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
-  adapter smoke test plus the HTTP route, persistence, and real-engine route
-  tests above.
+  adapter smoke test plus the HTTP route, persistence, real-engine route, and
+  KeyPackage runtime-delivery tests above.
 
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `10`
+- New CLI tests added: `11`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
   - group sync defaults to `after_seq = 0` and `limit = 50`
+  - KeyPackage inventory builds the route DTO
   - KeyPackage claim builds the route DTO
   - batch KeyPackage claim builds the route DTO with repeated owners and an
     idempotency key
@@ -265,7 +277,18 @@ Dependency note:
   should probably expose a smaller reusable HTTP route harness or keep this test
   in Darkmatter proper.
 
-Next meaningful gate: move selected copied client/runtime scenarios onto a
-Darkmatter-backed runtime delivery boundary, focusing on the actual MLS
-later-device fanout worker and same-epoch reprepare after a competing Commit
-wins.
+Runtime delivery checkpoint:
+
+- `cargo test -p finitechat-client --test client_state runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes`: pass
+- The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
+  Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
+- Reopening the HTTP server from SQLite proves the worker sees the persisted
+  inventory and uploads zero duplicate KeyPackages on replay.
+- This proves the current client runtime harness can be reused above a
+  Darkmatter HTTP adapter for inventory/upload. It does not yet prove Welcome
+  claim/ack, room sync, account-room discovery, or later-device fanout over the
+  same adapter.
+
+Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
+from KeyPackage inventory/upload into Welcome claim/ack or the later-device
+fanout worker, then tackle same-epoch reprepare after a competing Commit wins.

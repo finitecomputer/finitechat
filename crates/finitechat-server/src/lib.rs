@@ -27,6 +27,7 @@ pub struct HttpServerState {
     service: Arc<Mutex<HttpDeliveryService>>,
     publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
     key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
+    key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
@@ -38,6 +39,7 @@ impl HttpServerState {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
+            key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
@@ -47,17 +49,25 @@ impl HttpServerState {
     pub fn from_sqlite_path(path: impl AsRef<Path>) -> Result<Self, DurableStoreError> {
         let store = Arc::new(SqliteHttpDeliveryStore::open(path)?);
         let mut service = HttpDeliveryService::default();
-        for operation in store.load_operations()? {
+        let operations = store.load_operations()?;
+        for operation in operations.iter().cloned() {
             replay_operation(&mut service, operation)?;
         }
         let publish_idempotency = store.load_publish_idempotency()?;
         let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
+        let key_package_inventory = rebuild_key_package_inventory(&operations);
+        if store.load_key_package_inventory()? != key_package_inventory {
+            for record in key_package_inventory.values() {
+                store.upsert_key_package_inventory(record)?;
+            }
+        }
         let fanout_plans = store.load_fanout_plans()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
             key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
+            key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
@@ -138,13 +148,47 @@ impl HttpServerState {
         Ok(receipt)
     }
 
+    fn publish_key_package(
+        &self,
+        publication: HttpKeyPackagePublication,
+    ) -> Result<PublishKeyPackageResponse, ServerHttpError> {
+        self.apply_mutation(|service| {
+            service.publish_key_package(publication.clone())?;
+            Ok((
+                PublishKeyPackageResponse { published: true },
+                Some(PersistedOperation::PublishKeyPackage {
+                    publication: publication.clone(),
+                }),
+            ))
+        })?;
+        self.record_key_package_publication(&publication)?;
+        Ok(PublishKeyPackageResponse { published: true })
+    }
+
+    fn claim_key_package(
+        &self,
+        request: ClaimKeyPackageRequest,
+    ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
+        let claimed = self.apply_mutation(|service| {
+            let claimed = service.claim_key_package(&request.owner)?;
+            let operation = claimed
+                .is_some()
+                .then_some(PersistedOperation::ClaimKeyPackage {
+                    owner: request.owner,
+                });
+            Ok((claimed, operation))
+        })?;
+        self.record_claimed_key_packages(claimed.iter())?;
+        Ok(claimed)
+    }
+
     fn claim_key_packages(
         &self,
         request: ClaimKeyPackagesRequest,
     ) -> Result<Vec<HttpKeyPackageClaim>, ServerHttpError> {
         validate_key_package_claim_batch(&request.owners)?;
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.apply_mutation(|service| {
+            let claims = self.apply_mutation(|service| {
                 let claims = claim_key_packages_from_service(service, &request.owners)?;
                 let operation = claims
                     .iter()
@@ -153,7 +197,11 @@ impl HttpServerState {
                         owners: request.owners,
                     });
                 Ok((claims, operation))
-            });
+            })?;
+            self.record_claimed_key_packages(
+                claims.iter().filter_map(|claim| claim.claimed.as_ref()),
+            )?;
+            return Ok(claims);
         };
 
         if idempotency_key.is_empty() {
@@ -195,7 +243,94 @@ impl HttpServerState {
         }
         *service = candidate;
         idempotency.insert(idempotency_key, record);
+        self.record_claimed_key_packages(claims.iter().filter_map(|claim| claim.claimed.as_ref()))?;
         Ok(claims)
+    }
+
+    fn key_package_inventory(
+        &self,
+        request: KeyPackageInventoryRequest,
+    ) -> Result<HttpKeyPackageInventory, ServerHttpError> {
+        let inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut available = 0usize;
+        let mut claimed = 0usize;
+        for record in inventory.values() {
+            if record.owner != request.owner {
+                continue;
+            }
+            match record.state {
+                KeyPackageInventoryState::Available => available += 1,
+                KeyPackageInventoryState::Claimed => claimed += 1,
+            }
+        }
+        Ok(HttpKeyPackageInventory {
+            owner: request.owner,
+            available: usize_to_u32("available", available)?,
+            claimed: usize_to_u32("claimed", claimed)?,
+        })
+    }
+
+    fn record_key_package_publication(
+        &self,
+        publication: &HttpKeyPackagePublication,
+    ) -> Result<(), ServerHttpError> {
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let record = inventory
+            .entry(publication.key_package_id.clone())
+            .or_insert_with(|| KeyPackageInventoryRecord {
+                key_package_id: publication.key_package_id.clone(),
+                owner: publication.owner.clone(),
+                state: KeyPackageInventoryState::Available,
+            });
+        if record.owner != publication.owner {
+            return Err(ServerHttpError::InventoryConflict {
+                key_package_id: publication.key_package_id.clone(),
+            });
+        }
+        let record = record.clone();
+        if let Some(store) = &self.store {
+            store.upsert_key_package_inventory(&record)?;
+        }
+        Ok(())
+    }
+
+    fn record_claimed_key_packages<'a>(
+        &self,
+        claimed: impl IntoIterator<Item = &'a HttpClaimedKeyPackage>,
+    ) -> Result<(), ServerHttpError> {
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut changed = Vec::new();
+        for package in claimed {
+            let record = inventory
+                .entry(package.key_package_id.clone())
+                .or_insert_with(|| KeyPackageInventoryRecord {
+                    key_package_id: package.key_package_id.clone(),
+                    owner: package.owner.clone(),
+                    state: KeyPackageInventoryState::Available,
+                });
+            if record.owner != package.owner {
+                return Err(ServerHttpError::InventoryConflict {
+                    key_package_id: package.key_package_id.clone(),
+                });
+            }
+            record.state = KeyPackageInventoryState::Claimed;
+            changed.push(record.clone());
+        }
+        if let Some(store) = &self.store {
+            for record in changed {
+                store.upsert_key_package_inventory(&record)?;
+            }
+        }
+        Ok(())
     }
 
     fn save_fanout_room(
@@ -460,6 +595,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
         .route("/key-packages", post(publish_key_package))
+        .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
         .route("/key-packages/claims", post(claim_key_packages))
         .route("/fanouts/get", post(get_fanout))
@@ -508,6 +644,18 @@ pub struct ClaimKeyPackagesRequest {
     pub owners: Vec<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageInventoryRequest {
+    pub owner: MemberId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpKeyPackageInventory {
+    pub owner: MemberId,
+    pub available: u32,
+    pub claimed: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,30 +796,24 @@ async fn publish_key_package(
     State(state): State<HttpServerState>,
     Json(publication): Json<HttpKeyPackagePublication>,
 ) -> Result<Json<PublishKeyPackageResponse>, ServerHttpError> {
-    state.apply_mutation(|service| {
-        service.publish_key_package(publication.clone())?;
-        Ok((
-            PublishKeyPackageResponse { published: true },
-            Some(PersistedOperation::PublishKeyPackage { publication }),
-        ))
-    })?;
-    Ok(Json(PublishKeyPackageResponse { published: true }))
+    let response = state.publish_key_package(publication)?;
+    Ok(Json(response))
 }
 
 async fn claim_key_package(
     State(state): State<HttpServerState>,
     Json(request): Json<ClaimKeyPackageRequest>,
 ) -> Result<Json<Option<HttpClaimedKeyPackage>>, ServerHttpError> {
-    let claimed = state.apply_mutation(|service| {
-        let claimed = service.claim_key_package(&request.owner)?;
-        let operation = claimed
-            .is_some()
-            .then_some(PersistedOperation::ClaimKeyPackage {
-                owner: request.owner,
-            });
-        Ok((claimed, operation))
-    })?;
+    let claimed = state.claim_key_package(request)?;
     Ok(Json(claimed))
+}
+
+async fn key_package_inventory(
+    State(state): State<HttpServerState>,
+    Json(request): Json<KeyPackageInventoryRequest>,
+) -> Result<Json<HttpKeyPackageInventory>, ServerHttpError> {
+    let inventory = state.key_package_inventory(request)?;
+    Ok(Json(inventory))
 }
 
 async fn claim_key_packages(
@@ -793,6 +935,19 @@ struct KeyPackageClaimIdempotencyRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeyPackageInventoryRecord {
+    key_package_id: HttpKeyPackageId,
+    owner: MemberId,
+    state: KeyPackageInventoryState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum KeyPackageInventoryState {
+    Available,
+    Claimed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WelcomeClaimRecord {
     recipient: MemberId,
     seq: HttpSequence,
@@ -842,6 +997,11 @@ impl SqliteHttpDeliveryStore {
                 idempotency_key TEXT PRIMARY KEY,
                 fingerprint_json TEXT NOT NULL,
                 response_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_key_package_inventory (
+                key_package_id_json TEXT PRIMARY KEY,
+                owner_json TEXT NOT NULL,
+                state_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_fanout_plans (
                 fanout_id TEXT PRIMARY KEY,
@@ -999,6 +1159,59 @@ impl SqliteHttpDeliveryStore {
         Ok(idempotency)
     }
 
+    fn upsert_key_package_inventory(
+        &self,
+        record: &KeyPackageInventoryRecord,
+    ) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_key_package_inventory (
+                key_package_id_json,
+                owner_json,
+                state_json
+            ) VALUES (?1, ?2, ?3)
+            ON CONFLICT(key_package_id_json) DO UPDATE SET
+                owner_json = excluded.owner_json,
+                state_json = excluded.state_json",
+            params![
+                serde_json::to_string(&record.key_package_id)?,
+                serde_json::to_string(&record.owner)?,
+                serde_json::to_string(&record.state)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_key_package_inventory(
+        &self,
+    ) -> Result<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT key_package_id_json, owner_json, state_json FROM http_key_package_inventory",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut inventory = HashMap::new();
+        for row in rows {
+            let (key_package_id_json, owner_json, state_json) = row?;
+            let key_package_id: HttpKeyPackageId = serde_json::from_str(&key_package_id_json)?;
+            inventory.insert(
+                key_package_id.clone(),
+                KeyPackageInventoryRecord {
+                    key_package_id,
+                    owner: serde_json::from_str(&owner_json)?,
+                    state: serde_json::from_str(&state_json)?,
+                },
+            );
+        }
+        Ok(inventory)
+    }
+
     fn upsert_fanout_plan(&self, plan: &HttpFanoutPlan) -> Result<(), DurableStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -1115,6 +1328,54 @@ fn replay_operation(
     Ok(())
 }
 
+fn rebuild_key_package_inventory(
+    operations: &[PersistedOperation],
+) -> HashMap<HttpKeyPackageId, KeyPackageInventoryRecord> {
+    let mut inventory = HashMap::new();
+    for operation in operations {
+        match operation {
+            PersistedOperation::PublishKeyPackage { publication } => {
+                inventory
+                    .entry(publication.key_package_id.clone())
+                    .or_insert_with(|| KeyPackageInventoryRecord {
+                        key_package_id: publication.key_package_id.clone(),
+                        owner: publication.owner.clone(),
+                        state: KeyPackageInventoryState::Available,
+                    });
+            }
+            PersistedOperation::ClaimKeyPackage { owner } => {
+                mark_next_key_package_claimed(&mut inventory, owner);
+            }
+            PersistedOperation::ClaimKeyPackages { owners } => {
+                for owner in owners {
+                    mark_next_key_package_claimed(&mut inventory, owner);
+                }
+            }
+            PersistedOperation::PublishMessage { .. } => {}
+        }
+    }
+    inventory
+}
+
+fn mark_next_key_package_claimed(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    owner: &MemberId,
+) {
+    let selected = inventory
+        .iter()
+        .filter(|(_, record)| {
+            record.owner == *owner && record.state == KeyPackageInventoryState::Available
+        })
+        .map(|(key_package_id, _)| key_package_id.clone())
+        .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
+    if let Some(key_package_id) = selected {
+        inventory
+            .get_mut(&key_package_id)
+            .expect("selected KeyPackage must exist before claim")
+            .state = KeyPackageInventoryState::Claimed;
+    }
+}
+
 fn validate_fanout_id(fanout_id: &str) -> Result<(), ServerHttpError> {
     validate_string_id("fanout_id", fanout_id, MAX_HTTP_FANOUT_ID_BYTES)
 }
@@ -1176,6 +1437,11 @@ fn validate_key_package_claim_batch(owners: &[MemberId]) -> Result<(), ServerHtt
     Ok(())
 }
 
+fn usize_to_u32(field: &'static str, value: usize) -> Result<u32, ServerHttpError> {
+    u32::try_from(value)
+        .map_err(|_| ServerHttpError::KeyPackageInventoryCountOverflow { field, value })
+}
+
 #[derive(Debug, Error)]
 pub enum DurableStoreError {
     #[error("SQLite delivery store error: {0}")]
@@ -1199,6 +1465,13 @@ pub enum ServerHttpError {
     },
     DuplicateKeyPackageClaimOwner {
         owner: MemberId,
+    },
+    InventoryConflict {
+        key_package_id: HttpKeyPackageId,
+    },
+    KeyPackageInventoryCountOverflow {
+        field: &'static str,
+        value: usize,
     },
     InvalidFanoutRequest {
         reason: String,
@@ -1280,6 +1553,16 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "duplicate_key_package_claim_owner".to_owned(),
                 format!("KeyPackage claim batch contains duplicate owner {owner:?}"),
+            ),
+            Self::InventoryConflict { key_package_id } => (
+                StatusCode::CONFLICT,
+                "key_package_inventory_conflict".to_owned(),
+                format!("KeyPackage inventory has a conflicting owner for {key_package_id:?}"),
+            ),
+            Self::KeyPackageInventoryCountOverflow { field, value } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "key_package_inventory_count_overflow".to_owned(),
+                format!("KeyPackage inventory field {field} does not fit in u32: {value}"),
             ),
             Self::InvalidFanoutRequest { reason } => (
                 StatusCode::BAD_REQUEST,

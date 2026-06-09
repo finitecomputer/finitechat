@@ -677,16 +677,23 @@ dependencies = [
 name = "finitechat-client"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "cgka-traits",
  "finitechat-engine",
  "finitechat-mls",
  "finitechat-proto",
+ "finitechat-server",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tower",
+ "transport-http-server",
 ]
 
 [[package]]

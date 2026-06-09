@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, and KeyPackage operations",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, KeyPackage inventory, and KeyPackage operations",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -74,6 +74,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_key_package_batch_claim_replay",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
+        },
+        PortFinding {
+            area: "http_key_package_inventory_runtime_sync",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_runtime_sync_tick replenishes KeyPackages through Darkmatter HTTP inventory/upload routes and replays zero duplicate uploads after server restart",
         },
         PortFinding {
             area: "http_fanout_plan_checkpoint",
