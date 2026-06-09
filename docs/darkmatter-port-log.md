@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `292`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `325`
+  `293`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `326`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -26,7 +26,7 @@ Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 36 |
+| `crates/finitechat-client/tests/client_state.rs` | 37 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -77,6 +77,11 @@ Python test distribution:
   records, page them by room id, and reload them from SQLite. This gives the
   runtime link-fanout discovery loop a Darkmatter HTTP boundary, as long as a
   product-owned membership projection writes the directory.
+- The runtime link-fanout worker can complete a one-room later-device happy
+  path over the HTTP adapter when the initial room log and account-room
+  directory are seeded: discover the room, claim the target device's KeyPackage,
+  publish the add-device Commit through Darkmatter HTTP, sync the Commit back,
+  and let the later device claim and activate the released Welcome.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -124,6 +129,10 @@ Python test distribution:
   opaque current-room membership snapshots keyed by account and room id, while
   leaving the actual source of membership truth outside Darkmatter's transport
   core.
+- Runtime submit-commit mapping for the HTTP delivery surface. The adapter can
+  serialize a Finite `RoomLogEntry` into a Darkmatter HTTP group message,
+  publish derived `WelcomeRecord`s to recipient inboxes, and reconstruct
+  `CommitAccepted` from the HTTP receipt.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the route client cannot drift, but that is
   not the right long-term crate boundary.
@@ -137,8 +146,11 @@ Python test distribution:
   reprepare after same-epoch loss. The HTTP batch claim wrapper now covers the
   server-side package response-loss piece, the HTTP fanout wrapper now covers
   opaque room-plan checkpointing, and the account-room directory covers
-  discovery over HTTP. Commit submission, membership-derived directory writes,
-  real MLS reprepare, and same-epoch branch recovery remain unported.
+  discovery over HTTP. The HTTP runtime adapter now covers a one-room
+  happy-path commit submission and Welcome release. Membership-derived
+  directory writes, server-side membership validation/filtering,
+  response-loss coverage for HTTP submit, real MLS reprepare, and same-epoch
+  branch recovery remain unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -311,6 +323,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
@@ -328,13 +341,19 @@ Runtime delivery checkpoint:
 - The link-fanout worker can read serialized account-room discovery records
   through the HTTP account-room directory after server restart and complete a
   discovery-only tick when the target device is already current in the room.
+- The link-fanout worker can also complete a one-room later-device happy path
+  over the HTTP adapter: it discovers a room from the account-room directory,
+  claims the later device's KeyPackage, prepares and submits the add-device
+  Commit through `/messages`, syncs that Commit back through `/sync/group`, and
+  the later device claims and activates the released Welcome through the HTTP
+  inbox routes.
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
-  claim/ack, ordered room pull, and account-room discovery. It does not yet
-  prove submit-commit, membership-derived directory writes, server membership
-  filtering, or later-device fanout over the same adapter.
+  claim/ack, ordered room pull, account-room discovery, and a one-room
+  later-device fanout happy path. It does not yet prove membership-derived
+  directory writes, server membership filtering, HTTP submit response-loss
+  retry, or same-epoch reprepare over the same adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from maintenance, room pull, and account-room discovery into submit-commit or
-the later-device fanout worker, then tackle same-epoch reprepare after a
-competing Commit wins.
+from the one-room happy path into HTTP submit response-loss retry, multi-room
+fanout, or same-epoch reprepare after a competing Commit wins.

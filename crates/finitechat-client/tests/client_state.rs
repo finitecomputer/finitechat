@@ -15,7 +15,7 @@ use finitechat_engine::{
     AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
     CreateRoomRequest, DeliveryService, EngineError, EventAccepted, KeyPackageInventory,
     ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage,
-    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
+    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for, staged_welcomes_by_id,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -2155,6 +2155,151 @@ fn runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_link_fanout");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_link_fanout");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_link_fanout");
+    let mut source_server = DeliveryService::new();
+    let room_id = "room_http_link_fanout";
+    let group_id = "mls_http_link_fanout";
+
+    let bob_join_seq = create_group_room_with_member(
+        &mut source_server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_bob_http_link_fanout",
+            welcome_id: "welcome_bob_http_link_fanout",
+            idempotency_key: "add_bob_http_link_fanout",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let initial_page = source_server
+        .sync_events(room_id, alice_browser.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_page.entries.len(), 1);
+    delivery
+        .publish_room_log_entry(&initial_page.entries[0])
+        .unwrap();
+    let account_id = alice_browser.device_ref().account_id.clone();
+    let account_rooms = source_server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: account_id.clone(),
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(account_rooms.rooms.len(), 1);
+    assert!(
+        !account_rooms.rooms[0]
+            .devices
+            .iter()
+            .any(|device| device.device == *alice_phone.device_ref())
+    );
+    delivery
+        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
+        .unwrap();
+
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 1,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 1);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_http_link_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_link_phone",
+        &RuntimeLinkFanoutOptions {
+            max_discovery_pages_per_tick: 2,
+            max_commit_rooms_per_tick: 1,
+            max_completion_sync_pages_per_room: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.discovery_pages, 1);
+    assert_eq!(report.queued_rooms, 1);
+    assert_eq!(report.claimed_key_packages, 1);
+    assert_eq!(report.prepared_commits, 1);
+    assert_eq!(report.submitted_commits, 1);
+    assert_eq!(report.completed_rooms, 1);
+    assert!(report.complete);
+    assert_eq!(
+        report.applied_entries,
+        vec![finitechat_client::RuntimeAppliedEntry {
+            room_id: room_id.to_owned(),
+            seq: bob_join_seq + 1,
+            entry: AppliedLogEntry::Commit {
+                sender: alice_browser.device_ref().clone(),
+                epoch: 2,
+            },
+        }]
+    );
+    let LinkFanoutRoomStatus::Done { accepted_seq } = alice_browser
+        .link_fanout_room_status("fanout_http_link_phone", room_id)
+        .unwrap()
+    else {
+        panic!("HTTP fanout room did not complete");
+    };
+    assert_eq!(accepted_seq, bob_join_seq + 1);
+
+    let bob_page = delivery
+        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(
+        bob.apply_log_entry(room_id, &bob_page.entries[0]).unwrap(),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 1);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 1);
+    assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 2);
+}
+
+#[test]
 fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let dir = tempfile::tempdir().unwrap();
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
@@ -3895,7 +4040,7 @@ enum HttpRuntimeDeliveryError {
         expected: String,
         actual: String,
     },
-    Unsupported(&'static str),
+    CommitValidation(String),
 }
 
 struct HttpRuntimeDelivery {
@@ -4011,6 +4156,47 @@ impl HttpRuntimeDelivery {
         let _: SaveAccountRoomResponse = self.post_json("/account-rooms", &request)?;
         Ok(())
     }
+
+    fn publish_commit_request(
+        &self,
+        request: &SubmitCommitRequest,
+        message_id: &str,
+    ) -> Result<HttpPublishReceipt, HttpRuntimeDeliveryError> {
+        let transport_group_id = transport_group_id_for_room(&request.room_id);
+        let placeholder_entry = RoomLogEntry {
+            room_id: request.room_id.clone(),
+            seq: 0,
+            message_id: message_id.to_owned(),
+            sender: request.sender.clone(),
+            kind: LogEntryKind::Commit,
+            epoch: request.expected_epoch,
+            envelope: request.envelope.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let publish = PublishMessageRequest {
+            target: HttpPublishTarget::Group {
+                group_id: group_id_for_room(&request.room_id),
+                transport_group_id: transport_group_id.clone(),
+                commit_admission: Some(HttpCommitAdmission {
+                    source_epoch: EpochId(request.expected_epoch),
+                }),
+            },
+            message: TransportMessage {
+                id: DarkmatterMessageId::new(message_id.as_bytes().to_vec()),
+                payload: serde_json::to_vec(&placeholder_entry)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+                timestamp: Timestamp(0),
+                causal_deps: Vec::new(),
+                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+                envelope: TransportEnvelope::GroupMessage { transport_group_id },
+            },
+            idempotency_key: Some(format!(
+                "commit:{}:{}",
+                request.room_id, request.idempotency_key
+            )),
+        };
+        self.post_json("/messages", &publish)
+    }
 }
 
 impl RuntimeDelivery for HttpRuntimeDelivery {
@@ -4086,9 +4272,50 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
 
     fn submit_commit(
         &mut self,
-        _request: SubmitCommitRequest,
+        request: SubmitCommitRequest,
     ) -> Result<CommitAccepted, Self::Error> {
-        Err(HttpRuntimeDeliveryError::Unsupported("submit_commit"))
+        request
+            .validate_limits()
+            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
+        let message_id = request
+            .envelope
+            .message_id()
+            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+        if request.envelope.kind != LogEntryKind::Commit {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(
+                "commit request envelope must be a commit".to_owned(),
+            ));
+        }
+        if request.envelope.epoch != request.expected_epoch {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(format!(
+                "commit envelope epoch {} does not match expected epoch {}",
+                request.envelope.epoch, request.expected_epoch
+            )));
+        }
+        if request.envelope.sender != request.sender {
+            return Err(HttpRuntimeDeliveryError::CommitValidation(
+                "commit envelope sender does not match request sender".to_owned(),
+            ));
+        }
+        request
+            .membership_delta
+            .validate_structure(request.expected_epoch, &message_id)
+            .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
+        let receipt = self.publish_commit_request(&request, &message_id)?;
+        let released_welcomes = request
+            .membership_delta
+            .adds
+            .iter()
+            .map(|add| add.welcome_id.clone())
+            .collect::<Vec<_>>();
+        for welcome in released_welcome_records_for_commit(&request, receipt.seq)? {
+            self.publish_welcome_record(&welcome)?;
+        }
+        Ok(CommitAccepted {
+            seq: receipt.seq,
+            message_id,
+            released_welcomes,
+        })
     }
 
     fn list_account_rooms(
@@ -4181,7 +4408,7 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
             .entries
             .into_iter()
             .map(|queued| {
-                let entry: RoomLogEntry = serde_json::from_slice(&queued.message.payload)
+                let mut entry: RoomLogEntry = serde_json::from_slice(&queued.message.payload)
                     .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
                 if entry.room_id != room_id {
                     return Err(HttpRuntimeDeliveryError::RoomEntryMismatch {
@@ -4189,6 +4416,7 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
                         actual: entry.room_id,
                     });
                 }
+                entry.seq = queued.seq;
                 Ok(entry)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -4212,6 +4440,37 @@ fn group_id_for_room(room_id: &str) -> GroupId {
 
 fn transport_group_id_for_room(room_id: &str) -> Vec<u8> {
     room_id.as_bytes().to_vec()
+}
+
+fn released_welcome_records_for_commit(
+    request: &SubmitCommitRequest,
+    commit_seq: u64,
+) -> Result<Vec<WelcomeRecord>, HttpRuntimeDeliveryError> {
+    let staged = staged_welcomes_by_id(&request.membership_delta, &request.staged_welcomes)
+        .map_err(|error| HttpRuntimeDeliveryError::CommitValidation(error.to_string()))?;
+    request
+        .membership_delta
+        .adds
+        .iter()
+        .map(|add| {
+            let staged = staged
+                .get(&add.welcome_id)
+                .expect("validated staged welcome must exist");
+            Ok(WelcomeRecord {
+                welcome_id: add.welcome_id.clone(),
+                room_id: request.room_id.clone(),
+                commit_seq,
+                recipient: add.device.clone(),
+                sender: request.sender.clone(),
+                key_package_id: add.key_package_id.clone(),
+                join_epoch: request.membership_delta.post_commit_epoch,
+                state: WelcomeState::Released,
+                lease_token: Some(lease_token_for(&add.welcome_id, &add.device)),
+                welcome_payload: staged.welcome_payload.clone(),
+                ratchet_tree_payload: staged.ratchet_tree_payload.clone(),
+            })
+        })
+        .collect()
 }
 
 fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[SentPlaintext]) {

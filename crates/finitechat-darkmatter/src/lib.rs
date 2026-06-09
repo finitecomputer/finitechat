@@ -106,9 +106,14 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_link_fanout_tick can discover persisted opaque account-room records through Darkmatter HTTP routes after server restart when the target device is already current",
         },
         PortFinding {
+            area: "http_later_device_fanout_runtime_happy_path",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through Darkmatter HTTP, sync completion, and release a Welcome that the later device activates",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages, membership-derived account-room discovery, HTTP commit submission, and durable fanout progress",
+            evidence: "Remaining Finite parity requires membership-derived account-room writes, server-side membership validation/filtering, response-loss retry coverage, and same-epoch reprepare over the HTTP adapter",
         },
         PortFinding {
             area: "ordered_delivery_profile",
