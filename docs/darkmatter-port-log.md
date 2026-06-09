@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `297`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `335`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `336`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -81,12 +81,13 @@ Python test distribution:
 - The HTTP account-room bootstrap wrapper can derive the creator's initial
   active account-room record from typed Finite room metadata, persist it, replay
   it idempotently after restart, and reject conflicting bootstrap attempts.
-- The HTTP route layer can also project accepted Finite add/remove commit
-  payloads into the account-room directory. The later-device HTTP fanout test
-  proves an accepted add commit persists the new device as pending after
-  restart, and a remove-commit HTTP runtime test proves the removed account no
-  longer lists the room after restart without a second manual `/account-rooms`
-  write.
+- The HTTP route layer can also project accepted Finite add/remove commits into
+  the account-room directory. Typed `/commits` derives this projection from the
+  submitted request, while raw `/messages` keeps compatibility with an explicit
+  projection wrapper. The later-device HTTP fanout test proves an accepted add
+  commit persists the new device as pending after restart, and a remove-commit
+  HTTP runtime test proves the removed account no longer lists the room after
+  restart without a second manual `/account-rooms` write.
 - The HTTP Welcome ack wrapper can decode a claimed Finite `WelcomeRecord` on
   activated ack and promote the account-room device from pending to active
   across SQLite restart.
@@ -162,20 +163,23 @@ Python test distribution:
   later-device fanout path no longer needs an arbitrary opaque account-room
   write just to discover a newly created room.
 - Commit-derived account-room projection for the HTTP delivery surface. The
-  route layer can decode an explicit product commit projection payload, apply
-  adds/removes to persisted `AccountRoomRecord`s, and keep discovery state in
-  step with accepted add/remove commits. This is still product wrapper logic,
-  not Darkmatter becoming the MLS membership authority.
+  typed `/commits` route applies adds/removes from the submitted
+  `SubmitCommitRequest` to persisted `AccountRoomRecord`s, while raw
+  `/messages` can still decode an explicit compatibility projection wrapper.
+  This keeps discovery state in step with accepted add/remove commits, but it
+  is still a query-side account-room projection rather than Darkmatter becoming
+  the MLS membership authority.
 - Welcome-ack-derived account-room activation for the HTTP delivery surface. The
   server can decode a claimed Finite `WelcomeRecord` on activated ack and flip
   the matching pending account-room device to active, matching the original
   Finite store's Welcome activation rule.
 - Typed submit-commit route for the HTTP delivery surface. The route accepts a
   Finite `SubmitCommitRequest`, validates its structural commit metadata,
-  publishes the commit projection into the ordered Darkmatter group queue,
-  publishes derived `WelcomeRecord`s to recipient inboxes, and returns
-  `CommitAccepted` from the accepted HTTP sequence. Malformed staged Welcome
-  inputs are rejected before the route appends delivery side effects.
+  publishes a plain `RoomLogEntry` into the ordered Darkmatter group queue,
+  derives account-room membership updates from the submitted request, publishes
+  derived `WelcomeRecord`s to recipient inboxes, and returns `CommitAccepted`
+  from the accepted HTTP sequence. Malformed staged Welcome inputs are rejected
+  before the route appends delivery side effects.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the route client cannot drift, but that is
   not the right long-term crate boundary.
@@ -190,14 +194,15 @@ Python test distribution:
   server-side package response-loss piece, the HTTP fanout wrapper now covers
   opaque room-plan checkpointing, and the account-room directory covers
   discovery over HTTP. The HTTP server now covers a typed submit-commit route
-  that publishes the group commit projection and releases derived Welcomes,
-  including response-loss retry after the typed submit is accepted; the
-  runtime adapter covers that path across one-room and two-room fanout ticks.
+  that publishes the group `RoomLogEntry`, derives account-room membership
+  updates from the submitted request, and releases derived Welcomes, including
+  response-loss retry after the typed submit is accepted; the runtime adapter
+  covers that path across one-room and two-room fanout ticks.
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
   initial active device, account-room save/list now normalizes records to the
   requested account, and Welcome ack activation now promotes pending devices to
-  active. Complete server-authored commit/member truth remains unported.
+  active. Complete server-authored room/member truth remains unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -245,7 +250,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `23`
+- Route/store/engine tests added so far: `24`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -380,7 +385,8 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass
-- `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_route_publishes_commit_projection_and_welcome_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_raw_message_commit_projection_compatibility_survives_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
@@ -438,11 +444,11 @@ Runtime delivery checkpoint:
   commit-derived account-room updates for add/remove commits, and later-device
   fanout from typed bootstrap across the happy path, submit response-loss
   retry, multi-room fanout, and same-epoch reprepare. It does not yet prove
-  server-authored commit/member truth beyond typed product projection payloads,
-  but typed submit side effects and Welcome ack activation are now
-  server-derived.
+  server-authored room/member truth beyond account-room directory projections,
+  but typed submit side effects, commit-derived account-room updates, and
+  Welcome ack activation are now server-derived.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from product-wrapper account-room projections into server-authored commit/member
-truth, or start moving the test-only HTTP runtime adapter into production
-client/server boundaries.
+from account-room directory projections into server-authored room/member truth,
+or start moving the test-only HTTP runtime adapter into production client/server
+boundaries.

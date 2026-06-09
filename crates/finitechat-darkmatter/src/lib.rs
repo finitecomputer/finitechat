@@ -118,7 +118,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_account_room_commit_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server can project accepted Finite add/remove commits into persisted account-room records and reload the updated discovery state after restart",
+            evidence: "finitechat-server can project typed /commits add/remove requests into persisted account-room records, keep raw /messages projection compatibility, and reload the updated discovery state after restart",
         },
         PortFinding {
             area: "http_welcome_ack_membership_activation",
@@ -128,7 +128,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes the ordered group commit projection, releases derived Welcome inbox messages, and replays idempotently after restart",
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group RoomLogEntry, derives account-room membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
         },
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
@@ -153,7 +153,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-authored commit/member truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates; typed submit side effects and Welcome ack activation are now server-derived",
+            evidence: "Remaining Finite parity requires server-authored room/member truth instead of account-room directory projections; typed submit side effects, commit-derived account-room updates, and Welcome ack activation are now server-derived",
         },
         PortFinding {
             area: "ordered_delivery_profile",

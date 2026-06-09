@@ -711,6 +711,37 @@ impl HttpServerState {
         let room_id = payload.entry.room_id.clone();
         let mls_group_id = payload.entry.envelope.mls_group_id.clone();
         let current_epoch = payload.membership_delta.post_commit_epoch;
+        self.record_account_room_membership_delta(
+            &room_id,
+            &mls_group_id,
+            current_epoch,
+            &payload.membership_delta,
+            accepted_seq,
+        )
+    }
+
+    fn record_submit_commit_projection(
+        &self,
+        request: &SubmitCommitRequest,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        self.record_account_room_membership_delta(
+            &request.room_id,
+            &request.envelope.mls_group_id,
+            request.membership_delta.post_commit_epoch,
+            &request.membership_delta,
+            accepted_seq,
+        )
+    }
+
+    fn record_account_room_membership_delta(
+        &self,
+        room_id: &str,
+        mls_group_id: &str,
+        current_epoch: u64,
+        membership_delta: &MembershipDeltaV1,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
         let mut account_ids = BTreeSet::new();
         let mut directory = self
             .account_rooms
@@ -718,14 +749,14 @@ impl HttpServerState {
             .expect("HTTP account-room directory mutex");
 
         for (account_id, rooms) in directory.iter() {
-            if rooms.contains_key(&room_id) {
+            if rooms.contains_key(room_id) {
                 account_ids.insert(account_id.clone());
             }
         }
-        for add in &payload.membership_delta.adds {
+        for add in &membership_delta.adds {
             account_ids.insert(add.device.account_id.clone());
         }
-        for remove in &payload.membership_delta.removes {
+        for remove in &membership_delta.removes {
             account_ids.insert(remove.device.account_id.clone());
         }
 
@@ -733,8 +764,8 @@ impl HttpServerState {
         let mut deletes = Vec::new();
         for account_id in account_ids {
             let empty_record = || AccountRoomRecord {
-                room_id: room_id.clone(),
-                mls_group_id: mls_group_id.clone(),
+                room_id: room_id.to_owned(),
+                mls_group_id: mls_group_id.to_owned(),
                 current_epoch,
                 last_seq: accepted_seq,
                 status: RoomStatus::Open,
@@ -742,11 +773,11 @@ impl HttpServerState {
             };
             let existing_record = directory
                 .get(&account_id)
-                .and_then(|rooms| rooms.get(&room_id))
+                .and_then(|rooms| rooms.get(room_id))
                 .cloned();
             let mut record = match existing_record {
                 Some(value) => {
-                    match account_scoped_account_room_record(&account_id, &room_id, &value) {
+                    match account_scoped_account_room_record(&account_id, room_id, &value) {
                         Ok(Some(record)) => record,
                         Ok(None) => empty_record(),
                         Err(_) => continue,
@@ -758,11 +789,10 @@ impl HttpServerState {
             if record.room_id != room_id {
                 continue;
             }
-            record.mls_group_id = mls_group_id.clone();
+            record.mls_group_id = mls_group_id.to_owned();
             record.current_epoch = current_epoch;
             record.last_seq = accepted_seq;
-            for remove in payload
-                .membership_delta
+            for remove in membership_delta
                 .removes
                 .iter()
                 .filter(|remove| remove.device.account_id == account_id)
@@ -771,8 +801,7 @@ impl HttpServerState {
                     .devices
                     .retain(|device| device.device != remove.device);
             }
-            for add in payload
-                .membership_delta
+            for add in membership_delta
                 .adds
                 .iter()
                 .filter(|add| add.device.account_id == account_id)
@@ -794,12 +823,12 @@ impl HttpServerState {
 
             if record.devices.is_empty() {
                 if let Some(rooms) = directory.get_mut(&account_id) {
-                    rooms.remove(&room_id);
+                    rooms.remove(room_id);
                     if rooms.is_empty() {
                         directory.remove(&account_id);
                     }
                 }
-                deletes.push((account_id, room_id.clone()));
+                deletes.push((account_id, room_id.to_owned()));
                 continue;
             }
 
@@ -808,10 +837,10 @@ impl HttpServerState {
             directory
                 .entry(account_id.clone())
                 .or_default()
-                .insert(room_id.clone(), value.clone());
+                .insert(room_id.to_owned(), value.clone());
             upserts.push(AccountRoomDirectoryRecord {
                 account_id,
-                room_id: room_id.clone(),
+                room_id: room_id.to_owned(),
                 record: value,
             });
         }
@@ -839,7 +868,7 @@ impl HttpServerState {
         })?;
         let commit_publish = commit_publish_request(&request, &message_id)?;
         let receipt = self.publish_message(commit_publish.clone())?;
-        self.record_finite_commit_projection(&commit_publish, receipt.seq)?;
+        self.record_submit_commit_projection(&request, receipt.seq)?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
         for welcome in &welcomes {
@@ -2041,11 +2070,8 @@ fn commit_publish_request(
         },
         message: TransportMessage {
             id: MessageId::new(message_id.as_bytes().to_vec()),
-            payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
-                entry: placeholder_entry,
-                membership_delta: request.membership_delta.clone(),
-            })
-            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+            payload: serde_json::to_vec(&placeholder_entry)
+                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
             timestamp: Timestamp(0),
             causal_deps: Vec::new(),
             source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),

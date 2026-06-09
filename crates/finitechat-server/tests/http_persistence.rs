@@ -862,7 +862,7 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
 }
 
 #[tokio::test]
-async fn sqlite_submit_commit_route_publishes_commit_projection_and_welcome_after_restart() {
+async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
     let creator = DeviceRef::new("alice", "alice-laptop");
@@ -924,11 +924,19 @@ async fn sqlite_submit_commit_route_publishes_commit_projection_and_welcome_afte
     assert_eq!(group_page.entries.len(), 1);
     assert_eq!(group_page.entries[0].seq, accepted.seq);
     assert_eq!(group_page.entries[0].message.id, id(&accepted.message_id));
-    let projection: FiniteAccountRoomCommitProjection =
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&group_page.entries[0].message.payload)
+            .expect("commit payload json")
+            .get("membership_delta")
+            .is_none(),
+        "/commits must not publish the compatibility projection wrapper"
+    );
+    let entry: finitechat_proto::RoomLogEntry =
         serde_json::from_slice(&group_page.entries[0].message.payload)
-            .expect("commit projection payload");
-    assert_eq!(projection.entry.message_id, accepted.message_id);
-    assert_eq!(projection.membership_delta.adds[0].device, phone);
+            .expect("room log entry payload");
+    assert_eq!(entry.message_id, accepted.message_id);
+    assert_eq!(entry.room_id, room_id);
+    assert_eq!(entry.kind, LogEntryKind::Commit);
 
     let recipient = member_for_device(&DeviceRef::new("alice", "alice-phone"));
     let response = post_json(
@@ -969,6 +977,97 @@ async fn sqlite_submit_commit_route_publishes_commit_projection_and_welcome_afte
     assert_eq!(page.rooms[0]["current_epoch"], 1);
     assert_eq!(page.rooms[0]["last_seq"], accepted.seq);
     assert_eq!(page.rooms[0]["devices"][0]["active"], true);
+    assert_eq!(
+        page.rooms[0]["devices"][1]["device"]["device_id"],
+        "alice-phone"
+    );
+    assert_eq!(page.rooms[0]["devices"][1]["active"], false);
+}
+
+#[tokio::test]
+async fn sqlite_raw_message_commit_projection_compatibility_survives_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let room_id = "room-raw-projection-compat".to_owned();
+    let mls_group_id = "mls-raw-projection-compat".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        "welcome-raw-projection-compat",
+        "raw-projection-idempotency",
+    );
+    let message_id = request
+        .envelope
+        .message_id()
+        .expect("commit envelope message id");
+    let entry = finitechat_proto::RoomLogEntry {
+        room_id: room_id.clone(),
+        seq: 0,
+        message_id: message_id.clone(),
+        sender: creator.clone(),
+        kind: LogEntryKind::Commit,
+        epoch: request.expected_epoch,
+        envelope: request.envelope.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+    };
+    let payload = serde_json::to_vec(&FiniteAccountRoomCommitProjection {
+        entry,
+        membership_delta: request.membership_delta.clone(),
+    })
+    .expect("projection payload");
+    let transport_group_id = room_id.as_bytes().to_vec();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id,
+            creator,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app,
+        "/messages",
+        &PublishMessageRequest {
+            target: group_target(
+                group_id(&room_id),
+                transport_group_id.clone(),
+                Some(HttpCommitAdmission {
+                    source_epoch: EpochId(0),
+                }),
+            ),
+            message: group_message(&message_id, transport_group_id, &payload),
+            idempotency_key: Some("raw-projection-message-idempotency".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["room_id"], room_id);
+    assert_eq!(page.rooms[0]["current_epoch"], 1);
     assert_eq!(
         page.rooms[0]["devices"][1]["device"]["device_id"],
         "alice-phone"
