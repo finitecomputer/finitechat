@@ -63,6 +63,9 @@ Python test distribution:
 - The HTTP KeyPackage wrapper can claim one package per explicit device owner
   in a batch and replay the exact batch response by idempotency key after
   restart.
+- The HTTP fanout wrapper can persist opaque later-device fanout room plans,
+  prepared message ids, reprepare checkpoints, and accepted sequence markers
+  across restart without teaching the server MLS semantics.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -87,6 +90,10 @@ Python test distribution:
 - Batch KeyPackage claim replay for the HTTP delivery surface. This wraps
   Darkmatter's owner-scoped `claim_key_package` primitive so fanout callers can
   ask for one package per device owner and safely retry after response loss.
+- Opaque fanout plan checkpointing for the HTTP delivery surface. This stores
+  the coordination fields a client worker needs to resume after restart or
+  response loss, while leaving MLS validation and local pending Commit state on
+  the client.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the spike cannot drift, but that is not the
   right long-term crate boundary.
@@ -98,8 +105,9 @@ Python test distribution:
 - Later-device fanout into existing rooms. Finite tests require distinct
   KeyPackages per room, persistent fanout plans, response-loss retry, and
   reprepare after same-epoch loss. The HTTP batch claim wrapper now covers the
-  server-side package response-loss piece, but the durable client fanout worker
-  and same-epoch reprepare logic remain unported.
+  server-side package response-loss piece, and the HTTP fanout wrapper now
+  covers opaque room-plan checkpointing. The durable client fanout worker,
+  real MLS reprepare, and same-epoch branch recovery remain unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -147,7 +155,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `15`
+- Route/store/engine tests added so far: `17`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -156,6 +164,10 @@ Additional HTTP route checkpoint:
   - `POST /key-packages`
   - `POST /key-packages/claim`
   - `POST /key-packages/claims`
+  - `POST /fanouts/get`
+  - `POST /fanouts/rooms`
+  - `POST /fanouts/rooms/prepared`
+  - `POST /fanouts/rooms/done`
 - Persistence coverage proven:
   - group queue and duplicate-message index rebuild after restart
   - same-epoch commit admission rebuilds after restart
@@ -170,6 +182,9 @@ Additional HTTP route checkpoint:
     restart
   - conflicting batch KeyPackage claim idempotency key has no package side
     effects
+  - fanout room plan, prepared state, reprepare state, and done state survive
+    restart
+  - conflicting fanout room plan update does not overwrite the stored plan
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -200,6 +215,14 @@ Additional HTTP route checkpoint:
   - after server restart, replaying the same batch returned the same packages
   - a direct `claim-key-package --owner live-phone` then returned
     `live-phone-2`
+- Live fanout checkpoint smoke verified with a temporary SQLite file on
+  `127.0.0.1:18792`:
+  - `fanout-save-room` stored `live-fanout` / `live-room` with claimed
+    `live-kp-1`
+  - `fanout-mark-prepared` stored `live-commit-loser`
+  - after server restart, `fanout-get` returned the prepared loser state
+  - a second `fanout-mark-prepared` replaced it with `live-commit-retry`
+  - `fanout-mark-done --accepted-seq 12` recorded the terminal done state
 
 Important test caveat:
 
@@ -212,7 +235,7 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `8`
+- New CLI tests added: `10`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
@@ -221,6 +244,8 @@ Additional CLI checkpoint:
   - KeyPackage claim builds the route DTO
   - batch KeyPackage claim builds the route DTO with repeated owners and an
     idempotency key
+  - fanout save-room, mark-prepared, and mark-done commands build the route
+    DTOs
   - Welcome claim and ack build the route DTOs
   - unknown CLI flags fail as usage errors
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
@@ -240,6 +265,7 @@ Dependency note:
   should probably expose a smaller reusable HTTP route harness or keep this test
   in Darkmatter proper.
 
-Next meaningful gate: move selected copied server reducer scenarios onto the
-Darkmatter HTTP route/store boundary, focusing on durable later-device fanout
-plans and same-epoch reprepare after a competing Commit wins.
+Next meaningful gate: move selected copied client/runtime scenarios onto a
+Darkmatter-backed runtime delivery boundary, focusing on the actual MLS
+later-device fanout worker and same-epoch reprepare after a competing Commit
+wins.

@@ -5,7 +5,8 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
     AckWelcomeRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest,
-    GroupSyncRequest, InboxSyncRequest, PublishMessageRequest,
+    GetFanoutRequest, GroupSyncRequest, HttpFanoutRoomPlan, InboxSyncRequest,
+    MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest, SaveFanoutRoomRequest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -115,6 +116,10 @@ where
         "publish-key-package" => publish_key_package_request(&server, args),
         "claim-key-package" => claim_key_package_request(&server, args),
         "claim-key-packages" => claim_key_packages_request(&server, args),
+        "fanout-get" => fanout_get_request(&server, args),
+        "fanout-save-room" => fanout_save_room_request(&server, args),
+        "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
+        "fanout-mark-done" => fanout_mark_done_request(&server, args),
         "claim-welcomes" => claim_welcomes_request(&server, args),
         "ack-welcome" => ack_welcome_request(&server, args),
         _ => Err(CliError::Usage(http_usage())),
@@ -271,6 +276,81 @@ fn claim_key_packages_request(
         idempotency_key,
     };
     post_json_request(server, "/key-packages/claims", &request)
+}
+
+fn fanout_get_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let fanout_id = required_option(&mut args, "--fanout-id")?;
+    reject_extra_args(&args)?;
+
+    let request = GetFanoutRequest { fanout_id };
+    post_json_request(server, "/fanouts/get", &request)
+}
+
+fn fanout_save_room_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let fanout_id = required_option(&mut args, "--fanout-id")?;
+    let target_owner = required_option(&mut args, "--target-owner")?;
+    let room_id = required_option(&mut args, "--room-id")?;
+    let key_package_id = required_option(&mut args, "--key-package-id")?;
+    let welcome_id = required_option(&mut args, "--welcome-id")?;
+    let commit_idempotency_key = required_option(&mut args, "--commit-idempotency-key")?;
+    let claimed_key_package_id = take_option(&mut args, "--claimed-key-package-id")?;
+    reject_extra_args(&args)?;
+
+    let request = SaveFanoutRoomRequest {
+        fanout_id,
+        target_owner: MemberId::new(target_owner.into_bytes()),
+        room: HttpFanoutRoomPlan {
+            room_id: GroupId::new(room_id.into_bytes()),
+            key_package_id: HttpKeyPackageId::new(key_package_id.into_bytes()),
+            welcome_id: MessageId::new(welcome_id.into_bytes()),
+            commit_idempotency_key,
+            claimed_key_package_id: claimed_key_package_id
+                .map(|key_package_id| HttpKeyPackageId::new(key_package_id.into_bytes())),
+        },
+    };
+    post_json_request(server, "/fanouts/rooms", &request)
+}
+
+fn fanout_mark_prepared_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let fanout_id = required_option(&mut args, "--fanout-id")?;
+    let room_id = required_option(&mut args, "--room-id")?;
+    let message_id = required_option(&mut args, "--message-id")?;
+    reject_extra_args(&args)?;
+
+    let request = MarkFanoutPreparedRequest {
+        fanout_id,
+        room_id: GroupId::new(room_id.into_bytes()),
+        prepared_message_id: MessageId::new(message_id.into_bytes()),
+    };
+    post_json_request(server, "/fanouts/rooms/prepared", &request)
+}
+
+fn fanout_mark_done_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let fanout_id = required_option(&mut args, "--fanout-id")?;
+    let room_id = required_option(&mut args, "--room-id")?;
+    let message_id = required_option(&mut args, "--message-id")?;
+    let accepted_seq = required_option(&mut args, "--accepted-seq")?;
+    reject_extra_args(&args)?;
+
+    let request = MarkFanoutDoneRequest {
+        fanout_id,
+        room_id: GroupId::new(room_id.into_bytes()),
+        prepared_message_id: MessageId::new(message_id.into_bytes()),
+        accepted_seq: parse_u64("--accepted-seq", &accepted_seq)?,
+    };
+    post_json_request(server, "/fanouts/rooms/done", &request)
 }
 
 fn claim_welcomes_request(
@@ -441,7 +521,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -449,7 +529,8 @@ mod tests {
     use super::*;
     use finitechat_server::{
         AckWelcomeRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest, GroupSyncRequest,
-        PublishMessageRequest,
+        MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
+        SaveFanoutRoomRequest,
     };
 
     #[test]
@@ -569,6 +650,88 @@ mod tests {
         assert_eq!(body.owners[0].as_slice(), b"alice-phone");
         assert_eq!(body.owners[1].as_slice(), b"alice-laptop");
         assert_eq!(body.idempotency_key.as_deref(), Some("fanout-claim-1"));
+    }
+
+    #[test]
+    fn fanout_save_room_command_builds_route_dto() {
+        let request = prepare_http_request([
+            "fanout-save-room",
+            "--fanout-id",
+            "fanout-a",
+            "--target-owner",
+            "alice-phone",
+            "--room-id",
+            "room-a",
+            "--key-package-id",
+            "kp-a",
+            "--welcome-id",
+            "welcome-a",
+            "--commit-idempotency-key",
+            "link-a",
+            "--claimed-key-package-id",
+            "kp-a",
+        ])
+        .expect("request");
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.url, "http://127.0.0.1:8787/fanouts/rooms");
+        let body: SaveFanoutRoomRequest =
+            serde_json::from_value(request.json.expect("json")).expect("fanout room request");
+        assert_eq!(body.fanout_id, "fanout-a");
+        assert_eq!(body.target_owner.as_slice(), b"alice-phone");
+        assert_eq!(body.room.room_id.as_slice(), b"room-a");
+        assert_eq!(body.room.key_package_id.as_slice(), b"kp-a");
+        assert_eq!(body.room.welcome_id.as_slice(), b"welcome-a");
+        assert_eq!(body.room.commit_idempotency_key, "link-a");
+        assert_eq!(
+            body.room
+                .claimed_key_package_id
+                .expect("claimed package")
+                .as_slice(),
+            b"kp-a"
+        );
+    }
+
+    #[test]
+    fn fanout_status_commands_build_route_dtos() {
+        let prepared = prepare_http_request([
+            "fanout-mark-prepared",
+            "--fanout-id",
+            "fanout-a",
+            "--room-id",
+            "room-a",
+            "--message-id",
+            "commit-a",
+        ])
+        .expect("prepared request");
+
+        assert_eq!(prepared.url, "http://127.0.0.1:8787/fanouts/rooms/prepared");
+        let body: MarkFanoutPreparedRequest =
+            serde_json::from_value(prepared.json.expect("json")).expect("prepared body");
+        assert_eq!(body.fanout_id, "fanout-a");
+        assert_eq!(body.room_id.as_slice(), b"room-a");
+        assert_eq!(body.prepared_message_id.as_slice(), b"commit-a");
+
+        let done = prepare_http_request([
+            "fanout-mark-done",
+            "--fanout-id",
+            "fanout-a",
+            "--room-id",
+            "room-a",
+            "--message-id",
+            "commit-b",
+            "--accepted-seq",
+            "9",
+        ])
+        .expect("done request");
+
+        assert_eq!(done.url, "http://127.0.0.1:8787/fanouts/rooms/done");
+        let body: MarkFanoutDoneRequest =
+            serde_json::from_value(done.json.expect("json")).expect("done body");
+        assert_eq!(body.fanout_id, "fanout-a");
+        assert_eq!(body.room_id.as_slice(), b"room-a");
+        assert_eq!(body.prepared_message_id.as_slice(), b"commit-b");
+        assert_eq!(body.accepted_seq, 9);
     }
 
     #[test]

@@ -13,15 +13,21 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use transport_http_server::{
-    HttpClaimedKeyPackage, HttpDeliveryService, HttpKeyPackagePublication, HttpPublishReceipt,
-    HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
+    HttpClaimedKeyPackage, HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication,
+    HttpPublishReceipt, HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
+    MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
+
+const MAX_HTTP_FANOUT_ROOMS: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
+const MAX_HTTP_FANOUT_ID_BYTES: usize = 128;
+const MAX_HTTP_IDEMPOTENCY_KEY_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerState {
     service: Arc<Mutex<HttpDeliveryService>>,
     publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
     key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
+    fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -32,6 +38,7 @@ impl HttpServerState {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
+            fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -45,11 +52,13 @@ impl HttpServerState {
         }
         let publish_idempotency = store.load_publish_idempotency()?;
         let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
+        let fanout_plans = store.load_fanout_plans()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
             key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
+            fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -189,6 +198,174 @@ impl HttpServerState {
         Ok(claims)
     }
 
+    fn save_fanout_room(
+        &self,
+        request: SaveFanoutRoomRequest,
+    ) -> Result<HttpFanoutPlan, ServerHttpError> {
+        validate_fanout_id(&request.fanout_id)?;
+        validate_fanout_room_plan(&request.room)?;
+        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
+        let plan = fanouts
+            .entry(request.fanout_id.clone())
+            .or_insert_with(|| HttpFanoutPlan {
+                fanout_id: request.fanout_id.clone(),
+                target_owner: request.target_owner.clone(),
+                rooms: Vec::new(),
+            });
+        if plan.target_owner != request.target_owner {
+            return Err(ServerHttpError::FanoutConflict {
+                fanout_id: request.fanout_id,
+                reason: "target owner differs from existing fanout".to_owned(),
+            });
+        }
+        match plan
+            .rooms
+            .iter()
+            .position(|room| room.plan.room_id == request.room.room_id)
+        {
+            Some(index) if plan.rooms[index].plan == request.room => {}
+            Some(_) => {
+                return Err(ServerHttpError::FanoutConflict {
+                    fanout_id: request.fanout_id,
+                    reason: "room plan differs from existing fanout room".to_owned(),
+                });
+            }
+            None => {
+                if plan.rooms.len() >= MAX_HTTP_FANOUT_ROOMS {
+                    return Err(ServerHttpError::FanoutLimitExceeded {
+                        fanout_id: request.fanout_id,
+                        actual: plan.rooms.len() + 1,
+                        max: MAX_HTTP_FANOUT_ROOMS,
+                    });
+                }
+                plan.rooms.push(HttpFanoutRoomState {
+                    plan: request.room,
+                    status: HttpFanoutRoomStatus::Pending,
+                });
+                plan.rooms.sort_by(|left, right| {
+                    left.plan
+                        .room_id
+                        .as_slice()
+                        .cmp(right.plan.room_id.as_slice())
+                });
+            }
+        }
+        let plan = plan.clone();
+        if let Some(store) = &self.store {
+            store.upsert_fanout_plan(&plan)?;
+        }
+        Ok(plan)
+    }
+
+    fn get_fanout(
+        &self,
+        request: GetFanoutRequest,
+    ) -> Result<Option<HttpFanoutPlan>, ServerHttpError> {
+        validate_fanout_id(&request.fanout_id)?;
+        let fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
+        Ok(fanouts.get(&request.fanout_id).cloned())
+    }
+
+    fn mark_fanout_prepared(
+        &self,
+        request: MarkFanoutPreparedRequest,
+    ) -> Result<HttpFanoutPlan, ServerHttpError> {
+        validate_fanout_id(&request.fanout_id)?;
+        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
+        let plan =
+            fanouts
+                .get_mut(&request.fanout_id)
+                .ok_or_else(|| ServerHttpError::FanoutNotFound {
+                    fanout_id: request.fanout_id.clone(),
+                })?;
+        let room = plan
+            .rooms
+            .iter_mut()
+            .find(|room| room.plan.room_id == request.room_id)
+            .ok_or_else(|| ServerHttpError::FanoutRoomNotFound {
+                fanout_id: request.fanout_id.clone(),
+                room_id: request.room_id.clone(),
+            })?;
+        match &room.status {
+            HttpFanoutRoomStatus::Done { .. } => {
+                return Err(ServerHttpError::FanoutConflict {
+                    fanout_id: request.fanout_id,
+                    reason: "cannot mark a completed fanout room prepared".to_owned(),
+                });
+            }
+            HttpFanoutRoomStatus::Pending | HttpFanoutRoomStatus::Prepared { .. } => {
+                room.status = HttpFanoutRoomStatus::Prepared {
+                    prepared_message_id: request.prepared_message_id,
+                };
+            }
+        }
+        let plan = plan.clone();
+        if let Some(store) = &self.store {
+            store.upsert_fanout_plan(&plan)?;
+        }
+        Ok(plan)
+    }
+
+    fn mark_fanout_done(
+        &self,
+        request: MarkFanoutDoneRequest,
+    ) -> Result<HttpFanoutPlan, ServerHttpError> {
+        validate_fanout_id(&request.fanout_id)?;
+        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
+        let plan =
+            fanouts
+                .get_mut(&request.fanout_id)
+                .ok_or_else(|| ServerHttpError::FanoutNotFound {
+                    fanout_id: request.fanout_id.clone(),
+                })?;
+        let room = plan
+            .rooms
+            .iter_mut()
+            .find(|room| room.plan.room_id == request.room_id)
+            .ok_or_else(|| ServerHttpError::FanoutRoomNotFound {
+                fanout_id: request.fanout_id.clone(),
+                room_id: request.room_id.clone(),
+            })?;
+        match &room.status {
+            HttpFanoutRoomStatus::Pending => {
+                return Err(ServerHttpError::FanoutConflict {
+                    fanout_id: request.fanout_id,
+                    reason: "cannot complete a fanout room before it is prepared".to_owned(),
+                });
+            }
+            HttpFanoutRoomStatus::Prepared {
+                prepared_message_id,
+            } if *prepared_message_id == request.prepared_message_id => {
+                room.status = HttpFanoutRoomStatus::Done {
+                    prepared_message_id: request.prepared_message_id,
+                    accepted_seq: request.accepted_seq,
+                };
+            }
+            HttpFanoutRoomStatus::Prepared { .. } => {
+                return Err(ServerHttpError::FanoutConflict {
+                    fanout_id: request.fanout_id,
+                    reason: "prepared message id does not match fanout room state".to_owned(),
+                });
+            }
+            HttpFanoutRoomStatus::Done {
+                prepared_message_id,
+                accepted_seq,
+            } if *prepared_message_id == request.prepared_message_id
+                && *accepted_seq == request.accepted_seq => {}
+            HttpFanoutRoomStatus::Done { .. } => {
+                return Err(ServerHttpError::FanoutConflict {
+                    fanout_id: request.fanout_id,
+                    reason: "completed fanout room differs from request".to_owned(),
+                });
+            }
+        }
+        let plan = plan.clone();
+        if let Some(store) = &self.store {
+            store.upsert_fanout_plan(&plan)?;
+        }
+        Ok(plan)
+    }
+
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -285,6 +462,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/claim", post(claim_key_package))
         .route("/key-packages/claims", post(claim_key_packages))
+        .route("/fanouts/get", post(get_fanout))
+        .route("/fanouts/rooms", post(save_fanout_room))
+        .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
+        .route("/fanouts/rooms/done", post(mark_fanout_done))
         .route("/welcomes/claim", post(claim_welcomes))
         .route("/welcomes/ack", post(ack_welcome))
         .with_state(state)
@@ -333,6 +514,68 @@ pub struct ClaimKeyPackagesRequest {
 pub struct HttpKeyPackageClaim {
     pub owner: MemberId,
     pub claimed: Option<HttpClaimedKeyPackage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveFanoutRoomRequest {
+    pub fanout_id: String,
+    pub target_owner: MemberId,
+    pub room: HttpFanoutRoomPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetFanoutRequest {
+    pub fanout_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkFanoutPreparedRequest {
+    pub fanout_id: String,
+    pub room_id: GroupId,
+    pub prepared_message_id: MessageId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkFanoutDoneRequest {
+    pub fanout_id: String,
+    pub room_id: GroupId,
+    pub prepared_message_id: MessageId,
+    pub accepted_seq: HttpSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpFanoutPlan {
+    pub fanout_id: String,
+    pub target_owner: MemberId,
+    pub rooms: Vec<HttpFanoutRoomState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpFanoutRoomState {
+    pub plan: HttpFanoutRoomPlan,
+    pub status: HttpFanoutRoomStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpFanoutRoomPlan {
+    pub room_id: GroupId,
+    pub key_package_id: HttpKeyPackageId,
+    pub welcome_id: MessageId,
+    pub commit_idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_key_package_id: Option<HttpKeyPackageId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpFanoutRoomStatus {
+    Pending,
+    Prepared {
+        prepared_message_id: MessageId,
+    },
+    Done {
+        prepared_message_id: MessageId,
+        accepted_seq: HttpSequence,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +680,38 @@ async fn claim_key_packages(
 ) -> Result<Json<Vec<HttpKeyPackageClaim>>, ServerHttpError> {
     let claimed = state.claim_key_packages(request)?;
     Ok(Json(claimed))
+}
+
+async fn save_fanout_room(
+    State(state): State<HttpServerState>,
+    Json(request): Json<SaveFanoutRoomRequest>,
+) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
+    let fanout = state.save_fanout_room(request)?;
+    Ok(Json(fanout))
+}
+
+async fn get_fanout(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetFanoutRequest>,
+) -> Result<Json<Option<HttpFanoutPlan>>, ServerHttpError> {
+    let fanout = state.get_fanout(request)?;
+    Ok(Json(fanout))
+}
+
+async fn mark_fanout_prepared(
+    State(state): State<HttpServerState>,
+    Json(request): Json<MarkFanoutPreparedRequest>,
+) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
+    let fanout = state.mark_fanout_prepared(request)?;
+    Ok(Json(fanout))
+}
+
+async fn mark_fanout_done(
+    State(state): State<HttpServerState>,
+    Json(request): Json<MarkFanoutDoneRequest>,
+) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
+    let fanout = state.mark_fanout_done(request)?;
+    Ok(Json(fanout))
 }
 
 async fn claim_welcomes(
@@ -567,6 +842,10 @@ impl SqliteHttpDeliveryStore {
                 idempotency_key TEXT PRIMARY KEY,
                 fingerprint_json TEXT NOT NULL,
                 response_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_fanout_plans (
+                fanout_id TEXT PRIMARY KEY,
+                plan_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_welcome_claims (
                 message_id_json TEXT PRIMARY KEY,
@@ -720,6 +999,32 @@ impl SqliteHttpDeliveryStore {
         Ok(idempotency)
     }
 
+    fn upsert_fanout_plan(&self, plan: &HttpFanoutPlan) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_fanout_plans (fanout_id, plan_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(fanout_id) DO UPDATE SET
+                plan_json = excluded.plan_json",
+            params![plan.fanout_id, serde_json::to_string(plan)?],
+        )?;
+        Ok(())
+    }
+
+    fn load_fanout_plans(&self) -> Result<HashMap<String, HttpFanoutPlan>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare("SELECT fanout_id, plan_json FROM http_fanout_plans")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut fanouts = HashMap::new();
+        for row in rows {
+            let (fanout_id, plan_json) = row?;
+            fanouts.insert(fanout_id, serde_json::from_str(&plan_json)?);
+        }
+        Ok(fanouts)
+    }
+
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -810,6 +1115,32 @@ fn replay_operation(
     Ok(())
 }
 
+fn validate_fanout_id(fanout_id: &str) -> Result<(), ServerHttpError> {
+    validate_string_id("fanout_id", fanout_id, MAX_HTTP_FANOUT_ID_BYTES)
+}
+
+fn validate_fanout_room_plan(plan: &HttpFanoutRoomPlan) -> Result<(), ServerHttpError> {
+    if plan.commit_idempotency_key.is_empty() {
+        return Err(ServerHttpError::InvalidFanoutRequest {
+            reason: "commit idempotency key must not be empty".to_owned(),
+        });
+    }
+    validate_string_id(
+        "commit_idempotency_key",
+        &plan.commit_idempotency_key,
+        MAX_HTTP_IDEMPOTENCY_KEY_BYTES,
+    )
+}
+
+fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<(), ServerHttpError> {
+    if value.is_empty() || value.len() > max {
+        return Err(ServerHttpError::InvalidFanoutRequest {
+            reason: format!("{field} must contain between 1 and {max} bytes"),
+        });
+    }
+    Ok(())
+}
+
 fn claim_key_packages_from_service(
     service: &mut HttpDeliveryService,
     owners: &[MemberId],
@@ -868,6 +1199,25 @@ pub enum ServerHttpError {
     },
     DuplicateKeyPackageClaimOwner {
         owner: MemberId,
+    },
+    InvalidFanoutRequest {
+        reason: String,
+    },
+    FanoutLimitExceeded {
+        fanout_id: String,
+        actual: usize,
+        max: usize,
+    },
+    FanoutConflict {
+        fanout_id: String,
+        reason: String,
+    },
+    FanoutNotFound {
+        fanout_id: String,
+    },
+    FanoutRoomNotFound {
+        fanout_id: String,
+        room_id: GroupId,
     },
     InvalidWelcomeClaimLimit {
         actual: usize,
@@ -930,6 +1280,35 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "duplicate_key_package_claim_owner".to_owned(),
                 format!("KeyPackage claim batch contains duplicate owner {owner:?}"),
+            ),
+            Self::InvalidFanoutRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_fanout_request".to_owned(),
+                reason,
+            ),
+            Self::FanoutLimitExceeded {
+                fanout_id,
+                actual,
+                max,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "fanout_limit_exceeded".to_owned(),
+                format!("fanout {fanout_id} has {actual} rooms, max {max}"),
+            ),
+            Self::FanoutConflict { fanout_id, reason } => (
+                StatusCode::CONFLICT,
+                "fanout_conflict".to_owned(),
+                format!("fanout {fanout_id} conflict: {reason}"),
+            ),
+            Self::FanoutNotFound { fanout_id } => (
+                StatusCode::NOT_FOUND,
+                "fanout_not_found".to_owned(),
+                format!("fanout {fanout_id} was not found"),
+            ),
+            Self::FanoutRoomNotFound { fanout_id, room_id } => (
+                StatusCode::NOT_FOUND,
+                "fanout_room_not_found".to_owned(),
+                format!("fanout {fanout_id} has no room {room_id:?}"),
             ),
             Self::InvalidWelcomeClaimLimit { actual, max } => (
                 StatusCode::BAD_REQUEST,

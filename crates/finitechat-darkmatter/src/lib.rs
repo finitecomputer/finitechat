@@ -76,6 +76,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
         },
         PortFinding {
+            area: "http_fanout_plan_checkpoint",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
             evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",

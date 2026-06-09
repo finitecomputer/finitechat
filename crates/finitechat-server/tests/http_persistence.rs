@@ -6,8 +6,9 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim,
-    HttpServerState, PublishMessageRequest, http_router,
+    ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
+    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpServerState, MarkFanoutDoneRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, SaveFanoutRoomRequest, http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -414,6 +415,175 @@ async fn sqlite_batch_key_package_claim_conflict_has_no_side_effects() {
 }
 
 #[tokio::test]
+async fn sqlite_fanout_room_plan_survives_restart_and_reprepare() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let fanout_id = "fanout-reprepare".to_owned();
+    let room_id = group_id("fanout-room");
+    let request = SaveFanoutRoomRequest {
+        fanout_id: fanout_id.clone(),
+        target_owner: member("alice-phone"),
+        room: fanout_room_plan("fanout-room", "kp-fanout-1", "welcome-fanout-1", "link-1"),
+    };
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app, "/fanouts/rooms", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: HttpFanoutPlan = read_json(response).await;
+    assert_eq!(fanout.rooms.len(), 1);
+    assert_eq!(fanout.rooms[0].status, HttpFanoutRoomStatus::Pending);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/fanouts/rooms/prepared",
+        &MarkFanoutPreparedRequest {
+            fanout_id: fanout_id.clone(),
+            room_id: room_id.clone(),
+            prepared_message_id: id("prepared-loser"),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: HttpFanoutPlan = read_json(response).await;
+    assert_eq!(
+        fanout.rooms[0].status,
+        HttpFanoutRoomStatus::Prepared {
+            prepared_message_id: id("prepared-loser")
+        }
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/fanouts/rooms/prepared",
+        &MarkFanoutPreparedRequest {
+            fanout_id: fanout_id.clone(),
+            room_id: room_id.clone(),
+            prepared_message_id: id("prepared-retry"),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: HttpFanoutPlan = read_json(response).await;
+    assert_eq!(
+        fanout.rooms[0].status,
+        HttpFanoutRoomStatus::Prepared {
+            prepared_message_id: id("prepared-retry")
+        }
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/fanouts/rooms/done",
+        &MarkFanoutDoneRequest {
+            fanout_id: fanout_id.clone(),
+            room_id: room_id.clone(),
+            prepared_message_id: id("prepared-loser"),
+            accepted_seq: 7,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "fanout_conflict");
+
+    let response = post_json(
+        app,
+        "/fanouts/rooms/done",
+        &MarkFanoutDoneRequest {
+            fanout_id: fanout_id.clone(),
+            room_id,
+            prepared_message_id: id("prepared-retry"),
+            accepted_seq: 8,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: HttpFanoutPlan = read_json(response).await;
+    assert_eq!(
+        fanout.rooms[0].status,
+        HttpFanoutRoomStatus::Done {
+            prepared_message_id: id("prepared-retry"),
+            accepted_seq: 8,
+        }
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/fanouts/get",
+        &finitechat_server::GetFanoutRequest { fanout_id },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: Option<HttpFanoutPlan> = read_json(response).await;
+    assert_eq!(
+        fanout.expect("stored fanout").rooms[0].status,
+        HttpFanoutRoomStatus::Done {
+            prepared_message_id: id("prepared-retry"),
+            accepted_seq: 8,
+        }
+    );
+}
+
+#[tokio::test]
+async fn sqlite_fanout_room_plan_conflict_does_not_overwrite_existing_plan() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let fanout_id = "fanout-conflict".to_owned();
+    let initial = SaveFanoutRoomRequest {
+        fanout_id: fanout_id.clone(),
+        target_owner: member("alice-phone"),
+        room: fanout_room_plan(
+            "fanout-conflict-room",
+            "kp-original",
+            "welcome-original",
+            "link",
+        ),
+    };
+    let conflicting = SaveFanoutRoomRequest {
+        fanout_id: fanout_id.clone(),
+        target_owner: member("alice-phone"),
+        room: fanout_room_plan(
+            "fanout-conflict-room",
+            "kp-other",
+            "welcome-original",
+            "link",
+        ),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/fanouts/rooms", &initial)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let response = post_json(app, "/fanouts/rooms", &conflicting).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "fanout_conflict");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/fanouts/get",
+        &finitechat_server::GetFanoutRequest { fanout_id },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fanout: Option<HttpFanoutPlan> = read_json(response).await;
+    assert_eq!(
+        fanout.expect("stored fanout").rooms[0]
+            .plan
+            .key_package_id
+            .as_slice(),
+        b"kp-original"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_welcome_claim_survives_restart_before_ack() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -617,6 +787,21 @@ fn key_package_publication(
         key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
         owner,
         key_package: KeyPackage::new(bytes.to_vec()),
+    }
+}
+
+fn fanout_room_plan(
+    room_id: &str,
+    key_package_id: &str,
+    welcome_id: &str,
+    commit_idempotency_key: &str,
+) -> finitechat_server::HttpFanoutRoomPlan {
+    finitechat_server::HttpFanoutRoomPlan {
+        room_id: group_id(room_id),
+        key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
+        welcome_id: id(welcome_id),
+        commit_idempotency_key: commit_idempotency_key.to_owned(),
+        claimed_key_package_id: Some(HttpKeyPackageId::new(key_package_id.as_bytes().to_vec())),
     }
 }
 
