@@ -41,6 +41,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "Darkmatter http_delivery_compatibility test carries real Marmot invite and app messages through the service core",
         },
         PortFinding {
+            area: "marmot_engine_over_finite_http_routes",
+            status: PortStatus::WorksOutOfBox,
+            evidence: "finitechat-server route tests carry real Marmot Welcome, invite Commit, and app messages through Axum HTTP handlers",
+        },
+        PortFinding {
             area: "finite_application_policy_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "Finite app event push/unread/command policy can stay above opaque Marmot application payloads",

@@ -57,6 +57,9 @@ Python test distribution:
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
+- The `finitechat-server` Axum route layer can carry those real Marmot Welcome,
+  invite Commit, and application messages end to end when driven by
+  Darkmatter's conformance simulator clients.
 - The copied Finite Chat application-policy tests can remain above the encrypted
   application payload boundary. Push, unread, command-inbox, runtime-state, and
   activity projection logic does not need the server to decrypt payloads.
@@ -141,6 +144,10 @@ Additional HTTP route checkpoint:
   - group queue and duplicate-message index rebuild after restart
   - same-epoch commit admission rebuilds after restart
   - consumed KeyPackage state rebuilds after restart
+- Real Marmot engine coverage proven:
+  - `cargo test -p finitechat-server --test http_engine_routes`: pass
+  - route layer carries a real create Welcome, invite Commit, invite Welcome,
+    and application message between `HarnessClient`s
 - Live persistent-mode smoke verified with a temporary SQLite file on
   `127.0.0.1:18788`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18788 health`
@@ -151,7 +158,8 @@ Important test caveat:
 - The copied Rust and Python suites still mostly exercise the original Finite
   Chat implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
-  adapter smoke test plus the HTTP route and persistence tests above.
+  adapter smoke test plus the HTTP route, persistence, and real-engine route
+  tests above.
 
 Additional CLI checkpoint:
 
@@ -174,6 +182,11 @@ Dependency note:
   pulls the workspace toward `rusqlite 0.32` through OpenMLS/Darkmatter's
   SQLite dependency graph, so this port repo aligns its workspace `rusqlite`
   version to `0.32` to avoid two `libsqlite3-sys` packages linking `sqlite3`.
+- The real-engine route test uses Darkmatter's `cgka-conformance-simulator` as
+  a dev dependency. That is useful proof for this port, but it pulls in the
+  simulator's Nostr/storage/proptest dependency graph. A long-term upstream PR
+  should probably expose a smaller reusable HTTP route harness or keep this test
+  in Darkmatter proper.
 
 Next meaningful gate: move selected copied server reducer scenarios onto the
 Darkmatter HTTP route/store boundary, starting with idempotent response replay

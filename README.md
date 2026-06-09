@@ -76,6 +76,7 @@ cargo test
 python3 -m unittest discover -s tests -p '*test*.py'
 cargo test -p finitechat-server --test http_routes
 cargo test -p finitechat-server --test http_persistence
+cargo test -p finitechat-server --test http_engine_routes
 cargo test -p finitechat-cli
 cargo run -p finitechat-server -- smoke
 cargo run -p finitechat-cli -- http-smoke
