@@ -5,8 +5,9 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
-    ClaimKeyPackageRequest, ErrorResponse, GroupSyncRequest, HttpServerState,
-    PublishMessageRequest, http_router,
+    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
+    ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpServerState, PublishMessageRequest,
+    http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -258,6 +259,165 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
     assert_eq!(claimed, None);
 }
 
+#[tokio::test]
+async fn sqlite_welcome_claim_survives_restart_before_ack() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let recipient = member("welcome-recipient");
+    let welcome = PublishMessageRequest {
+        target: HttpPublishTarget::Inbox {
+            recipient: recipient.clone(),
+        },
+        message: welcome_message("welcome-restart", recipient.clone(), b"welcome-bytes"),
+        idempotency_key: Some("idem-welcome-restart".to_owned()),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/messages", &welcome).await.status(),
+        StatusCode::OK
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].seq, 1);
+    assert_eq!(claimed[0].message.id, id("welcome-restart"));
+
+    let response = post_json(
+        app,
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let duplicate_claim: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert!(duplicate_claim.is_empty());
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_restart_claim: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert!(after_restart_claim.is_empty());
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-restart"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let acked: AckWelcomeResponse = read_json(response).await;
+    assert!(acked.acked);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-restart"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let acked: AckWelcomeResponse = read_json(response).await;
+    assert!(acked.acked);
+}
+
+#[tokio::test]
+async fn sqlite_welcome_failed_ack_is_terminal_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let recipient = member("failed-welcome-recipient");
+    let welcome = PublishMessageRequest {
+        target: HttpPublishTarget::Inbox {
+            recipient: recipient.clone(),
+        },
+        message: welcome_message("welcome-failed", recipient.clone(), b"welcome-bytes"),
+        idempotency_key: None,
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/messages", &welcome).await.status(),
+        StatusCode::OK
+    );
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-failed"),
+            activated: false,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert!(claimed.is_empty());
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-failed"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "welcome_ack_conflict");
+}
+
 fn persistent_app(path: &std::path::Path) -> Router {
     http_router(HttpServerState::from_sqlite_path(path).expect("persistent server state"))
 }
@@ -318,5 +478,16 @@ fn group_message(
         causal_deps: Vec::new(),
         source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
         envelope: TransportEnvelope::GroupMessage { transport_group_id },
+    }
+}
+
+fn welcome_message(message_id: &str, recipient: MemberId, payload: &[u8]) -> TransportMessage {
+    TransportMessage {
+        id: id(message_id),
+        payload: payload.to_vec(),
+        timestamp: Timestamp(43),
+        causal_deps: Vec::new(),
+        source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+        envelope: TransportEnvelope::Welcome { recipient },
     }
 }

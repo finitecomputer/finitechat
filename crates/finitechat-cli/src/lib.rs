@@ -4,7 +4,8 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
-    ClaimKeyPackageRequest, GroupSyncRequest, InboxSyncRequest, PublishMessageRequest,
+    AckWelcomeRequest, ClaimKeyPackageRequest, ClaimWelcomesRequest, GroupSyncRequest,
+    InboxSyncRequest, PublishMessageRequest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -113,6 +114,8 @@ where
         "sync-inbox" => sync_inbox_request(&server, args),
         "publish-key-package" => publish_key_package_request(&server, args),
         "claim-key-package" => claim_key_package_request(&server, args),
+        "claim-welcomes" => claim_welcomes_request(&server, args),
+        "ack-welcome" => ack_welcome_request(&server, args),
         _ => Err(CliError::Usage(http_usage())),
     }
 }
@@ -245,6 +248,36 @@ fn claim_key_package_request(
     post_json_request(server, "/key-packages/claim", &request)
 }
 
+fn claim_welcomes_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let recipient = required_option(&mut args, "--recipient")?;
+    let limit = optional_usize(&mut args, "--limit", DEFAULT_SYNC_LIMIT)?;
+    reject_extra_args(&args)?;
+
+    let request = ClaimWelcomesRequest {
+        recipient: MemberId::new(recipient.into_bytes()),
+        limit,
+    };
+    post_json_request(server, "/welcomes/claim", &request)
+}
+
+fn ack_welcome_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let message_id = required_option(&mut args, "--message-id")?;
+    let activated = required_option(&mut args, "--activated")?;
+    reject_extra_args(&args)?;
+
+    let request = AckWelcomeRequest {
+        message_id: MessageId::new(message_id.into_bytes()),
+        activated: parse_bool("--activated", &activated)?,
+    };
+    post_json_request(server, "/welcomes/ack", &request)
+}
+
 fn post_json_request<T: Serialize>(
     server: &str,
     path: &str,
@@ -340,6 +373,14 @@ fn parse_u64(name: &'static str, value: &str) -> Result<u64, CliError> {
         .map_err(|_| CliError::Usage(format!("{name} must be an unsigned integer")))
 }
 
+fn parse_bool(name: &'static str, value: &str) -> Result<bool, CliError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(CliError::Usage(format!("{name} must be true or false"))),
+    }
+}
+
 fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         Ok(())
@@ -359,13 +400,15 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_server::{GroupSyncRequest, PublishMessageRequest};
+    use finitechat_server::{
+        AckWelcomeRequest, ClaimWelcomesRequest, GroupSyncRequest, PublishMessageRequest,
+    };
 
     #[test]
     fn publish_group_command_builds_route_dto() {
@@ -461,6 +504,44 @@ mod tests {
         let body: ClaimKeyPackageRequest =
             serde_json::from_value(request.json.expect("json")).expect("claim request");
         assert_eq!(body.owner.as_slice(), b"alice");
+    }
+
+    #[test]
+    fn claim_welcomes_command_builds_claim_request() {
+        let request = prepare_http_request([
+            "claim-welcomes",
+            "--recipient",
+            "bob-device",
+            "--limit",
+            "3",
+        ])
+        .expect("request");
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/claim");
+        let body: ClaimWelcomesRequest =
+            serde_json::from_value(request.json.expect("json")).expect("claim welcomes request");
+        assert_eq!(body.recipient.as_slice(), b"bob-device");
+        assert_eq!(body.limit, 3);
+    }
+
+    #[test]
+    fn ack_welcome_command_builds_ack_request() {
+        let request = prepare_http_request([
+            "ack-welcome",
+            "--message-id",
+            "welcome-bob",
+            "--activated",
+            "true",
+        ])
+        .expect("request");
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/ack");
+        let body: AckWelcomeRequest =
+            serde_json::from_value(request.json.expect("json")).expect("ack welcome request");
+        assert_eq!(body.message_id.as_slice(), b"welcome-bob");
+        assert!(body.activated);
     }
 
     #[test]

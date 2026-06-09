@@ -7,19 +7,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cgka_traits::{GroupId, MemberId};
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::{GroupId, MemberId, MessageId};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use transport_http_server::{
     HttpClaimedKeyPackage, HttpDeliveryService, HttpKeyPackagePublication, HttpPublishReceipt,
-    HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
+    HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerState {
     service: Arc<Mutex<HttpDeliveryService>>,
     publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
+    welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
 
@@ -28,6 +30,7 @@ impl HttpServerState {
         Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
+            welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
     }
@@ -39,9 +42,11 @@ impl HttpServerState {
             replay_operation(&mut service, operation)?;
         }
         let publish_idempotency = store.load_publish_idempotency()?;
+        let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
+            welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
     }
@@ -119,6 +124,92 @@ impl HttpServerState {
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
     }
+
+    fn claim_welcomes(
+        &self,
+        request: ClaimWelcomesRequest,
+    ) -> Result<Vec<HttpClaimedWelcome>, ServerHttpError> {
+        if request.limit == 0 || request.limit > MAX_HTTP_SYNC_PAGE_ENTRIES {
+            return Err(ServerHttpError::InvalidWelcomeClaimLimit {
+                actual: request.limit,
+                max: MAX_HTTP_SYNC_PAGE_ENTRIES,
+            });
+        }
+
+        let service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut claims = self
+            .welcome_claims
+            .lock()
+            .expect("HTTP welcome claims mutex");
+        let mut claimed = Vec::new();
+        let mut after_seq = 0;
+        loop {
+            let page =
+                service.sync_inbox(&request.recipient, after_seq, MAX_HTTP_SYNC_PAGE_ENTRIES)?;
+            for entry in page.entries {
+                if claimed.len() >= request.limit {
+                    break;
+                }
+                if !matches!(entry.message.envelope, TransportEnvelope::Welcome { .. }) {
+                    continue;
+                }
+                if claims.contains_key(&entry.message.id) {
+                    continue;
+                }
+                let record = WelcomeClaimRecord {
+                    recipient: request.recipient.clone(),
+                    seq: entry.seq,
+                    message: entry.message,
+                    state: WelcomeClaimState::Claimed,
+                };
+                if let Some(store) = &self.store {
+                    store.upsert_welcome_claim(&record)?;
+                }
+                claims.insert(record.message.id.clone(), record.clone());
+                claimed.push(record.into_claimed_welcome());
+            }
+            if claimed.len() >= request.limit || !page.has_more {
+                break;
+            }
+            after_seq = page.next_after_seq;
+        }
+        Ok(claimed)
+    }
+
+    fn ack_welcome(
+        &self,
+        request: AckWelcomeRequest,
+    ) -> Result<AckWelcomeResponse, ServerHttpError> {
+        let mut claims = self
+            .welcome_claims
+            .lock()
+            .expect("HTTP welcome claims mutex");
+        let Some(record) = claims.get_mut(&request.message_id) else {
+            return Err(ServerHttpError::WelcomeNotFound {
+                message_id: request.message_id,
+            });
+        };
+        let terminal_state = if request.activated {
+            WelcomeClaimState::Acked
+        } else {
+            WelcomeClaimState::Failed
+        };
+        match (record.state, terminal_state) {
+            (WelcomeClaimState::Claimed, _) => {
+                record.state = terminal_state;
+                if let Some(store) = &self.store {
+                    store.upsert_welcome_claim(record)?;
+                }
+                Ok(AckWelcomeResponse { acked: true })
+            }
+            (current, wanted) if current == wanted => Ok(AckWelcomeResponse { acked: true }),
+            (current, wanted) => Err(ServerHttpError::WelcomeAckConflict {
+                message_id: request.message_id,
+                current,
+                wanted,
+            }),
+        }
+    }
 }
 
 pub fn http_router(state: HttpServerState) -> Router {
@@ -129,6 +220,8 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/sync/inbox", post(sync_inbox))
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/claim", post(claim_key_package))
+        .route("/welcomes/claim", post(claim_welcomes))
+        .route("/welcomes/ack", post(ack_welcome))
         .with_state(state)
 }
 
@@ -162,6 +255,29 @@ pub struct InboxSyncRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimWelcomesRequest {
+    pub recipient: MemberId,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpClaimedWelcome {
+    pub seq: HttpSequence,
+    pub message: TransportMessage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckWelcomeRequest {
+    pub message_id: MessageId,
+    pub activated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckWelcomeResponse {
+    pub acked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +353,22 @@ async fn claim_key_package(
     Ok(Json(claimed))
 }
 
+async fn claim_welcomes(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ClaimWelcomesRequest>,
+) -> Result<Json<Vec<HttpClaimedWelcome>>, ServerHttpError> {
+    let claimed = state.claim_welcomes(request)?;
+    Ok(Json(claimed))
+}
+
+async fn ack_welcome(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AckWelcomeRequest>,
+) -> Result<Json<AckWelcomeResponse>, ServerHttpError> {
+    let acked = state.ack_welcome(request)?;
+    Ok(Json(acked))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum PersistedOperation {
     PublishMessage {
@@ -284,6 +416,30 @@ struct PublishIdempotencyRecord {
     receipt: HttpPublishReceipt,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct WelcomeClaimRecord {
+    recipient: MemberId,
+    seq: HttpSequence,
+    message: TransportMessage,
+    state: WelcomeClaimState,
+}
+
+impl WelcomeClaimRecord {
+    fn into_claimed_welcome(self) -> HttpClaimedWelcome {
+        HttpClaimedWelcome {
+            seq: self.seq,
+            message: self.message,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WelcomeClaimState {
+    Claimed,
+    Acked,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 struct SqliteHttpDeliveryStore {
     path: Arc<PathBuf>,
@@ -305,6 +461,13 @@ impl SqliteHttpDeliveryStore {
                 idempotency_key TEXT PRIMARY KEY,
                 fingerprint_json TEXT NOT NULL,
                 receipt_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_welcome_claims (
+                message_id_json TEXT PRIMARY KEY,
+                recipient_json TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                message_json TEXT NOT NULL,
+                state_json TEXT NOT NULL
             );",
         )?;
         Ok(store)
@@ -391,6 +554,66 @@ impl SqliteHttpDeliveryStore {
         Ok(idempotency)
     }
 
+    fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_welcome_claims (
+                message_id_json,
+                recipient_json,
+                seq,
+                message_json,
+                state_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(message_id_json) DO UPDATE SET
+                recipient_json = excluded.recipient_json,
+                seq = excluded.seq,
+                message_json = excluded.message_json,
+                state_json = excluded.state_json",
+            params![
+                serde_json::to_string(&record.message.id)?,
+                serde_json::to_string(&record.recipient)?,
+                record.seq,
+                serde_json::to_string(&record.message)?,
+                serde_json::to_string(&record.state)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_welcome_claims(
+        &self,
+    ) -> Result<HashMap<MessageId, WelcomeClaimRecord>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT message_id_json, recipient_json, seq, message_json, state_json
+             FROM http_welcome_claims",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut claims = HashMap::new();
+        for row in rows {
+            let (message_id_json, recipient_json, seq, message_json, state_json) = row?;
+            let message_id = serde_json::from_str(&message_id_json)?;
+            claims.insert(
+                message_id,
+                WelcomeClaimRecord {
+                    recipient: serde_json::from_str(&recipient_json)?,
+                    seq,
+                    message: serde_json::from_str(&message_json)?,
+                    state: serde_json::from_str(&state_json)?,
+                },
+            );
+        }
+        Ok(claims)
+    }
+
     fn connection(&self) -> Result<Connection, rusqlite::Error> {
         Connection::open(&*self.path)
     }
@@ -429,9 +652,23 @@ pub enum DurableStoreError {
 #[derive(Debug)]
 pub enum ServerHttpError {
     Delivery(HttpServerError),
-    IdempotencyConflict { idempotency_key: String },
+    IdempotencyConflict {
+        idempotency_key: String,
+    },
     InvalidIdempotencyKey,
+    InvalidWelcomeClaimLimit {
+        actual: usize,
+        max: usize,
+    },
     Store(DurableStoreError),
+    WelcomeAckConflict {
+        message_id: MessageId,
+        current: WelcomeClaimState,
+        wanted: WelcomeClaimState,
+    },
+    WelcomeNotFound {
+        message_id: MessageId,
+    },
 }
 
 impl From<HttpServerError> for ServerHttpError {
@@ -468,6 +705,25 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_idempotency_key".to_owned(),
                 "idempotency key must not be empty".to_owned(),
+            ),
+            Self::InvalidWelcomeClaimLimit { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_welcome_claim_limit".to_owned(),
+                format!("welcome claim limit must be between 1 and {max}, got {actual}"),
+            ),
+            Self::WelcomeAckConflict {
+                message_id,
+                current,
+                wanted,
+            } => (
+                StatusCode::CONFLICT,
+                "welcome_ack_conflict".to_owned(),
+                format!("welcome {message_id} is already {current:?}; cannot ack as {wanted:?}"),
+            ),
+            Self::WelcomeNotFound { message_id } => (
+                StatusCode::NOT_FOUND,
+                "welcome_not_found".to_owned(),
+                format!("welcome {message_id} was not claimed"),
             ),
         };
         let body = ErrorResponse { kind, error };

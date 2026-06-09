@@ -57,6 +57,9 @@ Python test distribution:
 - The HTTP `/messages` route now accepts an optional idempotency key. Matching
   retries replay the original receipt after restart, and same-key retries with
   a different target/message conflict without appending a second delivery.
+- The HTTP Welcome wrapper can claim Welcome inbox messages, hide already
+  claimed messages from duplicate claims, and persist activated or failed ack
+  terminal state across restart.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -76,6 +79,8 @@ Python test distribution:
 - Public server DTO polish, auth, rate limits, and additional idempotency
   wrappers around the HTTP delivery service core, as long as the underlying
   state transition already exists.
+- Welcome claim/ack recovery for the HTTP delivery surface. This is route/store
+  wrapper state over Darkmatter Welcome inbox messages, not a Darkmatter fork.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the spike cannot drift, but that is not the
   right long-term crate boundary.
@@ -84,8 +89,6 @@ Python test distribution:
 
 ## Thick Or Wonky Logic
 
-- Durable Welcome claim/ack recovery. Finite tests require claimed Welcome bytes
-  and ratchet-tree material to survive restart before activation and ack.
 - Later-device fanout into existing rooms. Finite tests require distinct
   KeyPackages per room, persistent fanout plans, response-loss retry, and
   reprepare after same-epoch loss.
@@ -136,7 +139,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `11`
+- Route/store/engine tests added so far: `13`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -151,6 +154,9 @@ Additional HTTP route checkpoint:
   - idempotent `/messages` retry replays the original receipt after restart
   - same idempotency key with a different target/message conflicts without a
     second append
+  - claimed Welcome inbox messages are not claimed twice before ack
+  - activated Welcome ack is idempotent after restart
+  - failed Welcome ack is terminal after restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -166,6 +172,12 @@ Additional HTTP route checkpoint:
     `duplicate:false`
   - publishing a different target/message with the same key returned
     `409 idempotency_conflict`
+- Live Welcome claim/ack smoke verified with a temporary SQLite file on
+  `127.0.0.1:18790`:
+  - `publish-inbox` stored a Welcome message for `live-welcome-recipient`
+  - first `claim-welcomes` returned the Welcome, duplicate `claim-welcomes`
+    returned `[]`
+  - `ack-welcome --activated true` returned `{"acked":true}`
 
 Important test caveat:
 
@@ -178,13 +190,14 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `5`
+- New CLI tests added: `7`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
   - group sync defaults to `after_seq = 0` and `limit = 50`
   - KeyPackage claim builds the route DTO
+  - Welcome claim and ack build the route DTOs
   - unknown CLI flags fail as usage errors
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 health`
@@ -204,5 +217,5 @@ Dependency note:
   in Darkmatter proper.
 
 Next meaningful gate: move selected copied server reducer scenarios onto the
-Darkmatter HTTP route/store boundary, starting with Welcome claim/ack recovery
-and later-device fanout.
+Darkmatter HTTP route/store boundary, starting with later-device fanout and
+device-scoped KeyPackage ownership.
