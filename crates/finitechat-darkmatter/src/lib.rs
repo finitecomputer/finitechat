@@ -163,7 +163,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_room_membership_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, and typed rooms reject raw plain commits without membership deltas",
+            evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, removed devices can sync through their removal but not later entries after restart, stale removed devices cannot send events or commits, and typed rooms reject raw plain commits without membership deltas",
         },
         PortFinding {
             area: "http_invalid_commit_repair_state",

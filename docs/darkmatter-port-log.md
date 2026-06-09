@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `361`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `362`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 19 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 33 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 34 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -76,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `369` (`361` Rust, `8` Python)
+- Port parsed tests: `370` (`362` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `75`
+- Port-only test names: `76`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +90,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 19 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 39 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 40 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -130,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `75` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `76` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -150,7 +150,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 19 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 39 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 40 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -196,6 +196,11 @@ publish and single-owner claim, skips revoked owners in batch KeyPackage claim
 without consuming inventory, rejects revoked Welcome claim and activated ack,
 rejects revoked typed application-event and commit senders, and rejects typed
 commits that try to add a revoked device.
+
+Current room-membership removal progress: the HTTP server now persists removal
+intervals across restart. A removed device can sync the commit that removes it,
+cannot send later typed events or commits, and later requester-filtered sync
+advances over hidden post-removal messages without exposing them.
 
 Current typed-event progress: the HTTP `/events` route now preserves stricter
 Finite typed-event semantics above the looser Darkmatter transport duplicate
@@ -341,6 +346,9 @@ Fork-only requirements beyond the current HTTP branch:
   intervals from typed bootstrap, typed `/commits`, and activated Welcome acks,
   persist them, filter group sync pages by requester, and reject typed
   application events or tracked typed commits from pending/unacked devices.
+  It now also persists removal intervals across restart so removed devices can
+  sync through their removal commit, cannot send later events or commits, and
+  advance cursors over hidden post-removal entries without seeing them.
   Typed `/commits` publish a `FiniteAccountRoomCommitProjection` payload, and
   raw `/messages` commit imports for typed rooms must carry the same projection
   wrapper; plain raw commits are rejected before append instead of weakening
@@ -571,7 +579,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `39`
+- Route/store/engine tests added so far: `40`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -638,6 +646,9 @@ Additional HTTP route checkpoint:
     after typed commits, rejects pending typed application events and tracked
     pending typed commits, and accepts typed application events after Welcome
     activation survives restart
+  - removed-device membership intervals survive restart; removed devices can
+    sync through their removal commit, cannot send later typed events or
+    commits, and advance cursors over hidden post-removal messages
   - typed `/events` rejects oversized application payloads before durable
     append, replays exact idempotent responses after restart, rejects duplicate
     typed event message ids submitted with new idempotency keys, and leaves the
@@ -770,6 +781,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_rejects_oversized_payload_without_persisting_log`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_conflicts`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http`: pass
@@ -866,6 +878,10 @@ Runtime delivery checkpoint:
   `finitechat-client` and `finitechat-cli` no longer depend on
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
+- Removed-device sync is now proven over the HTTP wrapper and SQLite rebuild:
+  removed devices can pull their own removal commit, cannot send later typed
+  events or commits, and requester-filtered sync advances over hidden
+  post-removal messages without exposing them.
 - Revoked-device status is now proven over the HTTP wrapper and SQLite rebuild:
   it blocks KeyPackage publish/claim, Welcome claim/activation, typed event and
   commit senders, and typed commits that add a revoked device while preserving
