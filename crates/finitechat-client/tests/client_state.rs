@@ -2,7 +2,9 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use cgka_traits::MemberId;
+use cgka_traits::MessageId as DarkmatterMessageId;
 use cgka_traits::engine::KeyPackage as DarkmatterKeyPackage;
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
     LinkFanoutRoomPlan, LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions,
@@ -16,18 +18,22 @@ use finitechat_engine::{
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE, ProtocolLimitError,
-    WelcomeState,
+    DeviceRef, KeyPackageState, LogEntryKind, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_WELCOME_CLAIMS_PER_REQUEST, ProtocolLimitError, WelcomeState,
 };
 use finitechat_server::{
+    AckWelcomeRequest, AckWelcomeResponse, ClaimWelcomesRequest, HttpClaimedWelcome,
     HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
-    PublishKeyPackageResponse, http_router,
+    PublishKeyPackageResponse, PublishMessageRequest, http_router,
 };
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
-use transport_http_server::{HttpKeyPackageId, HttpKeyPackagePublication};
+use transport_http_server::{
+    HTTP_SERVER_SOURCE, HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt,
+    HttpPublishTarget,
+};
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -1852,6 +1858,77 @@ fn runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_welcome_worker");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_welcome_sender");
+    let mut source_server = DeliveryService::new();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+    alice_store.save_device_state(&alice).unwrap();
+
+    source_server
+        .create_or_get_direct_room(bob.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            alice.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    bob.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    source_server
+        .upload_key_package(
+            alice
+                .upload_key_package_request("kp_http_welcome_alice")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = source_server
+        .claim_key_package_for_device(alice.device_ref())
+        .unwrap()
+        .expect("alice package");
+    let prepared = bob
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_http_runtime_alice",
+            "commit_http_runtime_alice",
+        )
+        .unwrap();
+    let accepted = source_server.submit_commit(prepared.request).unwrap();
+    let welcome = source_server
+        .welcome("welcome_http_runtime_alice")
+        .expect("released welcome")
+        .clone();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    delivery.publish_welcome_record(&welcome).unwrap();
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(report.uploaded_key_packages, 0);
+    assert_eq!(report.claimed_welcomes, 1);
+    assert_eq!(report.activated_welcome_acks_sent, 1);
+    assert_eq!(alice.group_epoch(ROOM_ID).unwrap(), 1);
+    assert_eq!(alice.last_applied_seq(ROOM_ID).unwrap(), accepted.seq);
+    assert_eq!(alice.pending_welcome_count(), 0);
+    assert_eq!(alice.pending_welcome_ack_count(), 0);
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(replay.claimed_welcomes, 0);
+    assert_eq!(replay.activated_welcome_acks_sent, 0);
+    delivery
+        .ack_welcome("welcome_http_runtime_alice", true)
+        .unwrap();
+}
+
+#[test]
 fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let dir = tempfile::tempdir().unwrap();
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
@@ -3572,6 +3649,14 @@ enum HttpRuntimeDeliveryError {
     Json(String),
     HttpStatus(StatusCode, String),
     Router(String),
+    WelcomeIdMismatch {
+        message_id: Vec<u8>,
+        welcome_id: String,
+    },
+    WelcomeRecipientMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
     Unsupported(&'static str),
 }
 
@@ -3621,6 +3706,30 @@ impl HttpRuntimeDelivery {
             serde_json::from_slice(&bytes)
                 .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
         })
+    }
+
+    fn publish_welcome_record(
+        &self,
+        welcome: &WelcomeRecord,
+    ) -> Result<(), HttpRuntimeDeliveryError> {
+        let recipient = member_id_for_device(&welcome.recipient)?;
+        let request = PublishMessageRequest {
+            target: HttpPublishTarget::Inbox {
+                recipient: recipient.clone(),
+            },
+            message: TransportMessage {
+                id: DarkmatterMessageId::new(welcome.welcome_id.as_bytes().to_vec()),
+                payload: serde_json::to_vec(welcome)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+                timestamp: Timestamp(0),
+                causal_deps: Vec::new(),
+                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+                envelope: TransportEnvelope::Welcome { recipient },
+            },
+            idempotency_key: Some(format!("welcome:{}", welcome.welcome_id)),
+        };
+        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
+        Ok(())
     }
 }
 
@@ -3676,11 +3785,45 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
         Err(HttpRuntimeDeliveryError::Unsupported("list_account_rooms"))
     }
 
-    fn claim_welcomes(&mut self, _device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
-        Ok(Vec::new())
+    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
+        let claimed: Vec<HttpClaimedWelcome> = self.post_json(
+            "/welcomes/claim",
+            &ClaimWelcomesRequest {
+                recipient: member_id_for_device(device)?,
+                limit: MAX_WELCOME_CLAIMS_PER_REQUEST as usize,
+            },
+        )?;
+        claimed
+            .into_iter()
+            .map(|claim| {
+                let mut welcome: WelcomeRecord = serde_json::from_slice(&claim.message.payload)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+                if claim.message.id.as_slice() != welcome.welcome_id.as_bytes() {
+                    return Err(HttpRuntimeDeliveryError::WelcomeIdMismatch {
+                        message_id: claim.message.id.as_slice().to_vec(),
+                        welcome_id: welcome.welcome_id,
+                    });
+                }
+                if welcome.recipient != *device {
+                    return Err(HttpRuntimeDeliveryError::WelcomeRecipientMismatch {
+                        expected: device.clone(),
+                        actual: welcome.recipient,
+                    });
+                }
+                welcome.state = WelcomeState::Claimed;
+                Ok(welcome)
+            })
+            .collect()
     }
 
-    fn ack_welcome(&mut self, _welcome_id: &str, _activated: bool) -> Result<(), Self::Error> {
+    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
+        let _: AckWelcomeResponse = self.post_json(
+            "/welcomes/ack",
+            &AckWelcomeRequest {
+                message_id: DarkmatterMessageId::new(welcome_id.as_bytes().to_vec()),
+                activated,
+            },
+        )?;
         Ok(())
     }
 
