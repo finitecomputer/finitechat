@@ -30,8 +30,9 @@ pub use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MembershipAddV1,
-    MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
+    DeviceRef, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MembershipAddV1, MembershipDeltaV1, RoomLogEntry,
+    RoomStatus, WelcomeState,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,7 @@ impl HttpServerState {
         }
 
         let mut candidate = service.clone();
+        ensure_publish_idempotency_capacity(&idempotency, &request)?;
         let receipt = candidate.publish(request.target.clone(), request.message.clone())?;
         let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
             target: request.target,
@@ -220,6 +222,7 @@ impl HttpServerState {
 
         let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
         let mut candidate = service.clone();
+        ensure_publish_idempotency_capacity(&idempotency, &request)?;
         let receipt = match candidate.publish(request.target.clone(), request.message.clone()) {
             Ok(receipt) => receipt,
             Err(HttpServerError::ConflictingMessageId { .. }) => {
@@ -2171,6 +2174,42 @@ struct PublishIdempotencyRecord {
     receipt: HttpPublishReceipt,
 }
 
+fn ensure_publish_idempotency_capacity(
+    idempotency: &HashMap<String, PublishIdempotencyRecord>,
+    request: &PublishMessageRequest,
+) -> Result<(), ServerHttpError> {
+    let fingerprint = PublishMessageFingerprint::from_request(request);
+    let Some((room_id, sender)) = publish_idempotency_scope(&fingerprint) else {
+        return Ok(());
+    };
+    let records = idempotency
+        .values()
+        .filter_map(|record| publish_idempotency_scope(&record.fingerprint))
+        .filter(|(record_room_id, record_sender)| {
+            record_room_id == &room_id && record_sender == &sender
+        })
+        .count();
+    if records < MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE as usize {
+        Ok(())
+    } else {
+        Err(ServerHttpError::IdempotencyCapacityExceeded {
+            room_id,
+            sender,
+            max_records: MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+        })
+    }
+}
+
+fn publish_idempotency_scope(
+    fingerprint: &PublishMessageFingerprint,
+) -> Option<(String, DeviceRef)> {
+    if !matches!(&fingerprint.target, HttpPublishTarget::Group { .. }) {
+        return None;
+    }
+    let entry = room_log_entry_from_payload(&fingerprint.message.payload)?;
+    Some((entry.room_id, entry.sender))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct KeyPackageClaimFingerprint {
     owners: Vec<MemberId>,
@@ -2909,6 +2948,7 @@ fn publish_request_to_candidate(
         }
         return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
     }
+    ensure_publish_idempotency_capacity(idempotency, &request)?;
 
     let receipt = service.publish(request.target.clone(), request.message.clone())?;
     let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
@@ -3877,6 +3917,11 @@ pub enum ServerHttpError {
         idempotency_key: String,
     },
     InvalidIdempotencyKey,
+    IdempotencyCapacityExceeded {
+        room_id: String,
+        sender: DeviceRef,
+        max_records: u32,
+    },
     InvalidKeyPackageClaimBatch {
         actual: usize,
         max: usize,
@@ -4023,6 +4068,17 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_idempotency_key".to_owned(),
                 "idempotency key must not be empty".to_owned(),
+            ),
+            Self::IdempotencyCapacityExceeded {
+                room_id,
+                sender,
+                max_records,
+            } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "idempotency_capacity_exceeded".to_owned(),
+                format!(
+                    "idempotency capacity exceeded for room {room_id} and sender {sender:?}: max {max_records}"
+                ),
             ),
             Self::InvalidKeyPackageClaimBatch { actual, max } => (
                 StatusCode::BAD_REQUEST,

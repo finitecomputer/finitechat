@@ -186,6 +186,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server /events accepts typed AppendEventRequest payloads, rejects pending tracked senders and oversized payloads before durable append, preserves exact idempotent replay across restart, rejects duplicate typed message ids with new idempotency keys, publishes plain RoomLogEntry payloads, and persists the room head across restart",
         },
         PortFinding {
+            area: "http_scoped_idempotency_capacity",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server derives typed publish idempotency scope from RoomLogEntry payloads, rejects fresh per-room/per-sender overflow, and still replays existing typed /events responses across SQLite restart",
+        },
+        PortFinding {
             area: "http_ephemeral_activity_cache",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server accepts opaque ephemeral activity over HTTP for active members, rejects pending, revoked, wrong-epoch, and expired activity, caps per-route volatile cache entries, and does not append durable group messages or persist activity across SQLite restart",

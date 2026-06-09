@@ -23,8 +23,9 @@ use finitechat_http::{
 };
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, RoomStatus, StagedWelcomeV1,
+    WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -2503,6 +2504,104 @@ async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_confli
 }
 
 #[tokio::test]
+async fn sqlite_typed_event_idempotency_capacity_rejects_new_keys_but_replays_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-event-idempotency-capacity".to_owned();
+    let mls_group_id = "mls-event-idempotency-capacity".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(app);
+    for index in 0..(MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE - 1) {
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            format!("seeded-capacity-event-{index}").as_bytes(),
+            &format!("seeded-capacity-event-{index}"),
+        );
+        let message_id = request.envelope.message_id().expect("seeded message id");
+        let publish = event_publish_request_for_test(&request, &message_id);
+        insert_durable_publish_idempotency_only(&db_path, &publish, u64::from(index) + 1);
+    }
+
+    let app = persistent_app(&db_path);
+    let final_request = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        b"capacity-event-final",
+        "capacity-event-final",
+    );
+    let response = post_json(app.clone(), "/events", &final_request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let final_accepted: EventAccepted = read_json(response).await;
+    assert_eq!(final_accepted.seq, 1);
+
+    let overflow_request = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        b"capacity-event-overflow",
+        "capacity-event-overflow",
+    );
+    let response = post_json(app.clone(), "/events", &overflow_request).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "idempotency_capacity_exceeded");
+
+    let response = post_json(app.clone(), "/events", &final_request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: EventAccepted = read_json(response).await;
+    assert_eq!(replayed, final_accepted);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/events", &final_request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed_after_restart: EventAccepted = read_json(response).await;
+    assert_eq!(replayed_after_restart, final_accepted);
+
+    let response = post_json(app.clone(), "/events", &overflow_request).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "idempotency_capacity_exceeded");
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, 1);
+    assert_eq!(page.next_after_seq, 1);
+    assert!(!page.has_more);
+}
+
+#[tokio::test]
 async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -3767,6 +3866,38 @@ fn commit_publish_request_for_test(
     }
 }
 
+fn event_publish_request_for_test(
+    request: &AppendEventRequest,
+    message_id: &str,
+) -> PublishMessageRequest {
+    let transport_group_id = request.room_id.as_bytes().to_vec();
+    let entry = finitechat_proto::RoomLogEntry {
+        room_id: request.room_id.clone(),
+        seq: 0,
+        message_id: message_id.to_owned(),
+        sender: request.sender.clone(),
+        kind: request.envelope.kind,
+        epoch: request.envelope.epoch,
+        envelope: request.envelope.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+    };
+    PublishMessageRequest {
+        target: group_target(group_id(&request.room_id), transport_group_id.clone(), None),
+        message: TransportMessage {
+            id: id(message_id),
+            payload: serde_json::to_vec(&entry).expect("event projection payload"),
+            timestamp: Timestamp(0),
+            causal_deps: Vec::new(),
+            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage { transport_group_id },
+        },
+        idempotency_key: Some(format!(
+            "event:{}:{}",
+            request.room_id, request.idempotency_key
+        )),
+    }
+}
+
 fn insert_durable_commit_publish_without_projection(
     db_path: &std::path::Path,
     request: &PublishMessageRequest,
@@ -3803,6 +3934,40 @@ fn insert_durable_commit_publish_without_projection(
         params!["publish_message", operation_json],
     )
     .expect("insert durable publish operation");
+    conn.execute(
+        "INSERT INTO http_publish_idempotency (
+            idempotency_key,
+            fingerprint_json,
+            receipt_json
+        ) VALUES (?1, ?2, ?3)",
+        params![idempotency_key, fingerprint_json, receipt_json],
+    )
+    .expect("insert durable publish idempotency");
+}
+
+fn insert_durable_publish_idempotency_only(
+    db_path: &std::path::Path,
+    request: &PublishMessageRequest,
+    seq: u64,
+) {
+    let fingerprint_json = serde_json::to_string(&serde_json::json!({
+        "target": &request.target,
+        "message": &request.message,
+    }))
+    .expect("publish fingerprint json");
+    let receipt_json = serde_json::to_string(&HttpPublishReceipt {
+        message_id: request.message.id.clone(),
+        plane: HttpDeliveryPlane::Group,
+        seq,
+        duplicate: false,
+    })
+    .expect("publish receipt json");
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .expect("publish idempotency key");
+
+    let conn = Connection::open(db_path).expect("sqlite connection");
     conn.execute(
         "INSERT INTO http_publish_idempotency (
             idempotency_key,
