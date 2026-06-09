@@ -624,15 +624,17 @@ mod tests {
     use finitechat_engine::{CommitAccepted, SubmitCommitRequest, WelcomeRecord};
     use finitechat_http::{
         AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
-        ClaimWelcomesRequest, GroupSyncRequest, HttpClaimedWelcome, KeyPackageInventoryRequest,
+        ClaimWelcomesRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
+        HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-        PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+        PublishKeyPackageResponse, PublishMessageRequest, SaveAccountRoomRequest,
+        SaveFanoutRoomRequest,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
         WelcomeState,
     };
-    use transport_http_server::HttpSyncPage;
+    use transport_http_server::{HttpDeliveryPlane, HttpPublishReceipt, HttpSyncPage};
 
     #[test]
     fn publish_group_command_builds_route_dto() {
@@ -1144,6 +1146,292 @@ mod tests {
     }
 
     #[test]
+    fn live_cli_publish_sync_and_idempotency_conflict_over_http_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server_db = dir.path().join("cli-live-publish.sqlite3");
+        let server_url = spawn_live_cli_server(&server_db);
+        let group_id = "cli-live-room";
+        let transport_group_id = "cli-live-transport";
+        let message_id = "cli-live-commit-1";
+        let idempotency_key = "cli-live-idempotency";
+
+        let health = run_cli_json(["http", "--server", &server_url, "health"]);
+        assert_eq!(health["status"], "ok");
+
+        let published: HttpPublishReceipt = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "publish-group",
+            "--group-id",
+            group_id,
+            "--transport-group-id",
+            transport_group_id,
+            "--message-id",
+            message_id,
+            "--payload",
+            "commit-bytes",
+            "--commit-epoch",
+            "1",
+            "--idempotency-key",
+            idempotency_key,
+        ]))
+        .expect("publish receipt");
+        assert_eq!(published.message_id.as_slice(), message_id.as_bytes());
+        assert_eq!(published.plane, HttpDeliveryPlane::Group);
+        assert_eq!(published.seq, 1);
+        assert!(!published.duplicate);
+
+        let replayed: HttpPublishReceipt = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "publish-group",
+            "--group-id",
+            group_id,
+            "--transport-group-id",
+            transport_group_id,
+            "--message-id",
+            message_id,
+            "--payload",
+            "commit-bytes",
+            "--commit-epoch",
+            "1",
+            "--idempotency-key",
+            idempotency_key,
+        ]))
+        .expect("replayed publish receipt");
+        assert_eq!(replayed, published);
+
+        let page: HttpSyncPage = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "sync-group",
+            "--group-id",
+            group_id,
+            "--limit",
+            "10",
+        ]))
+        .expect("group page");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].seq, published.seq);
+        assert_eq!(page.entries[0].message.payload, b"commit-bytes");
+
+        let conflict = run(
+            [
+                "http",
+                "--server",
+                &server_url,
+                "publish-group",
+                "--group-id",
+                group_id,
+                "--transport-group-id",
+                transport_group_id,
+                "--message-id",
+                "cli-live-commit-conflict",
+                "--payload",
+                "different-commit",
+                "--commit-epoch",
+                "2",
+                "--idempotency-key",
+                idempotency_key,
+            ],
+            &mut Vec::new(),
+        )
+        .expect_err("conflicting idempotency key fails");
+        assert!(matches!(
+            conflict,
+            CliError::Server {
+                status: reqwest::StatusCode::CONFLICT,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_cli_batch_key_package_claim_replays_over_http_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server_db = dir.path().join("cli-live-key-packages.sqlite3");
+        let server_url = spawn_live_cli_server(&server_db);
+
+        for (owner, key_package_id, bytes) in [
+            ("live-laptop", "live-laptop-1", "laptop-package"),
+            ("live-phone", "live-phone-1", "phone-package-1"),
+            ("live-phone", "live-phone-2", "phone-package-2"),
+        ] {
+            let response: PublishKeyPackageResponse = serde_json::from_value(run_cli_json([
+                "http",
+                "--server",
+                &server_url,
+                "publish-key-package",
+                "--owner",
+                owner,
+                "--key-package-id",
+                key_package_id,
+                "--bytes",
+                bytes,
+            ]))
+            .expect("publish package response");
+            assert!(response.published);
+        }
+
+        let claims: Vec<HttpKeyPackageClaim> = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "claim-key-packages",
+            "--owner",
+            "live-laptop",
+            "--owner",
+            "live-phone",
+            "--idempotency-key",
+            "live-batch-claim",
+        ]))
+        .expect("batch claims");
+        assert_eq!(claims.len(), 2);
+        assert_claimed_package(&claims[0], "live-laptop", "live-laptop-1");
+        assert_claimed_package(&claims[1], "live-phone", "live-phone-1");
+
+        let replayed: Vec<HttpKeyPackageClaim> = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "claim-key-packages",
+            "--owner",
+            "live-laptop",
+            "--owner",
+            "live-phone",
+            "--idempotency-key",
+            "live-batch-claim",
+        ]))
+        .expect("batch claim replay");
+        assert_eq!(replayed, claims);
+
+        let remaining: transport_http_server::HttpClaimedKeyPackage =
+            serde_json::from_value(run_cli_json([
+                "http",
+                "--server",
+                &server_url,
+                "claim-key-package",
+                "--owner",
+                "live-phone",
+            ]))
+            .expect("remaining phone package");
+        assert_eq!(remaining.key_package_id.as_slice(), b"live-phone-2");
+        assert_eq!(remaining.owner.as_slice(), b"live-phone");
+    }
+
+    #[test]
+    fn live_cli_fanout_checkpoint_flow_over_http_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server_db = dir.path().join("cli-live-fanout.sqlite3");
+        let server_url = spawn_live_cli_server(&server_db);
+
+        let saved: HttpFanoutPlan = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "fanout-save-room",
+            "--fanout-id",
+            "live-fanout",
+            "--target-owner",
+            "live-phone",
+            "--room-id",
+            "live-room",
+            "--key-package-id",
+            "live-kp-1",
+            "--welcome-id",
+            "live-welcome-1",
+            "--commit-idempotency-key",
+            "live-commit-key",
+            "--claimed-key-package-id",
+            "live-kp-1",
+        ]))
+        .expect("saved fanout");
+        assert_eq!(saved.fanout_id, "live-fanout");
+        assert_eq!(saved.rooms.len(), 1);
+        assert!(matches!(
+            saved.rooms[0].status,
+            HttpFanoutRoomStatus::Pending
+        ));
+
+        let prepared: HttpFanoutPlan = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "fanout-mark-prepared",
+            "--fanout-id",
+            "live-fanout",
+            "--room-id",
+            "live-room",
+            "--message-id",
+            "live-commit-loser",
+        ]))
+        .expect("prepared fanout");
+        assert!(matches!(
+            prepared.rooms[0].status,
+            HttpFanoutRoomStatus::Prepared {
+                ref prepared_message_id
+            } if prepared_message_id.as_slice() == b"live-commit-loser"
+        ));
+
+        let reprepared: HttpFanoutPlan = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "fanout-mark-prepared",
+            "--fanout-id",
+            "live-fanout",
+            "--room-id",
+            "live-room",
+            "--message-id",
+            "live-commit-retry",
+        ]))
+        .expect("reprepared fanout");
+        assert!(matches!(
+            reprepared.rooms[0].status,
+            HttpFanoutRoomStatus::Prepared {
+                ref prepared_message_id
+            } if prepared_message_id.as_slice() == b"live-commit-retry"
+        ));
+
+        let done: HttpFanoutPlan = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "fanout-mark-done",
+            "--fanout-id",
+            "live-fanout",
+            "--room-id",
+            "live-room",
+            "--message-id",
+            "live-commit-retry",
+            "--accepted-seq",
+            "12",
+        ]))
+        .expect("done fanout");
+        assert!(matches!(
+            done.rooms[0].status,
+            HttpFanoutRoomStatus::Done {
+                ref prepared_message_id,
+                accepted_seq: 12,
+            } if prepared_message_id.as_slice() == b"live-commit-retry"
+        ));
+
+        let loaded: HttpFanoutPlan = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "fanout-get",
+            "--fanout-id",
+            "live-fanout",
+        ]))
+        .expect("loaded fanout");
+        assert_eq!(loaded, done);
+    }
+
+    #[test]
     fn unknown_option_is_usage_error() {
         let error = prepare_http_request(["health", "--wat"]).expect_err("usage error");
         assert!(matches!(error, CliError::Usage(_)));
@@ -1193,6 +1481,13 @@ mod tests {
 
     fn member_for_device(device: &DeviceRef) -> MemberId {
         MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+    }
+
+    fn assert_claimed_package(claim: &HttpKeyPackageClaim, owner: &str, key_package_id: &str) {
+        assert_eq!(claim.owner.as_slice(), owner.as_bytes());
+        let claimed = claim.claimed.as_ref().expect("claimed package");
+        assert_eq!(claimed.owner.as_slice(), owner.as_bytes());
+        assert_eq!(claimed.key_package_id.as_slice(), key_package_id.as_bytes());
     }
 
     fn submit_add_device_request(

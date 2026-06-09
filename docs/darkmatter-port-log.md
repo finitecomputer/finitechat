@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `343`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `346`
 - Python Hermes adapter tests: `7`
 
 Copied/application Rust test distribution:
@@ -41,7 +41,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 
 | File | Count |
 | --- | ---: |
-| `crates/finitechat-cli/src/lib.rs` | 14 |
+| `crates/finitechat-cli/src/lib.rs` | 17 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
 | `crates/finitechat-server/tests/http_persistence.rs` | 20 |
@@ -413,7 +413,7 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `14`
+- New CLI tests added: `17`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
@@ -434,6 +434,11 @@ Additional CLI checkpoint:
   duplicate claim hiding, idempotent activated ack, conflicting failed ack
   rejection, and account-room activation through `finitechat_cli::run`
   against a localhost Axum server.
+- Additional automated live-server CLI coverage now drives health, persistent
+  group publish/sync, matching idempotent publish replay, conflicting
+  idempotency-key rejection, batch KeyPackage claim replay, direct claim of the
+  remaining package, and fanout save/prepared/reprepare/done/get checkpoints
+  through `finitechat_cli::run` against a localhost Axum server.
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 health`
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 publish-group --group-id cli-room --transport-group-id cli-transport --message-id cli-commit-1 --payload commit-bytes --commit-epoch 1`
@@ -543,6 +548,7 @@ Runtime delivery checkpoint:
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
 
-Next meaningful gate: automate the remaining manually documented live CLI smoke
-paths for persistent publish/sync, idempotency conflict, batch KeyPackage
-claim, and fanout checkpoints.
+Next meaningful gate: add a process-level smoke that starts the
+`finitechat-darkmatter-server` binary with a temporary SQLite file and drives
+the `finitechat-darkmatter` CLI binary against it, not only the library-level
+CLI runner.
