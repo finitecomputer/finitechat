@@ -56,6 +56,47 @@ Python test distribution:
 | `tests/hermes/test_finite_platform_adapter.py` | 7 |
 | `tests/test_process_binary_smoke.py` | 1 |
 
+## Test Suite Parity Audit
+
+Audit state:
+
+- Port code state audited: `codex/darkmatter-port` at `1cf257b` before this
+  documentation-only audit update
+- Baseline checkout: `/Users/futurepaul/dev/finite/finitechat`,
+  `marmot-investigation` at `7e8048d`
+- Baseline untracked docs were ignored because they are outside `crates/` and
+  `tests/`.
+- Method: compare parsed test keys by relative path, language, and test name.
+  Rust tests were parsed from `#[test]` / `#[tokio::test]` attributes and the
+  following `fn`; Python tests were parsed from `def test_*`.
+
+Parity result:
+
+- Baseline test-bearing files: `12`
+- Port test-bearing files: `18`
+- Baseline parsed tests: `294` (`287` Rust, `7` Python)
+- Port parsed tests: `354` (`346` Rust, `8` Python)
+- Missing baseline test names in the port: `0`
+- Port-only test names: `60`
+- Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
+  The baseline relative paths and test names are preserved; port-only tests
+  add Darkmatter HTTP/CLI/runtime/process coverage around them.
+
+Port-only test buckets:
+
+| Bucket | Count | Files |
+| --- | ---: | --- |
+| HTTP CLI request/live-server coverage | 17 | `crates/finitechat-cli/src/lib.rs` |
+| Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
+| Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 26 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
+
+Conclusion: the port currently preserves the full baseline test-name surface and
+adds Darkmatter-specific coverage. This audit does not prove every baseline test
+body is byte-identical or that every product workflow is now driven only through
+process binaries; those are tracked separately below.
+
 ## What Works Out Of The Box
 
 - Darkmatter's HTTP delivery service core can sequence opaque group
@@ -562,7 +603,7 @@ Runtime delivery checkpoint:
   `finitechat-darkmatter-server` binary with a temporary SQLite file and drives
   the `finitechat-darkmatter` CLI binary against it, not only the library-level
   CLI runner.
-- [ ] Run a test-suite parity audit against the baseline
+- [x] Run a test-suite parity audit against the baseline
   `/Users/futurepaul/dev/finite/finitechat` checkout: compare test files and
   test names, then document every intentionally reshaped, added, or still
   missing acceptance case.
