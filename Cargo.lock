@@ -665,6 +665,7 @@ version = "0.1.0"
 dependencies = [
  "cgka-traits",
  "finitechat-darkmatter",
+ "finitechat-proto",
  "finitechat-server",
  "reqwest",
  "serde",

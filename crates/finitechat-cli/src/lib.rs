@@ -3,12 +3,13 @@ use std::io::Write;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use finitechat_proto::DeviceRef;
 use finitechat_server::{
-    AckWelcomeRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest,
-    GetFanoutRequest, GroupSyncRequest, HttpFanoutRoomPlan, InboxSyncRequest,
-    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
-    SaveFanoutRoomRequest,
+    AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackageRequest,
+    ClaimKeyPackagesRequest, ClaimWelcomesRequest, GetFanoutRequest, GroupSyncRequest,
+    HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
+    PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -129,6 +130,7 @@ where
         "fanout-save-room" => fanout_save_room_request(&server, args),
         "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
         "fanout-mark-done" => fanout_mark_done_request(&server, args),
+        "account-room-bootstrap" => account_room_bootstrap_request(&server, args),
         "account-room-save" => account_room_save_request(&server, args),
         "account-rooms-list" => account_rooms_list_request(&server, args),
         "claim-welcomes" => claim_welcomes_request(&server, args),
@@ -394,6 +396,27 @@ fn account_room_save_request(
     post_json_request(server, "/account-rooms", &request)
 }
 
+fn account_room_bootstrap_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let room_id = required_option(&mut args, "--room-id")?;
+    let mls_group_id = required_option(&mut args, "--mls-group-id")?;
+    let account_id = required_option(&mut args, "--account-id")?;
+    let device_id = required_option(&mut args, "--device-id")?;
+    reject_extra_args(&args)?;
+
+    let request = BootstrapAccountRoomRequest {
+        room_id,
+        mls_group_id,
+        creator: DeviceRef {
+            account_id,
+            device_id,
+        },
+    };
+    post_json_request(server, "/account-rooms/bootstrap", &request)
+}
+
 fn account_rooms_list_request(
     server: &str,
     mut args: Vec<String>,
@@ -579,17 +602,17 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use finitechat_server::{
-        AckWelcomeRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest, GroupSyncRequest,
-        KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest,
-        MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
-        SaveFanoutRoomRequest,
+        AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
+        ClaimWelcomesRequest, GroupSyncRequest, KeyPackageInventoryRequest,
+        ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
+        PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
     };
 
     #[test]
@@ -807,6 +830,32 @@ mod tests {
 
     #[test]
     fn account_room_commands_build_route_dtos() {
+        let bootstrap = prepare_http_request([
+            "account-room-bootstrap",
+            "--room-id",
+            "room-a",
+            "--mls-group-id",
+            "mls-a",
+            "--account-id",
+            "alice",
+            "--device-id",
+            "alice-phone",
+        ])
+        .expect("bootstrap request");
+
+        assert_eq!(bootstrap.method, HttpMethod::Post);
+        assert_eq!(
+            bootstrap.url,
+            "http://127.0.0.1:8787/account-rooms/bootstrap"
+        );
+        let body: BootstrapAccountRoomRequest =
+            serde_json::from_value(bootstrap.json.expect("json"))
+                .expect("account-room bootstrap request");
+        assert_eq!(body.room_id, "room-a");
+        assert_eq!(body.mls_group_id, "mls-a");
+        assert_eq!(body.creator.account_id, "alice");
+        assert_eq!(body.creator.device_id, "alice-phone");
+
         let save = prepare_http_request([
             "account-room-save",
             "--account-id",

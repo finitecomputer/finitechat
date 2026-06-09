@@ -106,6 +106,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_link_fanout_tick can discover persisted opaque account-room records through Darkmatter HTTP routes after server restart when the target device is already current",
         },
         PortFinding {
+            area: "http_account_room_bootstrap_projection",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server can bootstrap the creator's initial active account-room record from typed Finite room metadata and reload it after restart",
+        },
+        PortFinding {
             area: "http_account_room_commit_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server can project accepted Finite add/remove commits into persisted account-room records and reload the updated discovery state after restart",
@@ -133,7 +138,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-side membership validation/filtering and canonical room bootstrap projection instead of seeded product wrapper state",
+            evidence: "Remaining Finite parity requires server-side membership validation/filtering instead of trusting product wrapper projections for room discovery",
         },
         PortFinding {
             area: "ordered_delivery_profile",

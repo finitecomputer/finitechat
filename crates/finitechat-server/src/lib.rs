@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{GroupId, MemberId, MessageId};
 use finitechat_engine::{AccountRoomDevice, AccountRoomRecord};
-use finitechat_proto::{LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus};
+use finitechat_proto::{DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -534,6 +534,85 @@ impl HttpServerState {
         Ok(SaveAccountRoomResponse { saved: true })
     }
 
+    fn bootstrap_account_room(
+        &self,
+        request: BootstrapAccountRoomRequest,
+    ) -> Result<BootstrapAccountRoomResponse, ServerHttpError> {
+        validate_account_room_id("room_id", &request.room_id)?;
+        validate_account_room_id("mls_group_id", &request.mls_group_id)?;
+        request.creator.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            }
+        })?;
+
+        let account_id = request.creator.account_id.clone();
+        validate_account_room_id("account_id", &account_id)?;
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        if let Some(existing_value) = directory
+            .get(&account_id)
+            .and_then(|rooms| rooms.get(&request.room_id))
+        {
+            let existing_record = serde_json::from_value::<AccountRoomRecord>(
+                existing_value.clone(),
+            )
+            .map_err(|error| ServerHttpError::AccountRoomBootstrapConflict {
+                account_id: account_id.clone(),
+                room_id: request.room_id.clone(),
+                reason: format!("existing record is not a Finite account-room record: {error}"),
+            })?;
+            let has_creator = existing_record
+                .devices
+                .iter()
+                .any(|device| device.device == request.creator && device.active);
+            if existing_record.mls_group_id != request.mls_group_id || !has_creator {
+                return Err(ServerHttpError::AccountRoomBootstrapConflict {
+                    account_id,
+                    room_id: request.room_id,
+                    reason: "existing account-room record differs from bootstrap request"
+                        .to_owned(),
+                });
+            }
+            return Ok(BootstrapAccountRoomResponse {
+                bootstrapped: false,
+            });
+        }
+
+        let record = AccountRoomRecord {
+            room_id: request.room_id.clone(),
+            mls_group_id: request.mls_group_id,
+            current_epoch: 0,
+            last_seq: 0,
+            status: RoomStatus::Open,
+            devices: vec![AccountRoomDevice {
+                device: request.creator,
+                active: true,
+            }],
+        };
+        record
+            .validate_limits()
+            .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            })?;
+        let value = serde_json::to_value(&record)
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+        directory
+            .entry(account_id.clone())
+            .or_default()
+            .insert(request.room_id.clone(), value.clone());
+        if let Some(store) = &self.store {
+            store.upsert_account_room(&AccountRoomDirectoryRecord {
+                account_id,
+                room_id: request.room_id,
+                record: value,
+            })?;
+        }
+        Ok(BootstrapAccountRoomResponse { bootstrapped: true })
+    }
+
     fn list_account_rooms(
         &self,
         request: ListAccountRoomDirectoryRequest,
@@ -817,6 +896,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/fanouts/rooms", post(save_fanout_room))
         .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
         .route("/fanouts/rooms/done", post(mark_fanout_done))
+        .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
         .route("/welcomes/claim", post(claim_welcomes))
@@ -959,6 +1039,18 @@ pub struct SaveAccountRoomRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaveAccountRoomResponse {
     pub saved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapAccountRoomRequest {
+    pub room_id: String,
+    pub mls_group_id: String,
+    pub creator: DeviceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootstrapAccountRoomResponse {
+    pub bootstrapped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,6 +1205,14 @@ async fn save_account_room(
     Json(request): Json<SaveAccountRoomRequest>,
 ) -> Result<Json<SaveAccountRoomResponse>, ServerHttpError> {
     let response = state.save_account_room(request)?;
+    Ok(Json(response))
+}
+
+async fn bootstrap_account_room(
+    State(state): State<HttpServerState>,
+    Json(request): Json<BootstrapAccountRoomRequest>,
+) -> Result<Json<BootstrapAccountRoomResponse>, ServerHttpError> {
+    let response = state.bootstrap_account_room(request)?;
     Ok(Json(response))
 }
 
@@ -1846,6 +1946,11 @@ pub enum ServerHttpError {
     InvalidAccountRoomRequest {
         reason: String,
     },
+    AccountRoomBootstrapConflict {
+        account_id: String,
+        room_id: String,
+        reason: String,
+    },
     ProjectionJson(String),
     InvalidAccountRoomListLimit {
         actual: usize,
@@ -1956,6 +2061,15 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_account_room_request".to_owned(),
                 reason,
+            ),
+            Self::AccountRoomBootstrapConflict {
+                account_id,
+                room_id,
+                reason,
+            } => (
+                StatusCode::CONFLICT,
+                "account_room_bootstrap_conflict".to_owned(),
+                format!("account-room bootstrap conflict for {account_id}/{room_id}: {reason}"),
             ),
             Self::ProjectionJson(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

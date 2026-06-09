@@ -23,7 +23,8 @@ use finitechat_proto::{
     MAX_WELCOME_CLAIMS_PER_REQUEST, ProtocolLimitError, RoomLogEntry, WelcomeState,
 };
 use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
     FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
     HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, PublishKeyPackageResponse,
@@ -2195,8 +2196,16 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     delivery
         .publish_room_log_entry(&initial_page.entries[0])
         .unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: group_id.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+    delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
     let account_id = alice_browser.device_ref().account_id.clone();
-    let account_rooms = source_server
+    let account_rooms = delivery
         .list_account_rooms(ListAccountRoomsRequest {
             account_id: account_id.clone(),
             after_room_id: None,
@@ -2204,15 +2213,21 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
         })
         .unwrap();
     assert_eq!(account_rooms.rooms.len(), 1);
+    assert_eq!(account_rooms.rooms[0].room_id, room_id);
+    assert_eq!(account_rooms.rooms[0].current_epoch, 0);
+    assert_eq!(account_rooms.rooms[0].last_seq, 0);
+    assert!(
+        account_rooms.rooms[0]
+            .devices
+            .iter()
+            .any(|device| device.device == *alice_browser.device_ref() && device.active)
+    );
     assert!(
         !account_rooms.rooms[0]
             .devices
             .iter()
             .any(|device| device.device == *alice_phone.device_ref())
     );
-    delivery
-        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
-        .unwrap();
 
     let phone_replenish = run_runtime_sync_tick(
         &mut phone_store,
@@ -4783,6 +4798,20 @@ impl HttpRuntimeDelivery {
                 .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
         };
         let _: SaveAccountRoomResponse = self.post_json("/account-rooms", &request)?;
+        Ok(())
+    }
+
+    fn bootstrap_account_room(
+        &self,
+        request: &CreateRoomRequest,
+    ) -> Result<(), HttpRuntimeDeliveryError> {
+        let request = BootstrapAccountRoomRequest {
+            room_id: request.room_id.clone(),
+            mls_group_id: request.mls_group_id.clone(),
+            creator: request.creator.clone(),
+        };
+        let _: BootstrapAccountRoomResponse =
+            self.post_json("/account-rooms/bootstrap", &request)?;
         Ok(())
     }
 

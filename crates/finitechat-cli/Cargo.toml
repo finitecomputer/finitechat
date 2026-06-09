@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 cgka-traits.workspace = true
 finitechat-darkmatter = { path = "../finitechat-darkmatter" }
+finitechat-proto = { path = "../finitechat-proto" }
 finitechat-server = { path = "../finitechat-server" }
 reqwest.workspace = true
 serde.workspace = true

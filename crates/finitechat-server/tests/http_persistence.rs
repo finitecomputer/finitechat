@@ -4,8 +4,10 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use finitechat_proto::DeviceRef;
 use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
     HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpServerState,
     KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
@@ -705,6 +707,72 @@ async fn sqlite_account_room_directory_pages_and_survives_restart() {
     assert_eq!(page.rooms, vec![second.record]);
     assert_eq!(page.next_after_room_id.as_deref(), Some("room-b"));
     assert!(!page.has_more);
+}
+
+#[tokio::test]
+async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let bootstrap = BootstrapAccountRoomRequest {
+        room_id: "room-bootstrap".to_owned(),
+        mls_group_id: "mls-bootstrap".to_owned(),
+        creator: DeviceRef {
+            account_id: "alice".to_owned(),
+            device_id: "alice-laptop".to_owned(),
+        },
+    };
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app, "/account-rooms/bootstrap", &bootstrap).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bootstrapped: BootstrapAccountRoomResponse = read_json(response).await;
+    assert!(bootstrapped.bootstrapped);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["room_id"], "room-bootstrap");
+    assert_eq!(page.rooms[0]["mls_group_id"], "mls-bootstrap");
+    assert_eq!(page.rooms[0]["current_epoch"], 0);
+    assert_eq!(page.rooms[0]["last_seq"], 0);
+    assert_eq!(page.rooms[0]["devices"][0]["device"]["account_id"], "alice");
+    assert_eq!(
+        page.rooms[0]["devices"][0]["device"]["device_id"],
+        "alice-laptop"
+    );
+    assert_eq!(page.rooms[0]["devices"][0]["active"], true);
+
+    let response = post_json(app.clone(), "/account-rooms/bootstrap", &bootstrap).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: BootstrapAccountRoomResponse = read_json(response).await;
+    assert!(!replayed.bootstrapped);
+
+    let response = post_json(
+        app,
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            creator: DeviceRef {
+                account_id: "alice".to_owned(),
+                device_id: "alice-phone".to_owned(),
+            },
+            ..bootstrap
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "account_room_bootstrap_conflict");
 }
 
 #[tokio::test]

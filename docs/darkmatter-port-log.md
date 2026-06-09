@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `297`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `330`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `331`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -77,6 +77,9 @@ Python test distribution:
   records, page them by room id, and reload them from SQLite. This gives the
   runtime link-fanout discovery loop a Darkmatter HTTP boundary, as long as a
   product-owned membership projection writes the directory.
+- The HTTP account-room bootstrap wrapper can derive the creator's initial
+  active account-room record from typed Finite room metadata, persist it, replay
+  it idempotently after restart, and reject conflicting bootstrap attempts.
 - The HTTP route layer can also project accepted Finite add/remove commit
   payloads into the account-room directory. The later-device HTTP fanout test
   proves an accepted add commit persists the new device as pending after
@@ -147,6 +150,10 @@ Python test distribution:
   opaque current-room membership snapshots keyed by account and room id, while
   leaving the actual source of membership truth outside Darkmatter's transport
   core.
+- Account-room bootstrap projection for the HTTP delivery surface. This derives
+  the creator's initial active device record from typed room metadata, so the
+  later-device fanout path no longer needs an arbitrary opaque account-room
+  write just to discover a newly created room.
 - Commit-derived account-room projection for the HTTP delivery surface. The
   route layer can decode an explicit product commit projection payload, apply
   adds/removes to persisted `AccountRoomRecord`s, and keep discovery state in
@@ -173,9 +180,9 @@ Python test distribution:
   happy-path commit submission and Welcome release, including response-loss
   retry after the submit publish is accepted, plus a two-room fanout tick.
   Commit-derived account-room updates are now proven for add-device and
-  remove-device commits. Server-side membership validation/filtering and
-  replacing initial seeded wrapper state with a canonical server-derived room
-  projection remain unported.
+  remove-device commits, and typed bootstrap projection is proven for the
+  creator's initial active device. Server-side membership validation/filtering
+  remains unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -223,7 +230,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `19`
+- Route/store/engine tests added so far: `20`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -237,6 +244,7 @@ Additional HTTP route checkpoint:
   - `POST /fanouts/rooms`
   - `POST /fanouts/rooms/prepared`
   - `POST /fanouts/rooms/done`
+  - `POST /account-rooms/bootstrap`
   - `POST /account-rooms`
   - `POST /account-rooms/list`
 - Persistence coverage proven:
@@ -258,6 +266,8 @@ Additional HTTP route checkpoint:
   - fanout room plan, prepared state, reprepare state, and done state survive
     restart
   - conflicting fanout room plan update does not overwrite the stored plan
+  - typed account-room bootstrap survives restart, replays idempotently, and
+    rejects a conflicting creator device
   - account-room directory pages by room id and survives restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
@@ -321,7 +331,7 @@ Additional CLI checkpoint:
     idempotency key
   - fanout save-room, mark-prepared, and mark-done commands build the route
     DTOs
-  - account-room save and list commands build the route DTOs
+  - account-room bootstrap, save, and list commands build the route DTOs
   - Welcome claim and ack build the route DTOs
   - unknown CLI flags fail as usage errors
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
@@ -371,11 +381,11 @@ Runtime delivery checkpoint:
   through the HTTP account-room directory after server restart and complete a
   discovery-only tick when the target device is already current in the room.
 - The link-fanout worker can also complete a one-room later-device happy path
-  over the HTTP adapter: it discovers a room from the account-room directory,
-  claims the later device's KeyPackage, prepares and submits the add-device
-  Commit through `/messages`, syncs that Commit back through `/sync/group`, and
-  the later device claims and activates the released Welcome through the HTTP
-  inbox routes.
+  over the HTTP adapter: it discovers a room from a typed bootstrap
+  account-room projection, claims the later device's KeyPackage, prepares and
+  submits the add-device Commit through `/messages`, syncs that Commit back
+  through `/sync/group`, and the later device claims and activates the released
+  Welcome through the HTTP inbox routes.
 - The same HTTP happy path now proves the accepted add-device Commit updates
   the persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery lists the new device in that room as pending
@@ -400,11 +410,11 @@ Runtime delivery checkpoint:
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
   claim/ack, ordered room pull, account-room discovery, commit-derived
   account-room updates for add/remove commits, and a one-room later-device
-  fanout happy path with submit response-loss retry and multi-room fanout,
-  including same-epoch reprepare. It does not yet prove server membership
-  filtering or canonical room bootstrap projection over the same adapter.
+  fanout happy path from typed bootstrap with submit response-loss retry and
+  multi-room fanout, including same-epoch reprepare. It does not yet prove
+  server membership filtering over the same adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from commit-derived account-room projections into server membership filtering
-and canonical room bootstrap projection, or start moving the test-only HTTP
-runtime adapter into production client/server boundaries.
+from product-wrapper account-room projections into server membership filtering,
+or start moving the test-only HTTP runtime adapter into production
+client/server boundaries.
