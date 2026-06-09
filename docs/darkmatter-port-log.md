@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `294`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `327`
+  `295`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `328`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -26,7 +26,7 @@ Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 38 |
+| `crates/finitechat-client/tests/client_state.rs` | 39 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -86,6 +86,10 @@ Python test distribution:
   persisted prepared state. The commit publish and Welcome publish are
   idempotent, so retry completes without appending a duplicate group entry or
   delivering duplicate Welcomes.
+- The HTTP fanout path also handles the worker's multi-room shape: paged
+  account-room discovery across two rooms, two distinct target KeyPackage
+  claims, two submitted commits, two completion syncs, and two later-device
+  Welcome activations.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -152,9 +156,10 @@ Python test distribution:
   opaque room-plan checkpointing, and the account-room directory covers
   discovery over HTTP. The HTTP runtime adapter now covers a one-room
   happy-path commit submission and Welcome release, including response-loss
-  retry after the submit publish is accepted. Membership-derived directory
-  writes, server-side membership validation/filtering, multi-room HTTP fanout,
-  real MLS reprepare, and same-epoch branch recovery remain unported.
+  retry after the submit publish is accepted, plus a two-room fanout tick.
+  Membership-derived directory writes, server-side membership
+  validation/filtering, real MLS reprepare, and same-epoch branch recovery
+  remain unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -329,6 +334,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
+- `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
@@ -356,13 +362,18 @@ Runtime delivery checkpoint:
   have been accepted, the worker reloads the prepared commit from durable local
   state, retries the same HTTP idempotency keys, completes the room, and leaves
   exactly one new group Commit and one claimed Welcome.
+- With two existing rooms, the same worker pages account-room discovery one
+  room at a time, claims two distinct target-device KeyPackages, submits and
+  completes both room commits, and the later device activates both released
+  Welcomes.
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
   claim/ack, ordered room pull, account-room discovery, and a one-room
-  later-device fanout happy path with submit response-loss retry. It does not
-  yet prove membership-derived directory writes, server membership filtering,
-  multi-room fanout, or same-epoch reprepare over the same adapter.
+  later-device fanout happy path with submit response-loss retry and multi-room
+  fanout. It does not yet prove membership-derived directory writes, server
+  membership filtering, or same-epoch reprepare over the same adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from the one-room retry path into multi-room fanout or same-epoch reprepare
-after a competing Commit wins.
+from the multi-room fanout path into same-epoch reprepare after a competing
+Commit wins, or make account-room directory writes membership-derived instead
+of seeded by the adapter.
