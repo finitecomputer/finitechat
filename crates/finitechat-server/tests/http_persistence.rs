@@ -1129,6 +1129,124 @@ async fn sqlite_submit_commit_replay_repairs_projection_after_partial_durable_pu
 }
 
 #[tokio::test]
+async fn sqlite_rejected_submit_commit_replays_rejection_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let tablet = DeviceRef::new("alice", "alice-tablet");
+    let room_id = "room-rejected-submit-replay".to_owned();
+    let mls_group_id = "mls-rejected-submit-replay".to_owned();
+    let winner = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        "welcome-rejected-submit-phone",
+        "rejected-submit-winner",
+    );
+    let loser = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &tablet,
+        "welcome-rejected-submit-tablet",
+        "rejected-submit-loser",
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(app.clone(), "/commits", &winner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+
+    let response = post_json(app, "/commits", &loser).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let first_error: ErrorResponse = read_json(response).await;
+    assert_eq!(first_error.kind, "invalid_commit_request");
+    assert!(
+        first_error
+            .error
+            .contains("commit expected epoch 0 does not match room epoch 1")
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &loser).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let replayed_error: ErrorResponse = read_json(response).await;
+    assert_eq!(replayed_error, first_error);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, accepted.seq);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&tablet),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inbox_page: HttpSyncPage = read_json(response).await;
+    assert!(inbox_page.entries.is_empty());
+
+    let response = post_json(
+        app,
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["current_epoch"], 1);
+    assert_eq!(page.rooms[0]["last_seq"], accepted.seq);
+    assert_eq!(
+        page.rooms[0]["devices"].as_array().expect("devices").len(),
+        2
+    );
+    assert!(
+        !page.rooms[0]["devices"]
+            .as_array()
+            .expect("devices")
+            .iter()
+            .any(|device| device["device"]["device_id"] == "alice-tablet")
+    );
+}
+
+#[tokio::test]
 async fn sqlite_raw_message_commit_projection_compatibility_survives_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
