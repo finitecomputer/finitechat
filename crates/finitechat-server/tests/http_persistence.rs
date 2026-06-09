@@ -22,9 +22,9 @@ use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, RoomStatus, StagedWelcomeV1,
-    WelcomeState,
+    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -2198,6 +2198,158 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let carol_page: HttpSyncPage = read_json(response).await;
     assert!(carol_page.entries.is_empty());
     assert_eq!(carol_page.next_after_seq, bob_acceptance.seq);
+}
+
+#[tokio::test]
+async fn sqlite_typed_event_rejects_oversized_payload_without_persisting_log() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-event-oversized".to_owned();
+    let mls_group_id = "mls-event-oversized".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let oversized = vec![0; MAX_ENVELOPE_PAYLOAD_BYTES as usize + 1];
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            &oversized,
+            "oversized-event-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_event_request");
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+}
+
+#[tokio::test]
+async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_conflicts() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-event-duplicate-message-id".to_owned();
+    let mls_group_id = "mls-event-duplicate-message-id".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let first = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        b"same ciphertext",
+        "first-event-idempotency",
+    );
+    let duplicate = AppendEventRequest {
+        idempotency_key: "second-event-idempotency".to_owned(),
+        ..first.clone()
+    };
+    let message_id = first.envelope.message_id().expect("event message id");
+
+    let response = post_json(app.clone(), "/events", &first).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EventAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(accepted.message_id, message_id);
+
+    let response = post_json(app.clone(), "/events", &first).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: EventAccepted = read_json(response).await;
+    assert_eq!(replayed, accepted);
+
+    let response = post_json(app.clone(), "/events", &duplicate).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "duplicate_message_id");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/events", &first).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed_after_restart: EventAccepted = read_json(response).await;
+    assert_eq!(replayed_after_restart, accepted);
+
+    let response = post_json(app.clone(), "/events", &duplicate).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "duplicate_message_id");
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.next_after_seq, 1);
 }
 
 #[tokio::test]

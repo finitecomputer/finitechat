@@ -178,7 +178,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_typed_event_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /events accepts typed AppendEventRequest payloads, rejects pending tracked senders, publishes plain RoomLogEntry payloads, and persists the room head across restart",
+            evidence: "finitechat-server /events accepts typed AppendEventRequest payloads, rejects pending tracked senders and oversized payloads before durable append, preserves exact idempotent replay across restart, rejects duplicate typed message ids with new idempotency keys, publishes plain RoomLogEntry payloads, and persists the room head across restart",
         },
         PortFinding {
             area: "http_ephemeral_activity_cache",

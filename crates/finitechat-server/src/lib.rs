@@ -193,6 +193,65 @@ impl HttpServerState {
         Ok(receipt)
     }
 
+    fn publish_typed_event_message(
+        &self,
+        request: PublishMessageRequest,
+        message_id: &str,
+    ) -> Result<HttpPublishReceipt, ServerHttpError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return Err(ServerHttpError::InvalidIdempotencyKey);
+        };
+        if idempotency_key.is_empty() {
+            return Err(ServerHttpError::InvalidIdempotencyKey);
+        }
+
+        let fingerprint = PublishMessageFingerprint::from_request(&request);
+        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut idempotency = self
+            .publish_idempotency
+            .lock()
+            .expect("HTTP publish idempotency mutex");
+        if let Some(record) = idempotency.get(&idempotency_key) {
+            if record.fingerprint == fingerprint {
+                return Ok(record.receipt.clone());
+            }
+            return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
+        }
+
+        let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
+        let mut candidate = service.clone();
+        let receipt = match candidate.publish(request.target.clone(), request.message.clone()) {
+            Ok(receipt) => receipt,
+            Err(HttpServerError::ConflictingMessageId { .. }) => {
+                return Err(ServerHttpError::DuplicateMessageId {
+                    message_id: typed_message_id,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if receipt.duplicate {
+            return Err(ServerHttpError::DuplicateMessageId {
+                message_id: typed_message_id,
+            });
+        }
+
+        let operation = PersistedOperation::PublishMessage {
+            target: request.target,
+            message: request.message,
+            idempotency_key: Some(idempotency_key.clone()),
+        };
+        let record = PublishIdempotencyRecord {
+            fingerprint,
+            receipt: receipt.clone(),
+        };
+        if let Some(store) = &self.store {
+            store.append_publish_mutation(Some(&operation), Some((&idempotency_key, &record)))?;
+        }
+        *service = candidate;
+        idempotency.insert(idempotency_key, record);
+        Ok(receipt)
+    }
+
     fn validate_raw_commit_import(
         &self,
         request: &PublishMessageRequest,
@@ -1481,7 +1540,7 @@ impl HttpServerState {
         }
 
         let event_publish = event_publish_request(&request, &message_id)?;
-        let receipt = self.publish_message(event_publish)?;
+        let receipt = self.publish_typed_event_message(event_publish, &message_id)?;
         self.record_room_event_acceptance(&request.room_id, receipt.seq)?;
         Ok(EventAccepted {
             seq: receipt.seq,
@@ -3852,6 +3911,9 @@ pub enum ServerHttpError {
     InvalidEventRequest {
         reason: String,
     },
+    DuplicateMessageId {
+        message_id: MessageId,
+    },
     InvalidActivityRequest {
         reason: String,
     },
@@ -4018,6 +4080,11 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_event_request".to_owned(),
                 reason,
+            ),
+            Self::DuplicateMessageId { message_id } => (
+                StatusCode::CONFLICT,
+                "duplicate_message_id".to_owned(),
+                format!("duplicate typed event message id {message_id}"),
             ),
             Self::InvalidActivityRequest { reason } => (
                 StatusCode::BAD_REQUEST,
