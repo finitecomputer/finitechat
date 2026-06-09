@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +9,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{GroupId, MemberId, MessageId};
+use finitechat_engine::{AccountRoomDevice, AccountRoomRecord};
+use finitechat_proto::{LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -576,6 +578,144 @@ impl HttpServerState {
         })
     }
 
+    fn record_finite_commit_projection(
+        &self,
+        request: &PublishMessageRequest,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        let Ok(payload) =
+            serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&request.message.payload)
+        else {
+            return Ok(());
+        };
+        if !matches!(&request.target, HttpPublishTarget::Group { .. })
+            || request.message.id.as_slice() != payload.entry.message_id.as_bytes()
+            || payload.entry.kind != LogEntryKind::Commit
+            || payload.entry.envelope.kind != LogEntryKind::Commit
+            || payload.entry.envelope.room_id != payload.entry.room_id
+            || payload
+                .membership_delta
+                .validate_structure(payload.entry.epoch, &payload.entry.message_id)
+                .is_err()
+        {
+            return Ok(());
+        }
+
+        let room_id = payload.entry.room_id.clone();
+        let mls_group_id = payload.entry.envelope.mls_group_id.clone();
+        let current_epoch = payload.membership_delta.post_commit_epoch;
+        let mut account_ids = BTreeSet::new();
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+
+        for (account_id, rooms) in directory.iter() {
+            if rooms.contains_key(&room_id) {
+                account_ids.insert(account_id.clone());
+            }
+        }
+        for add in &payload.membership_delta.adds {
+            account_ids.insert(add.device.account_id.clone());
+        }
+        for remove in &payload.membership_delta.removes {
+            account_ids.insert(remove.device.account_id.clone());
+        }
+
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        for account_id in account_ids {
+            let existing_record = directory
+                .get(&account_id)
+                .and_then(|rooms| rooms.get(&room_id))
+                .cloned();
+            let mut record = match existing_record {
+                Some(value) => match serde_json::from_value::<AccountRoomRecord>(value) {
+                    Ok(record) => record,
+                    Err(_) => continue,
+                },
+                None => AccountRoomRecord {
+                    room_id: room_id.clone(),
+                    mls_group_id: mls_group_id.clone(),
+                    current_epoch,
+                    last_seq: accepted_seq,
+                    status: RoomStatus::Open,
+                    devices: Vec::new(),
+                },
+            };
+
+            if record.room_id != room_id {
+                continue;
+            }
+            record.mls_group_id = mls_group_id.clone();
+            record.current_epoch = current_epoch;
+            record.last_seq = accepted_seq;
+            for remove in payload
+                .membership_delta
+                .removes
+                .iter()
+                .filter(|remove| remove.device.account_id == account_id)
+            {
+                record
+                    .devices
+                    .retain(|device| device.device != remove.device);
+            }
+            for add in payload
+                .membership_delta
+                .adds
+                .iter()
+                .filter(|add| add.device.account_id == account_id)
+            {
+                if !record
+                    .devices
+                    .iter()
+                    .any(|device| device.device == add.device)
+                {
+                    record.devices.push(AccountRoomDevice {
+                        device: add.device.clone(),
+                        active: false,
+                    });
+                }
+            }
+            record
+                .devices
+                .sort_by(|left, right| left.device.device_id.cmp(&right.device.device_id));
+
+            if record.devices.is_empty() {
+                if let Some(rooms) = directory.get_mut(&account_id) {
+                    rooms.remove(&room_id);
+                    if rooms.is_empty() {
+                        directory.remove(&account_id);
+                    }
+                }
+                deletes.push((account_id, room_id.clone()));
+                continue;
+            }
+
+            let value = serde_json::to_value(&record)
+                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+            directory
+                .entry(account_id.clone())
+                .or_default()
+                .insert(room_id.clone(), value.clone());
+            upserts.push(AccountRoomDirectoryRecord {
+                account_id,
+                room_id: room_id.clone(),
+                record: value,
+            });
+        }
+
+        if let Some(store) = &self.store {
+            for (account_id, room_id) in deletes {
+                store.delete_account_room(&account_id, &room_id)?;
+            }
+            for record in upserts {
+                store.upsert_account_room(&record)?;
+            }
+        }
+        Ok(())
+    }
+
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -695,6 +835,12 @@ pub struct PublishMessageRequest {
     pub message: cgka_traits::transport::TransportMessage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteAccountRoomCommitProjection {
+    pub entry: RoomLogEntry,
+    pub membership_delta: MembershipDeltaV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,7 +1021,8 @@ async fn publish_message(
     State(state): State<HttpServerState>,
     Json(request): Json<PublishMessageRequest>,
 ) -> Result<Json<HttpPublishReceipt>, ServerHttpError> {
-    let receipt = state.publish_message(request)?;
+    let receipt = state.publish_message(request.clone())?;
+    state.record_finite_commit_projection(&request, receipt.seq)?;
     Ok(Json(receipt))
 }
 
@@ -1418,6 +1565,19 @@ impl SqliteHttpDeliveryStore {
         Ok(directory)
     }
 
+    fn delete_account_room(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "DELETE FROM http_account_rooms WHERE account_id = ?1 AND room_id = ?2",
+            params![account_id, room_id],
+        )?;
+        Ok(())
+    }
+
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -1686,6 +1846,7 @@ pub enum ServerHttpError {
     InvalidAccountRoomRequest {
         reason: String,
     },
+    ProjectionJson(String),
     InvalidAccountRoomListLimit {
         actual: usize,
         max: usize,
@@ -1795,6 +1956,11 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_account_room_request".to_owned(),
                 reason,
+            ),
+            Self::ProjectionJson(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "finite_projection_json".to_owned(),
+                error,
             ),
             Self::InvalidAccountRoomListLimit { actual, max } => (
                 StatusCode::BAD_REQUEST,

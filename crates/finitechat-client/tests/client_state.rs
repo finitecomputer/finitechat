@@ -24,10 +24,10 @@ use finitechat_proto::{
 };
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageInventory, HttpServerState,
-    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
-    PublishKeyPackageResponse, PublishMessageRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, http_router,
+    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
+    HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, PublishKeyPackageResponse,
+    PublishMessageRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, http_router,
 };
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -2270,6 +2270,26 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
         panic!("HTTP fanout room did not complete");
     };
     assert_eq!(accepted_seq, bob_join_seq + 1);
+
+    delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let projected_rooms = delivery
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: account_id.clone(),
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(projected_rooms.rooms.len(), 1);
+    let projected_room = &projected_rooms.rooms[0];
+    assert_eq!(projected_room.room_id, room_id);
+    assert_eq!(projected_room.current_epoch, 2);
+    assert_eq!(projected_room.last_seq, accepted_seq);
+    assert!(
+        projected_room
+            .devices
+            .iter()
+            .any(|device| { device.device == *alice_phone.device_ref() && !device.active })
+    );
 
     let bob_page = delivery
         .sync_events(room_id, bob.device_ref(), bob_join_seq)
@@ -4729,8 +4749,11 @@ impl HttpRuntimeDelivery {
             },
             message: TransportMessage {
                 id: DarkmatterMessageId::new(message_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(&placeholder_entry)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+                payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
+                    entry: placeholder_entry,
+                    membership_delta: request.membership_delta.clone(),
+                })
+                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
                 timestamp: Timestamp(0),
                 causal_deps: Vec::new(),
                 source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
@@ -4962,8 +4985,7 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
             .entries
             .into_iter()
             .map(|queued| {
-                let mut entry: RoomLogEntry = serde_json::from_slice(&queued.message.payload)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+                let mut entry = decode_http_room_log_entry(&queued.message.payload)?;
                 if entry.room_id != room_id {
                     return Err(HttpRuntimeDeliveryError::RoomEntryMismatch {
                         expected: room_id.to_owned(),
@@ -4980,6 +5002,14 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
             has_more: page.has_more,
         })
     }
+}
+
+fn decode_http_room_log_entry(payload: &[u8]) -> Result<RoomLogEntry, HttpRuntimeDeliveryError> {
+    if let Ok(projection) = serde_json::from_slice::<FiniteAccountRoomCommitProjection>(payload) {
+        return Ok(projection.entry);
+    }
+    serde_json::from_slice(payload)
+        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
 }
 
 fn member_id_for_device(owner: &DeviceRef) -> Result<MemberId, HttpRuntimeDeliveryError> {

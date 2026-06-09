@@ -77,6 +77,11 @@ Python test distribution:
   records, page them by room id, and reload them from SQLite. This gives the
   runtime link-fanout discovery loop a Darkmatter HTTP boundary, as long as a
   product-owned membership projection writes the directory.
+- The HTTP route layer can also project accepted Finite add-device commit
+  payloads into the account-room directory. The later-device HTTP fanout test
+  now proves the accepted commit updates and persists the room record so a
+  restarted server lists the new device as pending without a second manual
+  `/account-rooms` write.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log and account-room
   directory are seeded: discover the room, claim the target device's KeyPackage,
@@ -141,6 +146,11 @@ Python test distribution:
   opaque current-room membership snapshots keyed by account and room id, while
   leaving the actual source of membership truth outside Darkmatter's transport
   core.
+- Commit-derived account-room projection for the HTTP delivery surface. The
+  route layer can decode an explicit product commit projection payload, apply
+  adds/removes to persisted `AccountRoomRecord`s, and keep discovery state in
+  step with accepted add-device commits. This is still product wrapper logic,
+  not Darkmatter becoming the MLS membership authority.
 - Runtime submit-commit mapping for the HTTP delivery surface. The adapter can
   serialize a Finite `RoomLogEntry` into a Darkmatter HTTP group message,
   publish derived `WelcomeRecord`s to recipient inboxes, and reconstruct
@@ -161,9 +171,10 @@ Python test distribution:
   discovery over HTTP. The HTTP runtime adapter now covers a one-room
   happy-path commit submission and Welcome release, including response-loss
   retry after the submit publish is accepted, plus a two-room fanout tick.
-  Membership-derived directory writes, server-side membership
-  validation/filtering, and replacing seeded wrapper state with server-derived
-  membership projections remain unported.
+  Commit-derived account-room updates are now proven for add-device commits.
+  Server-side membership validation/filtering and replacing initial seeded
+  wrapper state with a canonical server-derived room projection remain
+  unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -363,6 +374,10 @@ Runtime delivery checkpoint:
   Commit through `/messages`, syncs that Commit back through `/sync/group`, and
   the later device claims and activates the released Welcome through the HTTP
   inbox routes.
+- The same HTTP happy path now proves the accepted add-device Commit updates
+  the persisted account-room record. After reopening the HTTP server from the
+  same SQLite file, discovery lists the new device in that room as pending
+  without a second manual `/account-rooms` write.
 - When the HTTP submit response is lost after the commit and Welcome publishes
   have been accepted, the worker reloads the prepared commit from durable local
   state, retries the same HTTP idempotency keys, completes the room, and leaves
@@ -377,13 +392,14 @@ Runtime delivery checkpoint:
   next epoch.
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
-  claim/ack, ordered room pull, account-room discovery, and a one-room
-  later-device fanout happy path with submit response-loss retry and multi-room
-  fanout, including same-epoch reprepare. It does not yet prove
-  membership-derived directory writes or server membership filtering over the
-  same adapter.
+  claim/ack, ordered room pull, account-room discovery, commit-derived
+  account-room updates for add-device commits, and a one-room later-device
+  fanout happy path with submit response-loss retry and multi-room fanout,
+  including same-epoch reprepare. It does not yet prove server membership
+  filtering or canonical room bootstrap/removal projection over the same
+  adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from seeded account-room directory records into membership-derived directory
-writes/server filtering, or start moving the test-only HTTP runtime adapter into
-production client/server boundaries.
+from commit-derived account-room add projections into server membership
+filtering and canonical room bootstrap/removal projection, or start moving the
+test-only HTTP runtime adapter into production client/server boundaries.

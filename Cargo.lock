@@ -759,6 +759,8 @@ dependencies = [
  "cgka-conformance-simulator",
  "cgka-traits",
  "finitechat-darkmatter",
+ "finitechat-engine",
+ "finitechat-proto",
  "rusqlite",
  "serde",
  "serde_json",
