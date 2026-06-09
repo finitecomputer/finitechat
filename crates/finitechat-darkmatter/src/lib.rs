@@ -71,6 +71,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server persists claimed Welcome inbox messages and terminal ack/failure state across restart",
         },
         PortFinding {
+            area: "http_key_package_batch_claim_replay",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
             evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",

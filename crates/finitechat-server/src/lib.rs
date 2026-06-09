@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,7 @@ use transport_http_server::{
 pub struct HttpServerState {
     service: Arc<Mutex<HttpDeliveryService>>,
     publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
+    key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -30,6 +31,7 @@ impl HttpServerState {
         Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
+            key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -42,10 +44,12 @@ impl HttpServerState {
             replay_operation(&mut service, operation)?;
         }
         let publish_idempotency = store.load_publish_idempotency()?;
+        let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
+            key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -123,6 +127,66 @@ impl HttpServerState {
         *service = candidate;
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
+    }
+
+    fn claim_key_packages(
+        &self,
+        request: ClaimKeyPackagesRequest,
+    ) -> Result<Vec<HttpKeyPackageClaim>, ServerHttpError> {
+        validate_key_package_claim_batch(&request.owners)?;
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.apply_mutation(|service| {
+                let claims = claim_key_packages_from_service(service, &request.owners)?;
+                let operation = claims
+                    .iter()
+                    .any(|claim| claim.claimed.is_some())
+                    .then_some(PersistedOperation::ClaimKeyPackages {
+                        owners: request.owners,
+                    });
+                Ok((claims, operation))
+            });
+        };
+
+        if idempotency_key.is_empty() {
+            return Err(ServerHttpError::InvalidIdempotencyKey);
+        }
+
+        let fingerprint = KeyPackageClaimFingerprint {
+            owners: request.owners.clone(),
+        };
+        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut idempotency = self
+            .key_package_claim_idempotency
+            .lock()
+            .expect("HTTP KeyPackage claim idempotency mutex");
+        if let Some(record) = idempotency.get(&idempotency_key) {
+            if record.fingerprint == fingerprint {
+                return Ok(record.response.clone());
+            }
+            return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
+        }
+
+        let mut candidate = service.clone();
+        let claims = claim_key_packages_from_service(&mut candidate, &request.owners)?;
+        let operation = claims
+            .iter()
+            .any(|claim| claim.claimed.is_some())
+            .then_some(PersistedOperation::ClaimKeyPackages {
+                owners: request.owners,
+            });
+        let record = KeyPackageClaimIdempotencyRecord {
+            fingerprint,
+            response: claims.clone(),
+        };
+        if let Some(store) = &self.store {
+            store.append_key_package_claim_mutation(
+                operation.as_ref(),
+                Some((&idempotency_key, &record)),
+            )?;
+        }
+        *service = candidate;
+        idempotency.insert(idempotency_key, record);
+        Ok(claims)
     }
 
     fn claim_welcomes(
@@ -220,6 +284,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/sync/inbox", post(sync_inbox))
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/claim", post(claim_key_package))
+        .route("/key-packages/claims", post(claim_key_packages))
         .route("/welcomes/claim", post(claim_welcomes))
         .route("/welcomes/ack", post(ack_welcome))
         .with_state(state)
@@ -255,6 +320,19 @@ pub struct InboxSyncRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimKeyPackagesRequest {
+    pub owners: Vec<MemberId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpKeyPackageClaim {
+    pub owner: MemberId,
+    pub claimed: Option<HttpClaimedKeyPackage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +431,14 @@ async fn claim_key_package(
     Ok(Json(claimed))
 }
 
+async fn claim_key_packages(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ClaimKeyPackagesRequest>,
+) -> Result<Json<Vec<HttpKeyPackageClaim>>, ServerHttpError> {
+    let claimed = state.claim_key_packages(request)?;
+    Ok(Json(claimed))
+}
+
 async fn claim_welcomes(
     State(state): State<HttpServerState>,
     Json(request): Json<ClaimWelcomesRequest>,
@@ -383,6 +469,9 @@ enum PersistedOperation {
     ClaimKeyPackage {
         owner: MemberId,
     },
+    ClaimKeyPackages {
+        owners: Vec<MemberId>,
+    },
 }
 
 impl PersistedOperation {
@@ -391,6 +480,7 @@ impl PersistedOperation {
             Self::PublishMessage { .. } => "publish_message",
             Self::PublishKeyPackage { .. } => "publish_key_package",
             Self::ClaimKeyPackage { .. } => "claim_key_package",
+            Self::ClaimKeyPackages { .. } => "claim_key_packages",
         }
     }
 }
@@ -414,6 +504,17 @@ impl PublishMessageFingerprint {
 struct PublishIdempotencyRecord {
     fingerprint: PublishMessageFingerprint,
     receipt: HttpPublishReceipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeyPackageClaimFingerprint {
+    owners: Vec<MemberId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeyPackageClaimIdempotencyRecord {
+    fingerprint: KeyPackageClaimFingerprint,
+    response: Vec<HttpKeyPackageClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +562,11 @@ impl SqliteHttpDeliveryStore {
                 idempotency_key TEXT PRIMARY KEY,
                 fingerprint_json TEXT NOT NULL,
                 receipt_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_key_package_claim_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                fingerprint_json TEXT NOT NULL,
+                response_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_welcome_claims (
                 message_id_json TEXT PRIMARY KEY,
@@ -514,6 +620,37 @@ impl SqliteHttpDeliveryStore {
         Ok(())
     }
 
+    fn append_key_package_claim_mutation(
+        &self,
+        operation: Option<&PersistedOperation>,
+        idempotency: Option<(&str, &KeyPackageClaimIdempotencyRecord)>,
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if let Some(operation) = operation {
+            transaction.execute(
+                "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+                params![operation.kind(), serde_json::to_string(operation)?],
+            )?;
+        }
+        if let Some((idempotency_key, record)) = idempotency {
+            transaction.execute(
+                "INSERT INTO http_key_package_claim_idempotency (
+                    idempotency_key,
+                    fingerprint_json,
+                    response_json
+                ) VALUES (?1, ?2, ?3)",
+                params![
+                    idempotency_key,
+                    serde_json::to_string(&record.fingerprint)?,
+                    serde_json::to_string(&record.response)?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn load_operations(&self) -> Result<Vec<PersistedOperation>, DurableStoreError> {
         let conn = self.connection()?;
         let mut statement =
@@ -548,6 +685,35 @@ impl SqliteHttpDeliveryStore {
                 PublishIdempotencyRecord {
                     fingerprint: serde_json::from_str(&fingerprint_json)?,
                     receipt: serde_json::from_str(&receipt_json)?,
+                },
+            );
+        }
+        Ok(idempotency)
+    }
+
+    fn load_key_package_claim_idempotency(
+        &self,
+    ) -> Result<HashMap<String, KeyPackageClaimIdempotencyRecord>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT idempotency_key, fingerprint_json, response_json
+             FROM http_key_package_claim_idempotency",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut idempotency = HashMap::new();
+        for row in rows {
+            let (key, fingerprint_json, response_json) = row?;
+            idempotency.insert(
+                key,
+                KeyPackageClaimIdempotencyRecord {
+                    fingerprint: serde_json::from_str(&fingerprint_json)?,
+                    response: serde_json::from_str(&response_json)?,
                 },
             );
         }
@@ -635,6 +801,46 @@ fn replay_operation(
         PersistedOperation::ClaimKeyPackage { owner } => {
             service.claim_key_package(&owner)?;
         }
+        PersistedOperation::ClaimKeyPackages { owners } => {
+            for owner in owners {
+                service.claim_key_package(&owner)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn claim_key_packages_from_service(
+    service: &mut HttpDeliveryService,
+    owners: &[MemberId],
+) -> Result<Vec<HttpKeyPackageClaim>, HttpServerError> {
+    owners
+        .iter()
+        .map(|owner| {
+            let claimed = service.claim_key_package(owner)?;
+            Ok(HttpKeyPackageClaim {
+                owner: owner.clone(),
+                claimed,
+            })
+        })
+        .collect()
+}
+
+fn validate_key_package_claim_batch(owners: &[MemberId]) -> Result<(), ServerHttpError> {
+    if owners.is_empty() || owners.len() > MAX_HTTP_SYNC_PAGE_ENTRIES {
+        return Err(ServerHttpError::InvalidKeyPackageClaimBatch {
+            actual: owners.len(),
+            max: MAX_HTTP_SYNC_PAGE_ENTRIES,
+        });
+    }
+
+    let mut seen = HashSet::new();
+    for owner in owners {
+        if !seen.insert(owner) {
+            return Err(ServerHttpError::DuplicateKeyPackageClaimOwner {
+                owner: owner.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -656,6 +862,13 @@ pub enum ServerHttpError {
         idempotency_key: String,
     },
     InvalidIdempotencyKey,
+    InvalidKeyPackageClaimBatch {
+        actual: usize,
+        max: usize,
+    },
+    DuplicateKeyPackageClaimOwner {
+        owner: MemberId,
+    },
     InvalidWelcomeClaimLimit {
         actual: usize,
         max: usize,
@@ -705,6 +918,18 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_idempotency_key".to_owned(),
                 "idempotency key must not be empty".to_owned(),
+            ),
+            Self::InvalidKeyPackageClaimBatch { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_key_package_claim_batch".to_owned(),
+                format!(
+                    "KeyPackage claim batch must contain between 1 and {max} owners, got {actual}"
+                ),
+            ),
+            Self::DuplicateKeyPackageClaimOwner { owner } => (
+                StatusCode::BAD_REQUEST,
+                "duplicate_key_package_claim_owner".to_owned(),
+                format!("KeyPackage claim batch contains duplicate owner {owner:?}"),
             ),
             Self::InvalidWelcomeClaimLimit { actual, max } => (
                 StatusCode::BAD_REQUEST,

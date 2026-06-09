@@ -5,9 +5,9 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpServerState, PublishMessageRequest,
-    http_router,
+    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim,
+    HttpServerState, PublishMessageRequest, http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -260,6 +260,160 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
 }
 
 #[tokio::test]
+async fn sqlite_batch_key_package_claim_replays_exact_response_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let phone = member("alice-phone");
+    let laptop = member("alice-laptop");
+    let missing = member("alice-tablet");
+    let other = member("bob-phone");
+
+    let app = persistent_app(&db_path);
+    for publication in [
+        key_package_publication("kp-phone-1", phone.clone(), b"phone-one"),
+        key_package_publication("kp-phone-2", phone.clone(), b"phone-two"),
+        key_package_publication("kp-laptop-1", laptop.clone(), b"laptop-one"),
+        key_package_publication("kp-other-1", other.clone(), b"other-one"),
+    ] {
+        assert_eq!(
+            post_json(app.clone(), "/key-packages", &publication)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let request = ClaimKeyPackagesRequest {
+        owners: vec![laptop.clone(), phone.clone(), missing.clone()],
+        idempotency_key: Some("fanout-claim-replay".to_owned()),
+    };
+    let response = post_json(app, "/key-packages/claims", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpKeyPackageClaim> = read_json(response).await;
+    assert_eq!(claimed.len(), 3);
+    assert_eq!(claimed[0].owner, laptop);
+    assert_eq!(
+        claimed[0]
+            .claimed
+            .as_ref()
+            .expect("laptop claim")
+            .key_package_id
+            .as_slice(),
+        b"kp-laptop-1"
+    );
+    assert_eq!(claimed[1].owner, phone.clone());
+    assert_eq!(
+        claimed[1]
+            .claimed
+            .as_ref()
+            .expect("phone claim")
+            .key_package_id
+            .as_slice(),
+        b"kp-phone-1"
+    );
+    assert_eq!(claimed[2].owner, missing);
+    assert_eq!(claimed[2].claimed, None);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages/claims", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: Vec<HttpKeyPackageClaim> = read_json(response).await;
+    assert_eq!(replayed, claimed);
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: phone.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let remaining_phone: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        remaining_phone
+            .expect("second phone package remains available")
+            .key_package_id
+            .as_slice(),
+        b"kp-phone-2"
+    );
+
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest { owner: other },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let other_claim: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        other_claim
+            .expect("other owner package remains available")
+            .key_package_id
+            .as_slice(),
+        b"kp-other-1"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_batch_key_package_claim_conflict_has_no_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let phone = member("conflict-phone");
+    let laptop = member("conflict-laptop");
+
+    let app = persistent_app(&db_path);
+    for publication in [
+        key_package_publication("kp-conflict-phone", phone.clone(), b"phone"),
+        key_package_publication("kp-conflict-laptop", laptop.clone(), b"laptop"),
+    ] {
+        assert_eq!(
+            post_json(app.clone(), "/key-packages", &publication)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let first = ClaimKeyPackagesRequest {
+        owners: vec![phone.clone()],
+        idempotency_key: Some("fanout-conflict".to_owned()),
+    };
+    assert_eq!(
+        post_json(app.clone(), "/key-packages/claims", &first)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let conflicting = ClaimKeyPackagesRequest {
+        owners: vec![laptop.clone()],
+        idempotency_key: Some("fanout-conflict".to_owned()),
+    };
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages/claims", &conflicting).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "idempotency_conflict");
+
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest { owner: laptop },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let laptop_claim: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        laptop_claim
+            .expect("conflict must not consume laptop package")
+            .key_package_id
+            .as_slice(),
+        b"kp-conflict-laptop"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_welcome_claim_survives_restart_before_ack() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -452,6 +606,18 @@ fn group_id(label: &str) -> GroupId {
 
 fn member(label: &str) -> MemberId {
     MemberId::new(label.as_bytes().to_vec())
+}
+
+fn key_package_publication(
+    key_package_id: &str,
+    owner: MemberId,
+    bytes: &[u8],
+) -> HttpKeyPackagePublication {
+    HttpKeyPackagePublication {
+        key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
+        owner,
+        key_package: KeyPackage::new(bytes.to_vec()),
+    }
 }
 
 fn group_target(
