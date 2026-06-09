@@ -50,6 +50,10 @@ Python test distribution:
   logic. The current route tests cover group publish/sync, exact duplicate
   replay, same-epoch commit conflict, inbox publish/sync, and single-use
   KeyPackage claims.
+- A SQLite operation log can replay accepted HTTP delivery operations into a
+  fresh Darkmatter service core after restart. The current persistence tests
+  prove group queue order, duplicate replay, same-epoch commit admission, and
+  consumed KeyPackage state survive restart.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -79,8 +83,10 @@ Python test distribution:
 - Later-device fanout into existing rooms. Finite tests require distinct
   KeyPackages per room, persistent fanout plans, response-loss retry, and
   reprepare after same-epoch loss.
-- Mapping Finite's server cursor, idempotency records, and repair states onto
-  Darkmatter's engine/storage model without duplicating protocol state.
+- Mapping Finite's server cursor, idempotency records, repair states, and
+  crash-atomic response replay onto Darkmatter's engine/storage model without
+  duplicating protocol state. The SQLite operation log only proves basic
+  restart replay for accepted Darkmatter HTTP operations.
 - Replacing the current fake-MLS reducer tests while preserving their
   transaction and replay assertions.
 
@@ -103,8 +109,10 @@ workspace members:
   message.
 - `finitechat-cli` exposes `compat-report` and `http-smoke` commands.
 - `finitechat-server` exposes in-process HTTP routes over the in-memory
-  Darkmatter delivery core and keeps `serve` as an explicit binary mode.
-  Auth, durable persistence, and production server behavior remain unported.
+  Darkmatter delivery core and keeps `serve` as an explicit binary mode. It can
+  optionally rebuild state from a SQLite operation log with
+  `serve [addr] --sqlite PATH`. Auth and production server behavior remain
+  unported.
 - `finitechat-cli` can now call the HTTP delivery routes for health, group
   publish/sync, inbox publish/sync, KeyPackage publish, and KeyPackage claim.
 
@@ -120,6 +128,7 @@ Verified after adding the Darkmatter dependency graph:
 Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
+- `cargo test -p finitechat-server --test http_persistence`: pass
 - New tests added: `5`
 - Route coverage proven:
   - `GET /health`
@@ -128,13 +137,21 @@ Additional HTTP route checkpoint:
   - `POST /sync/inbox`
   - `POST /key-packages`
   - `POST /key-packages/claim`
+- Persistence coverage proven:
+  - group queue and duplicate-message index rebuild after restart
+  - same-epoch commit admission rebuilds after restart
+  - consumed KeyPackage state rebuilds after restart
+- Live persistent-mode smoke verified with a temporary SQLite file on
+  `127.0.0.1:18788`:
+  - `finitechat-darkmatter http --server http://127.0.0.1:18788 health`
+  - `finitechat-darkmatter http --server http://127.0.0.1:18788 publish-group --group-id sqlite-live-room --transport-group-id sqlite-live-transport --message-id sqlite-live-commit --payload commit --commit-epoch 1`
 
 Important test caveat:
 
 - The copied Rust and Python suites still mostly exercise the original Finite
   Chat implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
-  adapter smoke test plus the HTTP route tests above.
+  adapter smoke test plus the HTTP route and persistence tests above.
 
 Additional CLI checkpoint:
 
@@ -158,5 +175,6 @@ Dependency note:
   SQLite dependency graph, so this port repo aligns its workspace `rusqlite`
   version to `0.32` to avoid two `libsqlite3-sys` packages linking `sqlite3`.
 
-Next meaningful gate: add durable storage behind the HTTP route layer, then move
-the copied server reducer tests onto that route/store boundary.
+Next meaningful gate: move selected copied server reducer scenarios onto the
+Darkmatter HTTP route/store boundary, starting with idempotent response replay
+and Welcome claim/ack recovery.

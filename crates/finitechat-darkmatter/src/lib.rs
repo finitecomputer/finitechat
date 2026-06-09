@@ -51,6 +51,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, and KeyPackage operations",
         },
         PortFinding {
+            area: "http_sqlite_operation_log",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server can replay accepted Darkmatter HTTP delivery operations from SQLite after restart",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
             evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",

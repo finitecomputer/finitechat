@@ -1,0 +1,226 @@
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, Response, StatusCode};
+use cgka_traits::engine::KeyPackage;
+use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
+use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use finitechat_server::{
+    ClaimKeyPackageRequest, ErrorResponse, GroupSyncRequest, HttpServerState,
+    PublishMessageRequest, http_router,
+};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tempfile::TempDir;
+use tower::ServiceExt;
+use transport_http_server::{
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpKeyPackageId,
+    HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget, HttpSyncPage,
+};
+
+#[tokio::test]
+async fn sqlite_log_rebuilds_group_queue_and_duplicate_index_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let group_id = group_id("durable-group");
+    let transport_group_id = b"durable-transport".to_vec();
+    let first = PublishMessageRequest {
+        target: group_target(
+            group_id.clone(),
+            transport_group_id.clone(),
+            Some(HttpCommitAdmission {
+                source_epoch: EpochId(1),
+            }),
+        ),
+        message: group_message("commit-1", transport_group_id.clone(), b"commit"),
+    };
+    let second = PublishMessageRequest {
+        target: group_target(group_id.clone(), transport_group_id.clone(), None),
+        message: group_message("app-1", transport_group_id, b"app"),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/messages", &first).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_json(app.clone(), "/messages", &second).await.status(),
+        StatusCode::OK
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id.clone(),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(page.entries[0].message.id, id("commit-1"));
+    assert_eq!(page.entries[1].message.id, id("app-1"));
+    assert_eq!(page.next_after_seq, 2);
+
+    let response = post_json(app, "/messages", &first).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: HttpPublishReceipt = read_json(response).await;
+    assert_eq!(receipt.seq, 1);
+    assert!(receipt.duplicate);
+}
+
+#[tokio::test]
+async fn sqlite_log_rebuilds_commit_admission_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let group_id = group_id("epoch-durable-group");
+    let transport_group_id = b"epoch-durable-transport".to_vec();
+    let first = PublishMessageRequest {
+        target: group_target(
+            group_id.clone(),
+            transport_group_id.clone(),
+            Some(HttpCommitAdmission {
+                source_epoch: EpochId(9),
+            }),
+        ),
+        message: group_message("commit-epoch-9-a", transport_group_id.clone(), b"commit-a"),
+    };
+    let second = PublishMessageRequest {
+        target: group_target(
+            group_id,
+            transport_group_id.clone(),
+            Some(HttpCommitAdmission {
+                source_epoch: EpochId(9),
+            }),
+        ),
+        message: group_message("commit-epoch-9-b", transport_group_id, b"commit-b"),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app, "/messages", &first).await.status(),
+        StatusCode::OK
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app, "/messages", &second).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "stale_epoch");
+}
+
+#[tokio::test]
+async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let owner = member("durable-owner");
+    let key_package_id = HttpKeyPackageId::new(b"durable-kp".to_vec());
+    let publication = HttpKeyPackagePublication {
+        key_package_id: key_package_id.clone(),
+        owner: owner.clone(),
+        key_package: KeyPackage::new(b"durable-key-package".to_vec()),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &publication)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        claimed
+            .expect("claim before restart")
+            .key_package_id
+            .as_slice(),
+        key_package_id.as_slice()
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest { owner },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(claimed, None);
+}
+
+fn persistent_app(path: &std::path::Path) -> Router {
+    http_router(HttpServerState::from_sqlite_path(path).expect("persistent server state"))
+}
+
+async fn post_json<T: Serialize>(app: Router, uri: &str, body: &T) -> Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).expect("json body")))
+            .expect("request"),
+    )
+    .await
+    .expect("response")
+}
+
+async fn read_json<T: DeserializeOwned>(response: Response<Body>) -> T {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    serde_json::from_slice(&bytes).expect("json response")
+}
+
+fn id(label: &str) -> MessageId {
+    MessageId::new(label.as_bytes().to_vec())
+}
+
+fn group_id(label: &str) -> GroupId {
+    GroupId::new(label.as_bytes().to_vec())
+}
+
+fn member(label: &str) -> MemberId {
+    MemberId::new(label.as_bytes().to_vec())
+}
+
+fn group_target(
+    group_id: GroupId,
+    transport_group_id: Vec<u8>,
+    commit_admission: Option<HttpCommitAdmission>,
+) -> HttpPublishTarget {
+    HttpPublishTarget::Group {
+        group_id,
+        transport_group_id,
+        commit_admission,
+    }
+}
+
+fn group_message(
+    message_id: &str,
+    transport_group_id: Vec<u8>,
+    payload: &[u8],
+) -> TransportMessage {
+    TransportMessage {
+        id: id(message_id),
+        payload: payload.to_vec(),
+        timestamp: Timestamp(42),
+        causal_deps: Vec::new(),
+        source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+        envelope: TransportEnvelope::GroupMessage { transport_group_id },
+    }
+}

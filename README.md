@@ -48,7 +48,7 @@ keeps Finite-owned product behavior above that boundary.
 - `crates/finitechat-darkmatter`: small adapter layer that records which
   Darkmatter primitives are already usable from this repo.
 - `crates/finitechat-server`: Axum HTTP route layer over Darkmatter's delivery
-  service core.
+  service core, with optional SQLite operation-log replay for local durability.
 - `crates/finitechat-cli`: CLI entrypoint for compatibility reports, local
   smoke checks, and HTTP delivery route calls.
 - `integrations/hermes/finite-platform`: thin Hermes plugin over the Finite
@@ -75,6 +75,7 @@ keeps Finite-owned product behavior above that boundary.
 cargo test
 python3 -m unittest discover -s tests -p '*test*.py'
 cargo test -p finitechat-server --test http_routes
+cargo test -p finitechat-server --test http_persistence
 cargo test -p finitechat-cli
 cargo run -p finitechat-server -- smoke
 cargo run -p finitechat-cli -- http-smoke
