@@ -101,6 +101,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client exposes generic HttpRuntimeDelivery over HttpRuntimeTransport; tests now reuse that production adapter and keep only in-process routing plus failure injection in the harness",
         },
         PortFinding {
+            area: "http_runtime_delivery_network_transport",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client ReqwestHttpRuntimeTransport drives HttpRuntimeDelivery against a live localhost Axum server and preserves non-success HTTP status errors",
+        },
+        PortFinding {
             area: "http_fanout_plan_checkpoint",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",

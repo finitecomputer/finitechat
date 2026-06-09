@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `298`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `338`
+  `299`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `339`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -26,7 +26,7 @@ Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 42 |
+| `crates/finitechat-client/tests/client_state.rs` | 43 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -127,6 +127,11 @@ Python test distribution:
   Welcome, account-room, typed commit, typed event, and ordered room-sync calls
   onto the HTTP DTOs; the client-state tests now provide only an in-process
   transport harness and failure injection.
+- `finitechat-client` also provides a concrete reqwest-backed runtime transport
+  for live HTTP servers. A client-state test starts the Axum server on an
+  ephemeral localhost listener, exercises KeyPackage upload/claim through
+  `RuntimeDelivery`, and verifies non-success HTTP statuses remain visible to
+  callers.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -160,6 +165,9 @@ Python test distribution:
   mapping, envelope/body consistency checks, commit request validation, and
   ordered room-sync decoding independently from the test transport used to
   exercise the Axum routes.
+- Runtime HTTP network transport. The production client can now reuse the same
+  adapter against a real server URL through reqwest, while tests can still
+  inject a different transport for deterministic response-loss scenarios.
 - Runtime KeyPackage metadata mapping. The Darkmatter HTTP KeyPackage store
   carries opaque bytes; the client adapter can encode the original
   `UploadKeyPackageRequest` so a later claim reconstructs Finite's package
@@ -500,8 +508,11 @@ Runtime delivery checkpoint:
   errors to assertions, and injects before-accept or after-accept `/commits`
   failures. The runtime DTO mapping and validation it used to duplicate now
   live in `finitechat-client::HttpRuntimeDelivery`.
+- A live-network runtime transport test proves
+  `finitechat-client::ReqwestHttpRuntimeTransport` can drive that production
+  adapter against an actual localhost Axum server, including successful
+  KeyPackage upload/claim and a visible `404` server-status error.
 
-Next meaningful gate: add a concrete network transport for
-`HttpRuntimeDelivery`, move route DTOs into a shared protocol crate, or close
-the raw-history compatibility caveat by ensuring imported commits carry
-membership deltas before strict member authorization is enabled for every room.
+Next meaningful gate: move route DTOs into a shared protocol crate, or close the
+raw-history compatibility caveat by ensuring imported commits carry membership
+deltas before strict member authorization is enabled for every room.

@@ -2690,6 +2690,75 @@ pub trait HttpRuntimeTransport {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReqwestHttpRuntimeTransport {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl ReqwestHttpRuntimeTransport {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_client(base_url, reqwest::blocking::Client::new())
+    }
+
+    pub fn with_client(base_url: impl Into<String>, client: reqwest::blocking::Client) -> Self {
+        Self {
+            base_url: base_url.into(),
+            client,
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn route_url(&self, uri: &str) -> String {
+        format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            uri.trim_start_matches('/')
+        )
+    }
+}
+
+impl HttpRuntimeTransport for ReqwestHttpRuntimeTransport {
+    type Error = ReqwestHttpRuntimeTransportError;
+
+    fn post_json<T, R>(&mut self, uri: &str, body: &T) -> Result<R, Self::Error>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let response = self
+            .client
+            .post(self.route_url(uri))
+            .json(body)
+            .send()
+            .map_err(ReqwestHttpRuntimeTransportError::Request)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .map_err(ReqwestHttpRuntimeTransportError::Request)?;
+            return Err(ReqwestHttpRuntimeTransportError::Server { status, body });
+        }
+        response
+            .json()
+            .map_err(ReqwestHttpRuntimeTransportError::Request)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ReqwestHttpRuntimeTransportError {
+    #[error("HTTP runtime request failed: {0}")]
+    Request(reqwest::Error),
+    #[error("server returned {status}: {body}")]
+    Server {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct HttpRuntimeDelivery<T> {
     transport: T,
 }

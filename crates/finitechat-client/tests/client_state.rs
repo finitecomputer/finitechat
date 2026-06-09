@@ -4,9 +4,9 @@ use axum::http::{Method, Request, StatusCode};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
     HttpRuntimeDelivery, HttpRuntimeDeliveryError, HttpRuntimeTransport, LinkFanoutRoomPlan,
-    LinkFanoutRoomStatus, RuntimeDelivery, RuntimeLinkFanoutOptions, RuntimeSyncOptions,
-    RuntimeWorkerError, SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick,
-    run_runtime_sync_tick,
+    LinkFanoutRoomStatus, ReqwestHttpRuntimeTransport, ReqwestHttpRuntimeTransportError,
+    RuntimeDelivery, RuntimeLinkFanoutOptions, RuntimeSyncOptions, RuntimeWorkerError,
+    SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_engine::{
     AppendEventRequest, CommitAccepted, CreateRoomRequest, DeliveryService, EngineError,
@@ -1875,6 +1875,48 @@ fn runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes() {
         .claim_key_package_for_device(&claimed.owner)
         .unwrap();
     assert_eq!(replay, None);
+}
+
+#[test]
+fn reqwest_http_runtime_delivery_claims_key_package_over_live_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-live.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_live_key_package_claim");
+    let request = bob
+        .upload_key_package_request("kp_http_live_claim_bob")
+        .unwrap();
+
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+    delivery.upload_key_package(request.clone()).unwrap();
+    let claimed = delivery
+        .claim_key_package_for_device(&request.owner)
+        .unwrap()
+        .expect("uploaded package can be claimed over live HTTP");
+    assert_eq!(claimed.key_package_id, request.key_package_id);
+    assert_eq!(claimed.owner, request.owner);
+    assert_eq!(claimed.key_package_ref, request.key_package_ref);
+    assert_eq!(claimed.key_package_hash, request.key_package_hash);
+    assert_eq!(claimed.key_package_payload, request.key_package_payload);
+
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(format!("{server_url}/")));
+    let replay = delivery
+        .claim_key_package_for_device(&claimed.owner)
+        .unwrap();
+    assert_eq!(replay, None);
+
+    let mut transport = ReqwestHttpRuntimeTransport::new(server_url);
+    let missing = transport
+        .post_json::<_, serde_json::Value>("/missing", &serde_json::json!({"probe": true}));
+    assert!(matches!(
+        missing,
+        Err(ReqwestHttpRuntimeTransportError::Server {
+            status: StatusCode::NOT_FOUND,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -4791,6 +4833,40 @@ impl std::fmt::Display for InProcessHttpTransportError {
 }
 
 type TestHttpRuntimeDelivery = HttpRuntimeDelivery<InProcessHttpTransport>;
+
+fn spawn_live_http_server(path: &std::path::Path) -> String {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = http_router(HttpServerState::from_sqlite_path(path).unwrap());
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    let server_url = format!("http://{addr}");
+    wait_for_live_http_server(&server_url);
+    server_url
+}
+
+fn wait_for_live_http_server(server_url: &str) {
+    let health_url = format!("{}/health", server_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(&health_url)
+            .send()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("live HTTP test server did not become healthy at {health_url}");
+}
 
 struct InProcessHttpTransport {
     app: Router,
