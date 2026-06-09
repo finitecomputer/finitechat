@@ -35,7 +35,7 @@ use tower::ServiceExt;
 use transport_http_server::{
     HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
     HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
-    HttpSyncPage,
+    HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
 #[tokio::test]
@@ -2500,6 +2500,94 @@ async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_confli
     let page: HttpSyncPage = read_json(response).await;
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.next_after_seq, 1);
+}
+
+#[tokio::test]
+async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-event-bounded-sync".to_owned();
+    let mls_group_id = "mls-event-bounded-sync".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for index in 0..=MAX_HTTP_SYNC_PAGE_ENTRIES {
+        let response = post_json(
+            app.clone(),
+            "/events",
+            &append_application_request(
+                &room_id,
+                &mls_group_id,
+                &alice,
+                0,
+                format!("small-{index}").as_bytes(),
+                &format!("bounded-event-{index}"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EventAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, (index as u64) + 1);
+    }
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: MAX_HTTP_SYNC_PAGE_ENTRIES,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(first_page.entries.len(), MAX_HTTP_SYNC_PAGE_ENTRIES);
+    assert_eq!(first_page.entries.first().unwrap().seq, 1);
+    assert_eq!(
+        first_page.entries.last().unwrap().seq,
+        MAX_HTTP_SYNC_PAGE_ENTRIES as u64
+    );
+    assert_eq!(first_page.next_after_seq, MAX_HTTP_SYNC_PAGE_ENTRIES as u64);
+    assert!(first_page.has_more);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: first_page.next_after_seq,
+            limit: MAX_HTTP_SYNC_PAGE_ENTRIES,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let second_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(
+        second_page.entries[0].seq,
+        (MAX_HTTP_SYNC_PAGE_ENTRIES as u64) + 1
+    );
+    assert_eq!(
+        second_page.next_after_seq,
+        (MAX_HTTP_SYNC_PAGE_ENTRIES as u64) + 1
+    );
+    assert!(!second_page.has_more);
 }
 
 #[tokio::test]
