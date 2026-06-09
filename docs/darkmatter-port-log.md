@@ -19,7 +19,9 @@ Current copied acceptance surface:
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
 - Current Rust tests overall, including HTTP route/CLI adapter tests: `346`
+- Python tests overall: `8`
 - Python Hermes adapter tests: `7`
+- Python process binary smoke tests: `1`
 
 Copied/application Rust test distribution:
 
@@ -52,6 +54,7 @@ Python test distribution:
 | File | Count |
 | --- | ---: |
 | `tests/hermes/test_finite_platform_adapter.py` | 7 |
+| `tests/test_process_binary_smoke.py` | 1 |
 
 ## What Works Out Of The Box
 
@@ -439,6 +442,11 @@ Additional CLI checkpoint:
   idempotency-key rejection, batch KeyPackage claim replay, direct claim of the
   remaining package, and fanout save/prepared/reprepare/done/get checkpoints
   through `finitechat_cli::run` against a localhost Axum server.
+- Process-level binary smoke now builds `finitechat-darkmatter-server` and
+  `finitechat-darkmatter`, starts the server binary with a temporary SQLite
+  file, drives the CLI binary through health, publish, sync, exact idempotent
+  replay, and conflict rejection, then restarts the server binary and verifies
+  the persisted group log is still visible.
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 health`
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 publish-group --group-id cli-room --transport-group-id cli-transport --message-id cli-commit-1 --payload commit-bytes --commit-epoch 1`
@@ -548,7 +556,22 @@ Runtime delivery checkpoint:
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
 
-Next meaningful gate: add a process-level smoke that starts the
-`finitechat-darkmatter-server` binary with a temporary SQLite file and drives
-the `finitechat-darkmatter` CLI binary against it, not only the library-level
-CLI runner.
+## Remaining Gates
+
+- [x] Add a process-level smoke that starts the
+  `finitechat-darkmatter-server` binary with a temporary SQLite file and drives
+  the `finitechat-darkmatter` CLI binary against it, not only the library-level
+  CLI runner.
+- [ ] Run a test-suite parity audit against the baseline
+  `/Users/futurepaul/dev/finite/finitechat` checkout: compare test files and
+  test names, then document every intentionally reshaped, added, or still
+  missing acceptance case.
+- [ ] Decide whether any runtime/client flow still needs process-level binary
+  coverage beyond the current library-level runtime tests, live Axum tests, and
+  CLI binary smoke.
+- [ ] Split the Darkmatter-facing delta into maintainable buckets: upstreamable
+  HTTP transport work, upstreamable ordered-delivery profile work, Finite-owned
+  adapter/application logic, and fork-only requirements.
+- [ ] Refresh the compatibility report after the next Darkmatter branch update
+  and verify that `RequiresDarkmatterFork` still only names the ordered
+  delivery profile.
