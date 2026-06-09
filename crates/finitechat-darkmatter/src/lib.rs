@@ -76,6 +76,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_runtime_sync_tick claims serialized WelcomeRecord payloads through Darkmatter HTTP inbox routes, activates locally, and acks without duplicate replay after restart",
         },
         PortFinding {
+            area: "http_room_runtime_sync",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_runtime_sync_tick decodes serialized RoomLogEntry payloads from Darkmatter HTTP group pages and applies encrypted application entries with replay-safe cursors",
+        },
+        PortFinding {
             area: "http_key_package_batch_claim_replay",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
