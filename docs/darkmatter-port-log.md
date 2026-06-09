@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `346`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `347`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 17 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 20 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 21 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -75,9 +75,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `354` (`346` Rust, `8` Python)
+- Port parsed tests: `355` (`347` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `60`
+- Port-only test names: `61`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -89,7 +89,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 17 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 26 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 27 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -129,7 +129,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `60` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `61` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -149,7 +149,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 17 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 26 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 27 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -163,6 +163,12 @@ Highest-risk preserved fake/store proofs to port next:
 | P1 | `welcome_is_not_released_before_accepted_commit`, `sqlite_welcome_not_released_before_accepted_commit` | Typed submit-commit tests that assert Welcome release remains coupled to durable accepted Commit append. |
 | P1 | `consumed_key_package_cannot_be_reused`, `sqlite_key_package_lease_expiry_and_reclaim_survives_reopen` | HTTP KeyPackage lease/consume/reclaim tests beyond current single-use and inventory coverage. |
 | P1 | `revoked_active_device_cannot_send_or_commit`, `sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages` | HTTP room-membership/account-room projection tests for revoked-device send/commit/package rejection. |
+
+Current P0 progress: typed HTTP `/commits` now proves successful
+lost-response replay after restart and repair after the commit publish/idempotency
+rows survive without finite projection rows. The full old SQLite crash matrix is
+not yet ported because it injected failures at every commit reducer/store
+boundary.
 
 Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
 coverage, but the migration is not complete. The remaining implementation work
@@ -654,6 +660,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_replay_repairs_projection_after_partial_durable_publish`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_raw_message_commit_projection_compatibility_survives_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_account_room_bootstrap_rejects_raw_commit_history_without_membership_delta`: pass
 - `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
@@ -702,6 +709,11 @@ Runtime delivery checkpoint:
   discovery, reloads the prepared commit from durable local state, retries the
   same HTTP idempotency keys through the typed route, completes the room, and
   leaves exactly one new group Commit and one claimed Welcome.
+- A server persistence test now covers the narrower interrupted-server window
+  where the commit publish operation and idempotency receipt are durable, but
+  finite account-room and room-membership projections were not written. Retrying
+  typed `/commits` repairs the projections, replays the accepted commit response,
+  and releases one Welcome.
 - With two existing rooms, the same worker pages typed bootstrap account-room
   discovery one room at a time, claims two distinct target-device KeyPackages,
   submits and completes both room commits, and the later device activates both

@@ -23,13 +23,15 @@ use finitechat_proto::{
     StagedWelcomeV1, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpKeyPackageId,
-    HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget, HttpSyncPage,
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
+    HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
+    HttpSyncPage,
 };
 
 #[tokio::test]
@@ -1020,6 +1022,112 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
 }
 
 #[tokio::test]
+async fn sqlite_submit_commit_replay_repairs_projection_after_partial_durable_publish() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let room_id = "room-submit-partial-replay".to_owned();
+    let mls_group_id = "mls-submit-partial-replay".to_owned();
+    let welcome_id = "welcome-submit-partial-replay".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        &welcome_id,
+        "partial-replay-idempotency",
+    );
+    let message_id = request
+        .envelope
+        .message_id()
+        .expect("commit envelope message id");
+    let commit_publish = commit_publish_request_for_test(&request, &message_id);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id,
+            creator,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Model a process interruption after the commit publish/idempotency rows are
+    // durable but before the finite projection writes run.
+    insert_durable_commit_publish_without_projection(&db_path, &commit_publish, 1);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let before_retry: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(before_retry.rooms.len(), 1);
+    assert_eq!(before_retry.rooms[0]["current_epoch"], 0);
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(accepted.message_id, message_id);
+    assert_eq!(accepted.released_welcomes, vec![welcome_id.clone()]);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: CommitAccepted = read_json(response).await;
+    assert_eq!(replayed, accepted);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_retry: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(after_retry.rooms.len(), 1);
+    assert_eq!(after_retry.rooms[0]["current_epoch"], 1);
+    assert_eq!(after_retry.rooms[0]["last_seq"], accepted.seq);
+    assert_eq!(
+        after_retry.rooms[0]["devices"][1]["device"]["device_id"],
+        "alice-phone"
+    );
+    assert_eq!(after_retry.rooms[0]["devices"][1]["active"], false);
+
+    let response = post_json(
+        app,
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&DeviceRef::new("alice", "alice-phone")),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inbox_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(inbox_page.entries.len(), 1);
+    assert_eq!(inbox_page.entries[0].message.id, id(&welcome_id));
+}
+
+#[tokio::test]
 async fn sqlite_raw_message_commit_projection_compatibility_survives_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -1770,6 +1878,97 @@ fn submit_add_device_request(
         }],
         idempotency_key: idempotency_key.to_owned(),
     }
+}
+
+fn commit_publish_request_for_test(
+    request: &SubmitCommitRequest,
+    message_id: &str,
+) -> PublishMessageRequest {
+    let transport_group_id = request.room_id.as_bytes().to_vec();
+    let entry = finitechat_proto::RoomLogEntry {
+        room_id: request.room_id.clone(),
+        seq: 0,
+        message_id: message_id.to_owned(),
+        sender: request.sender.clone(),
+        kind: LogEntryKind::Commit,
+        epoch: request.expected_epoch,
+        envelope: request.envelope.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+    };
+    let payload = serde_json::to_vec(&FiniteAccountRoomCommitProjection {
+        entry,
+        membership_delta: request.membership_delta.clone(),
+    })
+    .expect("commit projection payload");
+
+    PublishMessageRequest {
+        target: group_target(
+            group_id(&request.room_id),
+            transport_group_id.clone(),
+            Some(HttpCommitAdmission {
+                source_epoch: EpochId(request.expected_epoch),
+            }),
+        ),
+        message: TransportMessage {
+            id: id(message_id),
+            payload,
+            timestamp: Timestamp(0),
+            causal_deps: Vec::new(),
+            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage { transport_group_id },
+        },
+        idempotency_key: Some(format!(
+            "commit:{}:{}",
+            request.room_id, request.idempotency_key
+        )),
+    }
+}
+
+fn insert_durable_commit_publish_without_projection(
+    db_path: &std::path::Path,
+    request: &PublishMessageRequest,
+    seq: u64,
+) {
+    let operation_json = serde_json::to_string(&serde_json::json!({
+        "PublishMessage": {
+            "target": &request.target,
+            "message": &request.message,
+            "idempotency_key": &request.idempotency_key,
+        }
+    }))
+    .expect("persisted operation json");
+    let fingerprint_json = serde_json::to_string(&serde_json::json!({
+        "target": &request.target,
+        "message": &request.message,
+    }))
+    .expect("publish fingerprint json");
+    let receipt_json = serde_json::to_string(&HttpPublishReceipt {
+        message_id: request.message.id.clone(),
+        plane: HttpDeliveryPlane::Group,
+        seq,
+        duplicate: false,
+    })
+    .expect("publish receipt json");
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .expect("commit publish idempotency key");
+
+    let conn = Connection::open(db_path).expect("sqlite connection");
+    conn.execute(
+        "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+        params!["publish_message", operation_json],
+    )
+    .expect("insert durable publish operation");
+    conn.execute(
+        "INSERT INTO http_publish_idempotency (
+            idempotency_key,
+            fingerprint_json,
+            receipt_json
+        ) VALUES (?1, ?2, ?3)",
+        params![idempotency_key, fingerprint_json, receipt_json],
+    )
+    .expect("insert durable publish idempotency");
 }
 
 fn append_application_request(

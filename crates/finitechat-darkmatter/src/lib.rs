@@ -148,7 +148,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group commit projection with membership deltas, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group commit projection with membership deltas, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, replays idempotently after restart, and repairs finite projections when a retry observes a durable commit publish without its projection rows",
         },
         PortFinding {
             area: "http_typed_event_route",

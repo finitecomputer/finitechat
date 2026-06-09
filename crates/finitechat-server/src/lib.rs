@@ -965,6 +965,29 @@ impl HttpServerState {
         )
     }
 
+    fn ensure_submit_commit_projection(
+        &self,
+        request: &SubmitCommitRequest,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let projection_is_current = rooms.get(&request.room_id).is_some_and(|projection| {
+            projection.mls_group_id == request.envelope.mls_group_id
+                && projection.current_epoch >= request.membership_delta.post_commit_epoch
+                && projection.last_seq >= accepted_seq
+        });
+        drop(rooms);
+
+        if projection_is_current {
+            return Ok(());
+        }
+
+        self.record_submit_commit_projection(request, accepted_seq)
+    }
+
     fn record_account_room_membership_delta(
         &self,
         room_id: &str,
@@ -1177,6 +1200,7 @@ impl HttpServerState {
         })?;
         let commit_publish = commit_publish_request(&request, &message_id)?;
         if let Some(receipt) = self.replayed_publish_receipt(&commit_publish) {
+            self.ensure_submit_commit_projection(&request, receipt.seq)?;
             let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
             for welcome in &welcomes {
                 self.publish_message(welcome_publish_request(welcome)?)?;
