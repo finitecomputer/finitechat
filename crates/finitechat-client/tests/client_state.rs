@@ -2319,7 +2319,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     let room_id = "room_http_link_fanout";
     let group_id = "mls_http_link_fanout";
 
-    let bob_join_seq = create_group_room_with_member(
+    let bob_join = create_group_room_with_member_and_request(
         &mut source_server,
         &mut alice_browser,
         &mut bob,
@@ -2333,7 +2333,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     );
     alice_store.save_device_state(&alice_browser).unwrap();
     alice_store
-        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join.join_seq)
         .unwrap();
     phone_store.save_device_state(&alice_phone).unwrap();
 
@@ -2343,7 +2343,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
         .unwrap();
     assert_eq!(initial_page.entries.len(), 1);
     delivery
-        .publish_room_log_entry(&initial_page.entries[0])
+        .publish_commit_projection(&bob_join.request, &initial_page.entries[0])
         .unwrap();
     delivery
         .bootstrap_account_room(&CreateRoomRequest {
@@ -2420,7 +2420,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
         report.applied_entries,
         vec![finitechat_client::RuntimeAppliedEntry {
             room_id: room_id.to_owned(),
-            seq: bob_join_seq + 1,
+            seq: bob_join.join_seq + 1,
             entry: AppliedLogEntry::Commit {
                 sender: alice_browser.device_ref().clone(),
                 epoch: 2,
@@ -2433,7 +2433,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     else {
         panic!("HTTP fanout room did not complete");
     };
-    assert_eq!(accepted_seq, bob_join_seq + 1);
+    assert_eq!(accepted_seq, bob_join.join_seq + 1);
 
     delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
     let projected_rooms = delivery
@@ -2456,7 +2456,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     );
 
     let bob_page = delivery
-        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .sync_events(room_id, bob.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(bob_page.entries.len(), 1);
     assert_eq!(
@@ -2577,7 +2577,7 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     let room_id = "room_http_link_retry";
     let group_id = "mls_http_link_retry";
 
-    let bob_join_seq = create_group_room_with_member(
+    let bob_join = create_group_room_with_member_and_request(
         &mut source_server,
         &mut alice_browser,
         &mut bob,
@@ -2591,7 +2591,7 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     );
     alice_store.save_device_state(&alice_browser).unwrap();
     alice_store
-        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join.join_seq)
         .unwrap();
     phone_store.save_device_state(&alice_phone).unwrap();
 
@@ -2601,7 +2601,7 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
         .unwrap();
     assert_eq!(initial_page.entries.len(), 1);
     delivery
-        .publish_room_log_entry(&initial_page.entries[0])
+        .publish_commit_projection(&bob_join.request, &initial_page.entries[0])
         .unwrap();
     delivery
         .bootstrap_account_room(&CreateRoomRequest {
@@ -2657,10 +2657,10 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
         LinkFanoutRoomStatus::Prepared { .. }
     ));
     let after_failure = delivery
-        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .sync_events(room_id, bob.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(after_failure.entries.len(), 1);
-    assert_eq!(after_failure.entries[0].seq, bob_join_seq + 1);
+    assert_eq!(after_failure.entries[0].seq, bob_join.join_seq + 1);
     assert_eq!(after_failure.entries[0].kind, LogEntryKind::Commit);
 
     let report = run_link_fanout_tick(
@@ -2679,10 +2679,10 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     assert!(report.complete);
 
     let after_retry = delivery
-        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .sync_events(room_id, bob.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(after_retry.entries.len(), 1);
-    assert_eq!(after_retry.entries[0].seq, bob_join_seq + 1);
+    assert_eq!(after_retry.entries[0].seq, bob_join.join_seq + 1);
     assert_eq!(
         bob.apply_log_entry(room_id, &after_retry.entries[0])
             .unwrap(),
@@ -2738,7 +2738,7 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
     let room_b = "room_http_multi_link_b";
     let group_b = "mls_http_multi_link_b";
 
-    let bob_join_seq = create_group_room_with_member(
+    let bob_join = create_group_room_with_member_and_request(
         &mut source_server,
         &mut alice_browser,
         &mut bob,
@@ -2750,7 +2750,7 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
             idempotency_key: "add_bob_http_multi_link_a",
         },
     );
-    let dana_join_seq = create_group_room_with_member(
+    let dana_join = create_group_room_with_member_and_request(
         &mut source_server,
         &mut alice_browser,
         &mut dana,
@@ -2764,10 +2764,10 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
     );
     alice_store.save_device_state(&alice_browser).unwrap();
     alice_store
-        .advance_room_cursor_and_save(&mut alice_browser, room_a, bob_join_seq)
+        .advance_room_cursor_and_save(&mut alice_browser, room_a, bob_join.join_seq)
         .unwrap();
     alice_store
-        .advance_room_cursor_and_save(&mut alice_browser, room_b, dana_join_seq)
+        .advance_room_cursor_and_save(&mut alice_browser, room_b, dana_join.join_seq)
         .unwrap();
     phone_store.save_device_state(&alice_phone).unwrap();
 
@@ -2777,14 +2777,14 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
         .unwrap();
     assert_eq!(initial_a.entries.len(), 1);
     delivery
-        .publish_room_log_entry(&initial_a.entries[0])
+        .publish_commit_projection(&bob_join.request, &initial_a.entries[0])
         .unwrap();
     let initial_b = source_server
         .sync_events(room_b, alice_browser.device_ref(), 0)
         .unwrap();
     assert_eq!(initial_b.entries.len(), 1);
     delivery
-        .publish_room_log_entry(&initial_b.entries[0])
+        .publish_commit_projection(&dana_join.request, &initial_b.entries[0])
         .unwrap();
 
     let account_id = alice_browser.device_ref().account_id.clone();
@@ -2874,11 +2874,11 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
     else {
         panic!("HTTP multi-room fanout did not complete room b");
     };
-    assert_eq!(accepted_a_seq, bob_join_seq + 1);
-    assert_eq!(accepted_b_seq, dana_join_seq + 1);
+    assert_eq!(accepted_a_seq, bob_join.join_seq + 1);
+    assert_eq!(accepted_b_seq, dana_join.join_seq + 1);
 
     let bob_page = delivery
-        .sync_events(room_a, bob.device_ref(), bob_join_seq)
+        .sync_events(room_a, bob.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(bob_page.entries.len(), 1);
     assert_eq!(
@@ -2889,7 +2889,7 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
         }
     );
     let dana_page = delivery
-        .sync_events(room_b, dana.device_ref(), dana_join_seq)
+        .sync_events(room_b, dana.device_ref(), dana_join.join_seq)
         .unwrap();
     assert_eq!(dana_page.entries.len(), 1);
     assert_eq!(
@@ -2932,7 +2932,7 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     let room_id = "room_http_link_race";
     let group_id = "mls_http_link_race";
 
-    let bob_join_seq = create_group_room_with_member(
+    let bob_join = create_group_room_with_member_and_request(
         &mut source_server,
         &mut alice_browser,
         &mut bob,
@@ -2946,7 +2946,7 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     );
     alice_store.save_device_state(&alice_browser).unwrap();
     alice_store
-        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join_seq)
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join.join_seq)
         .unwrap();
     phone_store.save_device_state(&alice_phone).unwrap();
 
@@ -2957,7 +2957,7 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
         .unwrap();
     assert_eq!(initial_page.entries.len(), 1);
     delivery
-        .publish_room_log_entry(&initial_page.entries[0])
+        .publish_commit_projection(&bob_join.request, &initial_page.entries[0])
         .unwrap();
     delivery
         .bootstrap_account_room(&CreateRoomRequest {
@@ -2965,6 +2965,13 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
             mls_group_id: group_id.to_owned(),
             creator: alice_browser.device_ref().clone(),
         })
+        .unwrap();
+    delivery.publish_welcome_record(&bob_join.welcome).unwrap();
+    let claimed_welcomes = delivery.claim_welcomes(bob.device_ref()).unwrap();
+    assert_eq!(claimed_welcomes.len(), 1);
+    assert_eq!(claimed_welcomes[0].welcome_id, bob_join.welcome.welcome_id);
+    delivery
+        .ack_welcome(&bob_join.welcome.welcome_id, true)
         .unwrap();
 
     let phone_replenish = run_runtime_sync_tick(
@@ -3020,14 +3027,14 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     let bob_winner_message_id = bob_winner.message_id.clone();
     let bob_accepted = delivery.submit_commit(bob_winner.request).unwrap();
     let bob_page = delivery
-        .sync_events(room_id, bob.device_ref(), bob_join_seq)
+        .sync_events(room_id, bob.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(bob_page.entries.len(), 1);
     bob.merge_pending_commit_from_log(room_id, &bob_page.entries, &bob_winner_message_id)
         .unwrap();
 
     let page = delivery
-        .sync_events(room_id, alice_browser.device_ref(), bob_join_seq)
+        .sync_events(room_id, alice_browser.device_ref(), bob_join.join_seq)
         .unwrap();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(
@@ -3039,7 +3046,7 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
             epoch: 2,
         })
     );
-    assert_eq!(bob_accepted.seq, bob_join_seq + 1);
+    assert_eq!(bob_accepted.seq, bob_join.join_seq + 1);
     assert!(!alice_browser.has_pending_commit(room_id).unwrap());
 
     let report = run_link_fanout_tick(
@@ -4278,6 +4285,15 @@ fn claim_and_activate_room(
     room_id: &str,
     welcome_id: &str,
 ) -> u64 {
+    claim_and_activate_room_record(server, device, room_id, welcome_id).commit_seq
+}
+
+fn claim_and_activate_room_record(
+    server: &mut DeliveryService,
+    device: &mut FiniteChatDevice,
+    room_id: &str,
+    welcome_id: &str,
+) -> WelcomeRecord {
     let claimed_welcomes = server.claim_welcomes(device.device_ref()).unwrap();
     let welcome = claimed_welcomes
         .into_iter()
@@ -4291,7 +4307,7 @@ fn claim_and_activate_room(
         )
         .unwrap();
     server.ack_welcome(welcome_id, true).unwrap();
-    welcome.commit_seq
+    welcome
 }
 
 fn active_alice_bob_room() -> (DeliveryService, FiniteChatDevice, FiniteChatDevice, u64) {
@@ -4339,12 +4355,27 @@ struct GroupMemberSetup<'a> {
     idempotency_key: &'a str,
 }
 
+struct CreatedGroupMember {
+    join_seq: u64,
+    request: SubmitCommitRequest,
+    welcome: WelcomeRecord,
+}
+
 fn create_group_room_with_member(
     server: &mut DeliveryService,
     alice: &mut FiniteChatDevice,
     member: &mut FiniteChatDevice,
     setup: GroupMemberSetup<'_>,
 ) -> u64 {
+    create_group_room_with_member_and_request(server, alice, member, setup).join_seq
+}
+
+fn create_group_room_with_member_and_request(
+    server: &mut DeliveryService,
+    alice: &mut FiniteChatDevice,
+    member: &mut FiniteChatDevice,
+    setup: GroupMemberSetup<'_>,
+) -> CreatedGroupMember {
     server
         .create_room(CreateRoomRequest {
             room_id: setup.room_id.to_string(),
@@ -4371,6 +4402,7 @@ fn create_group_room_with_member(
             setup.idempotency_key,
         )
         .unwrap();
+    let request = prepared.request.clone();
     let accepted = server.submit_commit(prepared.request).unwrap();
     let alice_page = server
         .sync_events(setup.room_id, alice.device_ref(), 0)
@@ -4378,11 +4410,16 @@ fn create_group_room_with_member(
     alice
         .merge_pending_commit_from_log(setup.room_id, &alice_page.entries, &prepared.message_id)
         .unwrap();
-    let join_seq = claim_and_activate_room(server, member, setup.room_id, setup.welcome_id);
+    let welcome = claim_and_activate_room_record(server, member, setup.room_id, setup.welcome_id);
+    let join_seq = welcome.commit_seq;
     assert_eq!(join_seq, accepted.seq);
     assert_eq!(alice.group_epoch(setup.room_id).unwrap(), 1);
     assert_eq!(member.group_epoch(setup.room_id).unwrap(), 1);
-    join_seq
+    CreatedGroupMember {
+        join_seq,
+        request,
+        welcome,
+    }
 }
 
 struct ActiveThreeMemberRoom {

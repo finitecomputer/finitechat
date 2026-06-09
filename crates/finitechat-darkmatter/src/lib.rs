@@ -133,7 +133,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_account_room_commit_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server can project typed /commits add/remove requests into persisted account-room records, keep raw /messages projection compatibility, and reload the updated discovery state after restart",
+            evidence: "finitechat-server can project typed /commits and raw /messages projection wrappers into persisted account-room records, then reload the updated discovery state after restart",
         },
         PortFinding {
             area: "http_welcome_ack_membership_activation",
@@ -143,12 +143,12 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_room_membership_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors",
+            evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, and typed rooms reject raw plain commits without membership deltas",
         },
         PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group RoomLogEntry, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group commit projection with membership deltas, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
         },
         PortFinding {
             area: "http_typed_event_route",
@@ -177,8 +177,8 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         },
         PortFinding {
             area: "multi_device_later_device_fanout",
-            status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires closing raw-history membership imports before strict member authorization can apply to every room; typed bootstrap/commit/event flows now have server-owned room-membership projection, filtered sync, pending-send rejection, and Welcome ack activation",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "Typed bootstrap/commit/event flows now have server-owned room-membership projection, filtered sync, pending-send rejection, Welcome ack activation, and rejection of raw plain commits that would otherwise weaken typed room membership",
         },
         PortFinding {
             area: "ordered_delivery_profile",
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn port_findings_name_all_status_buckets() {
+    fn port_findings_name_current_status_buckets() {
         let findings = current_port_findings();
         assert!(
             findings
@@ -269,7 +269,7 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .any(|finding| finding.status == PortStatus::ThickOrWonkyLogic)
+                .all(|finding| finding.status != PortStatus::ThickOrWonkyLogic)
         );
         assert!(
             findings

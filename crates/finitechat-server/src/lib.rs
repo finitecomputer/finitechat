@@ -128,6 +128,7 @@ impl HttpServerState {
         &self,
         request: PublishMessageRequest,
     ) -> Result<HttpPublishReceipt, ServerHttpError> {
+        self.validate_raw_commit_import(&request)?;
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.apply_mutation(|service| {
                 let receipt = service.publish(request.target.clone(), request.message.clone())?;
@@ -175,6 +176,45 @@ impl HttpServerState {
         *service = candidate;
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
+    }
+
+    fn validate_raw_commit_import(
+        &self,
+        request: &PublishMessageRequest,
+    ) -> Result<(), ServerHttpError> {
+        if !matches!(&request.target, HttpPublishTarget::Group { .. })
+            || serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&request.message.payload)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        let Some(entry) = room_log_entry_from_payload(&request.message.payload) else {
+            return Ok(());
+        };
+        if entry.kind != LogEntryKind::Commit
+            || entry.envelope.kind != LogEntryKind::Commit
+            || entry.envelope.room_id != entry.room_id
+            || request.message.id.as_slice() != entry.message_id.as_bytes()
+        {
+            return Ok(());
+        }
+
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get(&entry.room_id) else {
+            return Ok(());
+        };
+        if projection.mls_group_id == entry.envelope.mls_group_id && projection.membership_complete
+        {
+            return Err(ServerHttpError::InvalidRawCommitImport {
+                room_id: entry.room_id,
+                reason: "raw commit import for a typed room must carry membership_delta projection"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     fn publish_key_package(
@@ -733,15 +773,20 @@ impl HttpServerState {
             return Ok(());
         }
 
-        let (current_epoch, last_seq) =
-            self.observed_room_head(&request.room_id, &request.mls_group_id)?;
+        let observed = self.observed_room_head(&request.room_id, &request.mls_group_id)?;
+        if observed.raw_commit_without_projection {
+            return Err(ServerHttpError::RoomMembershipConflict {
+                room_id: request.room_id.clone(),
+                reason: "typed bootstrap requires existing raw commit history to carry membership_delta projection wrappers".to_owned(),
+            });
+        }
         let projection = initial_room_membership_projection(
             &request.room_id,
             &request.mls_group_id,
             &request.creator,
-            current_epoch,
-            last_seq,
-            last_seq == 0,
+            observed.current_epoch,
+            observed.last_seq,
+            true,
         );
         rooms.insert(request.room_id.clone(), projection.clone());
         drop(rooms);
@@ -756,16 +801,21 @@ impl HttpServerState {
         &self,
         room_id: &str,
         mls_group_id: &str,
-    ) -> Result<(u64, HttpSequence), ServerHttpError> {
+    ) -> Result<ObservedRoomHead, ServerHttpError> {
         let group_id = group_id_for_room(room_id);
         let service = self.service.lock().expect("HTTP delivery service mutex");
         let mut current_epoch = 0;
         let mut last_seq = 0;
         let mut after_seq = 0;
+        let mut raw_commit_without_projection = false;
         loop {
             let page = service.sync_group(&group_id, after_seq, MAX_HTTP_SYNC_PAGE_ENTRIES)?;
             for queued in &page.entries {
                 last_seq = last_seq.max(queued.seq);
+                let has_membership_delta = serde_json::from_slice::<
+                    FiniteAccountRoomCommitProjection,
+                >(&queued.message.payload)
+                .is_ok();
                 let Some(entry) = room_log_entry_from_payload(&queued.message.payload) else {
                     continue;
                 };
@@ -774,6 +824,9 @@ impl HttpServerState {
                     && entry.kind == LogEntryKind::Commit
                 {
                     current_epoch = current_epoch.max(entry.epoch.saturating_add(1));
+                    if !has_membership_delta {
+                        raw_commit_without_projection = true;
+                    }
                 }
             }
             if !page.has_more || page.next_after_seq <= after_seq {
@@ -781,7 +834,11 @@ impl HttpServerState {
             }
             after_seq = page.next_after_seq;
         }
-        Ok((current_epoch, last_seq))
+        Ok(ObservedRoomHead {
+            current_epoch,
+            last_seq,
+            raw_commit_without_projection,
+        })
     }
 
     fn record_finite_commit_projection(
@@ -1812,6 +1869,13 @@ struct HttpRoomMembershipProjection {
     membership: BTreeMap<String, DeviceMembership>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ObservedRoomHead {
+    current_epoch: u64,
+    last_seq: HttpSequence,
+    raw_commit_without_projection: bool,
+}
+
 impl HttpRoomMembershipProjection {
     fn tracks_device(&self, device: &DeviceRef) -> bool {
         self.membership.contains_key(&DeviceMembership::key(device))
@@ -2477,8 +2541,11 @@ fn commit_publish_request(
         },
         message: TransportMessage {
             id: MessageId::new(message_id.as_bytes().to_vec()),
-            payload: serde_json::to_vec(&placeholder_entry)
-                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+            payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
+                entry: placeholder_entry,
+                membership_delta: request.membership_delta.clone(),
+            })
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
             timestamp: Timestamp(0),
             causal_deps: Vec::new(),
             source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
@@ -2809,6 +2876,10 @@ pub enum ServerHttpError {
     InvalidCommitRequest {
         reason: String,
     },
+    InvalidRawCommitImport {
+        room_id: String,
+        reason: String,
+    },
     InvalidEventRequest {
         reason: String,
     },
@@ -2934,6 +3005,11 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_commit_request".to_owned(),
                 reason,
+            ),
+            Self::InvalidRawCommitImport { room_id, reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_raw_commit_import".to_owned(),
+                format!("raw commit import for {room_id} is invalid: {reason}"),
             ),
             Self::InvalidEventRequest { reason } => (
                 StatusCode::BAD_REQUEST,

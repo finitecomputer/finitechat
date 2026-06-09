@@ -857,6 +857,51 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
 }
 
 #[tokio::test]
+async fn sqlite_account_room_bootstrap_rejects_raw_commit_history_without_membership_delta() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-bootstrap-raw-commit-rejected".to_owned();
+    let mls_group_id = "mls-bootstrap-raw-commit-rejected".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/messages",
+        &raw_commit_publish_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            "raw-bootstrap-commit-without-delta",
+            "raw-bootstrap-commit-without-delta-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id,
+            mls_group_id,
+            creator: alice,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "room_membership_conflict");
+    assert!(
+        error
+            .error
+            .contains("existing raw commit history to carry membership_delta")
+    );
+}
+
+#[tokio::test]
 async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -920,19 +965,13 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
     assert_eq!(group_page.entries.len(), 1);
     assert_eq!(group_page.entries[0].seq, accepted.seq);
     assert_eq!(group_page.entries[0].message.id, id(&accepted.message_id));
-    assert!(
-        serde_json::from_slice::<serde_json::Value>(&group_page.entries[0].message.payload)
-            .expect("commit payload json")
-            .get("membership_delta")
-            .is_none(),
-        "/commits must not publish the compatibility projection wrapper"
-    );
-    let entry: finitechat_proto::RoomLogEntry =
+    let projection: FiniteAccountRoomCommitProjection =
         serde_json::from_slice(&group_page.entries[0].message.payload)
-            .expect("room log entry payload");
-    assert_eq!(entry.message_id, accepted.message_id);
-    assert_eq!(entry.room_id, room_id);
-    assert_eq!(entry.kind, LogEntryKind::Commit);
+            .expect("commit projection payload");
+    assert_eq!(projection.entry.message_id, accepted.message_id);
+    assert_eq!(projection.entry.room_id, room_id);
+    assert_eq!(projection.entry.kind, LogEntryKind::Commit);
+    assert_eq!(projection.membership_delta, request.membership_delta);
 
     let recipient = member_for_device(&DeviceRef::new("alice", "alice-phone"));
     let response = post_json(
@@ -1302,6 +1341,24 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let bob_acceptance: EventAccepted = read_json(response).await;
     assert_eq!(bob_acceptance.seq, 4);
 
+    let response = post_json(
+        app.clone(),
+        "/messages",
+        &raw_commit_publish_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            1,
+            "raw-commit-without-membership-delta",
+            "raw-commit-without-membership-delta-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_raw_commit_import");
+
+    let app = persistent_app(&db_path);
     let response = post_json(
         app,
         "/sync/group",
@@ -1735,6 +1792,46 @@ fn append_application_request(
             payload: payload.to_vec(),
         },
         idempotency_key: idempotency_key.to_owned(),
+    }
+}
+
+fn raw_commit_publish_request(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    epoch: u64,
+    message_id: &str,
+    idempotency_key: &str,
+) -> PublishMessageRequest {
+    let entry = finitechat_proto::RoomLogEntry {
+        room_id: room_id.to_owned(),
+        seq: 0,
+        message_id: message_id.to_owned(),
+        sender: sender.clone(),
+        kind: LogEntryKind::Commit,
+        epoch,
+        envelope: FiniteEnvelope {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            epoch,
+            sender: sender.clone(),
+            kind: LogEntryKind::Commit,
+            payload: b"raw-commit-without-membership-delta".to_vec(),
+        },
+        idempotency_key: idempotency_key.to_owned(),
+    };
+    let transport_group_id = room_id.as_bytes().to_vec();
+    let payload = serde_json::to_vec(&entry).expect("room log entry json");
+    PublishMessageRequest {
+        target: group_target(
+            group_id(room_id),
+            transport_group_id.clone(),
+            Some(HttpCommitAdmission {
+                source_epoch: EpochId(epoch),
+            }),
+        ),
+        message: group_message(message_id, transport_group_id, &payload),
+        idempotency_key: Some(idempotency_key.to_owned()),
     }
 }
 

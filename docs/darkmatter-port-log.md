@@ -18,10 +18,10 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `299`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `339`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `340`
 - Python Hermes adapter tests: `7`
 
-Rust test distribution:
+Copied/application Rust test distribution:
 
 | File | Count |
 | --- | ---: |
@@ -36,6 +36,16 @@ Rust test distribution:
 | `crates/finitechat-sim/tests/scenarios.rs` | 78 |
 | `crates/finitechat-store/src/lib.rs` | 1 |
 | `crates/finitechat-store/tests/sqlite_scenarios.rs` | 43 |
+
+Additional HTTP/CLI/Darkmatter Rust test distribution:
+
+| File | Count |
+| --- | ---: |
+| `crates/finitechat-cli/src/lib.rs` | 13 |
+| `crates/finitechat-darkmatter/src/lib.rs` | 2 |
+| `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 20 |
+| `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
 
@@ -95,9 +105,10 @@ Python test distribution:
   intervals from typed bootstrap, typed `/commits`, and activated Welcome acks,
   persist them, filter group sync pages by requester, and reject typed
   application events or tracked typed commits from pending/unacked devices.
-  Raw historical room-log imports remain a compatibility mode: the server can
-  observe their group head/epoch, but marks the projection incomplete because
-  plain `RoomLogEntry` commits do not carry membership deltas.
+  Typed `/commits` publish a `FiniteAccountRoomCommitProjection` payload, and
+  raw `/messages` commit imports for typed rooms must carry the same projection
+  wrapper; plain raw commits are rejected before append instead of weakening
+  strict membership filtering.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log is published and
   account-room discovery starts from typed bootstrap projection: discover the
@@ -208,8 +219,9 @@ Python test distribution:
   Finite store's Welcome activation rule.
 - Typed submit-commit route for the HTTP delivery surface. The route accepts a
   Finite `SubmitCommitRequest`, validates its structural commit metadata,
-  publishes a plain `RoomLogEntry` into the ordered Darkmatter group queue,
-  derives account-room and room-membership updates from the submitted request,
+  publishes a `FiniteAccountRoomCommitProjection` into the ordered Darkmatter
+  group queue, derives account-room and room-membership updates from the
+  submitted request,
   publishes derived `WelcomeRecord`s to recipient inboxes, and returns
   `CommitAccepted` from the accepted HTTP sequence. Malformed staged Welcome
   inputs are rejected before the route appends delivery side effects, and exact
@@ -239,20 +251,18 @@ Python test distribution:
   server-side package response-loss piece, the HTTP fanout wrapper now covers
   opaque room-plan checkpointing, and the account-room directory covers
   discovery over HTTP. The HTTP server now covers a typed submit-commit route
-  that publishes the group `RoomLogEntry`, derives account-room membership
-  updates from the submitted request, and releases derived Welcomes, including
-  response-loss retry after the typed submit is accepted; the runtime adapter
-  covers that path across one-room and two-room fanout ticks.
+  that publishes a commit projection with membership deltas, derives
+  account-room membership updates from the submitted request, and releases
+  derived Welcomes, including response-loss retry after the typed submit is
+  accepted; the runtime adapter covers that path across one-room and two-room
+  fanout ticks.
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
   initial active device, account-room save/list now normalizes records to the
   requested account, Welcome ack activation now promotes pending devices to
-  active, and typed room-membership projection now filters sync and rejects
-  pending sends. Complete server-authored room/member truth still has one
-  compatibility caveat: rooms imported from raw plain `RoomLogEntry` history can
-  advance the projected epoch/head, but because those commits do not carry
-  membership deltas, unknown members fall back to raw transport compatibility
-  instead of strict membership denial.
+  active, typed room-membership projection now filters sync and rejects pending
+  sends, and typed rooms reject raw plain Commit imports that do not include
+  membership deltas.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -445,6 +455,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_raw_message_commit_projection_compatibility_survives_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_account_room_bootstrap_rejects_raw_commit_history_without_membership_delta`: pass
 - `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
@@ -505,8 +516,9 @@ Runtime delivery checkpoint:
   updates for add/remove commits, and later-device fanout from typed bootstrap
   across the happy path, submit response-loss retry, multi-room fanout, and
   same-epoch reprepare. Typed bootstrap/commit/event flows now have
-  server-owned room-membership projection; raw plain `RoomLogEntry` history
-  remains an incomplete compatibility mode because it lacks membership deltas.
+  server-owned room-membership projection, and typed rooms reject raw plain
+  Commit imports that lack membership deltas before they can weaken strict
+  membership filtering.
 - The test-local HTTP runtime adapter has been reduced to a transport harness:
   it serializes JSON into the in-process Axum router, exposes HTTP status
   errors to assertions, and injects before-accept or after-accept `/commits`
@@ -521,6 +533,5 @@ Runtime delivery checkpoint:
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
 
-Next meaningful gate: close the raw-history compatibility caveat by ensuring
-imported commits carry membership deltas before strict member authorization is
-enabled for every room.
+Next meaningful gate: exercise the production reqwest runtime transport across
+the later-device fanout and room-sync paths, not only the KeyPackage path.
