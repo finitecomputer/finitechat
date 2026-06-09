@@ -1247,6 +1247,84 @@ async fn sqlite_rejected_submit_commit_replays_rejection_after_restart() {
 }
 
 #[tokio::test]
+async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
+    for crash_point in HttpSubmitCommitCrashPoint::ALL {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("delivery.sqlite3");
+        let creator = DeviceRef::new("alice", "alice-laptop");
+        let phone = DeviceRef::new("alice", "alice-phone");
+        let tablet = DeviceRef::new("alice", "alice-tablet");
+        let room_id = "room-http-crash-matrix".to_owned();
+        let mls_group_id = "mls-http-crash-matrix".to_owned();
+        let first = submit_add_device_request(
+            &room_id,
+            &mls_group_id,
+            &creator,
+            &phone,
+            "welcome-http-crash-phone",
+            "http-crash-first",
+        );
+        let crash_request = submit_add_device_request_at_epoch_with_ids(
+            &room_id,
+            &mls_group_id,
+            &creator,
+            &tablet,
+            1,
+            "welcome-http-crash-tablet",
+            "http-crash-matrix-commit",
+        );
+
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app.clone(),
+            "/account-rooms/bootstrap",
+            &BootstrapAccountRoomRequest {
+                room_id: room_id.clone(),
+                mls_group_id: mls_group_id.clone(),
+                creator: creator.clone(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = post_json(app.clone(), "/commits", &first).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_accepted: CommitAccepted = read_json(response).await;
+        assert_eq!(first_accepted.seq, 1);
+
+        install_http_submit_commit_crash_trigger(&db_path, crash_point);
+        let response = post_json(app, "/commits", &crash_request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expected SQLite crash response at {crash_point:?}"
+        );
+        let error: ErrorResponse = read_json(response).await;
+        assert_eq!(error.kind, "delivery_store");
+        clear_http_submit_commit_crash_triggers(&db_path);
+
+        let app = persistent_app(&db_path);
+        assert_http_crash_commit_rolled_back(&app, &room_id, &tablet, first_accepted.seq).await;
+
+        let response = post_json(app.clone(), "/commits", &crash_request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: CommitAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, 2);
+        assert_eq!(
+            accepted.released_welcomes,
+            vec!["welcome-http-crash-tablet".to_owned()]
+        );
+
+        let response = post_json(app.clone(), "/commits", &crash_request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let replayed: CommitAccepted = read_json(response).await;
+        assert_eq!(replayed, accepted);
+
+        assert_http_crash_commit_converged(&app, &room_id, &tablet, accepted.seq).await;
+    }
+}
+
+#[tokio::test]
 async fn sqlite_raw_message_commit_projection_compatibility_survives_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -2111,13 +2189,33 @@ fn submit_add_device_request_at_epoch(
     epoch: u64,
 ) -> SubmitCommitRequest {
     let welcome_id = format!("welcome-{room_id}-{epoch}");
+    submit_add_device_request_at_epoch_with_ids(
+        room_id,
+        mls_group_id,
+        sender,
+        added,
+        epoch,
+        &welcome_id,
+        &format!("commit-{room_id}-{epoch}"),
+    )
+}
+
+fn submit_add_device_request_at_epoch_with_ids(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    added: &DeviceRef,
+    epoch: u64,
+    welcome_id: &str,
+    idempotency_key: &str,
+) -> SubmitCommitRequest {
     let mut request = submit_add_device_request(
         room_id,
         mls_group_id,
         sender,
         added,
-        &welcome_id,
-        &format!("commit-{room_id}-{epoch}"),
+        welcome_id,
+        idempotency_key,
     );
     request.expected_epoch = epoch;
     request.envelope.epoch = epoch;
@@ -2126,6 +2224,238 @@ fn submit_add_device_request_at_epoch(
     request.membership_delta.post_commit_epoch = epoch + 1;
     request.membership_delta.commit_message_id = commit_message_id;
     request
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HttpSubmitCommitCrashPoint {
+    CommitDeliveryOperation,
+    CommitIdempotencyRecord,
+    WelcomeDeliveryOperation,
+    WelcomeIdempotencyRecord,
+    AccountRoomProjection,
+    RoomMembershipProjection,
+}
+
+impl HttpSubmitCommitCrashPoint {
+    const ALL: [Self; 6] = [
+        Self::CommitDeliveryOperation,
+        Self::CommitIdempotencyRecord,
+        Self::WelcomeDeliveryOperation,
+        Self::WelcomeIdempotencyRecord,
+        Self::AccountRoomProjection,
+        Self::RoomMembershipProjection,
+    ];
+
+    fn trigger_sql(self) -> &'static str {
+        match self {
+            Self::CommitDeliveryOperation => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_commit_delivery
+                AFTER INSERT ON http_delivery_ops
+                WHEN NEW.kind = 'publish_message'
+                  AND NEW.body_json LIKE '%http-crash-matrix-commit%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after commit delivery');
+                END;
+                "#
+            }
+            Self::CommitIdempotencyRecord => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_commit_idempotency
+                AFTER INSERT ON http_publish_idempotency
+                WHEN NEW.idempotency_key = 'commit:room-http-crash-matrix:http-crash-matrix-commit'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after commit idempotency');
+                END;
+                "#
+            }
+            Self::WelcomeDeliveryOperation => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_welcome_delivery
+                AFTER INSERT ON http_delivery_ops
+                WHEN NEW.kind = 'publish_message'
+                  AND NEW.body_json LIKE '%welcome-http-crash-tablet%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after welcome delivery');
+                END;
+                "#
+            }
+            Self::WelcomeIdempotencyRecord => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_welcome_idempotency
+                AFTER INSERT ON http_publish_idempotency
+                WHEN NEW.idempotency_key = 'welcome:welcome-http-crash-tablet'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after welcome idempotency');
+                END;
+                "#
+            }
+            Self::AccountRoomProjection => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_account_room_projection
+                AFTER UPDATE OF record_json ON http_account_rooms
+                WHEN NEW.room_id = 'room-http-crash-matrix'
+                  AND NEW.record_json LIKE '%alice-tablet%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after account-room projection');
+                END;
+                "#
+            }
+            Self::RoomMembershipProjection => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_room_membership_projection
+                AFTER UPDATE OF projection_json ON http_room_memberships
+                WHEN NEW.room_id = 'room-http-crash-matrix'
+                  AND NEW.projection_json LIKE '%alice-tablet%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after room-membership projection');
+                END;
+                "#
+            }
+        }
+    }
+}
+
+fn install_http_submit_commit_crash_trigger(
+    db_path: &std::path::Path,
+    point: HttpSubmitCommitCrashPoint,
+) {
+    clear_http_submit_commit_crash_triggers(db_path);
+    let conn = Connection::open(db_path).expect("sqlite connection");
+    conn.execute_batch(point.trigger_sql())
+        .expect("install HTTP commit crash trigger");
+}
+
+fn clear_http_submit_commit_crash_triggers(db_path: &std::path::Path) {
+    let conn = Connection::open(db_path).expect("sqlite connection");
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_commit_delivery;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_commit_idempotency;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_welcome_delivery;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_welcome_idempotency;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_account_room_projection;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_room_membership_projection;
+        "#,
+    )
+    .expect("clear HTTP commit crash triggers");
+}
+
+async fn assert_http_crash_commit_rolled_back(
+    app: &Router,
+    room_id: &str,
+    tablet: &DeviceRef,
+    first_seq: u64,
+) {
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, first_seq);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(tablet),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inbox_page: HttpSyncPage = read_json(response).await;
+    assert!(inbox_page.entries.is_empty());
+
+    let page = account_room_page(app, "alice").await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["current_epoch"], 1);
+    assert_eq!(page.rooms[0]["last_seq"], first_seq);
+    assert!(
+        !page.rooms[0]["devices"]
+            .as_array()
+            .expect("devices")
+            .iter()
+            .any(|device| device["device"]["device_id"] == "alice-tablet")
+    );
+}
+
+async fn assert_http_crash_commit_converged(
+    app: &Router,
+    room_id: &str,
+    tablet: &DeviceRef,
+    accepted_seq: u64,
+) {
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(page.entries[1].seq, accepted_seq);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(tablet),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inbox_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(inbox_page.entries.len(), 1);
+    assert_eq!(
+        inbox_page.entries[0].message.id,
+        id("welcome-http-crash-tablet")
+    );
+
+    let page = account_room_page(app, "alice").await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["current_epoch"], 2);
+    assert_eq!(page.rooms[0]["last_seq"], accepted_seq);
+    assert!(
+        page.rooms[0]["devices"]
+            .as_array()
+            .expect("devices")
+            .iter()
+            .any(|device| device["device"]["device_id"] == "alice-tablet")
+    );
+}
+
+async fn account_room_page(app: &Router, account_id: &str) -> ListAccountRoomDirectoryResponse {
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: account_id.to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    read_json(response).await
 }
 
 fn commit_publish_request_for_test(

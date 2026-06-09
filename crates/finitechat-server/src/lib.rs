@@ -1084,114 +1084,25 @@ impl HttpServerState {
         membership_delta: &MembershipDeltaV1,
         accepted_seq: HttpSequence,
     ) -> Result<(), ServerHttpError> {
-        let mut account_ids = BTreeSet::new();
         let mut directory = self
             .account_rooms
             .lock()
             .expect("HTTP account-room directory mutex");
-
-        for (account_id, rooms) in directory.iter() {
-            if rooms.contains_key(room_id) {
-                account_ids.insert(account_id.clone());
-            }
-        }
-        for add in &membership_delta.adds {
-            account_ids.insert(add.device.account_id.clone());
-        }
-        for remove in &membership_delta.removes {
-            account_ids.insert(remove.device.account_id.clone());
-        }
-
-        let mut upserts = Vec::new();
-        let mut deletes = Vec::new();
-        for account_id in account_ids {
-            let empty_record = || AccountRoomRecord {
-                room_id: room_id.to_owned(),
-                mls_group_id: mls_group_id.to_owned(),
-                current_epoch,
-                last_seq: accepted_seq,
-                status: RoomStatus::Open,
-                devices: Vec::new(),
-            };
-            let existing_record = directory
-                .get(&account_id)
-                .and_then(|rooms| rooms.get(room_id))
-                .cloned();
-            let mut record = match existing_record {
-                Some(value) => {
-                    match account_scoped_account_room_record(&account_id, room_id, &value) {
-                        Ok(Some(record)) => record,
-                        Ok(None) => empty_record(),
-                        Err(_) => continue,
-                    }
-                }
-                None => empty_record(),
-            };
-
-            if record.room_id != room_id {
-                continue;
-            }
-            record.mls_group_id = mls_group_id.to_owned();
-            record.current_epoch = current_epoch;
-            record.last_seq = accepted_seq;
-            for remove in membership_delta
-                .removes
-                .iter()
-                .filter(|remove| remove.device.account_id == account_id)
-            {
-                record
-                    .devices
-                    .retain(|device| device.device != remove.device);
-            }
-            for add in membership_delta
-                .adds
-                .iter()
-                .filter(|add| add.device.account_id == account_id)
-            {
-                if !record
-                    .devices
-                    .iter()
-                    .any(|device| device.device == add.device)
-                {
-                    record.devices.push(AccountRoomDevice {
-                        device: add.device.clone(),
-                        active: false,
-                    });
-                }
-            }
-            record
-                .devices
-                .sort_by(|left, right| left.device.device_id.cmp(&right.device.device_id));
-
-            if record.devices.is_empty() {
-                if let Some(rooms) = directory.get_mut(&account_id) {
-                    rooms.remove(room_id);
-                    if rooms.is_empty() {
-                        directory.remove(&account_id);
-                    }
-                }
-                deletes.push((account_id, room_id.to_owned()));
-                continue;
-            }
-
-            let value = serde_json::to_value(&record)
-                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
-            directory
-                .entry(account_id.clone())
-                .or_default()
-                .insert(room_id.to_owned(), value.clone());
-            upserts.push(AccountRoomDirectoryRecord {
-                account_id,
-                room_id: room_id.to_owned(),
-                record: value,
-            });
-        }
+        let mutation = apply_account_room_membership_delta(
+            &mut directory,
+            room_id,
+            mls_group_id,
+            current_epoch,
+            membership_delta,
+            accepted_seq,
+        )?;
+        drop(directory);
 
         if let Some(store) = &self.store {
-            for (account_id, room_id) in deletes {
+            for (account_id, room_id) in mutation.deletes {
                 store.delete_account_room(&account_id, &room_id)?;
             }
-            for record in upserts {
+            for record in mutation.upserts {
                 store.upsert_account_room(&record)?;
             }
         }
@@ -1211,63 +1122,15 @@ impl HttpServerState {
             .room_memberships
             .lock()
             .expect("HTTP room-membership mutex");
-        let projection = rooms.entry(room_id.to_owned()).or_insert_with(|| {
-            initial_room_membership_projection(
-                room_id,
-                mls_group_id,
-                sender,
-                expected_epoch,
-                0,
-                expected_epoch == 0,
-            )
-        });
-        if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
-            return Err(ServerHttpError::RoomMembershipConflict {
-                room_id: room_id.to_owned(),
-                reason: "membership delta targets a different room or MLS group".to_owned(),
-            });
-        }
-        if projection.current_epoch != expected_epoch {
-            return Err(ServerHttpError::RoomMembershipConflict {
-                room_id: room_id.to_owned(),
-                reason: format!(
-                    "membership delta expected epoch {expected_epoch}, projection is at {}",
-                    projection.current_epoch
-                ),
-            });
-        }
-
-        for remove in &membership_delta.removes {
-            if let Some(membership) = projection
-                .membership
-                .get_mut(&DeviceMembership::key(&remove.device))
-                && let Some(interval) = membership
-                    .intervals
-                    .iter_mut()
-                    .rev()
-                    .find(|interval| interval.active && interval.end_seq.is_none())
-            {
-                interval.end_seq = Some(accepted_seq);
-            }
-        }
-        for add in &membership_delta.adds {
-            projection
-                .membership
-                .entry(DeviceMembership::key(&add.device))
-                .or_insert_with(|| DeviceMembership {
-                    device: add.device.clone(),
-                    intervals: Vec::new(),
-                })
-                .intervals
-                .push(MembershipInterval {
-                    start_seq: accepted_seq,
-                    end_seq: None,
-                    active: false,
-                });
-        }
-        projection.current_epoch = membership_delta.post_commit_epoch;
-        projection.last_seq = accepted_seq;
-        let projection = projection.clone();
+        let projection = apply_room_membership_delta(
+            &mut rooms,
+            room_id,
+            mls_group_id,
+            sender,
+            expected_epoch,
+            membership_delta,
+            accepted_seq,
+        )?;
         drop(rooms);
 
         if let Some(store) = &self.store {
@@ -1304,13 +1167,78 @@ impl HttpServerState {
         }
 
         self.validate_commit_room_membership(&request)?;
-        let receipt = self.publish_message(commit_publish.clone())?;
-        self.record_submit_commit_projection(&request, receipt.seq)?;
+
+        // Fresh typed commits must publish the commit, release Welcomes, and update
+        // Finite projections as one candidate snapshot before the durable swap.
+        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut publish_idempotency = self
+            .publish_idempotency
+            .lock()
+            .expect("HTTP publish idempotency mutex");
+        let mut account_rooms = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        let mut room_memberships = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+
+        let mut candidate_service = service.clone();
+        let mut candidate_publish_idempotency = publish_idempotency.clone();
+        let mut candidate_account_rooms = account_rooms.clone();
+        let mut candidate_room_memberships = room_memberships.clone();
+
+        let (receipt, commit_mutation) = publish_request_to_candidate(
+            &mut candidate_service,
+            &mut candidate_publish_idempotency,
+            commit_publish,
+        )?;
+        let account_room_mutation = apply_account_room_membership_delta(
+            &mut candidate_account_rooms,
+            &request.room_id,
+            &request.envelope.mls_group_id,
+            request.membership_delta.post_commit_epoch,
+            &request.membership_delta,
+            receipt.seq,
+        )?;
+        let room_membership_projection = apply_room_membership_delta(
+            &mut candidate_room_memberships,
+            &request.room_id,
+            &request.envelope.mls_group_id,
+            &request.sender,
+            request.expected_epoch,
+            &request.membership_delta,
+            receipt.seq,
+        )?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
+        let mut publish_mutations = commit_mutation.into_iter().collect::<Vec<_>>();
         for welcome in &welcomes {
-            self.publish_message(welcome_publish_request(welcome)?)?;
+            let (_, mutation) = publish_request_to_candidate(
+                &mut candidate_service,
+                &mut candidate_publish_idempotency,
+                welcome_publish_request(welcome)?,
+            )?;
+            publish_mutations.extend(mutation);
         }
+
+        if let Some(store) = &self.store {
+            store.append_submit_commit_mutation(
+                &publish_mutations,
+                &account_room_mutation,
+                &room_membership_projection,
+            )?;
+        }
+
+        *service = candidate_service;
+        *publish_idempotency = candidate_publish_idempotency;
+        *account_rooms = candidate_account_rooms;
+        *room_memberships = candidate_room_memberships;
+        drop(service);
+        drop(publish_idempotency);
+        drop(account_rooms);
+        drop(room_memberships);
 
         Ok(CommitAccepted {
             seq: receipt.seq,
@@ -1990,6 +1918,19 @@ struct AccountRoomDirectoryRecord {
     record: Value,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AccountRoomDirectoryMutation {
+    deletes: Vec<(String, String)>,
+    upserts: Vec<AccountRoomDirectoryRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PublishMutation {
+    operation: Option<PersistedOperation>,
+    idempotency_key: String,
+    record: PublishIdempotencyRecord,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct HttpRoomMembershipProjection {
     room_id: String,
@@ -2148,6 +2089,67 @@ impl SqliteHttpDeliveryStore {
                 ],
             )?;
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_submit_commit_mutation(
+        &self,
+        publish_mutations: &[PublishMutation],
+        account_room_mutation: &AccountRoomDirectoryMutation,
+        room_membership_projection: &HttpRoomMembershipProjection,
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        for mutation in publish_mutations {
+            if let Some(operation) = &mutation.operation {
+                transaction.execute(
+                    "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+                    params![operation.kind(), serde_json::to_string(operation)?],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO http_publish_idempotency (
+                    idempotency_key,
+                    fingerprint_json,
+                    receipt_json
+                ) VALUES (?1, ?2, ?3)",
+                params![
+                    mutation.idempotency_key,
+                    serde_json::to_string(&mutation.record.fingerprint)?,
+                    serde_json::to_string(&mutation.record.receipt)?,
+                ],
+            )?;
+        }
+        for (account_id, room_id) in &account_room_mutation.deletes {
+            transaction.execute(
+                "DELETE FROM http_account_rooms WHERE account_id = ?1 AND room_id = ?2",
+                params![account_id, room_id],
+            )?;
+        }
+        for record in &account_room_mutation.upserts {
+            transaction.execute(
+                "INSERT INTO http_account_rooms (account_id, room_id, record_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id, room_id) DO UPDATE SET
+                    record_json = excluded.record_json",
+                params![
+                    record.account_id,
+                    record.room_id,
+                    serde_json::to_string(&record.record)?,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO http_room_memberships (room_id, projection_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(room_id) DO UPDATE SET
+                projection_json = excluded.projection_json",
+            params![
+                room_membership_projection.room_id,
+                serde_json::to_string(room_membership_projection)?,
+            ],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -2519,6 +2521,222 @@ impl SqliteHttpDeliveryStore {
     fn connection(&self) -> Result<Connection, rusqlite::Error> {
         Connection::open(&*self.path)
     }
+}
+
+fn publish_request_to_candidate(
+    service: &mut HttpDeliveryService,
+    idempotency: &mut HashMap<String, PublishIdempotencyRecord>,
+    request: PublishMessageRequest,
+) -> Result<(HttpPublishReceipt, Option<PublishMutation>), ServerHttpError> {
+    let Some(idempotency_key) = request.idempotency_key.clone() else {
+        let receipt = service.publish(request.target, request.message)?;
+        return Ok((receipt, None));
+    };
+    if idempotency_key.is_empty() {
+        return Err(ServerHttpError::InvalidIdempotencyKey);
+    }
+
+    let fingerprint = PublishMessageFingerprint::from_request(&request);
+    if let Some(record) = idempotency.get(&idempotency_key) {
+        if record.fingerprint == fingerprint {
+            return Ok((record.receipt.clone(), None));
+        }
+        return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
+    }
+
+    let receipt = service.publish(request.target.clone(), request.message.clone())?;
+    let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
+        target: request.target,
+        message: request.message,
+        idempotency_key: Some(idempotency_key.clone()),
+    });
+    let record = PublishIdempotencyRecord {
+        fingerprint,
+        receipt: receipt.clone(),
+    };
+    idempotency.insert(idempotency_key.clone(), record.clone());
+
+    Ok((
+        receipt,
+        Some(PublishMutation {
+            operation,
+            idempotency_key,
+            record,
+        }),
+    ))
+}
+
+fn apply_account_room_membership_delta(
+    directory: &mut BTreeMap<String, BTreeMap<String, Value>>,
+    room_id: &str,
+    mls_group_id: &str,
+    current_epoch: u64,
+    membership_delta: &MembershipDeltaV1,
+    accepted_seq: HttpSequence,
+) -> Result<AccountRoomDirectoryMutation, ServerHttpError> {
+    let mut account_ids = BTreeSet::new();
+    for (account_id, rooms) in directory.iter() {
+        if rooms.contains_key(room_id) {
+            account_ids.insert(account_id.clone());
+        }
+    }
+    for add in &membership_delta.adds {
+        account_ids.insert(add.device.account_id.clone());
+    }
+    for remove in &membership_delta.removes {
+        account_ids.insert(remove.device.account_id.clone());
+    }
+
+    let mut mutation = AccountRoomDirectoryMutation::default();
+    for account_id in account_ids {
+        let empty_record = || AccountRoomRecord {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            current_epoch,
+            last_seq: accepted_seq,
+            status: RoomStatus::Open,
+            devices: Vec::new(),
+        };
+        let existing_record = directory
+            .get(&account_id)
+            .and_then(|rooms| rooms.get(room_id))
+            .cloned();
+        let mut record = match existing_record {
+            Some(value) => match account_scoped_account_room_record(&account_id, room_id, &value) {
+                Ok(Some(record)) => record,
+                Ok(None) => empty_record(),
+                Err(_) => continue,
+            },
+            None => empty_record(),
+        };
+
+        if record.room_id != room_id {
+            continue;
+        }
+        record.mls_group_id = mls_group_id.to_owned();
+        record.current_epoch = current_epoch;
+        record.last_seq = accepted_seq;
+        for remove in membership_delta
+            .removes
+            .iter()
+            .filter(|remove| remove.device.account_id == account_id)
+        {
+            record
+                .devices
+                .retain(|device| device.device != remove.device);
+        }
+        for add in membership_delta
+            .adds
+            .iter()
+            .filter(|add| add.device.account_id == account_id)
+        {
+            if !record
+                .devices
+                .iter()
+                .any(|device| device.device == add.device)
+            {
+                record.devices.push(AccountRoomDevice {
+                    device: add.device.clone(),
+                    active: false,
+                });
+            }
+        }
+        record
+            .devices
+            .sort_by(|left, right| left.device.device_id.cmp(&right.device.device_id));
+
+        if record.devices.is_empty() {
+            if let Some(rooms) = directory.get_mut(&account_id) {
+                rooms.remove(room_id);
+                if rooms.is_empty() {
+                    directory.remove(&account_id);
+                }
+            }
+            mutation.deletes.push((account_id, room_id.to_owned()));
+            continue;
+        }
+
+        let value = serde_json::to_value(&record)
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+        directory
+            .entry(account_id.clone())
+            .or_default()
+            .insert(room_id.to_owned(), value.clone());
+        mutation.upserts.push(AccountRoomDirectoryRecord {
+            account_id,
+            room_id: room_id.to_owned(),
+            record: value,
+        });
+    }
+    Ok(mutation)
+}
+
+fn apply_room_membership_delta(
+    rooms: &mut BTreeMap<String, HttpRoomMembershipProjection>,
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    expected_epoch: u64,
+    membership_delta: &MembershipDeltaV1,
+    accepted_seq: HttpSequence,
+) -> Result<HttpRoomMembershipProjection, ServerHttpError> {
+    let projection = rooms.entry(room_id.to_owned()).or_insert_with(|| {
+        initial_room_membership_projection(
+            room_id,
+            mls_group_id,
+            sender,
+            expected_epoch,
+            0,
+            expected_epoch == 0,
+        )
+    });
+    if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
+        return Err(ServerHttpError::RoomMembershipConflict {
+            room_id: room_id.to_owned(),
+            reason: "membership delta targets a different room or MLS group".to_owned(),
+        });
+    }
+    if projection.current_epoch != expected_epoch {
+        return Err(ServerHttpError::RoomMembershipConflict {
+            room_id: room_id.to_owned(),
+            reason: format!(
+                "membership delta expected epoch {expected_epoch}, projection is at {}",
+                projection.current_epoch
+            ),
+        });
+    }
+
+    for remove in &membership_delta.removes {
+        if let Some(membership) = projection
+            .membership
+            .get_mut(&DeviceMembership::key(&remove.device))
+            && let Some(interval) = membership
+                .intervals
+                .iter_mut()
+                .rev()
+                .find(|interval| interval.active && interval.end_seq.is_none())
+        {
+            interval.end_seq = Some(accepted_seq);
+        }
+    }
+    for add in &membership_delta.adds {
+        projection
+            .membership
+            .entry(DeviceMembership::key(&add.device))
+            .or_insert_with(|| DeviceMembership {
+                device: add.device.clone(),
+                intervals: Vec::new(),
+            })
+            .intervals
+            .push(MembershipInterval {
+                start_seq: accepted_seq,
+                end_seq: None,
+                active: false,
+            });
+    }
+    projection.current_epoch = membership_delta.post_commit_epoch;
+    projection.last_seq = accepted_seq;
+    Ok(projection.clone())
 }
 
 fn replay_operation(
