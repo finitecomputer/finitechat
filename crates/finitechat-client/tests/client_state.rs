@@ -2065,6 +2065,124 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let room_id = "room_http_membership_filter";
+    let mls_group_id = "mls_http_membership_filter";
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_membership_filter");
+    let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_membership_filter");
+
+    bob.create_group_state(room_id, mls_group_id).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: bob.device_ref().clone(),
+        })
+        .unwrap();
+
+    let before_invite = bob
+        .create_application_request(room_id, b"before invite", "bob_before_http_filter")
+        .unwrap();
+    let before_invite = delivery.append_event(&before_invite).unwrap();
+    assert_eq!(before_invite.seq, 1);
+
+    let alice_hidden = delivery
+        .sync_events(room_id, alice.device_ref(), 0)
+        .unwrap();
+    assert!(alice_hidden.entries.is_empty());
+    assert_eq!(alice_hidden.next_after_seq, before_invite.seq);
+
+    delivery
+        .upload_key_package(
+            alice
+                .upload_key_package_request("kp_alice_http_membership_filter")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = delivery
+        .claim_key_package_for_device(alice.device_ref())
+        .unwrap()
+        .expect("alice key package");
+    let prepared = bob
+        .prepare_add_member_commit(
+            room_id,
+            &claimed_key_package,
+            "welcome_alice_http_membership_filter",
+            "bob_add_alice_http_membership_filter",
+        )
+        .unwrap();
+    let accepted = delivery.submit_commit(prepared.request).unwrap();
+    assert_eq!(accepted.seq, 2);
+
+    let bob_page = delivery.sync_events(room_id, bob.device_ref(), 0).unwrap();
+    assert_eq!(bob_page.entries.len(), 2);
+    bob.merge_pending_commit_from_log(room_id, &bob_page.entries, &prepared.message_id)
+        .unwrap();
+
+    let pending_send = AppendEventRequest {
+        room_id: room_id.to_owned(),
+        sender: alice.device_ref().clone(),
+        envelope: envelope(
+            room_id.to_owned(),
+            mls_group_id.to_owned(),
+            alice.device_ref().clone(),
+            1,
+            LogEntryKind::Application,
+            b"pending send".to_vec(),
+        ),
+        idempotency_key: "alice_pending_http_filter".to_owned(),
+    };
+    let err = delivery.append_event(&pending_send).unwrap_err();
+    assert!(matches!(
+        err,
+        HttpRuntimeDeliveryError::HttpStatus(StatusCode::FORBIDDEN, body)
+            if body.contains("sender_not_active")
+    ));
+
+    let alice_pending_page = delivery
+        .sync_events(room_id, alice.device_ref(), alice_hidden.next_after_seq)
+        .unwrap();
+    assert_eq!(alice_pending_page.entries.len(), 1);
+    assert_eq!(alice_pending_page.entries[0].kind, LogEntryKind::Commit);
+
+    let claimed_welcomes = delivery.claim_welcomes(alice.device_ref()).unwrap();
+    assert_eq!(claimed_welcomes.len(), 1);
+    alice
+        .activate_welcome(
+            room_id,
+            &claimed_welcomes[0].welcome_payload,
+            &claimed_welcomes[0].ratchet_tree_payload,
+        )
+        .unwrap();
+    delivery
+        .ack_welcome("welcome_alice_http_membership_filter", true)
+        .unwrap();
+
+    let after_activation = alice
+        .create_application_request(
+            room_id,
+            b"after activation",
+            "alice_after_http_filter_activation",
+        )
+        .unwrap();
+    let after_activation = delivery.append_event(&after_activation).unwrap();
+    assert_eq!(after_activation.seq, 3);
+
+    let bob_after = delivery
+        .sync_events(room_id, bob.device_ref(), accepted.seq)
+        .unwrap();
+    assert_eq!(bob_after.entries.len(), 1);
+    assert_eq!(
+        bob.decrypt_application_entry(room_id, &bob_after.entries[0])
+            .unwrap(),
+        b"after activation"
+    );
+}
+
+#[test]
 fn runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
@@ -4831,6 +4949,13 @@ impl HttpRuntimeDelivery {
             self.post_json("/account-rooms/bootstrap", &request)?;
         Ok(())
     }
+
+    fn append_event(
+        &self,
+        request: &AppendEventRequest,
+    ) -> Result<EventAccepted, HttpRuntimeDeliveryError> {
+        self.post_json("/events", request)
+    }
 }
 
 impl RuntimeDelivery for HttpRuntimeDelivery {
@@ -5022,7 +5147,7 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
     fn sync_events(
         &mut self,
         room_id: &str,
-        _requester: &DeviceRef,
+        requester: &DeviceRef,
         after_seq: u64,
     ) -> Result<SyncEventsPage, Self::Error> {
         let page: HttpSyncPage = self.post_json(
@@ -5031,6 +5156,7 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
                 group_id: group_id_for_room(room_id),
                 after_seq,
                 limit: MAX_HTTP_SYNC_PAGE_ENTRIES,
+                requester: Some(member_id_for_device(requester)?),
             },
         )?;
         let entries = page

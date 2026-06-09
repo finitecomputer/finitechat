@@ -83,6 +83,7 @@ async fn group_publish_syncs_pages_and_replays_exact_duplicates() {
             group_id: group_id.clone(),
             after_seq: 0,
             limit: 1,
+            requester: None,
         },
     )
     .await;
@@ -101,6 +102,7 @@ async fn group_publish_syncs_pages_and_replays_exact_duplicates() {
             group_id,
             after_seq: page.next_after_seq,
             limit: 10,
+            requester: None,
         },
     )
     .await;

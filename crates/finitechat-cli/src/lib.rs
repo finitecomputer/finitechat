@@ -228,6 +228,7 @@ fn sync_group_request(
         group_id: GroupId::new(group_id.into_bytes()),
         after_seq,
         limit,
+        requester: None,
     };
     post_json_request(server, "/sync/group", &request)
 }

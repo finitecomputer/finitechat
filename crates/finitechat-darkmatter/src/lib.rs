@@ -126,9 +126,19 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can decode a claimed Finite WelcomeRecord on activated ack, mark the pending account-room device active, and reload that active projection after restart",
         },
         PortFinding {
+            area: "http_room_membership_projection",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors",
+        },
+        PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group RoomLogEntry, derives account-room membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group RoomLogEntry, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, and replays idempotently after restart",
+        },
+        PortFinding {
+            area: "http_typed_event_route",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server /events accepts typed AppendEventRequest payloads, rejects pending tracked senders, publishes plain RoomLogEntry payloads, and persists the room head across restart",
         },
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
@@ -153,7 +163,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-authored room/member truth instead of account-room directory projections; typed submit side effects, commit-derived account-room updates, and Welcome ack activation are now server-derived",
+            evidence: "Remaining Finite parity requires closing raw-history membership imports before strict member authorization can apply to every room; typed bootstrap/commit/event flows now have server-owned room-membership projection, filtered sync, pending-send rejection, and Welcome ack activation",
         },
         PortFinding {
             area: "ordered_delivery_profile",

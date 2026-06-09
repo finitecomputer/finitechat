@@ -10,8 +10,9 @@ use axum::{Json, Router};
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, CommitAccepted, SubmitCommitRequest, WelcomeRecord,
-    lease_token_for, staged_welcomes_by_id,
+    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, DeviceMembership,
+    EventAccepted, MembershipInterval, SubmitCommitRequest, WelcomeRecord, lease_token_for,
+    staged_welcomes_by_id,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
@@ -39,6 +40,7 @@ pub struct HttpServerState {
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
+    room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -52,6 +54,7 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
+            room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -74,6 +77,7 @@ impl HttpServerState {
         }
         let fanout_plans = store.load_fanout_plans()?;
         let account_rooms = store.load_account_room_directory()?;
+        let room_memberships = store.load_room_memberships()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
@@ -82,6 +86,7 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
+            room_memberships: Arc::new(Mutex::new(room_memberships)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -568,69 +573,74 @@ impl HttpServerState {
 
         let account_id = request.creator.account_id.clone();
         validate_account_room_id("account_id", &account_id)?;
-        let mut directory = self
-            .account_rooms
-            .lock()
-            .expect("HTTP account-room directory mutex");
-        if let Some(existing_value) = directory
-            .get(&account_id)
-            .and_then(|rooms| rooms.get(&request.room_id))
+        let mut bootstrapped = false;
         {
-            let existing_record = serde_json::from_value::<AccountRoomRecord>(
-                existing_value.clone(),
-            )
-            .map_err(|error| ServerHttpError::AccountRoomBootstrapConflict {
-                account_id: account_id.clone(),
-                room_id: request.room_id.clone(),
-                reason: format!("existing record is not a Finite account-room record: {error}"),
-            })?;
-            let has_creator = existing_record
-                .devices
-                .iter()
-                .any(|device| device.device == request.creator && device.active);
-            if existing_record.mls_group_id != request.mls_group_id || !has_creator {
-                return Err(ServerHttpError::AccountRoomBootstrapConflict {
-                    account_id,
-                    room_id: request.room_id,
-                    reason: "existing account-room record differs from bootstrap request"
-                        .to_owned(),
-                });
+            let mut directory = self
+                .account_rooms
+                .lock()
+                .expect("HTTP account-room directory mutex");
+            if let Some(existing_value) = directory
+                .get(&account_id)
+                .and_then(|rooms| rooms.get(&request.room_id))
+            {
+                let existing_record =
+                    serde_json::from_value::<AccountRoomRecord>(existing_value.clone()).map_err(
+                        |error| ServerHttpError::AccountRoomBootstrapConflict {
+                            account_id: account_id.clone(),
+                            room_id: request.room_id.clone(),
+                            reason: format!(
+                                "existing record is not a Finite account-room record: {error}"
+                            ),
+                        },
+                    )?;
+                let has_creator = existing_record
+                    .devices
+                    .iter()
+                    .any(|device| device.device == request.creator && device.active);
+                if existing_record.mls_group_id != request.mls_group_id || !has_creator {
+                    return Err(ServerHttpError::AccountRoomBootstrapConflict {
+                        account_id,
+                        room_id: request.room_id,
+                        reason: "existing account-room record differs from bootstrap request"
+                            .to_owned(),
+                    });
+                }
+            } else {
+                let record = AccountRoomRecord {
+                    room_id: request.room_id.clone(),
+                    mls_group_id: request.mls_group_id.clone(),
+                    current_epoch: 0,
+                    last_seq: 0,
+                    status: RoomStatus::Open,
+                    devices: vec![AccountRoomDevice {
+                        device: request.creator.clone(),
+                        active: true,
+                    }],
+                };
+                record.validate_limits().map_err(|error| {
+                    ServerHttpError::InvalidAccountRoomRequest {
+                        reason: error.to_string(),
+                    }
+                })?;
+                let value = serde_json::to_value(&record)
+                    .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+                directory
+                    .entry(account_id.clone())
+                    .or_default()
+                    .insert(request.room_id.clone(), value.clone());
+                if let Some(store) = &self.store {
+                    store.upsert_account_room(&AccountRoomDirectoryRecord {
+                        account_id: account_id.clone(),
+                        room_id: request.room_id.clone(),
+                        record: value,
+                    })?;
+                }
+                bootstrapped = true;
             }
-            return Ok(BootstrapAccountRoomResponse {
-                bootstrapped: false,
-            });
         }
 
-        let record = AccountRoomRecord {
-            room_id: request.room_id.clone(),
-            mls_group_id: request.mls_group_id,
-            current_epoch: 0,
-            last_seq: 0,
-            status: RoomStatus::Open,
-            devices: vec![AccountRoomDevice {
-                device: request.creator,
-                active: true,
-            }],
-        };
-        record
-            .validate_limits()
-            .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
-                reason: error.to_string(),
-            })?;
-        let value = serde_json::to_value(&record)
-            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
-        directory
-            .entry(account_id.clone())
-            .or_default()
-            .insert(request.room_id.clone(), value.clone());
-        if let Some(store) = &self.store {
-            store.upsert_account_room(&AccountRoomDirectoryRecord {
-                account_id,
-                room_id: request.room_id,
-                record: value,
-            })?;
-        }
-        Ok(BootstrapAccountRoomResponse { bootstrapped: true })
+        self.bootstrap_room_membership(&request)?;
+        Ok(BootstrapAccountRoomResponse { bootstrapped })
     }
 
     fn list_account_rooms(
@@ -685,6 +695,84 @@ impl HttpServerState {
         })
     }
 
+    fn bootstrap_room_membership(
+        &self,
+        request: &BootstrapAccountRoomRequest,
+    ) -> Result<(), ServerHttpError> {
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        if let Some(existing) = rooms.get(&request.room_id) {
+            let creator_is_active = existing
+                .membership
+                .get(&DeviceMembership::key(&request.creator))
+                .is_some_and(|membership| {
+                    membership.intervals.iter().any(|interval| {
+                        interval.active && interval.start_seq == 0 && interval.end_seq.is_none()
+                    })
+                });
+            if existing.mls_group_id != request.mls_group_id || !creator_is_active {
+                return Err(ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "existing room-membership projection differs from bootstrap request"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+
+        let (current_epoch, last_seq) =
+            self.observed_room_head(&request.room_id, &request.mls_group_id)?;
+        let projection = initial_room_membership_projection(
+            &request.room_id,
+            &request.mls_group_id,
+            &request.creator,
+            current_epoch,
+            last_seq,
+            last_seq == 0,
+        );
+        rooms.insert(request.room_id.clone(), projection.clone());
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&projection)?;
+        }
+        Ok(())
+    }
+
+    fn observed_room_head(
+        &self,
+        room_id: &str,
+        mls_group_id: &str,
+    ) -> Result<(u64, HttpSequence), ServerHttpError> {
+        let group_id = group_id_for_room(room_id);
+        let service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut current_epoch = 0;
+        let mut last_seq = 0;
+        let mut after_seq = 0;
+        loop {
+            let page = service.sync_group(&group_id, after_seq, MAX_HTTP_SYNC_PAGE_ENTRIES)?;
+            for queued in &page.entries {
+                last_seq = last_seq.max(queued.seq);
+                let Some(entry) = room_log_entry_from_payload(&queued.message.payload) else {
+                    continue;
+                };
+                if entry.room_id == room_id
+                    && entry.envelope.mls_group_id == mls_group_id
+                    && entry.kind == LogEntryKind::Commit
+                {
+                    current_epoch = current_epoch.max(entry.epoch.saturating_add(1));
+                }
+            }
+            if !page.has_more || page.next_after_seq <= after_seq {
+                break;
+            }
+            after_seq = page.next_after_seq;
+        }
+        Ok((current_epoch, last_seq))
+    }
+
     fn record_finite_commit_projection(
         &self,
         request: &PublishMessageRequest,
@@ -717,7 +805,74 @@ impl HttpServerState {
             current_epoch,
             &payload.membership_delta,
             accepted_seq,
+        )?;
+        self.record_room_membership_delta(
+            &room_id,
+            &mls_group_id,
+            &payload.entry.sender,
+            payload.entry.epoch,
+            &payload.membership_delta,
+            accepted_seq,
         )
+    }
+
+    fn record_room_log_entry_observation(
+        &self,
+        request: &PublishMessageRequest,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        if !matches!(&request.target, HttpPublishTarget::Group { .. }) {
+            return Ok(());
+        }
+        let has_membership_delta =
+            serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&request.message.payload)
+                .is_ok();
+        let Some(entry) = room_log_entry_from_payload(&request.message.payload) else {
+            return Ok(());
+        };
+        if request.message.id.as_slice() != entry.message_id.as_bytes()
+            || entry.envelope.room_id != entry.room_id
+        {
+            return Ok(());
+        }
+
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get_mut(&entry.room_id) else {
+            return Ok(());
+        };
+        if projection.mls_group_id != entry.envelope.mls_group_id {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        if entry.kind == LogEntryKind::Commit {
+            let observed_epoch = entry.epoch.saturating_add(1);
+            if projection.current_epoch < observed_epoch {
+                projection.current_epoch = observed_epoch;
+                changed = true;
+            }
+            if !has_membership_delta && projection.membership_complete {
+                projection.membership_complete = false;
+                changed = true;
+            }
+        }
+        if projection.last_seq < accepted_seq {
+            projection.last_seq = accepted_seq;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        let projection = projection.clone();
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&projection)?;
+        }
+        Ok(())
     }
 
     fn record_submit_commit_projection(
@@ -729,6 +884,14 @@ impl HttpServerState {
             &request.room_id,
             &request.envelope.mls_group_id,
             request.membership_delta.post_commit_epoch,
+            &request.membership_delta,
+            accepted_seq,
+        )?;
+        self.record_room_membership_delta(
+            &request.room_id,
+            &request.envelope.mls_group_id,
+            &request.sender,
+            request.expected_epoch,
             &request.membership_delta,
             accepted_seq,
         )
@@ -856,6 +1019,84 @@ impl HttpServerState {
         Ok(())
     }
 
+    fn record_room_membership_delta(
+        &self,
+        room_id: &str,
+        mls_group_id: &str,
+        sender: &DeviceRef,
+        expected_epoch: u64,
+        membership_delta: &MembershipDeltaV1,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let projection = rooms.entry(room_id.to_owned()).or_insert_with(|| {
+            initial_room_membership_projection(
+                room_id,
+                mls_group_id,
+                sender,
+                expected_epoch,
+                0,
+                expected_epoch == 0,
+            )
+        });
+        if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
+            return Err(ServerHttpError::RoomMembershipConflict {
+                room_id: room_id.to_owned(),
+                reason: "membership delta targets a different room or MLS group".to_owned(),
+            });
+        }
+        if projection.current_epoch != expected_epoch {
+            return Err(ServerHttpError::RoomMembershipConflict {
+                room_id: room_id.to_owned(),
+                reason: format!(
+                    "membership delta expected epoch {expected_epoch}, projection is at {}",
+                    projection.current_epoch
+                ),
+            });
+        }
+
+        for remove in &membership_delta.removes {
+            if let Some(membership) = projection
+                .membership
+                .get_mut(&DeviceMembership::key(&remove.device))
+                && let Some(interval) = membership
+                    .intervals
+                    .iter_mut()
+                    .rev()
+                    .find(|interval| interval.active && interval.end_seq.is_none())
+            {
+                interval.end_seq = Some(accepted_seq);
+            }
+        }
+        for add in &membership_delta.adds {
+            projection
+                .membership
+                .entry(DeviceMembership::key(&add.device))
+                .or_insert_with(|| DeviceMembership {
+                    device: add.device.clone(),
+                    intervals: Vec::new(),
+                })
+                .intervals
+                .push(MembershipInterval {
+                    start_seq: accepted_seq,
+                    end_seq: None,
+                    active: false,
+                });
+        }
+        projection.current_epoch = membership_delta.post_commit_epoch;
+        projection.last_seq = accepted_seq;
+        let projection = projection.clone();
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&projection)?;
+        }
+        Ok(())
+    }
+
     fn submit_commit(
         &self,
         request: SubmitCommitRequest,
@@ -867,6 +1108,22 @@ impl HttpServerState {
             }
         })?;
         let commit_publish = commit_publish_request(&request, &message_id)?;
+        if let Some(receipt) = self.replayed_publish_receipt(&commit_publish) {
+            let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
+            for welcome in &welcomes {
+                self.publish_message(welcome_publish_request(welcome)?)?;
+            }
+            return Ok(CommitAccepted {
+                seq: receipt.seq,
+                message_id,
+                released_welcomes: welcomes
+                    .into_iter()
+                    .map(|welcome| welcome.welcome_id)
+                    .collect(),
+            });
+        }
+
+        self.validate_commit_room_membership(&request)?;
         let receipt = self.publish_message(commit_publish.clone())?;
         self.record_submit_commit_projection(&request, receipt.seq)?;
 
@@ -883,6 +1140,132 @@ impl HttpServerState {
                 .map(|welcome| welcome.welcome_id)
                 .collect(),
         })
+    }
+
+    fn replayed_publish_receipt(
+        &self,
+        request: &PublishMessageRequest,
+    ) -> Option<HttpPublishReceipt> {
+        let idempotency_key = request.idempotency_key.as_ref()?;
+        let fingerprint = PublishMessageFingerprint::from_request(request);
+        let idempotency = self
+            .publish_idempotency
+            .lock()
+            .expect("HTTP publish idempotency mutex");
+        idempotency
+            .get(idempotency_key)
+            .filter(|record| record.fingerprint == fingerprint)
+            .map(|record| record.receipt.clone())
+    }
+
+    fn validate_commit_room_membership(
+        &self,
+        request: &SubmitCommitRequest,
+    ) -> Result<(), ServerHttpError> {
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get(&request.room_id) else {
+            return Ok(());
+        };
+        if projection.mls_group_id != request.envelope.mls_group_id {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: "commit envelope MLS group does not match room projection".to_owned(),
+            });
+        }
+        if request.expected_epoch != projection.current_epoch {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "commit expected epoch {} does not match room epoch {}",
+                    request.expected_epoch, projection.current_epoch
+                ),
+            });
+        }
+        let tracks_sender = projection.tracks_device(&request.sender);
+        if (tracks_sender || projection.membership_complete)
+            && !projection.device_active_at_head(&request.sender)
+        {
+            return Err(ServerHttpError::SenderNotActive {
+                sender: request.sender.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn append_event(&self, request: AppendEventRequest) -> Result<EventAccepted, ServerHttpError> {
+        validate_append_event_request(&request)?;
+        let message_id = request.envelope.message_id().map_err(|error| {
+            ServerHttpError::InvalidEventRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            let projection = rooms.get(&request.room_id).ok_or_else(|| {
+                ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "typed event requires a room-membership projection".to_owned(),
+                }
+            })?;
+            if projection.mls_group_id != request.envelope.mls_group_id {
+                return Err(ServerHttpError::InvalidEventRequest {
+                    reason: "event envelope MLS group does not match room projection".to_owned(),
+                });
+            }
+            if request.envelope.epoch != projection.current_epoch {
+                return Err(ServerHttpError::InvalidEventRequest {
+                    reason: format!(
+                        "event envelope epoch {} does not match room epoch {}",
+                        request.envelope.epoch, projection.current_epoch
+                    ),
+                });
+            }
+            let tracks_sender = projection.tracks_device(&request.sender);
+            if (tracks_sender || projection.membership_complete)
+                && !projection.device_active_at_head(&request.sender)
+            {
+                return Err(ServerHttpError::SenderNotActive {
+                    sender: request.sender,
+                });
+            }
+        }
+
+        let event_publish = event_publish_request(&request, &message_id)?;
+        let receipt = self.publish_message(event_publish)?;
+        self.record_room_event_acceptance(&request.room_id, receipt.seq)?;
+        Ok(EventAccepted {
+            seq: receipt.seq,
+            message_id,
+        })
+    }
+
+    fn record_room_event_acceptance(
+        &self,
+        room_id: &str,
+        accepted_seq: HttpSequence,
+    ) -> Result<(), ServerHttpError> {
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get_mut(room_id) else {
+            return Ok(());
+        };
+        if projection.last_seq >= accepted_seq {
+            return Ok(());
+        }
+        projection.last_seq = accepted_seq;
+        let projection = projection.clone();
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&projection)?;
+        }
+        Ok(())
     }
 
     fn claim_welcomes(
@@ -982,6 +1365,7 @@ impl HttpServerState {
 
         if let Some(message) = activation_message {
             self.activate_account_room_from_welcome(&message)?;
+            self.activate_room_membership_from_welcome(&message)?;
         }
         Ok(AckWelcomeResponse { acked: true })
     }
@@ -1048,12 +1432,88 @@ impl HttpServerState {
         }
         Ok(())
     }
+
+    fn sync_group(&self, request: GroupSyncRequest) -> Result<HttpSyncPage, ServerHttpError> {
+        if request.limit == 0 || request.limit > MAX_HTTP_SYNC_PAGE_ENTRIES {
+            return Err(ServerHttpError::InvalidGroupSyncLimit {
+                actual: request.limit,
+                max: MAX_HTTP_SYNC_PAGE_ENTRIES,
+            });
+        }
+        let service = self.service.lock().expect("HTTP delivery service mutex");
+        let page = service.sync_group(&request.group_id, request.after_seq, request.limit)?;
+        drop(service);
+
+        let Some(requester) = &request.requester else {
+            return Ok(page);
+        };
+        let requester = device_for_member_id(requester)?;
+        let room_id = room_id_for_group_id(&request.group_id)?;
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get(&room_id) else {
+            return Ok(page);
+        };
+        if !projection.membership_complete && !projection.tracks_device(&requester) {
+            return Ok(page);
+        }
+
+        let mut entries = Vec::new();
+        let mut scanned_to_seq = request.after_seq;
+        for entry in page.entries {
+            scanned_to_seq = entry.seq;
+            if projection.device_was_member_for_seq(&requester, entry.seq) {
+                entries.push(entry);
+            }
+        }
+        let next_after_seq = entries
+            .last()
+            .map(|entry| entry.seq)
+            .unwrap_or(scanned_to_seq);
+        Ok(HttpSyncPage {
+            entries,
+            next_after_seq,
+            has_more: page.has_more,
+        })
+    }
+
+    fn activate_room_membership_from_welcome(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<(), ServerHttpError> {
+        let Ok(welcome) = serde_json::from_slice::<WelcomeRecord>(&message.payload) else {
+            return Ok(());
+        };
+        if message.id.as_slice() != welcome.welcome_id.as_bytes() {
+            return Ok(());
+        }
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get_mut(&welcome.room_id) else {
+            return Ok(());
+        };
+        if !projection.activate_interval(&welcome.recipient, welcome.commit_seq) {
+            return Ok(());
+        }
+        let projection = projection.clone();
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&projection)?;
+        }
+        Ok(())
+    }
 }
 
 pub fn http_router(state: HttpServerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/messages", post(publish_message))
+        .route("/events", post(append_event))
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
@@ -1097,6 +1557,8 @@ pub struct GroupSyncRequest {
     pub group_id: GroupId,
     pub after_seq: HttpSequence,
     pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<MemberId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1284,7 +1746,15 @@ async fn publish_message(
 ) -> Result<Json<HttpPublishReceipt>, ServerHttpError> {
     let receipt = state.publish_message(request.clone())?;
     state.record_finite_commit_projection(&request, receipt.seq)?;
+    state.record_room_log_entry_observation(&request, receipt.seq)?;
     Ok(Json(receipt))
+}
+
+async fn append_event(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AppendEventRequest>,
+) -> Result<Json<EventAccepted>, ServerHttpError> {
+    Ok(Json(state.append_event(request)?))
 }
 
 async fn submit_commit(
@@ -1298,9 +1768,7 @@ async fn sync_group(
     State(state): State<HttpServerState>,
     Json(request): Json<GroupSyncRequest>,
 ) -> Result<Json<HttpSyncPage>, ServerHttpError> {
-    let service = state.service.lock().expect("HTTP delivery service mutex");
-    let page = service.sync_group(&request.group_id, request.after_seq, request.limit)?;
-    Ok(Json(page))
+    Ok(Json(state.sync_group(request)?))
 }
 
 async fn sync_inbox(
@@ -1522,6 +1990,63 @@ struct AccountRoomDirectoryRecord {
     record: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HttpRoomMembershipProjection {
+    room_id: String,
+    mls_group_id: String,
+    current_epoch: u64,
+    last_seq: HttpSequence,
+    status: RoomStatus,
+    #[serde(default = "default_membership_complete")]
+    membership_complete: bool,
+    membership: BTreeMap<String, DeviceMembership>,
+}
+
+impl HttpRoomMembershipProjection {
+    fn tracks_device(&self, device: &DeviceRef) -> bool {
+        self.membership.contains_key(&DeviceMembership::key(device))
+    }
+
+    fn device_active_at_head(&self, device: &DeviceRef) -> bool {
+        self.membership
+            .get(&DeviceMembership::key(device))
+            .map(|membership| {
+                membership.intervals.iter().any(|interval| {
+                    interval.active
+                        && interval.start_seq <= self.last_seq
+                        && interval.end_seq.is_none()
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn device_was_member_for_seq(&self, device: &DeviceRef, seq: HttpSequence) -> bool {
+        self.membership
+            .get(&DeviceMembership::key(device))
+            .map(|membership| {
+                membership.intervals.iter().any(|interval| {
+                    interval.start_seq <= seq && interval.end_seq.is_none_or(|end| seq <= end)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn activate_interval(&mut self, device: &DeviceRef, start_seq: HttpSequence) -> bool {
+        let Some(membership) = self.membership.get_mut(&DeviceMembership::key(device)) else {
+            return false;
+        };
+        let Some(interval) = membership
+            .intervals
+            .iter_mut()
+            .find(|interval| interval.start_seq == start_seq && !interval.active)
+        else {
+            return false;
+        };
+        interval.active = true;
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SqliteHttpDeliveryStore {
     path: Arc<PathBuf>,
@@ -1563,6 +2088,10 @@ impl SqliteHttpDeliveryStore {
                 room_id TEXT NOT NULL,
                 record_json TEXT NOT NULL,
                 PRIMARY KEY(account_id, room_id)
+            );
+            CREATE TABLE IF NOT EXISTS http_room_memberships (
+                room_id TEXT PRIMARY KEY,
+                projection_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_welcome_claims (
                 message_id_json TEXT PRIMARY KEY,
@@ -1854,6 +2383,41 @@ impl SqliteHttpDeliveryStore {
         Ok(())
     }
 
+    fn upsert_room_membership(
+        &self,
+        projection: &HttpRoomMembershipProjection,
+    ) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_room_memberships (room_id, projection_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(room_id) DO UPDATE SET
+                projection_json = excluded.projection_json",
+            params![&projection.room_id, serde_json::to_string(projection)?,],
+        )?;
+        Ok(())
+    }
+
+    fn load_room_memberships(
+        &self,
+    ) -> Result<BTreeMap<String, HttpRoomMembershipProjection>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT room_id, projection_json
+             FROM http_room_memberships
+             ORDER BY room_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut rooms = BTreeMap::new();
+        for row in rows {
+            let (room_id, projection_json) = row?;
+            rooms.insert(room_id, serde_json::from_str(&projection_json)?);
+        }
+        Ok(rooms)
+    }
+
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -2045,6 +2609,39 @@ fn validate_submit_commit_request(request: &SubmitCommitRequest) -> Result<(), S
     Ok(())
 }
 
+fn validate_append_event_request(request: &AppendEventRequest) -> Result<(), ServerHttpError> {
+    request
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidEventRequest {
+            reason: error.to_string(),
+        })?;
+    if request.envelope.kind == LogEntryKind::Commit {
+        return Err(ServerHttpError::InvalidEventRequest {
+            reason: "commit events must be submitted through /commits".to_owned(),
+        });
+    }
+    if request.envelope.room_id != request.room_id {
+        return Err(ServerHttpError::InvalidEventRequest {
+            reason: format!(
+                "event envelope room_id {} does not match request room_id {}",
+                request.envelope.room_id, request.room_id
+            ),
+        });
+    }
+    if request.envelope.sender != request.sender {
+        return Err(ServerHttpError::InvalidEventRequest {
+            reason: "event envelope sender does not match request sender".to_owned(),
+        });
+    }
+    request
+        .envelope
+        .message_id()
+        .map_err(|error| ServerHttpError::InvalidEventRequest {
+            reason: error.to_string(),
+        })?;
+    Ok(())
+}
+
 fn commit_publish_request(
     request: &SubmitCommitRequest,
     message_id: &str,
@@ -2082,6 +2679,50 @@ fn commit_publish_request(
             request.room_id, request.idempotency_key
         )),
     })
+}
+
+fn event_publish_request(
+    request: &AppendEventRequest,
+    message_id: &str,
+) -> Result<PublishMessageRequest, ServerHttpError> {
+    let transport_group_id = transport_group_id_for_room(&request.room_id);
+    let placeholder_entry = RoomLogEntry {
+        room_id: request.room_id.clone(),
+        seq: 0,
+        message_id: message_id.to_owned(),
+        sender: request.sender.clone(),
+        kind: request.envelope.kind,
+        epoch: request.envelope.epoch,
+        envelope: request.envelope.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+    };
+    Ok(PublishMessageRequest {
+        target: HttpPublishTarget::Group {
+            group_id: group_id_for_room(&request.room_id),
+            transport_group_id: transport_group_id.clone(),
+            commit_admission: None,
+        },
+        message: TransportMessage {
+            id: MessageId::new(message_id.as_bytes().to_vec()),
+            payload: serde_json::to_vec(&placeholder_entry)
+                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+            timestamp: Timestamp(0),
+            causal_deps: Vec::new(),
+            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
+            envelope: TransportEnvelope::GroupMessage { transport_group_id },
+        },
+        idempotency_key: Some(format!(
+            "event:{}:{}",
+            request.room_id, request.idempotency_key
+        )),
+    })
+}
+
+fn room_log_entry_from_payload(payload: &[u8]) -> Option<RoomLogEntry> {
+    if let Ok(projection) = serde_json::from_slice::<FiniteAccountRoomCommitProjection>(payload) {
+        return Some(projection.entry);
+    }
+    serde_json::from_slice(payload).ok()
 }
 
 fn released_welcome_records_for_commit(
@@ -2146,12 +2787,63 @@ fn member_id_for_device(device: &DeviceRef) -> Result<MemberId, ServerHttpError>
         })
 }
 
+fn device_for_member_id(member_id: &MemberId) -> Result<DeviceRef, ServerHttpError> {
+    serde_json::from_slice(member_id.as_slice()).map_err(|error| {
+        ServerHttpError::InvalidGroupSyncRequest {
+            reason: format!("requester must encode a Finite DeviceRef: {error}"),
+        }
+    })
+}
+
 fn group_id_for_room(room_id: &str) -> GroupId {
     GroupId::new(room_id.as_bytes().to_vec())
 }
 
+fn room_id_for_group_id(group_id: &GroupId) -> Result<String, ServerHttpError> {
+    String::from_utf8(group_id.as_slice().to_vec()).map_err(|error| {
+        ServerHttpError::InvalidGroupSyncRequest {
+            reason: format!("group_id must be a UTF-8 Finite room_id: {error}"),
+        }
+    })
+}
+
 fn transport_group_id_for_room(room_id: &str) -> Vec<u8> {
     room_id.as_bytes().to_vec()
+}
+
+fn initial_room_membership_projection(
+    room_id: &str,
+    mls_group_id: &str,
+    creator: &DeviceRef,
+    current_epoch: u64,
+    last_seq: HttpSequence,
+    membership_complete: bool,
+) -> HttpRoomMembershipProjection {
+    let mut membership = BTreeMap::new();
+    membership.insert(
+        DeviceMembership::key(creator),
+        DeviceMembership {
+            device: creator.clone(),
+            intervals: vec![MembershipInterval {
+                start_seq: 0,
+                end_seq: None,
+                active: true,
+            }],
+        },
+    );
+    HttpRoomMembershipProjection {
+        room_id: room_id.to_owned(),
+        mls_group_id: mls_group_id.to_owned(),
+        current_epoch,
+        last_seq,
+        status: RoomStatus::Open,
+        membership_complete,
+        membership,
+    }
+}
+
+fn default_membership_complete() -> bool {
+    true
 }
 
 fn validate_fanout_id(fanout_id: &str) -> Result<(), ServerHttpError> {
@@ -2307,6 +2999,12 @@ pub enum ServerHttpError {
     InvalidCommitRequest {
         reason: String,
     },
+    InvalidEventRequest {
+        reason: String,
+    },
+    SenderNotActive {
+        sender: DeviceRef,
+    },
     InvalidFanoutRequest {
         reason: String,
     },
@@ -2335,6 +3033,17 @@ pub enum ServerHttpError {
         reason: String,
     },
     ProjectionJson(String),
+    InvalidGroupSyncRequest {
+        reason: String,
+    },
+    InvalidGroupSyncLimit {
+        actual: usize,
+        max: usize,
+    },
+    RoomMembershipConflict {
+        room_id: String,
+        reason: String,
+    },
     InvalidAccountRoomListLimit {
         actual: usize,
         max: usize,
@@ -2416,6 +3125,16 @@ impl IntoResponse for ServerHttpError {
                 "invalid_commit_request".to_owned(),
                 reason,
             ),
+            Self::InvalidEventRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_event_request".to_owned(),
+                reason,
+            ),
+            Self::SenderNotActive { sender } => (
+                StatusCode::FORBIDDEN,
+                "sender_not_active".to_owned(),
+                format!("sender {sender:?} is not active in the room"),
+            ),
             Self::InvalidFanoutRequest { reason } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_fanout_request".to_owned(),
@@ -2463,6 +3182,21 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "finite_projection_json".to_owned(),
                 error,
+            ),
+            Self::InvalidGroupSyncRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_group_sync_request".to_owned(),
+                reason,
+            ),
+            Self::InvalidGroupSyncLimit { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_group_sync_limit".to_owned(),
+                format!("group sync limit must be between 1 and {max}, got {actual}"),
+            ),
+            Self::RoomMembershipConflict { room_id, reason } => (
+                StatusCode::CONFLICT,
+                "room_membership_conflict".to_owned(),
+                format!("room-membership projection conflict for {room_id}: {reason}"),
             ),
             Self::InvalidAccountRoomListLimit { actual, max } => (
                 StatusCode::BAD_REQUEST,

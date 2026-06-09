@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `297`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `336`
+  `298`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `338`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -26,7 +26,7 @@ Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 41 |
+| `crates/finitechat-client/tests/client_state.rs` | 42 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -91,6 +91,13 @@ Python test distribution:
 - The HTTP Welcome ack wrapper can decode a claimed Finite `WelcomeRecord` on
   activated ack and promote the account-room device from pending to active
   across SQLite restart.
+- The HTTP room-membership projection can derive server-owned membership
+  intervals from typed bootstrap, typed `/commits`, and activated Welcome acks,
+  persist them, filter group sync pages by requester, and reject typed
+  application events or tracked typed commits from pending/unacked devices.
+  Raw historical room-log imports remain a compatibility mode: the server can
+  observe their group head/epoch, but marks the projection incomplete because
+  plain `RoomLogEntry` commits do not carry membership deltas.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log is published and
   account-room discovery starts from typed bootstrap projection: discover the
@@ -110,6 +117,11 @@ Python test distribution:
   commit wins the epoch, the client syncs that winner and clears its pending
   commit, then the worker reprepares and submits the fanout commit at the next
   epoch.
+- A focused HTTP runtime delivery test now proves requester-filtered group
+  sync and typed `/events`: pre-invite history is hidden from a future member,
+  the pending member can still pull the add Commit, pending application sends
+  are rejected, activated Welcome ack promotes the device, and a post-ack
+  application event decrypts for the existing member.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -176,10 +188,22 @@ Python test distribution:
 - Typed submit-commit route for the HTTP delivery surface. The route accepts a
   Finite `SubmitCommitRequest`, validates its structural commit metadata,
   publishes a plain `RoomLogEntry` into the ordered Darkmatter group queue,
-  derives account-room membership updates from the submitted request, publishes
-  derived `WelcomeRecord`s to recipient inboxes, and returns `CommitAccepted`
-  from the accepted HTTP sequence. Malformed staged Welcome inputs are rejected
-  before the route appends delivery side effects.
+  derives account-room and room-membership updates from the submitted request,
+  publishes derived `WelcomeRecord`s to recipient inboxes, and returns
+  `CommitAccepted` from the accepted HTTP sequence. Malformed staged Welcome
+  inputs are rejected before the route appends delivery side effects, and exact
+  idempotent commit retries replay even after the room head has advanced.
+- Typed application-event route for the HTTP delivery surface. The route
+  accepts a Finite `AppendEventRequest`, checks the requester against the
+  server-owned room-membership projection when the projection is complete or
+  tracks that sender, publishes a plain `RoomLogEntry`, and persists the room
+  head across restart.
+- Server-owned room-membership projection for typed HTTP rooms. This remains a
+  Finite-owned projection over Darkmatter's ordered transport: typed bootstrap
+  creates the active creator interval, typed commits add pending intervals and
+  close removed intervals, activated Welcome ack marks the pending interval
+  active, and requester-aware group sync filters pages while still advancing
+  cursors over hidden messages.
 - Moving route DTOs into a shared protocol crate. The current CLI imports the
   server crate's DTOs directly so the route client cannot drift, but that is
   not the right long-term crate boundary.
@@ -201,8 +225,13 @@ Python test distribution:
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
   initial active device, account-room save/list now normalizes records to the
-  requested account, and Welcome ack activation now promotes pending devices to
-  active. Complete server-authored room/member truth remains unported.
+  requested account, Welcome ack activation now promotes pending devices to
+  active, and typed room-membership projection now filters sync and rejects
+  pending sends. Complete server-authored room/member truth still has one
+  compatibility caveat: rooms imported from raw plain `RoomLogEntry` history can
+  advance the projected epoch/head, but because those commits do not carry
+  membership deltas, unknown members fall back to raw transport compatibility
+  instead of strict membership denial.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -250,10 +279,11 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `24`
+- Route/store/engine tests added so far: `25`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
+  - `POST /events`
   - `POST /sync/group`
   - `POST /sync/inbox`
   - `POST /key-packages`
@@ -267,6 +297,8 @@ Additional HTTP route checkpoint:
   - `POST /account-rooms/bootstrap`
   - `POST /account-rooms`
   - `POST /account-rooms/list`
+  - `POST /welcomes/claim`
+  - `POST /welcomes/ack`
 - Persistence coverage proven:
   - group queue and duplicate-message index rebuild after restart
   - same-epoch commit admission rebuilds after restart
@@ -293,6 +325,11 @@ Additional HTTP route checkpoint:
     and survives restart
   - activated Finite Welcome ack promotes the pending account-room device to
     active and the projection survives restart
+  - requester-aware group sync filters through a persisted room-membership
+    projection, advances cursors over hidden messages, admits pending members
+    after typed commits, rejects pending typed application events and tracked
+    pending typed commits, and accepts typed application events after Welcome
+    activation survives restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -391,6 +428,8 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
+- `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
@@ -440,15 +479,15 @@ Runtime delivery checkpoint:
   reprepares/submits the fanout commit at the next epoch.
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, typed
-  submit-commit, Welcome claim/ack, ordered room pull, account-room discovery,
-  commit-derived account-room updates for add/remove commits, and later-device
-  fanout from typed bootstrap across the happy path, submit response-loss
-  retry, multi-room fanout, and same-epoch reprepare. It does not yet prove
-  server-authored room/member truth beyond account-room directory projections,
-  but typed submit side effects, commit-derived account-room updates, and
-  Welcome ack activation are now server-derived.
+  submit-commit, typed application events, Welcome claim/ack, requester-filtered
+  ordered room pull, account-room discovery, commit-derived account-room
+  updates for add/remove commits, and later-device fanout from typed bootstrap
+  across the happy path, submit response-loss retry, multi-room fanout, and
+  same-epoch reprepare. Typed bootstrap/commit/event flows now have
+  server-owned room-membership projection; raw plain `RoomLogEntry` history
+  remains an incomplete compatibility mode because it lacks membership deltas.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from account-room directory projections into server-authored room/member truth,
-or start moving the test-only HTTP runtime adapter into production client/server
-boundaries.
+from test-only adapters into production client/server boundaries, or close the
+raw-history compatibility caveat by ensuring imported commits carry membership
+deltas before strict member authorization is enabled for every room.

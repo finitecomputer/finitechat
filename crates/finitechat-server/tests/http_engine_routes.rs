@@ -186,6 +186,7 @@ async fn deliver_http_group_to_client(
             group_id: group_id.clone(),
             after_seq: *after_seq,
             limit: 10,
+            requester: None,
         },
     )
     .await;

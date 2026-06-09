@@ -5,7 +5,8 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, CommitAccepted, SubmitCommitRequest, WelcomeRecord,
+    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, EventAccepted,
+    SubmitCommitRequest, WelcomeRecord,
 };
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomStatus,
@@ -71,6 +72,7 @@ async fn sqlite_log_rebuilds_group_queue_and_duplicate_index_after_restart() {
             group_id: group_id.clone(),
             after_seq: 0,
             limit: 10,
+            requester: None,
         },
     )
     .await;
@@ -121,6 +123,7 @@ async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
             group_id,
             after_seq: 0,
             limit: 10,
+            requester: None,
         },
     )
     .await;
@@ -171,6 +174,7 @@ async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
             group_id,
             after_seq: 0,
             limit: 10,
+            requester: None,
         },
     )
     .await;
@@ -916,6 +920,7 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
             group_id: group_id(&room_id),
             after_seq: 0,
             limit: 10,
+            requester: None,
         },
     )
     .await;
@@ -1104,12 +1109,223 @@ async fn submit_commit_route_rejects_missing_staged_welcome_before_side_effects(
             group_id: group_id(&room_id),
             after_seq: 0,
             limit: 10,
+            requester: None,
         },
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let page: HttpSyncPage = read_json(response).await;
     assert!(page.entries.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-filtered-membership-sync".to_owned();
+    let mls_group_id = "mls-filtered-membership-sync".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let carol = DeviceRef::new("carol", "carol-phone");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            b"hidden",
+            "app-before-bob-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let hidden_acceptance: EventAccepted = read_json(response).await;
+    assert_eq!(hidden_acceptance.seq, 1);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&bob)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_hidden_page: HttpSyncPage = read_json(response).await;
+    assert!(bob_hidden_page.entries.is_empty());
+    assert_eq!(bob_hidden_page.next_after_seq, hidden_acceptance.seq);
+
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-filtered-bob",
+        "commit-filtered-bob",
+    );
+    let commit_message_id = request.envelope.message_id().expect("commit message id");
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 2);
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &bob,
+            1,
+            b"pending-send",
+            "bob-pending-send-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "sender_not_active");
+
+    let mut pending_commit = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &bob,
+        &carol,
+        "welcome-filtered-carol",
+        "bob-pending-commit-idempotency",
+    );
+    pending_commit.expected_epoch = 1;
+    pending_commit.envelope.epoch = 1;
+    let pending_commit_message_id = pending_commit
+        .envelope
+        .message_id()
+        .expect("pending commit message id");
+    pending_commit.membership_delta.base_epoch = 1;
+    pending_commit.membership_delta.post_commit_epoch = 2;
+    pending_commit.membership_delta.commit_message_id = pending_commit_message_id;
+    let response = post_json(app.clone(), "/commits", &pending_commit).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "sender_not_active");
+
+    let response = post_json(
+        app,
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            1,
+            b"visible",
+            "app-after-bob-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let visible_acceptance: EventAccepted = read_json(response).await;
+    assert_eq!(visible_acceptance.seq, 3);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: bob_hidden_page.next_after_seq,
+            limit: 10,
+            requester: Some(member_for_device(&bob)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_visible_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(bob_visible_page.entries.len(), 2);
+    assert_eq!(
+        bob_visible_page.entries[0].message.id.as_slice(),
+        commit_message_id.as_bytes()
+    );
+    assert_eq!(
+        bob_visible_page.entries[1].message.id.as_slice(),
+        visible_acceptance.message_id.as_bytes()
+    );
+    assert_eq!(bob_visible_page.next_after_seq, visible_acceptance.seq);
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-filtered-bob"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &bob,
+            1,
+            b"activated-send",
+            "bob-activated-send-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_acceptance: EventAccepted = read_json(response).await;
+    assert_eq!(bob_acceptance.seq, 4);
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&carol)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let carol_page: HttpSyncPage = read_json(response).await;
+    assert!(carol_page.entries.is_empty());
+    assert_eq!(carol_page.next_after_seq, bob_acceptance.seq);
 }
 
 #[tokio::test]
@@ -1504,6 +1720,29 @@ fn submit_add_device_request(
             welcome_payload: b"welcome-add-device".to_vec(),
             ratchet_tree_payload: b"ratchet-tree-add-device".to_vec(),
         }],
+        idempotency_key: idempotency_key.to_owned(),
+    }
+}
+
+fn append_application_request(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    epoch: u64,
+    payload: &[u8],
+    idempotency_key: &str,
+) -> AppendEventRequest {
+    AppendEventRequest {
+        room_id: room_id.to_owned(),
+        sender: sender.clone(),
+        envelope: FiniteEnvelope {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            epoch,
+            sender: sender.clone(),
+            kind: LogEntryKind::Application,
+            payload: payload.to_vec(),
+        },
         idempotency_key: idempotency_key.to_owned(),
     }
 }
