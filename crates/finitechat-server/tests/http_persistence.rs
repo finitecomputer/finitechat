@@ -17,12 +17,12 @@ use finitechat_http::{
     HttpKeyPackageClaim, HttpKeyPackageInventory, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
     MarkFanoutPreparedRequest, PublishMessageRequest, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
-    SaveFanoutRoomRequest,
+    ReportInvalidCommitResponse, RevokeDeviceRequest, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomStatus,
-    StagedWelcomeV1, WelcomeState,
+    DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -399,6 +399,257 @@ async fn sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http(
     assert_eq!(reclaimed.owner, owner);
     assert_eq!(reclaimed.key_package, publication.key_package);
     assert_inventory(app, member("lease-owner"), 0, 1).await;
+}
+
+#[tokio::test]
+async fn sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let owner = member_for_device(&bob);
+    let first = key_package_publication("kp-revoked-bob-1", owner.clone(), b"revoked-one");
+    let second = key_package_publication("kp-revoked-bob-2", owner.clone(), b"revoked-two");
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &first)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_inventory(app.clone(), owner.clone(), 1, 0).await;
+
+    let response = post_json(
+        app.clone(),
+        "/devices/revoke",
+        &RevokeDeviceRequest {
+            device: bob.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages", &second).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claims",
+        &ClaimKeyPackagesRequest {
+            owners: vec![owner.clone()],
+            idempotency_key: Some("revoked-owner-batch".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claims: Vec<HttpKeyPackageClaim> = read_json(response).await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].owner, owner.clone());
+    assert!(claims[0].claimed.is_none());
+    assert_inventory(app, owner, 1, 0).await;
+}
+
+#[tokio::test]
+async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let pending_room_id = "room-revoked-pending".to_owned();
+    let pending_mls_group_id = "mls-revoked-pending".to_owned();
+    let active_room_id = "room-revoked-active".to_owned();
+    let active_mls_group_id = "mls-revoked-active".to_owned();
+    let target_room_id = "room-revoked-target".to_owned();
+    let target_mls_group_id = "mls-revoked-target".to_owned();
+    let pending_add = submit_add_device_request(
+        &pending_room_id,
+        &pending_mls_group_id,
+        &alice,
+        &bob,
+        "welcome-revoked-pending",
+        "commit-revoked-pending",
+    );
+    let active_add = submit_add_device_request(
+        &active_room_id,
+        &active_mls_group_id,
+        &alice,
+        &bob,
+        "welcome-revoked-active",
+        "commit-revoked-active",
+    );
+
+    let app = persistent_app(&db_path);
+    for (room_id, mls_group_id) in [
+        (&pending_room_id, &pending_mls_group_id),
+        (&active_room_id, &active_mls_group_id),
+    ] {
+        let response = post_json(
+            app.clone(),
+            "/account-rooms/bootstrap",
+            &BootstrapAccountRoomRequest {
+                room_id: room_id.clone(),
+                mls_group_id: mls_group_id.clone(),
+                creator: alice.clone(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    publish_and_claim_key_package_for_add(&app, &pending_add).await;
+    let response = post_json(app.clone(), "/commits", &pending_add).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending_claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(pending_claims.len(), 1);
+    assert_eq!(pending_claims[0].message.id, id("welcome-revoked-pending"));
+
+    publish_and_claim_key_package_for_add(&app, &active_add).await;
+    let response = post_json(app.clone(), "/commits", &active_add).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let active_claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(active_claims.len(), 1);
+    assert_eq!(active_claims[0].message.id, id("welcome-revoked-active"));
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-revoked-active"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    revoke_device(&app, &bob).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-revoked-pending"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+    let page = account_room_page(&app, "bob").await;
+    let pending_room = page
+        .rooms
+        .iter()
+        .find(|room| room["room_id"].as_str() == Some(pending_room_id.as_str()))
+        .expect("pending room");
+    let pending_bob = pending_room["devices"]
+        .as_array()
+        .expect("devices")
+        .iter()
+        .find(|device| device["device"]["device_id"] == "bob-phone")
+        .expect("pending Bob device");
+    assert_eq!(pending_bob["active"], false);
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &active_room_id,
+            &active_mls_group_id,
+            &bob,
+            1,
+            b"revoked-send",
+            "revoked-send-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let remove = submit_remove_device_request(
+        &active_room_id,
+        &active_mls_group_id,
+        &bob,
+        &alice,
+        1,
+        "revoked-commit-idempotency",
+    );
+    let response = post_json(app.clone(), "/commits", &remove).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: target_room_id.clone(),
+            mls_group_id: target_mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let target_add = submit_add_device_request(
+        &target_room_id,
+        &target_mls_group_id,
+        &alice,
+        &bob,
+        "welcome-revoked-target",
+        "commit-revoked-target",
+    );
+    let response = post_json(app, "/commits", &target_add).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
 }
 
 #[tokio::test]
@@ -2319,6 +2570,18 @@ async fn assert_inventory(app: Router, owner: MemberId, available: u32, claimed:
     assert_eq!(inventory.claimed, claimed);
 }
 
+async fn revoke_device(app: &Router, device: &DeviceRef) {
+    let response = post_json(
+        app.clone(),
+        "/devices/revoke",
+        &RevokeDeviceRequest {
+            device: device.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 fn id(label: &str) -> MessageId {
     MessageId::new(label.as_bytes().to_vec())
 }
@@ -2376,6 +2639,43 @@ fn submit_add_device_request(
             welcome_payload: b"welcome-add-device".to_vec(),
             ratchet_tree_payload: b"ratchet-tree-add-device".to_vec(),
         }],
+        idempotency_key: idempotency_key.to_owned(),
+    }
+}
+
+fn submit_remove_device_request(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    removed: &DeviceRef,
+    epoch: u64,
+    idempotency_key: &str,
+) -> SubmitCommitRequest {
+    let envelope = FiniteEnvelope {
+        room_id: room_id.to_owned(),
+        mls_group_id: mls_group_id.to_owned(),
+        epoch,
+        sender: sender.clone(),
+        kind: LogEntryKind::Commit,
+        payload: format!("commit-remove-{idempotency_key}").into_bytes(),
+    };
+    let commit_message_id = envelope.message_id().expect("commit message id");
+    SubmitCommitRequest {
+        room_id: room_id.to_owned(),
+        sender: sender.clone(),
+        expected_epoch: epoch,
+        envelope,
+        membership_delta: MembershipDeltaV1 {
+            base_epoch: epoch,
+            post_commit_epoch: epoch + 1,
+            commit_message_id,
+            adds: Vec::new(),
+            removes: vec![MembershipRemoveV1 {
+                device: removed.clone(),
+                removed_leaf_index: 1,
+            }],
+        },
+        staged_welcomes: Vec::new(),
         idempotency_key: idempotency_key.to_owned(),
     }
 }

@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage claim/lease expiry, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -104,6 +104,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_key_package_commit_lifecycle",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server typed /commits reject unclaimed KeyPackages and stale Finite KeyPackage metadata before side effects, consume claimed packages atomically with accepted commits, preserve consumed state after restart, and reject consumed-package reuse",
+        },
+        PortFinding {
+            area: "http_revoked_device_projection",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server persists revoked finite DeviceRefs over HTTP, rebuilds revoked state after restart, rejects revoked KeyPackage publish/claim, Welcome claim/activation, typed event senders, typed commit senders, and typed commits that add a revoked device; batch KeyPackage claim skips revoked owners without consuming inventory",
         },
         PortFinding {
             area: "http_runtime_delivery_adapter",

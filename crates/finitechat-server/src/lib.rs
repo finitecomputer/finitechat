@@ -25,8 +25,8 @@ pub use finitechat_http::{
     InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
     PublishKeyPackageResponse, PublishMessageRequest, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
-    SaveFanoutRoomRequest,
+    ReportInvalidCommitResponse, RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus,
@@ -53,6 +53,7 @@ pub struct HttpServerState {
     publish_idempotency: Arc<Mutex<HashMap<String, PublishIdempotencyRecord>>>,
     key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
+    revoked_devices: Arc<Mutex<BTreeSet<String>>>,
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
@@ -67,6 +68,7 @@ impl HttpServerState {
             publish_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
+            revoked_devices: Arc::new(Mutex::new(BTreeSet::new())),
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
@@ -85,6 +87,7 @@ impl HttpServerState {
         let publish_idempotency = store.load_publish_idempotency()?;
         let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
         let key_package_inventory = rebuild_key_package_inventory(&operations);
+        let revoked_devices = rebuild_revoked_devices(&operations);
         if !key_package_inventory_cache_matches(
             &store.load_key_package_inventory()?,
             &key_package_inventory,
@@ -102,6 +105,7 @@ impl HttpServerState {
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
             key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
+            revoked_devices: Arc::new(Mutex::new(revoked_devices)),
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
@@ -228,6 +232,7 @@ impl HttpServerState {
         &self,
         publication: HttpKeyPackagePublication,
     ) -> Result<PublishKeyPackageResponse, ServerHttpError> {
+        self.ensure_member_not_revoked(&publication.owner)?;
         self.apply_mutation(|service| {
             service.publish_key_package(publication.clone())?;
             Ok((
@@ -245,6 +250,7 @@ impl HttpServerState {
         &self,
         request: ClaimKeyPackageRequest,
     ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
+        self.ensure_member_not_revoked(&request.owner)?;
         let mut inventory = self
             .key_package_inventory
             .lock()
@@ -281,8 +287,13 @@ impl HttpServerState {
                 .key_package_inventory
                 .lock()
                 .expect("HTTP KeyPackage inventory mutex");
+            let revoked_devices = self.revoked_device_keys();
             let mut candidate = inventory.clone();
-            let claims = claim_key_packages_from_inventory(&mut candidate, &request.owners);
+            let claims = claim_key_packages_from_inventory(
+                &mut candidate,
+                &request.owners,
+                &revoked_devices,
+            );
             let changed = key_package_claim_inventory_records(&candidate, &claims);
             let operation = claims
                 .iter()
@@ -312,6 +323,7 @@ impl HttpServerState {
             .key_package_inventory
             .lock()
             .expect("HTTP KeyPackage inventory mutex");
+        let revoked_devices = self.revoked_device_keys();
         let mut idempotency = self
             .key_package_claim_idempotency
             .lock()
@@ -324,7 +336,8 @@ impl HttpServerState {
         }
 
         let mut candidate = inventory.clone();
-        let claims = claim_key_packages_from_inventory(&mut candidate, &request.owners);
+        let claims =
+            claim_key_packages_from_inventory(&mut candidate, &request.owners, &revoked_devices);
         let changed = key_package_claim_inventory_records(&candidate, &claims);
         let operation = claims
             .iter()
@@ -389,6 +402,48 @@ impl HttpServerState {
         }
         *inventory = candidate;
         Ok(ExpireKeyPackageLeaseResponse { expired: true })
+    }
+
+    fn revoke_device(
+        &self,
+        request: RevokeDeviceRequest,
+    ) -> Result<RevokeDeviceResponse, ServerHttpError> {
+        request.device.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidDeviceRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let device_key = DeviceMembership::key(&request.device);
+        let mut revoked_devices = self.revoked_devices.lock().expect("HTTP device mutex");
+        if !revoked_devices.contains(&device_key) {
+            let operation = PersistedOperation::RevokeDevice {
+                device: request.device.clone(),
+            };
+            if let Some(store) = &self.store {
+                store.append_operation(&operation)?;
+            }
+            revoked_devices.insert(device_key);
+        }
+        Ok(RevokeDeviceResponse { revoked: true })
+    }
+
+    fn revoked_device_keys(&self) -> BTreeSet<String> {
+        self.revoked_devices
+            .lock()
+            .expect("HTTP device mutex")
+            .clone()
+    }
+
+    fn ensure_device_not_revoked(&self, device: &DeviceRef) -> Result<(), ServerHttpError> {
+        let revoked_devices = self.revoked_devices.lock().expect("HTTP device mutex");
+        ensure_device_not_revoked_in(&revoked_devices, device)
+    }
+
+    fn ensure_member_not_revoked(&self, member: &MemberId) -> Result<(), ServerHttpError> {
+        if let Some(device) = finite_device_for_member_id(member) {
+            self.ensure_device_not_revoked(&device)?;
+        }
+        Ok(())
     }
 
     fn key_package_inventory(
@@ -1216,6 +1271,10 @@ impl HttpServerState {
             });
         }
 
+        self.ensure_device_not_revoked(&request.sender)?;
+        for add in &request.membership_delta.adds {
+            self.ensure_device_not_revoked(&add.device)?;
+        }
         self.validate_commit_room_membership(&request)?;
 
         // Fresh typed commits must publish the commit, release Welcomes, and update
@@ -1371,6 +1430,7 @@ impl HttpServerState {
 
     fn append_event(&self, request: AppendEventRequest) -> Result<EventAccepted, ServerHttpError> {
         validate_append_event_request(&request)?;
+        self.ensure_device_not_revoked(&request.sender)?;
         let message_id = request.envelope.message_id().map_err(|error| {
             ServerHttpError::InvalidEventRequest {
                 reason: error.to_string(),
@@ -1460,6 +1520,7 @@ impl HttpServerState {
                 max: MAX_HTTP_SYNC_PAGE_ENTRIES,
             });
         }
+        self.ensure_member_not_revoked(&request.recipient)?;
 
         let service = self.service.lock().expect("HTTP delivery service mutex");
         let mut claims = self
@@ -1515,6 +1576,12 @@ impl HttpServerState {
                 message_id: request.message_id,
             });
         };
+        if request.activated {
+            ensure_welcome_message_recipient_not_revoked(
+                &self.revoked_device_keys(),
+                &record.message,
+            )?;
+        }
         let terminal_state = if request.activated {
             WelcomeClaimState::Acked
         } else {
@@ -1699,6 +1766,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
+        .route("/devices/revoke", post(revoke_device))
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
@@ -1764,6 +1832,14 @@ async fn sync_inbox(
     let service = state.service.lock().expect("HTTP delivery service mutex");
     let page = service.sync_inbox(&request.recipient, request.after_seq, request.limit)?;
     Ok(Json(page))
+}
+
+async fn revoke_device(
+    State(state): State<HttpServerState>,
+    Json(request): Json<RevokeDeviceRequest>,
+) -> Result<Json<RevokeDeviceResponse>, ServerHttpError> {
+    let response = state.revoke_device(request)?;
+    Ok(Json(response))
 }
 
 async fn publish_key_package(
@@ -1897,6 +1973,9 @@ enum PersistedOperation {
     PublishKeyPackage {
         publication: HttpKeyPackagePublication,
     },
+    RevokeDevice {
+        device: DeviceRef,
+    },
     ClaimKeyPackage {
         owner: MemberId,
     },
@@ -1913,6 +1992,7 @@ impl PersistedOperation {
         match self {
             Self::PublishMessage { .. } => "publish_message",
             Self::PublishKeyPackage { .. } => "publish_key_package",
+            Self::RevokeDevice { .. } => "revoke_device",
             Self::ClaimKeyPackage { .. } => "claim_key_package",
             Self::ClaimKeyPackages { .. } => "claim_key_packages",
             Self::ExpireKeyPackageLease { .. } => "expire_key_package_lease",
@@ -2888,11 +2968,22 @@ fn replay_operation(
         PersistedOperation::PublishKeyPackage { publication } => {
             service.publish_key_package(publication)?;
         }
+        PersistedOperation::RevokeDevice { .. } => {}
         PersistedOperation::ClaimKeyPackage { .. }
         | PersistedOperation::ClaimKeyPackages { .. }
         | PersistedOperation::ExpireKeyPackageLease { .. } => {}
     }
     Ok(())
+}
+
+fn rebuild_revoked_devices(operations: &[PersistedOperation]) -> BTreeSet<String> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PersistedOperation::RevokeDevice { device } => Some(DeviceMembership::key(device)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn rebuild_key_package_inventory(
@@ -2936,6 +3027,7 @@ fn rebuild_key_package_inventory(
             PersistedOperation::PublishMessage { message, .. } => {
                 consume_key_packages_from_persisted_message(&mut inventory, message);
             }
+            PersistedOperation::RevokeDevice { .. } => {}
         }
     }
     inventory
@@ -3348,12 +3440,45 @@ fn member_id_for_device(device: &DeviceRef) -> Result<MemberId, ServerHttpError>
         })
 }
 
+fn finite_device_for_member_id(member_id: &MemberId) -> Option<DeviceRef> {
+    serde_json::from_slice(member_id.as_slice()).ok()
+}
+
 fn device_for_member_id(member_id: &MemberId) -> Result<DeviceRef, ServerHttpError> {
     serde_json::from_slice(member_id.as_slice()).map_err(|error| {
         ServerHttpError::InvalidGroupSyncRequest {
             reason: format!("requester must encode a Finite DeviceRef: {error}"),
         }
     })
+}
+
+fn ensure_device_not_revoked_in(
+    revoked_devices: &BTreeSet<String>,
+    device: &DeviceRef,
+) -> Result<(), ServerHttpError> {
+    if revoked_devices.contains(&DeviceMembership::key(device)) {
+        Err(ServerHttpError::DeviceRevoked {
+            device: device.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn member_id_is_revoked(member_id: &MemberId, revoked_devices: &BTreeSet<String>) -> bool {
+    finite_device_for_member_id(member_id)
+        .as_ref()
+        .is_some_and(|device| revoked_devices.contains(&DeviceMembership::key(device)))
+}
+
+fn ensure_welcome_message_recipient_not_revoked(
+    revoked_devices: &BTreeSet<String>,
+    message: &TransportMessage,
+) -> Result<(), ServerHttpError> {
+    let Ok(welcome) = serde_json::from_slice::<WelcomeRecord>(&message.payload) else {
+        return Ok(());
+    };
+    ensure_device_not_revoked_in(revoked_devices, &welcome.recipient)
 }
 
 fn group_id_for_room(room_id: &str) -> GroupId {
@@ -3489,11 +3614,16 @@ fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<()
 fn claim_key_packages_from_inventory(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     owners: &[MemberId],
+    revoked_devices: &BTreeSet<String>,
 ) -> Vec<HttpKeyPackageClaim> {
     owners
         .iter()
         .map(|owner| {
-            let claimed = claim_next_key_package_from_inventory(inventory, owner);
+            let claimed = if member_id_is_revoked(owner, revoked_devices) {
+                None
+            } else {
+                claim_next_key_package_from_inventory(inventory, owner)
+            };
             HttpKeyPackageClaim {
                 owner: owner.clone(),
                 claimed,
@@ -3588,6 +3718,12 @@ pub enum ServerHttpError {
     },
     InvalidKeyPackageLeaseRequest {
         reason: String,
+    },
+    InvalidDeviceRequest {
+        reason: String,
+    },
+    DeviceRevoked {
+        device: DeviceRef,
     },
     DuplicateKeyPackageClaimOwner {
         owner: MemberId,
@@ -3727,6 +3863,16 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_key_package_lease_request".to_owned(),
                 reason,
+            ),
+            Self::InvalidDeviceRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_device_request".to_owned(),
+                reason,
+            ),
+            Self::DeviceRevoked { device } => (
+                StatusCode::FORBIDDEN,
+                "device_revoked".to_owned(),
+                format!("device {device:?} is revoked"),
             ),
             Self::DuplicateKeyPackageClaimOwner { owner } => (
                 StatusCode::BAD_REQUEST,

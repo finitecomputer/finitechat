@@ -43,6 +43,16 @@ pub struct InboxSyncRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeDeviceRequest {
+    pub device: DeviceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeDeviceResponse {
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
 }

@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `353`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `356`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -43,10 +43,10 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 
 | File | Count |
 | --- | ---: |
-| `crates/finitechat-cli/src/lib.rs` | 18 |
+| `crates/finitechat-cli/src/lib.rs` | 19 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 26 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 28 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -61,7 +61,7 @@ Python test distribution:
 Audit state:
 
 - Port code state audited: `codex/darkmatter-port`, including HTTP
-  KeyPackage lease-expiry/reclaim coverage
+  KeyPackage lease-expiry/reclaim and revoked-device projection coverage
 - Baseline checkout: `/Users/futurepaul/dev/finite/finitechat`,
   `marmot-investigation` at `7e8048d`
 - Baseline untracked docs were ignored because they are outside `crates/` and
@@ -75,9 +75,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `361` (`353` Rust, `8` Python)
+- Port parsed tests: `364` (`356` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `67`
+- Port-only test names: `70`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -86,10 +86,10 @@ Port-only test buckets:
 
 | Bucket | Count | Files |
 | --- | ---: | --- |
-| HTTP CLI request/live-server coverage | 18 | `crates/finitechat-cli/src/lib.rs` |
+| HTTP CLI request/live-server coverage | 19 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 32 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 34 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -129,7 +129,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `67` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `70` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -147,9 +147,9 @@ Port-only Darkmatter coverage added so far:
 
 | Class | Count | Meaning |
 | --- | ---: | --- |
-| CLI HTTP route coverage | 18 | Request building and live-server route calls through `finitechat_cli::run`. |
+| CLI HTTP route coverage | 19 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 32 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 34 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -161,7 +161,6 @@ Highest-risk preserved fake/store proofs to port next:
 | P0 | `commit_effects_are_atomic_at_reducer_boundary`, `sqlite_rejected_commit_is_replayable_after_reopen` | Typed HTTP commit transaction tests that inject failures before and after delivery append. |
 | P0 | `invalid_commit_report_fails_closed`, `membership_delta_disagreement_enters_needs_repair`, `sqlite_invalid_commit_report_blocks_room_after_reopen` | Darkmatter-backed invalid-commit/repair-state route tests. |
 | P1 | `welcome_is_not_released_before_accepted_commit`, `sqlite_welcome_not_released_before_accepted_commit` | Typed submit-commit tests that assert Welcome release remains coupled to durable accepted Commit append. |
-| P1 | `revoked_active_device_cannot_send_or_commit`, `sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages` | HTTP room-membership/account-room projection tests for revoked-device send/commit/package rejection. |
 
 Current P0 progress: typed HTTP `/commits` now proves successful
 lost-response replay after restart, replayed rejection after a same-epoch loser
@@ -170,10 +169,11 @@ survive without finite projection rows, and SQLite crash-matrix rollback/retry
 convergence across commit delivery, commit idempotency, Welcome delivery,
 Welcome idempotency, account-room projection, room-membership projection, and
 KeyPackage consumed-projection write points. The HTTP server also has an
-invalid-commit repair route that
-persists `NeedsRepair` room state, reloads it after restart, and blocks later
-typed events and commits. The remaining old-store delta is not the atomic
-`/commits` bundle; it is lower-level coverage such as revoked-device edges.
+invalid-commit repair route that persists `NeedsRepair` room state, reloads it
+after restart, and blocks later typed events and commits. The remaining
+old-store delta is not the atomic `/commits` bundle; it is the broader
+fake/in-memory reducer and SQLite store surface that still needs to be audited
+for route/runtime equivalents.
 
 Current KeyPackage progress: typed HTTP `/commits` now rejects unclaimed
 KeyPackages and stale Finite KeyPackage metadata before side effects, consumes
@@ -184,10 +184,17 @@ Finite-style KeyPackage lease state above Marmot's opaque package bytes: it can
 expire a claimed lease back to available, persist that across restart, reclaim
 the same package, and reject attempts to expire consumed packages.
 
+Current revocation progress: the HTTP server now persists revoked finite
+`DeviceRef`s, rebuilds that state after restart, rejects revoked KeyPackage
+publish and single-owner claim, skips revoked owners in batch KeyPackage claim
+without consuming inventory, rejects revoked Welcome claim and activated ack,
+rejects revoked typed application-event and commit senders, and rejects typed
+commits that try to add a revoked device.
+
 Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
 coverage, but the migration is not complete. The remaining implementation work
 is concentrated in the old fake/in-memory reducer and SQLite store tests that
-do not yet run through Darkmatter HTTP, especially revocation edges.
+do not yet run through Darkmatter HTTP.
 
 ## Darkmatter-Facing Delta Buckets
 
@@ -240,7 +247,7 @@ Finite-owned adapter/application logic:
 - `finitechat-server` Axum routes, SQLite operation log, idempotency wrappers,
   Welcome claim/ack state, KeyPackage inventory/batch-claim wrappers, fanout
   checkpoints, account-room projection, room-membership projection, typed
-  submit-commit, and typed application-event routes.
+  submit-commit, typed application-event routes, and revoked-device projection.
 - `finitechat-client` runtime HTTP adapter, reqwest transport, local state,
   link-fanout retry/reprepare, and product-level payload decoding.
 - `finitechat-cli` route client and compatibility report.
@@ -282,6 +289,10 @@ Fork-only requirements beyond the current HTTP branch:
   an owner. This lets the runtime KeyPackage replenishment worker run over the
   Darkmatter HTTP boundary without teaching the server Finite-specific device
   structure.
+- The HTTP revoked-device wrapper can persist terminal finite device status,
+  rebuild it after restart, block revoked devices from server-mediated
+  KeyPackage, Welcome, event, and Commit paths, and skip revoked owners during
+  batch KeyPackage claim without consuming inventory.
 - The HTTP fanout wrapper can persist opaque later-device fanout room plans,
   prepared message ids, reprepare checkpoints, and accepted sequence markers
   across restart without teaching the server MLS semantics.
@@ -398,6 +409,11 @@ Fork-only requirements beyond the current HTTP branch:
 - KeyPackage lease expiry/reclaim for the HTTP delivery surface. This keeps
   Finite's claimed/available/consumed lease state in wrapper-owned durable
   inventory while reusing Marmot's opaque KeyPackage publication payloads.
+- Revoked-device projection for the HTTP delivery surface. This is
+  Finite-owned server state keyed by the finite `DeviceRef`; it gates
+  server-mediated KeyPackage, Welcome, typed event, and typed commit operations
+  without requiring Marmot's transport core to understand product device
+  lifecycle policy.
 - Opaque fanout plan checkpointing for the HTTP delivery surface. This stores
   the coordination fields a client worker needs to resume after restart or
   response loss, while leaving MLS validation and local pending Commit state on
@@ -517,7 +533,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `31`
+- Route/store/engine tests added so far: `34`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -525,6 +541,7 @@ Additional HTTP route checkpoint:
   - `POST /events`
   - `POST /sync/group`
   - `POST /sync/inbox`
+  - `POST /devices/revoke`
   - `POST /key-packages`
   - `POST /key-packages/inventory`
   - `POST /key-packages/claim`
@@ -549,6 +566,11 @@ Additional HTTP route checkpoint:
     KeyPackage metadata before side effects
   - typed `/commits` consumes claimed KeyPackages atomically with accepted
     commits, rebuilds consumed state after restart, and rejects consumed reuse
+  - revoked device status survives restart; revoked devices cannot publish or
+    single-claim KeyPackages, batch claims skip revoked owners without consuming
+    inventory, revoked devices cannot claim or activate Welcomes, revoked active
+    devices cannot send typed events or commits, and typed commits cannot add a
+    revoked device
   - idempotent `/messages` retry replays the original receipt after restart
   - same idempotency key with a different target/message conflicts without a
     second append
@@ -624,12 +646,13 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `17`
+- New CLI tests added: `18`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
   - typed submit-commit posts caller-provided JSON to `/commits`
+  - device revoke builds the `/devices/revoke` DTO
   - group sync defaults to `after_seq = 0` and `limit = 50`
   - KeyPackage inventory builds the route DTO
   - KeyPackage claim builds the route DTO
@@ -696,6 +719,9 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_restart`: pass
+- `cargo test -p finitechat-cli revoke_device_command_builds_revoke_request`: pass
 - `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
 - `cargo test -p finitechat-client --test client_state reqwest`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
@@ -785,6 +811,10 @@ Runtime delivery checkpoint:
   `finitechat-client` and `finitechat-cli` no longer depend on
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
+- Revoked-device status is now proven over the HTTP wrapper and SQLite rebuild:
+  it blocks KeyPackage publish/claim, Welcome claim/activation, typed event and
+  commit senders, and typed commits that add a revoked device while preserving
+  existing inventory.
 
 ## Remaining Gates
 
@@ -808,6 +838,5 @@ Runtime delivery checkpoint:
 - [x] Audit which preserved baseline tests still prove behavior only through
   the original fake/in-memory Finite delivery service instead of a Darkmatter
   engine or HTTP route path, then classify them by risk and owner.
-- [ ] Port the highest-risk remaining fake/in-memory reducer proofs to
-  Darkmatter-backed engine, HTTP route, or runtime-delivery tests, continuing
-  with revoked-device send/commit/package rejection edges.
+- [ ] Continue porting preserved fake/in-memory reducer proofs that still lack
+  Darkmatter-backed engine, HTTP route, or runtime-delivery equivalents.
