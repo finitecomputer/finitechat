@@ -181,6 +181,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server /events accepts typed AppendEventRequest payloads, rejects pending tracked senders, publishes plain RoomLogEntry payloads, and persists the room head across restart",
         },
         PortFinding {
+            area: "http_ephemeral_activity_cache",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server accepts opaque ephemeral activity over HTTP for active members, rejects pending, revoked, wrong-epoch, and expired activity, caps per-route volatile cache entries, and does not append durable group messages or persist activity across SQLite restart",
+        },
+        PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through the typed HTTP /commits route, sync completion, claim a server-released Welcome, and promote the later device from pending to active after ack through both in-process and live reqwest transports",

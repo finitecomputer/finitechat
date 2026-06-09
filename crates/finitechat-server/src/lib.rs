@@ -11,9 +11,10 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, DeviceMembership,
+    AccountRoomDevice, AccountRoomRecord, AppendEphemeralActivityRequest, AppendEventRequest,
+    CommitAccepted, DeviceMembership, EphemeralActivityAccepted, EphemeralActivityRecord,
     EventAccepted, MembershipInterval, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    lease_token_for, staged_welcomes_by_id,
+    lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
 };
 pub use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
@@ -29,8 +30,8 @@ pub use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus,
-    WelcomeState,
+    DeviceRef, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MembershipAddV1,
+    MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,7 @@ pub struct HttpServerState {
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
+    ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -72,6 +74,7 @@ impl HttpServerState {
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
+            ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -109,6 +112,7 @@ impl HttpServerState {
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
+            ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -1485,6 +1489,85 @@ impl HttpServerState {
         })
     }
 
+    fn append_ephemeral_activity(
+        &self,
+        request: AppendEphemeralActivityRequest,
+    ) -> Result<EphemeralActivityAccepted, ServerHttpError> {
+        validate_append_ephemeral_activity_request(&request)?;
+        self.ensure_device_not_revoked(&request.sender)?;
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            let projection = rooms.get(&request.room_id).ok_or_else(|| {
+                ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "ephemeral activity requires a room-membership projection".to_owned(),
+                }
+            })?;
+            if projection.mls_group_id != request.mls_group_id {
+                return Err(ServerHttpError::InvalidActivityRequest {
+                    reason: "activity MLS group does not match room projection".to_owned(),
+                });
+            }
+            if projection.status != RoomStatus::Open {
+                return Err(ServerHttpError::RoomNotOpen {
+                    room_id: request.room_id.clone(),
+                    status: projection.status,
+                });
+            }
+            if request.epoch != projection.current_epoch {
+                return Err(ServerHttpError::InvalidActivityRequest {
+                    reason: format!(
+                        "activity epoch {} does not match room epoch {}",
+                        request.epoch, projection.current_epoch
+                    ),
+                });
+            }
+            let tracks_sender = projection.tracks_device(&request.sender);
+            if (tracks_sender || projection.membership_complete)
+                && !projection.device_active_at_head(&request.sender)
+            {
+                return Err(ServerHttpError::SenderNotActive {
+                    sender: request.sender.clone(),
+                });
+            }
+        }
+
+        let route_key = finitechat_engine::ephemeral_activity_route_key(
+            &request.room_id,
+            request.conversation_id.as_deref(),
+            &request.sender,
+        );
+        let record = EphemeralActivityRecord {
+            room_id: request.room_id,
+            mls_group_id: request.mls_group_id,
+            epoch: request.epoch,
+            sender: request.sender,
+            conversation_id: request.conversation_id,
+            payload: request.payload,
+            received_at_ms: request.received_at_ms,
+            expires_at_ms: request.expires_at_ms,
+        };
+        let mut activity = self
+            .ephemeral_activity
+            .lock()
+            .expect("HTTP ephemeral activity mutex");
+        let records = activity.entry(route_key.clone()).or_default();
+        records.retain(|record| record.expires_at_ms > record.received_at_ms);
+        records.push(record);
+        while records.len() > MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE as usize {
+            records.remove(0);
+        }
+        let cached_events_for_route =
+            u32::try_from(records.len()).map_err(|_| ServerHttpError::CounterOverflow)?;
+        Ok(EphemeralActivityAccepted {
+            route_key,
+            cached_events_for_route,
+        })
+    }
+
     fn record_room_event_acceptance(
         &self,
         room_id: &str,
@@ -1763,6 +1846,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/health", get(health))
         .route("/messages", post(publish_message))
         .route("/events", post(append_event))
+        .route("/activities", post(append_ephemeral_activity))
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
@@ -1809,6 +1893,13 @@ async fn append_event(
     Json(request): Json<AppendEventRequest>,
 ) -> Result<Json<EventAccepted>, ServerHttpError> {
     Ok(Json(state.append_event(request)?))
+}
+
+async fn append_ephemeral_activity(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AppendEphemeralActivityRequest>,
+) -> Result<Json<EphemeralActivityAccepted>, ServerHttpError> {
+    Ok(Json(state.append_ephemeral_activity(request)?))
 }
 
 async fn submit_commit(
@@ -3292,6 +3383,21 @@ fn validate_append_event_request(request: &AppendEventRequest) -> Result<(), Ser
     Ok(())
 }
 
+fn validate_append_ephemeral_activity_request(
+    request: &AppendEphemeralActivityRequest,
+) -> Result<(), ServerHttpError> {
+    request
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidActivityRequest {
+            reason: error.to_string(),
+        })?;
+    validate_activity_expiry(request.received_at_ms, request.expires_at_ms).map_err(|error| {
+        ServerHttpError::InvalidActivityRequest {
+            reason: error.to_string(),
+        }
+    })
+}
+
 fn commit_publish_request(
     request: &SubmitCommitRequest,
     message_id: &str,
@@ -3735,6 +3841,7 @@ pub enum ServerHttpError {
         field: &'static str,
         value: usize,
     },
+    CounterOverflow,
     InvalidCommitRequest {
         reason: String,
     },
@@ -3743,6 +3850,9 @@ pub enum ServerHttpError {
         reason: String,
     },
     InvalidEventRequest {
+        reason: String,
+    },
+    InvalidActivityRequest {
         reason: String,
     },
     SenderNotActive {
@@ -3889,6 +3999,11 @@ impl IntoResponse for ServerHttpError {
                 "key_package_inventory_count_overflow".to_owned(),
                 format!("KeyPackage inventory field {field} does not fit in u32: {value}"),
             ),
+            Self::CounterOverflow => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "counter_overflow".to_owned(),
+                "counter value does not fit in u32".to_owned(),
+            ),
             Self::InvalidCommitRequest { reason } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_commit_request".to_owned(),
@@ -3902,6 +4017,11 @@ impl IntoResponse for ServerHttpError {
             Self::InvalidEventRequest { reason } => (
                 StatusCode::BAD_REQUEST,
                 "invalid_event_request".to_owned(),
+                reason,
+            ),
+            Self::InvalidActivityRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_activity_request".to_owned(),
                 reason,
             ),
             Self::SenderNotActive { sender } => (

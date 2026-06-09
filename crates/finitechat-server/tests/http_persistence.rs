@@ -5,8 +5,9 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, EventAccepted,
-    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
+    AccountRoomDevice, AccountRoomRecord, AppendEphemeralActivityRequest, AppendEventRequest,
+    CommitAccepted, EphemeralActivityAccepted, EventAccepted, SubmitCommitRequest,
+    UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
@@ -21,8 +22,9 @@ use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
+    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, RoomStatus, StagedWelcomeV1,
+    WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -2199,6 +2201,207 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
 }
 
 #[tokio::test]
+async fn sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequence() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-ephemeral-activity-volatile".to_owned();
+    let mls_group_id = "mls-ephemeral-activity-volatile".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request = ephemeral_activity_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        Some("topic-activity"),
+        1_000,
+    );
+    let response = post_json(app.clone(), "/activities", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EphemeralActivityAccepted = read_json(response).await;
+    assert_eq!(accepted.cached_events_for_route, 1);
+    assert_eq!(
+        accepted.route_key,
+        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-activity"), &alice)
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+
+    let response = post_json(app, "/activities", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EphemeralActivityAccepted = read_json(response).await;
+    assert_eq!(accepted.cached_events_for_route, 1);
+}
+
+#[tokio::test]
+async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-ephemeral-activity-auth".to_owned();
+    let mls_group_id = "mls-ephemeral-activity-auth".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let add_bob = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-ephemeral-bob",
+        "commit-ephemeral-bob",
+    );
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pending = ephemeral_activity_request(&room_id, &mls_group_id, &bob, 1, None, 1_000);
+    let response = post_json(app.clone(), "/activities", &pending).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "sender_not_active");
+
+    let wrong_epoch = ephemeral_activity_request(&room_id, &mls_group_id, &alice, 0, None, 1_000);
+    let response = post_json(app.clone(), "/activities", &wrong_epoch).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_activity_request");
+
+    let expired = AppendEphemeralActivityRequest {
+        expires_at_ms: 1_000,
+        ..ephemeral_activity_request(&room_id, &mls_group_id, &alice, 1, None, 1_000)
+    };
+    let response = post_json(app.clone(), "/activities", &expired).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_activity_request");
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-ephemeral-bob"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for index in 0..=MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE {
+        let mut request = ephemeral_activity_request(
+            &room_id,
+            &mls_group_id,
+            &bob,
+            1,
+            Some("topic-route"),
+            2_000 + u64::from(index),
+        );
+        request.payload = vec![0xff, index as u8];
+        let response = post_json(app.clone(), "/activities", &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EphemeralActivityAccepted = read_json(response).await;
+        assert_eq!(
+            accepted.cached_events_for_route,
+            (index + 1).min(MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE)
+        );
+    }
+
+    revoke_device(&app, &bob).await;
+    let response = post_json(
+        app.clone(),
+        "/activities",
+        &ephemeral_activity_request(&room_id, &mls_group_id, &bob, 1, Some("topic-route"), 3_000),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.next_after_seq, 1);
+}
+
+#[tokio::test]
 async fn sqlite_invalid_commit_report_blocks_typed_mutations_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -3241,6 +3444,26 @@ fn append_application_request(
             payload: payload.to_vec(),
         },
         idempotency_key: idempotency_key.to_owned(),
+    }
+}
+
+fn ephemeral_activity_request(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    epoch: u64,
+    conversation_id: Option<&str>,
+    received_at_ms: u64,
+) -> AppendEphemeralActivityRequest {
+    AppendEphemeralActivityRequest {
+        room_id: room_id.to_owned(),
+        mls_group_id: mls_group_id.to_owned(),
+        epoch,
+        sender: sender.clone(),
+        conversation_id: conversation_id.map(str::to_owned),
+        payload: format!("activity-{}-{received_at_ms}", sender.device_id).into_bytes(),
+        received_at_ms,
+        expires_at_ms: received_at_ms + 1_000,
     }
 }
 
