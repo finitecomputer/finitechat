@@ -47,8 +47,8 @@ keeps Finite-owned product behavior above that boundary.
   platform plugin.
 - `crates/finitechat-darkmatter`: small adapter layer that records which
   Darkmatter primitives are already usable from this repo.
-- `crates/finitechat-server`: server entrypoint shell for the HTTP delivery
-  service.
+- `crates/finitechat-server`: Axum HTTP route layer over Darkmatter's delivery
+  service core.
 - `crates/finitechat-cli`: CLI entrypoint shell for the port.
 - `integrations/hermes/finite-platform`: thin Hermes plugin over the Finite
   Chat bridge.
@@ -73,6 +73,8 @@ keeps Finite-owned product behavior above that boundary.
 ```sh
 cargo test
 python3 -m unittest discover -s tests -p '*test*.py'
+cargo test -p finitechat-server --test http_routes
+cargo run -p finitechat-server -- smoke
 ```
 
 The fake simulator tests prove the server-side ordering and persistence

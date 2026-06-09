@@ -46,6 +46,10 @@ Python test distribution:
 - Darkmatter's HTTP delivery service core can sequence opaque group
   `TransportMessage` bytes, reject a second commit for the same source epoch,
   sync bounded pages, and claim owner-scoped KeyPackages once.
+- A thin Axum route layer can expose that service core without extra protocol
+  logic. The current route tests cover group publish/sync, exact duplicate
+  replay, same-epoch commit conflict, inbox publish/sync, and single-use
+  KeyPackage claims.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -59,8 +63,9 @@ Python test distribution:
   state, and Hermes bridge JSON.
 - CLI/daemon command surfaces that call into the Darkmatter-backed client.
 - Push/unread/command-inbox projections from decrypted application events.
-- Thin server route DTOs and idempotency wrappers around the HTTP delivery
-  service core, as long as the underlying state transition already exists.
+- Public server DTO polish, auth, rate limits, deployment concerns, and
+  idempotency wrappers around the HTTP delivery service core, as long as the
+  underlying state transition already exists.
 
 ## Thick Or Wonky Logic
 
@@ -92,9 +97,9 @@ workspace members:
   proves the HTTP delivery core orders one admitted Commit followed by one app
   message.
 - `finitechat-cli` exposes `compat-report` and `http-smoke` commands.
-- `finitechat-server` is only an executable shell over the in-memory delivery
-  core. Socket-level HTTP routes, auth, persistence, and production server
-  behavior remain unported.
+- `finitechat-server` exposes in-process HTTP routes over the in-memory
+  Darkmatter delivery core and keeps `serve` as an explicit binary mode.
+  Auth, durable persistence, and production server behavior remain unported.
 
 Verified after adding the Darkmatter dependency graph:
 
@@ -102,7 +107,26 @@ Verified after adding the Darkmatter dependency graph:
 - `python3 -m unittest discover -s tests -p '*test*.py'`: pass
 - `cargo clippy --workspace --all-targets -- -D warnings`: pass
 - `cargo run -p finitechat-cli -- compat-report`: pass
-- `cargo run -p finitechat-server`: pass
+- `cargo run -p finitechat-server -- smoke`: pass
+
+Additional HTTP route checkpoint:
+
+- `cargo test -p finitechat-server --test http_routes`: pass
+- New tests added: `5`
+- Route coverage proven:
+  - `GET /health`
+  - `POST /messages`
+  - `POST /sync/group`
+  - `POST /sync/inbox`
+  - `POST /key-packages`
+  - `POST /key-packages/claim`
+
+Important test caveat:
+
+- The copied Rust and Python suites still mostly exercise the original Finite
+  Chat implementation. They are preserved here as the acceptance surface. The
+  Darkmatter-backed behavior directly proven in this repo is currently the
+  adapter smoke test plus the HTTP route tests above.
 
 Dependency note:
 
@@ -111,6 +135,5 @@ Dependency note:
   SQLite dependency graph, so this port repo aligns its workspace `rusqlite`
   version to `0.32` to avoid two `libsqlite3-sys` packages linking `sqlite3`.
 
-Next meaningful gate: make the server crate expose actual HTTP routes backed by
-the Darkmatter service core, then move the copied server reducer tests onto that
-route/store boundary.
+Next meaningful gate: add durable storage behind the HTTP route layer, then move
+the copied server reducer tests onto that route/store boundary.

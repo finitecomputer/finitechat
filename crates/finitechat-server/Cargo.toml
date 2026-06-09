@@ -11,4 +11,13 @@ name = "finitechat-darkmatter-server"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
+cgka-traits.workspace = true
 finitechat-darkmatter = { path = "../finitechat-darkmatter" }
+serde.workspace = true
+tokio.workspace = true
+transport-http-server.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tower.workspace = true
