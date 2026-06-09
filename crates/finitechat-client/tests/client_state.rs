@@ -2332,6 +2332,22 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     assert_eq!(phone_join.claimed_welcomes, 1);
     assert_eq!(phone_join.activated_welcome_acks_sent, 1);
     assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 2);
+
+    delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let activated_rooms = delivery
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id,
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(activated_rooms.rooms.len(), 1);
+    assert!(
+        activated_rooms.rooms[0]
+            .devices
+            .iter()
+            .any(|device| { device.device == *alice_phone.device_ref() && device.active })
+    );
 }
 
 #[test]

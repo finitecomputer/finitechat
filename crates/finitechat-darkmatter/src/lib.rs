@@ -121,9 +121,14 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can project accepted Finite add/remove commits into persisted account-room records and reload the updated discovery state after restart",
         },
         PortFinding {
+            area: "http_welcome_ack_membership_activation",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server can decode a claimed Finite WelcomeRecord on activated ack, mark the pending account-room device active, and reload that active projection after restart",
+        },
+        PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through Darkmatter HTTP, sync completion, and release a Welcome that the later device activates",
+            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through Darkmatter HTTP, sync completion, release a Welcome, and promote the later device from pending to active after ack",
         },
         PortFinding {
             area: "http_later_device_fanout_submit_retry",
@@ -143,7 +148,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-authored membership truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates",
+            evidence: "Remaining Finite parity requires server-authored commit/member truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates; Welcome ack activation is now server-derived",
         },
         PortFinding {
             area: "ordered_delivery_profile",

@@ -9,7 +9,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{GroupId, MemberId, MessageId};
-use finitechat_engine::{AccountRoomDevice, AccountRoomRecord};
+use finitechat_engine::{AccountRoomDevice, AccountRoomRecord, WelcomeRecord};
 use finitechat_proto::{DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -877,6 +877,7 @@ impl HttpServerState {
         &self,
         request: AckWelcomeRequest,
     ) -> Result<AckWelcomeResponse, ServerHttpError> {
+        let mut activation_message = None;
         let mut claims = self
             .welcome_claims
             .lock()
@@ -897,15 +898,92 @@ impl HttpServerState {
                 if let Some(store) = &self.store {
                     store.upsert_welcome_claim(record)?;
                 }
-                Ok(AckWelcomeResponse { acked: true })
+                if request.activated {
+                    activation_message = Some(record.message.clone());
+                }
             }
-            (current, wanted) if current == wanted => Ok(AckWelcomeResponse { acked: true }),
-            (current, wanted) => Err(ServerHttpError::WelcomeAckConflict {
-                message_id: request.message_id,
-                current,
-                wanted,
-            }),
+            (current, wanted) if current == wanted => {
+                if request.activated {
+                    activation_message = Some(record.message.clone());
+                }
+            }
+            (current, wanted) => {
+                return Err(ServerHttpError::WelcomeAckConflict {
+                    message_id: request.message_id,
+                    current,
+                    wanted,
+                });
+            }
         }
+        drop(claims);
+
+        if let Some(message) = activation_message {
+            self.activate_account_room_from_welcome(&message)?;
+        }
+        Ok(AckWelcomeResponse { acked: true })
+    }
+
+    fn activate_account_room_from_welcome(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<(), ServerHttpError> {
+        let Ok(welcome) = serde_json::from_slice::<WelcomeRecord>(&message.payload) else {
+            return Ok(());
+        };
+        if message.id.as_slice() != welcome.welcome_id.as_bytes() {
+            return Ok(());
+        }
+        validate_account_room_id("room_id", &welcome.room_id)?;
+        welcome.recipient.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            }
+        })?;
+
+        let account_id = welcome.recipient.account_id.clone();
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        let Some(existing_value) = directory
+            .get(&account_id)
+            .and_then(|rooms| rooms.get(&welcome.room_id))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(mut record) =
+            account_scoped_account_room_record(&account_id, &welcome.room_id, &existing_value)?
+        else {
+            return Ok(());
+        };
+
+        let mut changed = false;
+        for device in &mut record.devices {
+            if device.device == welcome.recipient && !device.active {
+                device.active = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let value = serde_json::to_value(&record)
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+        directory
+            .entry(account_id.clone())
+            .or_default()
+            .insert(welcome.room_id.clone(), value.clone());
+        drop(directory);
+
+        if let Some(store) = &self.store {
+            store.upsert_account_room(&AccountRoomDirectoryRecord {
+                account_id,
+                room_id: welcome.room_id,
+                record: value,
+            })?;
+        }
+        Ok(())
     }
 }
 

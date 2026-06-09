@@ -4,8 +4,8 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_engine::{AccountRoomDevice, AccountRoomRecord};
-use finitechat_proto::{DeviceRef, RoomStatus};
+use finitechat_engine::{AccountRoomDevice, AccountRoomRecord, WelcomeRecord};
+use finitechat_proto::{DeviceRef, RoomStatus, WelcomeState};
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
@@ -856,6 +856,143 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
 }
 
 #[tokio::test]
+async fn sqlite_welcome_activation_marks_account_room_device_active_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef {
+        account_id: "alice".to_owned(),
+        device_id: "alice-laptop".to_owned(),
+    };
+    let phone = DeviceRef {
+        account_id: "alice".to_owned(),
+        device_id: "alice-phone".to_owned(),
+    };
+    let room_id = "room-welcome-activation".to_owned();
+    let mls_group_id = "mls-welcome-activation".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms",
+        &SaveAccountRoomRequest {
+            account_id: "alice".to_owned(),
+            room_id: room_id.clone(),
+            record: serde_json::to_value(&AccountRoomRecord {
+                room_id: room_id.clone(),
+                mls_group_id,
+                current_epoch: 2,
+                last_seq: 7,
+                status: RoomStatus::Open,
+                devices: vec![
+                    AccountRoomDevice {
+                        device: creator,
+                        active: true,
+                    },
+                    AccountRoomDevice {
+                        device: phone.clone(),
+                        active: false,
+                    },
+                ],
+            })
+            .expect("account-room record json"),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recipient = member_for_device(&phone);
+    let welcome_record = WelcomeRecord {
+        welcome_id: "welcome-phone-activation".to_owned(),
+        room_id: room_id.clone(),
+        commit_seq: 7,
+        recipient: phone.clone(),
+        sender: DeviceRef {
+            account_id: "alice".to_owned(),
+            device_id: "alice-laptop".to_owned(),
+        },
+        key_package_id: "kp-phone-activation".to_owned(),
+        join_epoch: 2,
+        state: WelcomeState::Released,
+        lease_token: Some("lease-phone-activation".to_owned()),
+        welcome_payload: b"welcome-bytes".to_vec(),
+        ratchet_tree_payload: b"ratchet-tree".to_vec(),
+    };
+    let welcome_payload = serde_json::to_vec(&welcome_record).expect("welcome record json");
+    let response = post_json(
+        app.clone(),
+        "/messages",
+        &PublishMessageRequest {
+            target: HttpPublishTarget::Inbox {
+                recipient: recipient.clone(),
+            },
+            message: welcome_message(
+                "welcome-phone-activation",
+                recipient.clone(),
+                &welcome_payload,
+            ),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-phone-activation"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(
+        page.rooms[0]["devices"][1]["device"]["device_id"],
+        "alice-phone"
+    );
+    assert_eq!(page.rooms[0]["devices"][1]["active"], true);
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-phone-activation"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn sqlite_welcome_claim_survives_restart_before_ack() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -1064,6 +1201,10 @@ fn group_id(label: &str) -> GroupId {
 
 fn member(label: &str) -> MemberId {
     MemberId::new(label.as_bytes().to_vec())
+}
+
+fn member_for_device(device: &DeviceRef) -> MemberId {
+    MemberId::new(serde_json::to_vec(device).expect("device member id json"))
 }
 
 fn key_package_publication(

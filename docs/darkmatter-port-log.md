@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `297`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `331`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `332`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -87,6 +87,9 @@ Python test distribution:
   restart, and a remove-commit HTTP runtime test proves the removed account no
   longer lists the room after restart without a second manual `/account-rooms`
   write.
+- The HTTP Welcome ack wrapper can decode a claimed Finite `WelcomeRecord` on
+  activated ack and promote the account-room device from pending to active
+  across SQLite restart.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log is published and
   account-room discovery starts from typed bootstrap projection: discover the
@@ -163,6 +166,10 @@ Python test distribution:
   adds/removes to persisted `AccountRoomRecord`s, and keep discovery state in
   step with accepted add/remove commits. This is still product wrapper logic,
   not Darkmatter becoming the MLS membership authority.
+- Welcome-ack-derived account-room activation for the HTTP delivery surface. The
+  server can decode a claimed Finite `WelcomeRecord` on activated ack and flip
+  the matching pending account-room device to active, matching the original
+  Finite store's Welcome activation rule.
 - Runtime submit-commit mapping for the HTTP delivery surface. The adapter can
   serialize a Finite `RoomLogEntry` into a Darkmatter HTTP group message,
   publish derived `WelcomeRecord`s to recipient inboxes, and reconstruct
@@ -185,8 +192,9 @@ Python test distribution:
   retry after the submit publish is accepted, plus a two-room fanout tick.
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
-  initial active device, and account-room save/list now normalizes records to the
-  requested account. Server-authored membership truth remains unported.
+  initial active device, account-room save/list now normalizes records to the
+  requested account, and Welcome ack activation now promotes pending devices to
+  active. Complete server-authored commit/member truth remains unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -234,7 +242,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `20`
+- Route/store/engine tests added so far: `21`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -275,6 +283,8 @@ Additional HTTP route checkpoint:
   - account-room directory normalizes typed records to the requested account's
     devices, rejects records with no devices for that account, pages by room id,
     and survives restart
+  - activated Finite Welcome ack promotes the pending account-room device to
+    active and the projection survives restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -396,6 +406,9 @@ Runtime delivery checkpoint:
   the persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery lists the new device in that room as pending
   without a second manual `/account-rooms` write.
+- After the later device claims, activates, and acks the released Welcome, the
+  HTTP server reopens from SQLite with that device marked active in the
+  account-room projection.
 - A remove-commit runtime test now proves the same projection path can remove
   a persisted account-room record. After reopening the HTTP server from the
   same SQLite file, discovery for the removed account no longer lists that
@@ -419,9 +432,10 @@ Runtime delivery checkpoint:
   account-room updates for add/remove commits, and later-device fanout from
   typed bootstrap across the happy path, submit response-loss retry, multi-room
   fanout, and same-epoch reprepare. It does not yet prove server-authored
-  membership truth beyond typed product projection payloads.
+  commit/member truth beyond typed product projection payloads, but Welcome ack
+  activation is now server-derived.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from product-wrapper account-room projections into server-authored membership
+from product-wrapper account-room projections into server-authored commit/member
 truth, or start moving the test-only HTTP runtime adapter into production
 client/server boundaries.
