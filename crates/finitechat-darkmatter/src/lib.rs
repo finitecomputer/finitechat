@@ -103,7 +103,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_runtime_delivery_network_transport",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client ReqwestHttpRuntimeTransport drives HttpRuntimeDelivery against a live localhost Axum server and preserves non-success HTTP status errors",
+            evidence: "finitechat-client ReqwestHttpRuntimeTransport drives HttpRuntimeDelivery against a live localhost Axum server for KeyPackage claim, ordered room sync, later-device fanout, and visible non-success HTTP status errors",
         },
         PortFinding {
             area: "http_route_dto_boundary",
@@ -158,7 +158,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through the typed HTTP /commits route, sync completion, claim a server-released Welcome, and promote the later device from pending to active after ack",
+            evidence: "finitechat-client run_link_fanout_tick can discover one room, claim a target KeyPackage, submit a serialized commit through the typed HTTP /commits route, sync completion, claim a server-released Welcome, and promote the later device from pending to active after ack through both in-process and live reqwest transports",
         },
         PortFinding {
             area: "http_later_device_fanout_submit_retry",

@@ -1920,6 +1920,108 @@ fn reqwest_http_runtime_delivery_claims_key_package_over_live_server() {
 }
 
 #[test]
+fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-live-room-sync.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_live_room_sync");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_live_room_sync");
+    let mut source_server = DeliveryService::new();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+
+    source_server
+        .create_or_get_direct_room(alice.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            bob.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    alice.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    source_server
+        .upload_key_package(
+            bob.upload_key_package_request("kp_http_live_room_bob")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = source_server
+        .claim_key_package("kp_http_live_room_bob")
+        .unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_http_live_room_bob",
+            "commit_http_live_room_bob",
+        )
+        .unwrap();
+    let add_accepted = source_server.submit_commit(prepared.request).unwrap();
+    let commit_page = source_server
+        .sync_events(ROOM_ID, alice.device_ref(), 0)
+        .unwrap();
+    assert_eq!(commit_page.entries.len(), 1);
+    alice
+        .merge_pending_commit_from_log(ROOM_ID, &commit_page.entries, &prepared.message_id)
+        .unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice, ROOM_ID, add_accepted.seq)
+        .unwrap();
+
+    let claimed_welcomes = source_server.claim_welcomes(bob.device_ref()).unwrap();
+    assert_eq!(claimed_welcomes.len(), 1);
+    bob.activate_welcome(
+        ROOM_ID,
+        &claimed_welcomes[0].welcome_payload,
+        &claimed_welcomes[0].ratchet_tree_payload,
+    )
+    .unwrap();
+    source_server
+        .ack_welcome("welcome_http_live_room_bob", true)
+        .unwrap();
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"live http room sync"}}"#;
+    let message = bob
+        .create_application_request(ROOM_ID, plaintext, "app_http_live_room_sync")
+        .unwrap();
+    let message_accepted = source_server.append_event(message).unwrap();
+    assert_eq!(message_accepted.seq, add_accepted.seq + 1);
+    let app_page = source_server
+        .sync_events(ROOM_ID, alice.device_ref(), add_accepted.seq)
+        .unwrap();
+    assert_eq!(app_page.entries.len(), 1);
+
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+    delivery
+        .publish_room_log_entry(&commit_page.entries[0])
+        .unwrap();
+    delivery
+        .publish_room_log_entry(&app_page.entries[0])
+        .unwrap();
+    let report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(report.sync_pages, 1);
+    assert_eq!(report.applied_entries.len(), 1);
+    assert_eq!(report.applied_entries[0].room_id, ROOM_ID);
+    assert_eq!(report.applied_entries[0].seq, message_accepted.seq);
+    assert_eq!(
+        report.applied_entries[0].entry,
+        AppliedLogEntry::Application(plaintext.to_vec())
+    );
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url));
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert!(replay.applied_entries.is_empty());
+}
+
+#[test]
 fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
@@ -2497,6 +2599,132 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
             .iter()
             .any(|device| { device.device == *alice_phone.device_ref() && device.active })
     );
+}
+
+#[test]
+fn reqwest_runtime_link_fanout_tick_links_later_device_over_live_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-live-link.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_live_link_fanout");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_live_link_fanout");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_live_link_fanout");
+    let mut source_server = DeliveryService::new();
+    let room_id = "room_http_live_link_fanout";
+    let group_id = "mls_http_live_link_fanout";
+
+    let bob_join = create_group_room_with_member_and_request(
+        &mut source_server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_bob_http_live_link_fanout",
+            welcome_id: "welcome_bob_http_live_link_fanout",
+            idempotency_key: "add_bob_http_live_link_fanout",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_id, bob_join.join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+    let initial_page = source_server
+        .sync_events(room_id, alice_browser.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_page.entries.len(), 1);
+    delivery
+        .publish_commit_projection(&bob_join.request, &initial_page.entries[0])
+        .unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: group_id.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 1,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 1);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_http_live_link_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_live_link_phone",
+        &RuntimeLinkFanoutOptions {
+            max_discovery_pages_per_tick: 2,
+            max_commit_rooms_per_tick: 1,
+            max_completion_sync_pages_per_room: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.discovery_pages, 1);
+    assert_eq!(report.queued_rooms, 1);
+    assert_eq!(report.claimed_key_packages, 1);
+    assert_eq!(report.prepared_commits, 1);
+    assert_eq!(report.submitted_commits, 1);
+    assert_eq!(report.completed_rooms, 1);
+    assert!(report.complete);
+    let LinkFanoutRoomStatus::Done { accepted_seq } = alice_browser
+        .link_fanout_room_status("fanout_http_live_link_phone", room_id)
+        .unwrap()
+    else {
+        panic!("live HTTP fanout room did not complete");
+    };
+    assert_eq!(accepted_seq, bob_join.join_seq + 1);
+
+    let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url));
+    let bob_page = delivery
+        .sync_events(room_id, bob.device_ref(), bob_join.join_seq)
+        .unwrap();
+    assert_eq!(bob_page.entries.len(), 1);
+    assert_eq!(
+        bob.apply_log_entry(room_id, &bob_page.entries[0]).unwrap(),
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 1);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 1);
+    assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 2);
 }
 
 #[test]

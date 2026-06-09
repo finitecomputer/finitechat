@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `299`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `340`
+  `301`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `342`
 - Python Hermes adapter tests: `7`
 
 Copied/application Rust test distribution:
@@ -26,7 +26,7 @@ Copied/application Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 43 |
+| `crates/finitechat-client/tests/client_state.rs` | 45 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -140,9 +140,9 @@ Python test distribution:
   transport harness and failure injection.
 - `finitechat-client` also provides a concrete reqwest-backed runtime transport
   for live HTTP servers. A client-state test starts the Axum server on an
-  ephemeral localhost listener, exercises KeyPackage upload/claim through
-  `RuntimeDelivery`, and verifies non-success HTTP statuses remain visible to
-  callers.
+  ephemeral localhost listener, exercises KeyPackage upload/claim, ordered room
+  sync, and later-device fanout through `RuntimeDelivery`, and verifies
+  non-success HTTP statuses remain visible to callers.
 - `finitechat-http` now owns the shared HTTP route DTOs. The server imports
   those types for handlers and re-exports them for compatibility, while
   `finitechat-client` and `finitechat-cli` depend on the shared crate instead
@@ -462,6 +462,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
 - `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
+- `cargo test -p finitechat-client --test client_state reqwest`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
@@ -524,14 +525,16 @@ Runtime delivery checkpoint:
   errors to assertions, and injects before-accept or after-accept `/commits`
   failures. The runtime DTO mapping and validation it used to duplicate now
   live in `finitechat-client::HttpRuntimeDelivery`.
-- A live-network runtime transport test proves
+- Live-network runtime transport tests prove
   `finitechat-client::ReqwestHttpRuntimeTransport` can drive that production
   adapter against an actual localhost Axum server, including successful
-  KeyPackage upload/claim and a visible `404` server-status error.
+  KeyPackage upload/claim, ordered room sync with cursor replay, later-device
+  fanout through typed submit and Welcome activation, and a visible `404`
+  server-status error.
 - The route DTO boundary is now shared through `finitechat-http`: production
   `finitechat-client` and `finitechat-cli` no longer depend on
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
 
-Next meaningful gate: exercise the production reqwest runtime transport across
-the later-device fanout and room-sync paths, not only the KeyPackage path.
+Next meaningful gate: run the CLI against a live server for the typed
+submit-commit and Welcome claim/ack surfaces, not just publish/sync smoke.
