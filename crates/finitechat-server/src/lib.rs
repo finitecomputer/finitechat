@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
@@ -17,7 +18,8 @@ use finitechat_engine::{
 pub use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
+    ClaimWelcomesRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
     GroupSyncRequest, HealthResponse, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
     HttpFanoutRoomState, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
     InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
@@ -243,16 +245,29 @@ impl HttpServerState {
         &self,
         request: ClaimKeyPackageRequest,
     ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
-        let claimed = self.apply_mutation(|service| {
-            let claimed = service.claim_key_package(&request.owner)?;
-            let operation = claimed
-                .is_some()
-                .then_some(PersistedOperation::ClaimKeyPackage {
-                    owner: request.owner,
-                });
-            Ok((claimed, operation))
-        })?;
-        self.record_claimed_key_packages(claimed.iter())?;
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut candidate = inventory.clone();
+        let claimed = claim_next_key_package_from_inventory(&mut candidate, &request.owner);
+        let changed = claimed
+            .as_ref()
+            .and_then(|package| candidate.get(&package.key_package_id).cloned());
+        let changed = changed.into_iter().collect::<Vec<_>>();
+        let operation = claimed
+            .is_some()
+            .then_some(PersistedOperation::ClaimKeyPackage {
+                owner: request.owner,
+            });
+        if let Some(store) = &self.store {
+            store.append_key_package_claim_mutation(
+                operation.as_ref(),
+                None,
+                changed.as_slice(),
+            )?;
+        }
+        *inventory = candidate;
         Ok(claimed)
     }
 
@@ -262,19 +277,27 @@ impl HttpServerState {
     ) -> Result<Vec<HttpKeyPackageClaim>, ServerHttpError> {
         validate_key_package_claim_batch(&request.owners)?;
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            let claims = self.apply_mutation(|service| {
-                let claims = claim_key_packages_from_service(service, &request.owners)?;
-                let operation = claims
-                    .iter()
-                    .any(|claim| claim.claimed.is_some())
-                    .then_some(PersistedOperation::ClaimKeyPackages {
-                        owners: request.owners,
-                    });
-                Ok((claims, operation))
-            })?;
-            self.record_claimed_key_packages(
-                claims.iter().filter_map(|claim| claim.claimed.as_ref()),
-            )?;
+            let mut inventory = self
+                .key_package_inventory
+                .lock()
+                .expect("HTTP KeyPackage inventory mutex");
+            let mut candidate = inventory.clone();
+            let claims = claim_key_packages_from_inventory(&mut candidate, &request.owners);
+            let changed = key_package_claim_inventory_records(&candidate, &claims);
+            let operation = claims
+                .iter()
+                .any(|claim| claim.claimed.is_some())
+                .then_some(PersistedOperation::ClaimKeyPackages {
+                    owners: request.owners,
+                });
+            if let Some(store) = &self.store {
+                store.append_key_package_claim_mutation(
+                    operation.as_ref(),
+                    None,
+                    changed.as_slice(),
+                )?;
+            }
+            *inventory = candidate;
             return Ok(claims);
         };
 
@@ -285,7 +308,10 @@ impl HttpServerState {
         let fingerprint = KeyPackageClaimFingerprint {
             owners: request.owners.clone(),
         };
-        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
         let mut idempotency = self
             .key_package_claim_idempotency
             .lock()
@@ -297,8 +323,9 @@ impl HttpServerState {
             return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
         }
 
-        let mut candidate = service.clone();
-        let claims = claim_key_packages_from_service(&mut candidate, &request.owners)?;
+        let mut candidate = inventory.clone();
+        let claims = claim_key_packages_from_inventory(&mut candidate, &request.owners);
+        let changed = key_package_claim_inventory_records(&candidate, &claims);
         let operation = claims
             .iter()
             .any(|claim| claim.claimed.is_some())
@@ -313,12 +340,55 @@ impl HttpServerState {
             store.append_key_package_claim_mutation(
                 operation.as_ref(),
                 Some((&idempotency_key, &record)),
+                changed.as_slice(),
             )?;
         }
-        *service = candidate;
+        *inventory = candidate;
         idempotency.insert(idempotency_key, record);
-        self.record_claimed_key_packages(claims.iter().filter_map(|claim| claim.claimed.as_ref()))?;
         Ok(claims)
+    }
+
+    fn expire_key_package_lease(
+        &self,
+        request: ExpireKeyPackageLeaseRequest,
+    ) -> Result<ExpireKeyPackageLeaseResponse, ServerHttpError> {
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut candidate = inventory.clone();
+        let record = candidate.get_mut(&request.key_package_id).ok_or_else(|| {
+            ServerHttpError::InvalidKeyPackageLeaseRequest {
+                reason: format!("KeyPackage {:?} was not published", request.key_package_id),
+            }
+        })?;
+        match record.state {
+            KeyPackageInventoryState::Claimed => {
+                record.state = KeyPackageInventoryState::Available;
+            }
+            KeyPackageInventoryState::Available => {
+                return Err(ServerHttpError::InvalidKeyPackageLeaseRequest {
+                    reason: format!("KeyPackage {:?} is not claimed", request.key_package_id),
+                });
+            }
+            KeyPackageInventoryState::Consumed => {
+                return Err(ServerHttpError::InvalidKeyPackageLeaseRequest {
+                    reason: format!(
+                        "KeyPackage {:?} is already consumed",
+                        request.key_package_id
+                    ),
+                });
+            }
+        }
+        let changed = record.clone();
+        let operation = PersistedOperation::ExpireKeyPackageLease {
+            key_package_id: request.key_package_id,
+        };
+        if let Some(store) = &self.store {
+            store.append_key_package_inventory_operation(&operation, &changed)?;
+        }
+        *inventory = candidate;
+        Ok(ExpireKeyPackageLeaseResponse { expired: true })
     }
 
     fn key_package_inventory(
@@ -361,6 +431,7 @@ impl HttpServerState {
             .or_insert_with(|| KeyPackageInventoryRecord {
                 key_package_id: publication.key_package_id.clone(),
                 owner: publication.owner.clone(),
+                key_package: publication.key_package.clone(),
                 state: KeyPackageInventoryState::Available,
                 finite_metadata: finite_key_package_metadata(publication),
             });
@@ -372,46 +443,12 @@ impl HttpServerState {
         if record.finite_metadata.is_none() {
             record.finite_metadata = finite_key_package_metadata(publication);
         }
+        if record.key_package.bytes().is_empty() {
+            record.key_package = publication.key_package.clone();
+        }
         let record = record.clone();
         if let Some(store) = &self.store {
             store.upsert_key_package_inventory(&record)?;
-        }
-        Ok(())
-    }
-
-    fn record_claimed_key_packages<'a>(
-        &self,
-        claimed: impl IntoIterator<Item = &'a HttpClaimedKeyPackage>,
-    ) -> Result<(), ServerHttpError> {
-        let mut inventory = self
-            .key_package_inventory
-            .lock()
-            .expect("HTTP KeyPackage inventory mutex");
-        let mut changed = Vec::new();
-        for package in claimed {
-            let record = inventory
-                .entry(package.key_package_id.clone())
-                .or_insert_with(|| KeyPackageInventoryRecord {
-                    key_package_id: package.key_package_id.clone(),
-                    owner: package.owner.clone(),
-                    state: KeyPackageInventoryState::Available,
-                    finite_metadata: finite_key_package_metadata_from_claim(package),
-                });
-            if record.owner != package.owner {
-                return Err(ServerHttpError::InventoryConflict {
-                    key_package_id: package.key_package_id.clone(),
-                });
-            }
-            if record.finite_metadata.is_none() {
-                record.finite_metadata = finite_key_package_metadata_from_claim(package);
-            }
-            record.state = KeyPackageInventoryState::Claimed;
-            changed.push(record.clone());
-        }
-        if let Some(store) = &self.store {
-            for record in changed {
-                store.upsert_key_package_inventory(&record)?;
-            }
         }
         Ok(())
     }
@@ -1666,6 +1703,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
         .route("/key-packages/claims", post(claim_key_packages))
+        .route(
+            "/key-packages/leases/expire",
+            post(expire_key_package_lease),
+        )
         .route("/fanouts/get", post(get_fanout))
         .route("/fanouts/rooms", post(save_fanout_room))
         .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
@@ -1755,6 +1796,14 @@ async fn claim_key_packages(
 ) -> Result<Json<Vec<HttpKeyPackageClaim>>, ServerHttpError> {
     let claimed = state.claim_key_packages(request)?;
     Ok(Json(claimed))
+}
+
+async fn expire_key_package_lease(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ExpireKeyPackageLeaseRequest>,
+) -> Result<Json<ExpireKeyPackageLeaseResponse>, ServerHttpError> {
+    let response = state.expire_key_package_lease(request)?;
+    Ok(Json(response))
 }
 
 async fn save_fanout_room(
@@ -1854,6 +1903,9 @@ enum PersistedOperation {
     ClaimKeyPackages {
         owners: Vec<MemberId>,
     },
+    ExpireKeyPackageLease {
+        key_package_id: HttpKeyPackageId,
+    },
 }
 
 impl PersistedOperation {
@@ -1863,6 +1915,7 @@ impl PersistedOperation {
             Self::PublishKeyPackage { .. } => "publish_key_package",
             Self::ClaimKeyPackage { .. } => "claim_key_package",
             Self::ClaimKeyPackages { .. } => "claim_key_packages",
+            Self::ExpireKeyPackageLease { .. } => "expire_key_package_lease",
         }
     }
 }
@@ -1903,6 +1956,7 @@ struct KeyPackageClaimIdempotencyRecord {
 struct KeyPackageInventoryRecord {
     key_package_id: HttpKeyPackageId,
     owner: MemberId,
+    key_package: KeyPackage,
     state: KeyPackageInventoryState,
     finite_metadata: Option<FiniteKeyPackageMetadata>,
 }
@@ -2186,21 +2240,7 @@ impl SqliteHttpDeliveryStore {
             ],
         )?;
         for record in key_package_inventory_mutation {
-            transaction.execute(
-                "INSERT INTO http_key_package_inventory (
-                    key_package_id_json,
-                    owner_json,
-                    state_json
-                ) VALUES (?1, ?2, ?3)
-                ON CONFLICT(key_package_id_json) DO UPDATE SET
-                    owner_json = excluded.owner_json,
-                    state_json = excluded.state_json",
-                params![
-                    serde_json::to_string(&record.key_package_id)?,
-                    serde_json::to_string(&record.owner)?,
-                    serde_json::to_string(&record.state)?,
-                ],
-            )?;
+            upsert_key_package_inventory_in_transaction(&transaction, record)?;
         }
         transaction.commit()?;
         Ok(())
@@ -2210,6 +2250,7 @@ impl SqliteHttpDeliveryStore {
         &self,
         operation: Option<&PersistedOperation>,
         idempotency: Option<(&str, &KeyPackageClaimIdempotencyRecord)>,
+        inventory_records: &[KeyPackageInventoryRecord],
     ) -> Result<(), DurableStoreError> {
         let mut conn = self.connection()?;
         let transaction = conn.transaction()?;
@@ -2233,6 +2274,25 @@ impl SqliteHttpDeliveryStore {
                 ],
             )?;
         }
+        for record in inventory_records {
+            upsert_key_package_inventory_in_transaction(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_key_package_inventory_operation(
+        &self,
+        operation: &PersistedOperation,
+        inventory_record: &KeyPackageInventoryRecord,
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+            params![operation.kind(), serde_json::to_string(operation)?],
+        )?;
+        upsert_key_package_inventory_in_transaction(&transaction, inventory_record)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2352,6 +2412,7 @@ impl SqliteHttpDeliveryStore {
                 KeyPackageInventoryRecord {
                     key_package_id,
                     owner: serde_json::from_str(&owner_json)?,
+                    key_package: KeyPackage::new(Vec::new()),
                     state: serde_json::from_str(&state_json)?,
                     finite_metadata: None,
                 },
@@ -2574,6 +2635,28 @@ impl SqliteHttpDeliveryStore {
     fn connection(&self) -> Result<Connection, rusqlite::Error> {
         Connection::open(&*self.path)
     }
+}
+
+fn upsert_key_package_inventory_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &KeyPackageInventoryRecord,
+) -> Result<(), DurableStoreError> {
+    transaction.execute(
+        "INSERT INTO http_key_package_inventory (
+            key_package_id_json,
+            owner_json,
+            state_json
+        ) VALUES (?1, ?2, ?3)
+        ON CONFLICT(key_package_id_json) DO UPDATE SET
+            owner_json = excluded.owner_json,
+            state_json = excluded.state_json",
+        params![
+            serde_json::to_string(&record.key_package_id)?,
+            serde_json::to_string(&record.owner)?,
+            serde_json::to_string(&record.state)?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn publish_request_to_candidate(
@@ -2805,14 +2888,9 @@ fn replay_operation(
         PersistedOperation::PublishKeyPackage { publication } => {
             service.publish_key_package(publication)?;
         }
-        PersistedOperation::ClaimKeyPackage { owner } => {
-            service.claim_key_package(&owner)?;
-        }
-        PersistedOperation::ClaimKeyPackages { owners } => {
-            for owner in owners {
-                service.claim_key_package(&owner)?;
-            }
-        }
+        PersistedOperation::ClaimKeyPackage { .. }
+        | PersistedOperation::ClaimKeyPackages { .. }
+        | PersistedOperation::ExpireKeyPackageLease { .. } => {}
     }
     Ok(())
 }
@@ -2829,9 +2907,13 @@ fn rebuild_key_package_inventory(
                     .or_insert_with(|| KeyPackageInventoryRecord {
                         key_package_id: publication.key_package_id.clone(),
                         owner: publication.owner.clone(),
+                        key_package: publication.key_package.clone(),
                         state: KeyPackageInventoryState::Available,
                         finite_metadata: finite_key_package_metadata(publication),
                     });
+                if record.key_package.bytes().is_empty() {
+                    record.key_package = publication.key_package.clone();
+                }
                 if record.finite_metadata.is_none() {
                     record.finite_metadata = finite_key_package_metadata(publication);
                 }
@@ -2842,6 +2924,13 @@ fn rebuild_key_package_inventory(
             PersistedOperation::ClaimKeyPackages { owners } => {
                 for owner in owners {
                     mark_next_key_package_claimed(&mut inventory, owner);
+                }
+            }
+            PersistedOperation::ExpireKeyPackageLease { key_package_id } => {
+                if let Some(record) = inventory.get_mut(key_package_id)
+                    && record.state == KeyPackageInventoryState::Claimed
+                {
+                    record.state = KeyPackageInventoryState::Available;
                 }
             }
             PersistedOperation::PublishMessage { message, .. } => {
@@ -2985,6 +3074,7 @@ fn consume_key_packages_from_persisted_message(
                 .or_insert_with(|| KeyPackageInventoryRecord {
                     key_package_id,
                     owner: owner.clone(),
+                    key_package: KeyPackage::new(Vec::new()),
                     state: KeyPackageInventoryState::Claimed,
                     finite_metadata: Some(FiniteKeyPackageMetadata {
                         owner: add.device.clone(),
@@ -3015,24 +3105,6 @@ fn finite_key_package_metadata(
         return None;
     }
     if member_id_for_device(&request.owner).ok()? != publication.owner {
-        return None;
-    }
-    Some(FiniteKeyPackageMetadata {
-        owner: request.owner,
-        key_package_ref: request.key_package_ref,
-        key_package_hash: request.key_package_hash,
-    })
-}
-
-fn finite_key_package_metadata_from_claim(
-    package: &HttpClaimedKeyPackage,
-) -> Option<FiniteKeyPackageMetadata> {
-    let request =
-        serde_json::from_slice::<UploadKeyPackageRequest>(package.key_package.bytes()).ok()?;
-    if package.key_package_id.as_slice() != request.key_package_id.as_bytes() {
-        return None;
-    }
-    if member_id_for_device(&request.owner).ok()? != package.owner {
         return None;
     }
     Some(FiniteKeyPackageMetadata {
@@ -3414,18 +3486,57 @@ fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<()
     Ok(())
 }
 
-fn claim_key_packages_from_service(
-    service: &mut HttpDeliveryService,
+fn claim_key_packages_from_inventory(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     owners: &[MemberId],
-) -> Result<Vec<HttpKeyPackageClaim>, HttpServerError> {
+) -> Vec<HttpKeyPackageClaim> {
     owners
         .iter()
         .map(|owner| {
-            let claimed = service.claim_key_package(owner)?;
-            Ok(HttpKeyPackageClaim {
+            let claimed = claim_next_key_package_from_inventory(inventory, owner);
+            HttpKeyPackageClaim {
                 owner: owner.clone(),
                 claimed,
-            })
+            }
+        })
+        .collect()
+}
+
+fn claim_next_key_package_from_inventory(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    owner: &MemberId,
+) -> Option<HttpClaimedKeyPackage> {
+    let selected = inventory
+        .iter()
+        .filter(|(_, record)| {
+            record.owner == *owner && record.state == KeyPackageInventoryState::Available
+        })
+        .map(|(key_package_id, _)| key_package_id.clone())
+        .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
+    let key_package_id = selected?;
+    let record = inventory
+        .get_mut(&key_package_id)
+        .expect("selected KeyPackage must exist before claim");
+    record.state = KeyPackageInventoryState::Claimed;
+    Some(HttpClaimedKeyPackage {
+        key_package_id,
+        owner: record.owner.clone(),
+        key_package: record.key_package.clone(),
+    })
+}
+
+fn key_package_claim_inventory_records(
+    inventory: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    claims: &[HttpKeyPackageClaim],
+) -> Vec<KeyPackageInventoryRecord> {
+    claims
+        .iter()
+        .filter_map(|claim| {
+            claim
+                .claimed
+                .as_ref()
+                .and_then(|package| inventory.get(&package.key_package_id))
+                .cloned()
         })
         .collect()
 }
@@ -3474,6 +3585,9 @@ pub enum ServerHttpError {
     InvalidKeyPackageClaimBatch {
         actual: usize,
         max: usize,
+    },
+    InvalidKeyPackageLeaseRequest {
+        reason: String,
     },
     DuplicateKeyPackageClaimOwner {
         owner: MemberId,
@@ -3608,6 +3722,11 @@ impl IntoResponse for ServerHttpError {
                 format!(
                     "KeyPackage claim batch must contain between 1 and {max} owners, got {actual}"
                 ),
+            ),
+            Self::InvalidKeyPackageLeaseRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_key_package_lease_request".to_owned(),
+                reason,
             ),
             Self::DuplicateKeyPackageClaimOwner { owner } => (
                 StatusCode::BAD_REQUEST,

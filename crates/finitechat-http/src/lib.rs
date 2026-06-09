@@ -48,6 +48,16 @@ pub struct ClaimKeyPackageRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireKeyPackageLeaseRequest {
+    pub key_package_id: HttpKeyPackageId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireKeyPackageLeaseResponse {
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackagesRequest {
     pub owners: Vec<MemberId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

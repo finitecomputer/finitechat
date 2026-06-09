@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage claim/lease expiry, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -94,6 +94,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_key_package_claim_runtime_sync",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-client RuntimeDelivery claims Darkmatter HTTP KeyPackages with Finite metadata preserved in opaque package bytes, deterministic lease tokens reconstructed, and claimed inventory mapped back to Finite leased counts",
+        },
+        PortFinding {
+            area: "http_key_package_lease_reclaim",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server owns HTTP KeyPackage lease state above Marmot's opaque package bytes, can expire a claimed lease back to available, reclaim the same package after restart, and refuses to expire consumed packages",
         },
         PortFinding {
             area: "http_key_package_commit_lifecycle",

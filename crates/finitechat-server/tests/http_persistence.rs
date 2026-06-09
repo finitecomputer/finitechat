@@ -11,7 +11,8 @@ use finitechat_engine::{
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
+    ClaimWelcomesRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
     GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomStatus,
     HttpKeyPackageClaim, HttpKeyPackageInventory, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
@@ -332,6 +333,72 @@ async fn sqlite_key_package_inventory_tracks_available_and_claimed_after_restart
         StatusCode::OK
     );
     assert_inventory(app, owner, 1, 1).await;
+}
+
+#[tokio::test]
+async fn sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let owner = member("lease-owner");
+    let key_package_id = HttpKeyPackageId::new(b"kp-lease-reclaim".to_vec());
+    let publication = HttpKeyPackagePublication {
+        key_package_id: key_package_id.clone(),
+        owner: owner.clone(),
+        key_package: KeyPackage::new(b"lease-reclaim-package".to_vec()),
+    };
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &publication)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        claimed.as_ref().expect("first claim").key_package_id,
+        key_package_id
+    );
+    assert_inventory(app.clone(), owner.clone(), 0, 1).await;
+    let response = post_json(
+        app.clone(),
+        "/key-packages/leases/expire",
+        &ExpireKeyPackageLeaseRequest {
+            key_package_id: key_package_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired: ExpireKeyPackageLeaseResponse = read_json(response).await;
+    assert!(expired.expired);
+    assert_inventory(app.clone(), owner.clone(), 1, 0).await;
+
+    let app = persistent_app(&db_path);
+    assert_inventory(app.clone(), owner.clone(), 1, 0).await;
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reclaimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    let reclaimed = reclaimed.expect("reclaimed package");
+    assert_eq!(reclaimed.key_package_id, key_package_id);
+    assert_eq!(reclaimed.owner, owner);
+    assert_eq!(reclaimed.key_package, publication.key_package);
+    assert_inventory(app, member("lease-owner"), 0, 1).await;
 }
 
 #[tokio::test]
@@ -1094,6 +1161,23 @@ async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_r
     let inventory = key_package_inventory_for_device(&app, &phone).await;
     assert_eq!(inventory.available, 0);
     assert_eq!(inventory.claimed, 0);
+    let response = post_json(
+        app.clone(),
+        "/key-packages/leases/expire",
+        &ExpireKeyPackageLeaseRequest {
+            key_package_id: HttpKeyPackageId::new(
+                request.membership_delta.adds[0]
+                    .key_package_id
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_key_package_lease_request");
+    assert!(error.error.contains("already consumed"));
 
     let mut reuse = submit_add_device_request_at_epoch_with_ids(
         &room_id,

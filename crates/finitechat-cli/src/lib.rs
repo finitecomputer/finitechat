@@ -5,8 +5,8 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_http::{
     AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackageRequest,
-    ClaimKeyPackagesRequest, ClaimWelcomesRequest, GetFanoutRequest, GroupSyncRequest,
-    HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
+    ClaimKeyPackagesRequest, ClaimWelcomesRequest, ExpireKeyPackageLeaseRequest, GetFanoutRequest,
+    GroupSyncRequest, HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
     PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
 };
@@ -127,6 +127,7 @@ where
         "key-package-inventory" => key_package_inventory_request(&server, args),
         "claim-key-package" => claim_key_package_request(&server, args),
         "claim-key-packages" => claim_key_packages_request(&server, args),
+        "expire-key-package-lease" => expire_key_package_lease_request(&server, args),
         "fanout-get" => fanout_get_request(&server, args),
         "fanout-save-room" => fanout_save_room_request(&server, args),
         "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
@@ -315,6 +316,19 @@ fn claim_key_packages_request(
         idempotency_key,
     };
     post_json_request(server, "/key-packages/claims", &request)
+}
+
+fn expire_key_package_lease_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let key_package_id = required_option(&mut args, "--key-package-id")?;
+    reject_extra_args(&args)?;
+
+    let request = ExpireKeyPackageLeaseRequest {
+        key_package_id: HttpKeyPackageId::new(key_package_id.into_bytes()),
+    };
+    post_json_request(server, "/key-packages/leases/expire", &request)
 }
 
 fn fanout_get_request(
@@ -615,7 +629,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -626,8 +640,8 @@ mod tests {
     };
     use finitechat_http::{
         AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
-        ClaimWelcomesRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
-        HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
+        ClaimWelcomesRequest, ExpireKeyPackageLeaseRequest, GroupSyncRequest, HttpClaimedWelcome,
+        HttpFanoutPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
         PublishKeyPackageResponse, PublishMessageRequest, SaveAccountRoomRequest,
         SaveFanoutRoomRequest,
@@ -785,6 +799,25 @@ mod tests {
         assert_eq!(body.owners[0].as_slice(), b"alice-phone");
         assert_eq!(body.owners[1].as_slice(), b"alice-laptop");
         assert_eq!(body.idempotency_key.as_deref(), Some("fanout-claim-1"));
+    }
+
+    #[test]
+    fn expire_key_package_lease_command_builds_expiry_request() {
+        let request = prepare_http_request([
+            "expire-key-package-lease",
+            "--key-package-id",
+            "kp-lease-expired",
+        ])
+        .expect("request");
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(
+            request.url,
+            "http://127.0.0.1:8787/key-packages/leases/expire"
+        );
+        let body: ExpireKeyPackageLeaseRequest =
+            serde_json::from_value(request.json.expect("json")).expect("expiry request");
+        assert_eq!(body.key_package_id.as_slice(), b"kp-lease-expired");
     }
 
     #[test]
