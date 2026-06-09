@@ -123,6 +123,53 @@ that owns `run_runtime_sync_tick` or `run_link_fanout_tick`. Until then, adding
 a process wrapper solely for tests would create a new product surface rather
 than prove an existing one.
 
+## Preserved Baseline Backend Audit
+
+Audit method:
+
+- Start from the `294` baseline test names proven present in the parity audit.
+- Classify preserved tests by file-level backend ownership, then separately
+  account for the `60` port-only Darkmatter/HTTP/CLI/process tests.
+- This audit intentionally treats preserved baseline tests as still requiring
+  migration unless their file is already product-only or OpenMLS-helper-only.
+
+Preserved baseline classification:
+
+| Class | Count | Meaning |
+| --- | ---: | --- |
+| Product logic, no delivery service | 95 | `finitechat-blob`, `finitechat-proto`, `finitechat-hermes`, and Hermes adapter tests validate product DTO/policy/bridge behavior above the encrypted payload boundary. |
+| Real OpenMLS helper coverage | 14 | `finitechat-mls` proves credentials, KeyPackages, Welcome, and basic OpenMLS operations without exercising the delivery service. |
+| Real OpenMLS client over old delivery service | 31 | Preserved `finitechat-client` tests use real client/MLS state but still use the original `DeliveryService` as the ordered server. |
+| Old in-memory delivery service | 110 | `finitechat-engine` plus `finitechat-sim` scenario/survival/boundary tests still prove reducer behavior through the original fake/in-memory service. |
+| Old SQLite delivery store | 44 | `finitechat-store` tests still prove durable reducer behavior through the original SQLite store. |
+
+Port-only Darkmatter coverage added so far:
+
+| Class | Count | Meaning |
+| --- | ---: | --- |
+| CLI HTTP route coverage | 17 | Request building and live-server route calls through `finitechat_cli::run`. |
+| Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
+| Server HTTP coverage | 26 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
+| Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
+
+Highest-risk preserved fake/store proofs to port next:
+
+| Priority | Preserved tests | Target proof shape |
+| --- | --- | --- |
+| P0 | `accepted_commit_response_lost_then_server_restart_replays_same_result`, `sqlite_commit_crash_matrix_rolls_back_and_retry_converges` | Darkmatter HTTP `/commits` plus SQLite operation-log crash/replay matrix. |
+| P0 | `commit_effects_are_atomic_at_reducer_boundary`, `sqlite_rejected_commit_is_replayable_after_reopen` | Typed HTTP commit transaction tests that inject failures before and after delivery append. |
+| P0 | `invalid_commit_report_fails_closed`, `membership_delta_disagreement_enters_needs_repair`, `sqlite_invalid_commit_report_blocks_room_after_reopen` | Darkmatter-backed invalid-commit/repair-state route tests. |
+| P1 | `welcome_is_not_released_before_accepted_commit`, `sqlite_welcome_not_released_before_accepted_commit` | Typed submit-commit tests that assert Welcome release remains coupled to durable accepted Commit append. |
+| P1 | `consumed_key_package_cannot_be_reused`, `sqlite_key_package_lease_expiry_and_reclaim_survives_reopen` | HTTP KeyPackage lease/consume/reclaim tests beyond current single-use and inventory coverage. |
+| P1 | `revoked_active_device_cannot_send_or_commit`, `sqlite_revoked_device_status_survives_reopen_and_blocks_key_packages` | HTTP room-membership/account-room projection tests for revoked-device send/commit/package rejection. |
+
+Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
+coverage, but the migration is not complete. The remaining implementation work
+is concentrated in the old fake/in-memory reducer and SQLite store tests,
+especially crash-atomic commit replay, rejected/repair states, and revocation
+edges.
+
 ## Darkmatter-Facing Delta Buckets
 
 Darkmatter source state:
@@ -708,7 +755,7 @@ Runtime delivery checkpoint:
 - [x] Refresh the compatibility report after the next Darkmatter branch update
   and verify that `RequiresDarkmatterFork` still only names the ordered
   delivery profile.
-- [ ] Audit which preserved baseline tests still prove behavior only through
+- [x] Audit which preserved baseline tests still prove behavior only through
   the original fake/in-memory Finite delivery service instead of a Darkmatter
   engine or HTTP route path, then classify them by risk and owner.
 - [ ] Port the highest-risk remaining fake/in-memory reducer proofs to
