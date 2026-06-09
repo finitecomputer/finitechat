@@ -2438,16 +2438,12 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     delivery
         .publish_room_log_entry(&initial_page.entries[0])
         .unwrap();
-    let account_id = alice_browser.device_ref().account_id.clone();
-    let account_rooms = source_server
-        .list_account_rooms(ListAccountRoomsRequest {
-            account_id: account_id.clone(),
-            after_room_id: None,
-            limit: 10,
-        })
-        .unwrap();
     delivery
-        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: group_id.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
         .unwrap();
     let phone_replenish = run_runtime_sync_tick(
         &mut phone_store,
@@ -2625,7 +2621,21 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
         .unwrap();
 
     let account_id = alice_browser.device_ref().account_id.clone();
-    let account_rooms = source_server
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_a.to_owned(),
+            mls_group_id: group_a.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_b.to_owned(),
+            mls_group_id: group_b.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+    let account_rooms = delivery
         .list_account_rooms(ListAccountRoomsRequest {
             account_id: account_id.clone(),
             after_room_id: None,
@@ -2639,11 +2649,6 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
             .iter()
             .any(|device| device.device == *alice_phone.device_ref())
     }));
-    for room in &account_rooms.rooms {
-        delivery
-            .publish_account_room_record(&account_id, room)
-            .unwrap();
-    }
 
     let phone_replenish = run_runtime_sync_tick(
         &mut phone_store,
@@ -2787,16 +2792,12 @@ fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     delivery
         .publish_room_log_entry(&initial_page.entries[0])
         .unwrap();
-    let account_id = alice_browser.device_ref().account_id.clone();
-    let account_rooms = source_server
-        .list_account_rooms(ListAccountRoomsRequest {
-            account_id: account_id.clone(),
-            after_room_id: None,
-            limit: 10,
-        })
-        .unwrap();
     delivery
-        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: group_id.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
         .unwrap();
 
     let phone_replenish = run_runtime_sync_tick(

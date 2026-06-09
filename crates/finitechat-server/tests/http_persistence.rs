@@ -4,7 +4,8 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_proto::DeviceRef;
+use finitechat_engine::{AccountRoomDevice, AccountRoomRecord};
+use finitechat_proto::{DeviceRef, RoomStatus};
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
@@ -646,23 +647,90 @@ async fn sqlite_fanout_room_plan_conflict_does_not_overwrite_existing_plan() {
 async fn sqlite_account_room_directory_pages_and_survives_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
+    let first_record = AccountRoomRecord {
+        room_id: "room-a".to_owned(),
+        mls_group_id: "mls-a".to_owned(),
+        current_epoch: 1,
+        last_seq: 7,
+        status: RoomStatus::Open,
+        devices: vec![
+            AccountRoomDevice {
+                device: DeviceRef {
+                    account_id: "bob".to_owned(),
+                    device_id: "bob-laptop".to_owned(),
+                },
+                active: true,
+            },
+            AccountRoomDevice {
+                device: DeviceRef {
+                    account_id: "alice".to_owned(),
+                    device_id: "alice-laptop".to_owned(),
+                },
+                active: true,
+            },
+        ],
+    };
+    let first_expected = AccountRoomRecord {
+        devices: vec![AccountRoomDevice {
+            device: DeviceRef {
+                account_id: "alice".to_owned(),
+                device_id: "alice-laptop".to_owned(),
+            },
+            active: true,
+        }],
+        ..first_record.clone()
+    };
+    let second_record = AccountRoomRecord {
+        room_id: "room-b".to_owned(),
+        mls_group_id: "mls-b".to_owned(),
+        current_epoch: 3,
+        last_seq: 11,
+        status: RoomStatus::Open,
+        devices: vec![
+            AccountRoomDevice {
+                device: DeviceRef {
+                    account_id: "alice".to_owned(),
+                    device_id: "alice-laptop".to_owned(),
+                },
+                active: true,
+            },
+            AccountRoomDevice {
+                device: DeviceRef {
+                    account_id: "alice".to_owned(),
+                    device_id: "alice-phone".to_owned(),
+                },
+                active: false,
+            },
+        ],
+    };
     let first = SaveAccountRoomRequest {
         account_id: "alice".to_owned(),
         room_id: "room-a".to_owned(),
-        record: serde_json::json!({
-            "room_id": "room-a",
-            "current_epoch": 1,
-            "devices": ["alice-laptop"]
-        }),
+        record: serde_json::to_value(&first_record).expect("first record json"),
     };
     let second = SaveAccountRoomRequest {
         account_id: "alice".to_owned(),
         room_id: "room-b".to_owned(),
-        record: serde_json::json!({
-            "room_id": "room-b",
-            "current_epoch": 3,
-            "devices": ["alice-laptop", "alice-phone"]
-        }),
+        record: serde_json::to_value(&second_record).expect("second record json"),
+    };
+    let wrong_account = SaveAccountRoomRequest {
+        account_id: "alice".to_owned(),
+        room_id: "room-wrong".to_owned(),
+        record: serde_json::to_value(&AccountRoomRecord {
+            room_id: "room-wrong".to_owned(),
+            mls_group_id: "mls-wrong".to_owned(),
+            current_epoch: 1,
+            last_seq: 3,
+            status: RoomStatus::Open,
+            devices: vec![AccountRoomDevice {
+                device: DeviceRef {
+                    account_id: "bob".to_owned(),
+                    device_id: "bob-laptop".to_owned(),
+                },
+                active: true,
+            }],
+        })
+        .expect("wrong-account record json"),
     };
 
     let app = persistent_app(&db_path);
@@ -671,9 +739,15 @@ async fn sqlite_account_room_directory_pages_and_survives_restart() {
     let saved: SaveAccountRoomResponse = read_json(response).await;
     assert!(saved.saved);
     assert_eq!(
-        post_json(app, "/account-rooms", &first).await.status(),
+        post_json(app.clone(), "/account-rooms", &first)
+            .await
+            .status(),
         StatusCode::OK
     );
+    let response = post_json(app, "/account-rooms", &wrong_account).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_account_room_request");
 
     let app = persistent_app(&db_path);
     let response = post_json(
@@ -688,7 +762,10 @@ async fn sqlite_account_room_directory_pages_and_survives_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let page: ListAccountRoomDirectoryResponse = read_json(response).await;
-    assert_eq!(page.rooms, vec![first.record.clone()]);
+    assert_eq!(
+        page.rooms,
+        vec![serde_json::to_value(&first_expected).expect("first expected json")]
+    );
     assert_eq!(page.next_after_room_id.as_deref(), Some("room-a"));
     assert!(page.has_more);
 
@@ -704,7 +781,10 @@ async fn sqlite_account_room_directory_pages_and_survives_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let page: ListAccountRoomDirectoryResponse = read_json(response).await;
-    assert_eq!(page.rooms, vec![second.record]);
+    assert_eq!(
+        page.rooms,
+        vec![serde_json::to_value(&second_record).expect("second expected json")]
+    );
     assert_eq!(page.next_after_room_id.as_deref(), Some("room-b"));
     assert!(!page.has_more);
 }

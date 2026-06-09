@@ -73,10 +73,11 @@ Python test distribution:
 - The HTTP fanout wrapper can persist opaque later-device fanout room plans,
   prepared message ids, reprepare checkpoints, and accepted sequence markers
   across restart without teaching the server MLS semantics.
-- The HTTP account-room directory wrapper can persist opaque account-room
-  records, page them by room id, and reload them from SQLite. This gives the
-  runtime link-fanout discovery loop a Darkmatter HTTP boundary, as long as a
-  product-owned membership projection writes the directory.
+- The HTTP account-room directory wrapper can persist typed account-room
+  records, normalize them to the requested account's devices, page them by room
+  id, and reload them from SQLite. This gives the runtime link-fanout discovery
+  loop a Darkmatter HTTP boundary while preventing arbitrary room-membership
+  JSON from becoming discovery output.
 - The HTTP account-room bootstrap wrapper can derive the creator's initial
   active account-room record from typed Finite room metadata, persist it, replay
   it idempotently after restart, and reject conflicting bootstrap attempts.
@@ -87,22 +88,24 @@ Python test distribution:
   longer lists the room after restart without a second manual `/account-rooms`
   write.
 - The runtime link-fanout worker can complete a one-room later-device happy
-  path over the HTTP adapter when the initial room log and account-room
-  directory are seeded: discover the room, claim the target device's KeyPackage,
-  publish the add-device Commit through Darkmatter HTTP, sync the Commit back,
-  and let the later device claim and activate the released Welcome.
+  path over the HTTP adapter when the initial room log is published and
+  account-room discovery starts from typed bootstrap projection: discover the
+  room, claim the target device's KeyPackage, publish the add-device Commit
+  through Darkmatter HTTP, sync the Commit back, and let the later device claim
+  and activate the released Welcome.
 - The same one-room HTTP fanout path can retry a lost submit response from the
   persisted prepared state. The commit publish and Welcome publish are
   idempotent, so retry completes without appending a duplicate group entry or
   delivering duplicate Welcomes.
-- The HTTP fanout path also handles the worker's multi-room shape: paged
-  account-room discovery across two rooms, two distinct target KeyPackage
-  claims, two submitted commits, two completion syncs, and two later-device
-  Welcome activations.
-- The HTTP fanout path can reprepare after a same-epoch race: a fanout submit
-  fails before accept, a competing member commit wins the epoch, the client
-  syncs that winner and clears its pending commit, then the worker reprepares
-  and submits the fanout commit at the next epoch.
+- The HTTP fanout path also handles the worker's multi-room shape from typed
+  bootstrap discovery: paged account-room discovery across two rooms, two
+  distinct target KeyPackage claims, two submitted commits, two completion
+  syncs, and two later-device Welcome activations.
+- The HTTP fanout path can reprepare from typed bootstrap discovery after a
+  same-epoch race: a fanout submit fails before accept, a competing member
+  commit wins the epoch, the client syncs that winner and clears its pending
+  commit, then the worker reprepares and submits the fanout commit at the next
+  epoch.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -147,9 +150,10 @@ Python test distribution:
   response loss, while leaving MLS validation and local pending Commit state on
   the client.
 - Account-room discovery projection for the HTTP delivery surface. This stores
-  opaque current-room membership snapshots keyed by account and room id, while
-  leaving the actual source of membership truth outside Darkmatter's transport
-  core.
+  typed current-room membership snapshots keyed by account and room id,
+  normalizes saved records to the requested account's devices, and rejects
+  records with no current devices for that account, while leaving the actual
+  source of membership truth outside Darkmatter's transport core.
 - Account-room bootstrap projection for the HTTP delivery surface. This derives
   the creator's initial active device record from typed room metadata, so the
   later-device fanout path no longer needs an arbitrary opaque account-room
@@ -180,9 +184,9 @@ Python test distribution:
   happy-path commit submission and Welcome release, including response-loss
   retry after the submit publish is accepted, plus a two-room fanout tick.
   Commit-derived account-room updates are now proven for add-device and
-  remove-device commits, and typed bootstrap projection is proven for the
-  creator's initial active device. Server-side membership validation/filtering
-  remains unported.
+  remove-device commits, typed bootstrap projection is proven for the creator's
+  initial active device, and account-room save/list now normalizes records to the
+  requested account. Server-authored membership truth remains unported.
 - Mapping Finite's server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
@@ -268,7 +272,9 @@ Additional HTTP route checkpoint:
   - conflicting fanout room plan update does not overwrite the stored plan
   - typed account-room bootstrap survives restart, replays idempotently, and
     rejects a conflicting creator device
-  - account-room directory pages by room id and survives restart
+  - account-room directory normalizes typed records to the requested account's
+    devices, rejects records with no devices for that account, pages by room id,
+    and survives restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -395,26 +401,27 @@ Runtime delivery checkpoint:
   same SQLite file, discovery for the removed account no longer lists that
   room.
 - When the HTTP submit response is lost after the commit and Welcome publishes
-  have been accepted, the worker reloads the prepared commit from durable local
-  state, retries the same HTTP idempotency keys, completes the room, and leaves
-  exactly one new group Commit and one claimed Welcome.
-- With two existing rooms, the same worker pages account-room discovery one
-  room at a time, claims two distinct target-device KeyPackages, submits and
-  completes both room commits, and the later device activates both released
-  Welcomes.
+  have been accepted, the worker starts from typed bootstrap discovery, reloads
+  the prepared commit from durable local state, retries the same HTTP
+  idempotency keys, completes the room, and leaves exactly one new group Commit
+  and one claimed Welcome.
+- With two existing rooms, the same worker pages typed bootstrap account-room
+  discovery one room at a time, claims two distinct target-device KeyPackages,
+  submits and completes both room commits, and the later device activates both
+  released Welcomes.
 - If the fanout submit fails before HTTP accept and a competing same-epoch
-  member commit wins, syncing that winning commit clears the local pending
-  commit and the next worker tick reprepares/submits the fanout commit at the
-  next epoch.
+  member commit wins, the worker starts from typed bootstrap discovery, syncing
+  that winning commit clears the local pending commit, and the next worker tick
+  reprepares/submits the fanout commit at the next epoch.
 - This proves the current client runtime harness can be reused above a
   Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
   claim/ack, ordered room pull, account-room discovery, commit-derived
-  account-room updates for add/remove commits, and a one-room later-device
-  fanout happy path from typed bootstrap with submit response-loss retry and
-  multi-room fanout, including same-epoch reprepare. It does not yet prove
-  server membership filtering over the same adapter.
+  account-room updates for add/remove commits, and later-device fanout from
+  typed bootstrap across the happy path, submit response-loss retry, multi-room
+  fanout, and same-epoch reprepare. It does not yet prove server-authored
+  membership truth beyond typed product projection payloads.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
-from product-wrapper account-room projections into server membership filtering,
-or start moving the test-only HTTP runtime adapter into production
+from product-wrapper account-room projections into server-authored membership
+truth, or start moving the test-only HTTP runtime adapter into production
 client/server boundaries.

@@ -103,7 +103,12 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_account_room_directory_runtime_discovery",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can discover persisted opaque account-room records through Darkmatter HTTP routes after server restart when the target device is already current",
+            evidence: "finitechat-client run_link_fanout_tick can discover persisted account-scoped account-room records through Darkmatter HTTP routes after server restart when the target device is already current",
+        },
+        PortFinding {
+            area: "http_account_room_membership_filtering",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server normalizes typed account-room records to the requested account's devices, rejects records with no devices for that account, and pages the normalized projection after restart",
         },
         PortFinding {
             area: "http_account_room_bootstrap_projection",
@@ -123,22 +128,22 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_later_device_fanout_submit_retry",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick retries a lost HTTP submit response from prepared local state, replays the idempotent commit and Welcome publishes, and does not duplicate the group log entry",
+            evidence: "finitechat-client run_link_fanout_tick retries a lost HTTP submit response from typed bootstrap discovery and prepared local state, replays the idempotent commit and Welcome publishes, and does not duplicate the group log entry",
         },
         PortFinding {
             area: "http_later_device_fanout_multi_room",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can page account-room discovery across two rooms, claim distinct target KeyPackages, submit both commits through Darkmatter HTTP, and activate both later-device Welcomes",
+            evidence: "finitechat-client run_link_fanout_tick can page typed bootstrap account-room discovery across two rooms, claim distinct target KeyPackages, submit both commits through Darkmatter HTTP, and activate both later-device Welcomes",
         },
         PortFinding {
             area: "http_later_device_fanout_same_epoch_reprepare",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client run_link_fanout_tick can recover after an HTTP fanout submit fails before accept, a competing same-epoch commit wins, sync clears the local pending commit, and the worker reprepares at the next epoch",
+            evidence: "finitechat-client run_link_fanout_tick can recover from typed bootstrap discovery after an HTTP fanout submit fails before accept, a competing same-epoch commit wins, sync clears the local pending commit, and the worker reprepares at the next epoch",
         },
         PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires server-side membership validation/filtering instead of trusting product wrapper projections for room discovery",
+            evidence: "Remaining Finite parity requires server-authored membership truth instead of trusting product wrapper projection payloads for room discovery and commit-derived account-room updates",
         },
         PortFinding {
             area: "ordered_delivery_profile",

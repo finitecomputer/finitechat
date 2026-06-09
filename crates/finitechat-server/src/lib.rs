@@ -515,6 +515,21 @@ impl HttpServerState {
     ) -> Result<SaveAccountRoomResponse, ServerHttpError> {
         validate_account_room_id("account_id", &request.account_id)?;
         validate_account_room_id("room_id", &request.room_id)?;
+        let Some(record) = account_scoped_account_room_record(
+            &request.account_id,
+            &request.room_id,
+            &request.record,
+        )?
+        else {
+            return Err(ServerHttpError::InvalidAccountRoomRequest {
+                reason: format!(
+                    "record has no current devices for account {}",
+                    request.account_id
+                ),
+            });
+        };
+        let value = serde_json::to_value(&record)
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
 
         let mut directory = self
             .account_rooms
@@ -523,12 +538,12 @@ impl HttpServerState {
         directory
             .entry(request.account_id.clone())
             .or_default()
-            .insert(request.room_id.clone(), request.record.clone());
+            .insert(request.room_id.clone(), value.clone());
         if let Some(store) = &self.store {
             store.upsert_account_room(&AccountRoomDirectoryRecord {
                 account_id: request.account_id,
                 room_id: request.room_id,
-                record: request.record,
+                record: value,
             })?;
         }
         Ok(SaveAccountRoomResponse { saved: true })
@@ -642,11 +657,19 @@ impl HttpServerState {
                 {
                     continue;
                 }
+                let Some(record) =
+                    account_scoped_account_room_record(&request.account_id, room_id, record)?
+                else {
+                    continue;
+                };
                 if rooms.len() == request.limit {
                     has_more = true;
                     break;
                 }
-                rooms.push(record.clone());
+                rooms.push(
+                    serde_json::to_value(&record)
+                        .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
+                );
                 next_after_room_id = Some(room_id.clone());
             }
         }
@@ -704,23 +727,27 @@ impl HttpServerState {
         let mut upserts = Vec::new();
         let mut deletes = Vec::new();
         for account_id in account_ids {
+            let empty_record = || AccountRoomRecord {
+                room_id: room_id.clone(),
+                mls_group_id: mls_group_id.clone(),
+                current_epoch,
+                last_seq: accepted_seq,
+                status: RoomStatus::Open,
+                devices: Vec::new(),
+            };
             let existing_record = directory
                 .get(&account_id)
                 .and_then(|rooms| rooms.get(&room_id))
                 .cloned();
             let mut record = match existing_record {
-                Some(value) => match serde_json::from_value::<AccountRoomRecord>(value) {
-                    Ok(record) => record,
-                    Err(_) => continue,
-                },
-                None => AccountRoomRecord {
-                    room_id: room_id.clone(),
-                    mls_group_id: mls_group_id.clone(),
-                    current_epoch,
-                    last_seq: accepted_seq,
-                    status: RoomStatus::Open,
-                    devices: Vec::new(),
-                },
+                Some(value) => {
+                    match account_scoped_account_room_record(&account_id, &room_id, &value) {
+                        Ok(Some(record)) => record,
+                        Ok(None) => empty_record(),
+                        Err(_) => continue,
+                    }
+                }
+                None => empty_record(),
             };
 
             if record.room_id != room_id {
@@ -1842,6 +1869,48 @@ fn validate_account_room_id(field: &'static str, value: &str) -> Result<(), Serv
         });
     }
     Ok(())
+}
+
+fn account_scoped_account_room_record(
+    account_id: &str,
+    room_id: &str,
+    value: &Value,
+) -> Result<Option<AccountRoomRecord>, ServerHttpError> {
+    let mut record =
+        serde_json::from_value::<AccountRoomRecord>(value.clone()).map_err(|error| {
+            ServerHttpError::InvalidAccountRoomRequest {
+                reason: format!("record must be a Finite account-room record: {error}"),
+            }
+        })?;
+    record
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
+            reason: error.to_string(),
+        })?;
+    if record.room_id != room_id {
+        return Err(ServerHttpError::InvalidAccountRoomRequest {
+            reason: format!(
+                "record room_id {} does not match directory room_id {room_id}",
+                record.room_id
+            ),
+        });
+    }
+
+    record
+        .devices
+        .retain(|device| device.device.account_id == account_id);
+    record
+        .devices
+        .sort_by(|left, right| left.device.device_id.cmp(&right.device.device_id));
+    if record.devices.is_empty() {
+        return Ok(None);
+    }
+    record
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
+            reason: error.to_string(),
+        })?;
+    Ok(Some(record))
 }
 
 fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<(), ServerHttpError> {
