@@ -93,7 +93,12 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_key_package_claim_runtime_sync",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-client RuntimeDelivery claims Darkmatter HTTP KeyPackages with Finite metadata preserved in opaque package bytes and deterministic lease tokens reconstructed",
+            evidence: "finitechat-client RuntimeDelivery claims Darkmatter HTTP KeyPackages with Finite metadata preserved in opaque package bytes, deterministic lease tokens reconstructed, and claimed inventory mapped back to Finite leased counts",
+        },
+        PortFinding {
+            area: "http_key_package_commit_lifecycle",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server typed /commits reject unclaimed KeyPackages and stale Finite KeyPackage metadata before side effects, consume claimed packages atomically with accepted commits, preserve consumed state after restart, and reject consumed-package reuse",
         },
         PortFinding {
             area: "http_runtime_delivery_adapter",
@@ -153,7 +158,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, atomically persists accepted commit delivery, idempotency, derived Welcome releases, and finite projections in SQLite, replays accepted commits and same-epoch rejected commits after restart, rolls back injected SQLite failures before retry convergence, and repairs legacy partial projection rows",
+            evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, atomically persists accepted commit delivery, idempotency, derived Welcome releases, consumed KeyPackage projection, and finite projections in SQLite, replays accepted commits and same-epoch rejected commits after restart, rolls back injected SQLite failures before retry convergence, and repairs legacy partial projection rows",
         },
         PortFinding {
             area: "http_typed_event_route",

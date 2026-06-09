@@ -11,8 +11,8 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, DeviceMembership,
-    EventAccepted, MembershipInterval, SubmitCommitRequest, WelcomeRecord, lease_token_for,
-    staged_welcomes_by_id,
+    EventAccepted, MembershipInterval, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
+    lease_token_for, staged_welcomes_by_id,
 };
 pub use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
@@ -27,7 +27,8 @@ pub use finitechat_http::{
     SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
+    DeviceRef, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus,
+    WelcomeState,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -82,7 +83,10 @@ impl HttpServerState {
         let publish_idempotency = store.load_publish_idempotency()?;
         let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
         let key_package_inventory = rebuild_key_package_inventory(&operations);
-        if store.load_key_package_inventory()? != key_package_inventory {
+        if !key_package_inventory_cache_matches(
+            &store.load_key_package_inventory()?,
+            &key_package_inventory,
+        ) {
             for record in key_package_inventory.values() {
                 store.upsert_key_package_inventory(record)?;
             }
@@ -334,6 +338,7 @@ impl HttpServerState {
             match record.state {
                 KeyPackageInventoryState::Available => available += 1,
                 KeyPackageInventoryState::Claimed => claimed += 1,
+                KeyPackageInventoryState::Consumed => {}
             }
         }
         Ok(HttpKeyPackageInventory {
@@ -357,11 +362,15 @@ impl HttpServerState {
                 key_package_id: publication.key_package_id.clone(),
                 owner: publication.owner.clone(),
                 state: KeyPackageInventoryState::Available,
+                finite_metadata: finite_key_package_metadata(publication),
             });
         if record.owner != publication.owner {
             return Err(ServerHttpError::InventoryConflict {
                 key_package_id: publication.key_package_id.clone(),
             });
+        }
+        if record.finite_metadata.is_none() {
+            record.finite_metadata = finite_key_package_metadata(publication);
         }
         let record = record.clone();
         if let Some(store) = &self.store {
@@ -386,11 +395,15 @@ impl HttpServerState {
                     key_package_id: package.key_package_id.clone(),
                     owner: package.owner.clone(),
                     state: KeyPackageInventoryState::Available,
+                    finite_metadata: finite_key_package_metadata_from_claim(package),
                 });
             if record.owner != package.owner {
                 return Err(ServerHttpError::InventoryConflict {
                     key_package_id: package.key_package_id.clone(),
                 });
+            }
+            if record.finite_metadata.is_none() {
+                record.finite_metadata = finite_key_package_metadata_from_claim(package);
             }
             record.state = KeyPackageInventoryState::Claimed;
             changed.push(record.clone());
@@ -1183,11 +1196,16 @@ impl HttpServerState {
             .room_memberships
             .lock()
             .expect("HTTP room-membership mutex");
+        let mut key_package_inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
 
         let mut candidate_service = service.clone();
         let mut candidate_publish_idempotency = publish_idempotency.clone();
         let mut candidate_account_rooms = account_rooms.clone();
         let mut candidate_room_memberships = room_memberships.clone();
+        let mut candidate_key_package_inventory = key_package_inventory.clone();
 
         let (receipt, commit_mutation) = publish_request_to_candidate(
             &mut candidate_service,
@@ -1211,6 +1229,10 @@ impl HttpServerState {
             &request.membership_delta,
             receipt.seq,
         )?;
+        let key_package_inventory_mutation = consume_claimed_key_packages_for_commit(
+            &mut candidate_key_package_inventory,
+            &request,
+        )?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
         let mut publish_mutations = commit_mutation.into_iter().collect::<Vec<_>>();
@@ -1228,6 +1250,7 @@ impl HttpServerState {
                 &publish_mutations,
                 &account_room_mutation,
                 &room_membership_projection,
+                &key_package_inventory_mutation,
             )?;
         }
 
@@ -1235,10 +1258,12 @@ impl HttpServerState {
         *publish_idempotency = candidate_publish_idempotency;
         *account_rooms = candidate_account_rooms;
         *room_memberships = candidate_room_memberships;
+        *key_package_inventory = candidate_key_package_inventory;
         drop(service);
         drop(publish_idempotency);
         drop(account_rooms);
         drop(room_memberships);
+        drop(key_package_inventory);
 
         Ok(CommitAccepted {
             seq: receipt.seq,
@@ -1879,12 +1904,21 @@ struct KeyPackageInventoryRecord {
     key_package_id: HttpKeyPackageId,
     owner: MemberId,
     state: KeyPackageInventoryState,
+    finite_metadata: Option<FiniteKeyPackageMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum KeyPackageInventoryState {
     Available,
     Claimed,
+    Consumed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FiniteKeyPackageMetadata {
+    owner: DeviceRef,
+    key_package_ref: String,
+    key_package_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2098,6 +2132,7 @@ impl SqliteHttpDeliveryStore {
         publish_mutations: &[PublishMutation],
         account_room_mutation: &AccountRoomDirectoryMutation,
         room_membership_projection: &HttpRoomMembershipProjection,
+        key_package_inventory_mutation: &[KeyPackageInventoryRecord],
     ) -> Result<(), DurableStoreError> {
         let mut conn = self.connection()?;
         let transaction = conn.transaction()?;
@@ -2150,6 +2185,23 @@ impl SqliteHttpDeliveryStore {
                 serde_json::to_string(room_membership_projection)?,
             ],
         )?;
+        for record in key_package_inventory_mutation {
+            transaction.execute(
+                "INSERT INTO http_key_package_inventory (
+                    key_package_id_json,
+                    owner_json,
+                    state_json
+                ) VALUES (?1, ?2, ?3)
+                ON CONFLICT(key_package_id_json) DO UPDATE SET
+                    owner_json = excluded.owner_json,
+                    state_json = excluded.state_json",
+                params![
+                    serde_json::to_string(&record.key_package_id)?,
+                    serde_json::to_string(&record.owner)?,
+                    serde_json::to_string(&record.state)?,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2301,6 +2353,7 @@ impl SqliteHttpDeliveryStore {
                     key_package_id,
                     owner: serde_json::from_str(&owner_json)?,
                     state: serde_json::from_str(&state_json)?,
+                    finite_metadata: None,
                 },
             );
         }
@@ -2771,13 +2824,17 @@ fn rebuild_key_package_inventory(
     for operation in operations {
         match operation {
             PersistedOperation::PublishKeyPackage { publication } => {
-                inventory
+                let record = inventory
                     .entry(publication.key_package_id.clone())
                     .or_insert_with(|| KeyPackageInventoryRecord {
                         key_package_id: publication.key_package_id.clone(),
                         owner: publication.owner.clone(),
                         state: KeyPackageInventoryState::Available,
+                        finite_metadata: finite_key_package_metadata(publication),
                     });
+                if record.finite_metadata.is_none() {
+                    record.finite_metadata = finite_key_package_metadata(publication);
+                }
             }
             PersistedOperation::ClaimKeyPackage { owner } => {
                 mark_next_key_package_claimed(&mut inventory, owner);
@@ -2787,10 +2844,25 @@ fn rebuild_key_package_inventory(
                     mark_next_key_package_claimed(&mut inventory, owner);
                 }
             }
-            PersistedOperation::PublishMessage { .. } => {}
+            PersistedOperation::PublishMessage { message, .. } => {
+                consume_key_packages_from_persisted_message(&mut inventory, message);
+            }
         }
     }
     inventory
+}
+
+fn key_package_inventory_cache_matches(
+    cached: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    rebuilt: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+) -> bool {
+    cached.len() == rebuilt.len()
+        && rebuilt.iter().all(|(key_package_id, rebuilt_record)| {
+            cached.get(key_package_id).is_some_and(|cached_record| {
+                cached_record.owner == rebuilt_record.owner
+                    && cached_record.state == rebuilt_record.state
+            })
+        })
 }
 
 fn mark_next_key_package_claimed(
@@ -2810,6 +2882,164 @@ fn mark_next_key_package_claimed(
             .expect("selected KeyPackage must exist before claim")
             .state = KeyPackageInventoryState::Claimed;
     }
+}
+
+fn consume_claimed_key_packages_for_commit(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    request: &SubmitCommitRequest,
+) -> Result<Vec<KeyPackageInventoryRecord>, ServerHttpError> {
+    let mut changed = Vec::new();
+    for add in &request.membership_delta.adds {
+        let record = validate_claimed_key_package_for_add(inventory, add)?;
+        record.state = KeyPackageInventoryState::Consumed;
+        changed.push(record.clone());
+    }
+    Ok(changed)
+}
+
+fn validate_claimed_key_package_for_add<'a>(
+    inventory: &'a mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    add: &MembershipAddV1,
+) -> Result<&'a mut KeyPackageInventoryRecord, ServerHttpError> {
+    let key_package_id = HttpKeyPackageId::new(add.key_package_id.as_bytes().to_vec());
+    let Some(record) = inventory.get_mut(&key_package_id) else {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} must be published and claimed before a typed commit can add {:?}",
+                add.key_package_id, add.device
+            ),
+        });
+    };
+    match record.state {
+        KeyPackageInventoryState::Claimed => {}
+        KeyPackageInventoryState::Available => {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "KeyPackage {} must be claimed before a typed commit can add {:?}",
+                    add.key_package_id, add.device
+                ),
+            });
+        }
+        KeyPackageInventoryState::Consumed => {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!("KeyPackage {} is already consumed", add.key_package_id),
+            });
+        }
+    }
+
+    let expected_owner = member_id_for_device(&add.device)?;
+    if record.owner != expected_owner {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} owner does not match added device",
+                add.key_package_id
+            ),
+        });
+    }
+    let Some(metadata) = &record.finite_metadata else {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} does not contain Finite upload metadata",
+                add.key_package_id
+            ),
+        });
+    };
+    if metadata.owner != add.device {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} metadata owner does not match added device",
+                add.key_package_id
+            ),
+        });
+    }
+    if metadata.key_package_ref != add.key_package_ref
+        || metadata.key_package_hash != add.key_package_hash
+    {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} metadata does not match membership add",
+                add.key_package_id
+            ),
+        });
+    }
+    Ok(record)
+}
+
+fn consume_key_packages_from_persisted_message(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    message: &TransportMessage,
+) {
+    let Ok(projection) =
+        serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&message.payload)
+    else {
+        return;
+    };
+    for add in &projection.membership_delta.adds {
+        let key_package_id = HttpKeyPackageId::new(add.key_package_id.as_bytes().to_vec());
+        let Ok(owner) = member_id_for_device(&add.device) else {
+            continue;
+        };
+        let record =
+            inventory
+                .entry(key_package_id.clone())
+                .or_insert_with(|| KeyPackageInventoryRecord {
+                    key_package_id,
+                    owner: owner.clone(),
+                    state: KeyPackageInventoryState::Claimed,
+                    finite_metadata: Some(FiniteKeyPackageMetadata {
+                        owner: add.device.clone(),
+                        key_package_ref: add.key_package_ref.clone(),
+                        key_package_hash: add.key_package_hash.clone(),
+                    }),
+                });
+        if record.owner != owner {
+            continue;
+        }
+        if record.finite_metadata.is_none() {
+            record.finite_metadata = Some(FiniteKeyPackageMetadata {
+                owner: add.device.clone(),
+                key_package_ref: add.key_package_ref.clone(),
+                key_package_hash: add.key_package_hash.clone(),
+            });
+        }
+        record.state = KeyPackageInventoryState::Consumed;
+    }
+}
+
+fn finite_key_package_metadata(
+    publication: &HttpKeyPackagePublication,
+) -> Option<FiniteKeyPackageMetadata> {
+    let request =
+        serde_json::from_slice::<UploadKeyPackageRequest>(publication.key_package.bytes()).ok()?;
+    if publication.key_package_id.as_slice() != request.key_package_id.as_bytes() {
+        return None;
+    }
+    if member_id_for_device(&request.owner).ok()? != publication.owner {
+        return None;
+    }
+    Some(FiniteKeyPackageMetadata {
+        owner: request.owner,
+        key_package_ref: request.key_package_ref,
+        key_package_hash: request.key_package_hash,
+    })
+}
+
+fn finite_key_package_metadata_from_claim(
+    package: &HttpClaimedKeyPackage,
+) -> Option<FiniteKeyPackageMetadata> {
+    let request =
+        serde_json::from_slice::<UploadKeyPackageRequest>(package.key_package.bytes()).ok()?;
+    if package.key_package_id.as_slice() != request.key_package_id.as_bytes() {
+        return None;
+    }
+    if member_id_for_device(&request.owner).ok()? != package.owner {
+        return None;
+    }
+    Some(FiniteKeyPackageMetadata {
+        owner: request.owner,
+        key_package_ref: request.key_package_ref,
+        key_package_hash: request.key_package_hash,
+    })
 }
 
 fn validate_submit_commit_request(request: &SubmitCommitRequest) -> Result<(), ServerHttpError> {

@@ -2949,7 +2949,7 @@ impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
         Ok(KeyPackageInventory {
             owner: owner.clone(),
             available: inventory.available,
-            leased: 0,
+            leased: inventory.claimed,
         })
     }
 

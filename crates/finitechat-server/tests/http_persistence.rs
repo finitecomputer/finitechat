@@ -6,7 +6,7 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, EventAccepted,
-    SubmitCommitRequest, WelcomeRecord,
+    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
@@ -121,7 +121,7 @@ async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
     assert!(!replayed.duplicate);
 
     let response = post_json(
-        app,
+        app.clone(),
         "/sync/group",
         &GroupSyncRequest {
             group_id,
@@ -172,7 +172,7 @@ async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
     assert!(error.error.contains("idem-conflict"));
 
     let response = post_json(
-        app,
+        app.clone(),
         "/sync/group",
         &GroupSyncRequest {
             group_id,
@@ -250,7 +250,7 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
         StatusCode::OK
     );
     let response = post_json(
-        app,
+        app.clone(),
         "/key-packages/claim",
         &ClaimKeyPackageRequest {
             owner: owner.clone(),
@@ -269,7 +269,7 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
 
     let app = persistent_app(&db_path);
     let response = post_json(
-        app,
+        app.clone(),
         "/key-packages/claim",
         &ClaimKeyPackageRequest { owner },
     )
@@ -939,6 +939,7 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    publish_and_claim_key_package_for_add(&app, &request).await;
     let response = post_json(app, "/commits", &request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let accepted: CommitAccepted = read_json(response).await;
@@ -1000,7 +1001,7 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
     assert_eq!(welcome.state, WelcomeState::Released);
 
     let response = post_json(
-        app,
+        app.clone(),
         "/account-rooms/list",
         &ListAccountRoomDirectoryRequest {
             account_id: "alice".to_owned(),
@@ -1020,6 +1021,114 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
         "alice-phone"
     );
     assert_eq!(page.rooms[0]["devices"][1]["active"], false);
+}
+
+#[tokio::test]
+async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let tablet = DeviceRef::new("alice", "alice-tablet");
+    let room_id = "room-submit-key-package-lifecycle".to_owned();
+    let mls_group_id = "mls-submit-key-package-lifecycle".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        "welcome-key-package-lifecycle-phone",
+        "key-package-lifecycle-phone",
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("must be published and claimed"));
+    assert_submit_commit_had_no_side_effects(&app, &room_id, &phone).await;
+
+    publish_and_claim_key_package_for_add(&app, &request).await;
+    let inventory = key_package_inventory_for_device(&app, &phone).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
+
+    let mut stale_ref = request.clone();
+    stale_ref.membership_delta.adds[0].key_package_ref = "stale-ref".to_owned();
+    let response = post_json(app.clone(), "/commits", &stale_ref).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("metadata does not match"));
+    assert_submit_commit_had_no_side_effects(&app, &room_id, &phone).await;
+    let inventory = key_package_inventory_for_device(&app, &phone).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(
+        accepted.released_welcomes,
+        vec!["welcome-key-package-lifecycle-phone".to_owned()]
+    );
+    let inventory = key_package_inventory_for_device(&app, &phone).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 0);
+
+    let app = persistent_app(&db_path);
+    let inventory = key_package_inventory_for_device(&app, &phone).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 0);
+
+    let mut reuse = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &tablet,
+        1,
+        "welcome-key-package-lifecycle-reuse",
+        "key-package-lifecycle-reuse",
+    );
+    reuse.membership_delta.adds[0].key_package_id =
+        request.membership_delta.adds[0].key_package_id.clone();
+    reuse.membership_delta.adds[0].key_package_ref =
+        request.membership_delta.adds[0].key_package_ref.clone();
+    reuse.membership_delta.adds[0].key_package_hash =
+        request.membership_delta.adds[0].key_package_hash.clone();
+    let response = post_json(app.clone(), "/commits", &reuse).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("already consumed"));
+
+    let response = post_json(
+        app,
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&tablet),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
 }
 
 #[tokio::test]
@@ -1167,6 +1276,7 @@ async fn sqlite_rejected_submit_commit_replays_rejection_after_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    publish_and_claim_key_package_for_add(&app, &winner).await;
     let response = post_json(app.clone(), "/commits", &winner).await;
     assert_eq!(response.status(), StatusCode::OK);
     let accepted: CommitAccepted = read_json(response).await;
@@ -1219,7 +1329,7 @@ async fn sqlite_rejected_submit_commit_replays_rejection_after_restart() {
     assert!(inbox_page.entries.is_empty());
 
     let response = post_json(
-        app,
+        app.clone(),
         "/account-rooms/list",
         &ListAccountRoomDirectoryRequest {
             account_id: "alice".to_owned(),
@@ -1287,11 +1397,13 @@ async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
+        publish_and_claim_key_package_for_add(&app, &first).await;
         let response = post_json(app.clone(), "/commits", &first).await;
         assert_eq!(response.status(), StatusCode::OK);
         let first_accepted: CommitAccepted = read_json(response).await;
         assert_eq!(first_accepted.seq, 1);
 
+        publish_and_claim_key_package_for_add(&app, &crash_request).await;
         install_http_submit_commit_crash_trigger(&db_path, crash_point);
         let response = post_json(app, "/commits", &crash_request).await;
         assert_eq!(
@@ -1518,6 +1630,7 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
         "commit-filtered-bob",
     );
     let commit_message_id = request.envelope.message_id().expect("commit message id");
+    publish_and_claim_key_package_for_add(&app, &request).await;
     let response = post_json(app.clone(), "/commits", &request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let accepted: CommitAccepted = read_json(response).await;
@@ -1712,6 +1825,7 @@ async fn sqlite_invalid_commit_report_blocks_typed_mutations_after_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    publish_and_claim_key_package_for_add(&app, &request).await;
     let response = post_json(app.clone(), "/commits", &request).await;
     assert_eq!(response.status(), StatusCode::OK);
     let accepted: CommitAccepted = read_json(response).await;
@@ -2154,6 +2268,7 @@ fn submit_add_device_request(
         payload: b"commit-add-device".to_vec(),
     };
     let commit_message_id = envelope.message_id().expect("commit message id");
+    let key_package_id = format!("key-package-{welcome_id}");
     SubmitCommitRequest {
         room_id: room_id.to_owned(),
         sender: sender.clone(),
@@ -2165,9 +2280,9 @@ fn submit_add_device_request(
             commit_message_id,
             adds: vec![MembershipAddV1 {
                 device: added.clone(),
-                key_package_id: "key-package-add-device".to_owned(),
-                key_package_ref: "key-package-ref-add-device".to_owned(),
-                key_package_hash: "key-package-hash-add-device".to_owned(),
+                key_package_id: key_package_id.clone(),
+                key_package_ref: format!("key-package-ref-{welcome_id}"),
+                key_package_hash: format!("key-package-hash-{welcome_id}"),
                 welcome_id: welcome_id.to_owned(),
             }],
             removes: Vec::new(),
@@ -2226,6 +2341,89 @@ fn submit_add_device_request_at_epoch_with_ids(
     request
 }
 
+async fn publish_and_claim_key_package_for_add(app: &Router, request: &SubmitCommitRequest) {
+    let add = request
+        .membership_delta
+        .adds
+        .first()
+        .expect("add-device request has one add");
+    let upload = UploadKeyPackageRequest {
+        key_package_id: add.key_package_id.clone(),
+        owner: add.device.clone(),
+        key_package_ref: add.key_package_ref.clone(),
+        key_package_hash: add.key_package_hash.clone(),
+        key_package_payload: format!("payload-{}", add.key_package_id).into_bytes(),
+    };
+    let publication = HttpKeyPackagePublication {
+        key_package_id: HttpKeyPackageId::new(upload.key_package_id.as_bytes().to_vec()),
+        owner: member_for_device(&upload.owner),
+        key_package: KeyPackage::new(serde_json::to_vec(&upload).expect("upload json")),
+    };
+    let response = post_json(app.clone(), "/key-packages", &publication).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: member_for_device(&upload.owner),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed = claimed.expect("claimed KeyPackage");
+    assert_eq!(claimed.key_package_id, publication.key_package_id);
+    assert_eq!(claimed.owner, publication.owner);
+}
+
+async fn key_package_inventory_for_device(
+    app: &Router,
+    owner: &DeviceRef,
+) -> HttpKeyPackageInventory {
+    let response = post_json(
+        app.clone(),
+        "/key-packages/inventory",
+        &KeyPackageInventoryRequest {
+            owner: member_for_device(owner),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    read_json(response).await
+}
+
+async fn assert_submit_commit_had_no_side_effects(app: &Router, room_id: &str, added: &DeviceRef) {
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(added),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum HttpSubmitCommitCrashPoint {
     CommitDeliveryOperation,
@@ -2234,16 +2432,18 @@ enum HttpSubmitCommitCrashPoint {
     WelcomeIdempotencyRecord,
     AccountRoomProjection,
     RoomMembershipProjection,
+    KeyPackageConsumedProjection,
 }
 
 impl HttpSubmitCommitCrashPoint {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::CommitDeliveryOperation,
         Self::CommitIdempotencyRecord,
         Self::WelcomeDeliveryOperation,
         Self::WelcomeIdempotencyRecord,
         Self::AccountRoomProjection,
         Self::RoomMembershipProjection,
+        Self::KeyPackageConsumedProjection,
     ];
 
     fn trigger_sql(self) -> &'static str {
@@ -2312,6 +2512,16 @@ impl HttpSubmitCommitCrashPoint {
                 END;
                 "#
             }
+            Self::KeyPackageConsumedProjection => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_key_package_consumed
+                AFTER UPDATE OF state_json ON http_key_package_inventory
+                WHEN NEW.state_json = '"Consumed"'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after KeyPackage consumed projection');
+                END;
+                "#
+            }
         }
     }
 }
@@ -2336,6 +2546,7 @@ fn clear_http_submit_commit_crash_triggers(db_path: &std::path::Path) {
         DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_welcome_idempotency;
         DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_account_room_projection;
         DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_room_membership_projection;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_key_package_consumed;
         "#,
     )
     .expect("clear HTTP commit crash triggers");
@@ -2388,6 +2599,10 @@ async fn assert_http_crash_commit_rolled_back(
             .iter()
             .any(|device| device["device"]["device_id"] == "alice-tablet")
     );
+
+    let inventory = key_package_inventory_for_device(app, tablet).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
 }
 
 async fn assert_http_crash_commit_converged(
@@ -2441,6 +2656,10 @@ async fn assert_http_crash_commit_converged(
             .iter()
             .any(|device| device["device"]["device_id"] == "alice-tablet")
     );
+
+    let inventory = key_package_inventory_for_device(app, tablet).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 0);
 }
 
 async fn account_room_page(app: &Router, account_id: &str) -> ListAccountRoomDirectoryResponse {

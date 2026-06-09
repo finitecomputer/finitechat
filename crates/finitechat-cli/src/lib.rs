@@ -621,7 +621,9 @@ fn http_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_engine::{CommitAccepted, SubmitCommitRequest, WelcomeRecord};
+    use finitechat_engine::{
+        CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
+    };
     use finitechat_http::{
         AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
         ClaimWelcomesRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
@@ -1007,6 +1009,42 @@ mod tests {
             &creator.device_id,
         ]);
         assert_eq!(bootstrap["bootstrapped"], true);
+
+        let add = &submit.membership_delta.adds[0];
+        let upload = UploadKeyPackageRequest {
+            key_package_id: add.key_package_id.clone(),
+            owner: phone.clone(),
+            key_package_ref: add.key_package_ref.clone(),
+            key_package_hash: add.key_package_hash.clone(),
+            key_package_payload: b"cli-live-submit-key-package".to_vec(),
+        };
+        let owner = serde_json::to_string(&phone).expect("owner json");
+        let upload_json = serde_json::to_string(&upload).expect("upload json");
+        let published: PublishKeyPackageResponse = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "publish-key-package",
+            "--owner",
+            &owner,
+            "--key-package-id",
+            &upload.key_package_id,
+            "--bytes",
+            &upload_json,
+        ]))
+        .expect("publish commit KeyPackage");
+        assert!(published.published);
+        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> =
+            serde_json::from_value(run_cli_json([
+                "http",
+                "--server",
+                &server_url,
+                "claim-key-package",
+                "--owner",
+                &owner,
+            ]))
+            .expect("claim commit KeyPackage");
+        assert!(claimed.is_some());
 
         let accepted: CommitAccepted = serde_json::from_value(run_cli_json([
             "http",
