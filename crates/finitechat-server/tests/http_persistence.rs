@@ -8,8 +8,9 @@ use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimWelcomesRequest, ErrorResponse, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
     HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpServerState,
-    KeyPackageInventoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    PublishMessageRequest, SaveFanoutRoomRequest, http_router,
+    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
+    MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest, http_router,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -637,6 +638,73 @@ async fn sqlite_fanout_room_plan_conflict_does_not_overwrite_existing_plan() {
             .as_slice(),
         b"kp-original"
     );
+}
+
+#[tokio::test]
+async fn sqlite_account_room_directory_pages_and_survives_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let first = SaveAccountRoomRequest {
+        account_id: "alice".to_owned(),
+        room_id: "room-a".to_owned(),
+        record: serde_json::json!({
+            "room_id": "room-a",
+            "current_epoch": 1,
+            "devices": ["alice-laptop"]
+        }),
+    };
+    let second = SaveAccountRoomRequest {
+        account_id: "alice".to_owned(),
+        room_id: "room-b".to_owned(),
+        record: serde_json::json!({
+            "room_id": "room-b",
+            "current_epoch": 3,
+            "devices": ["alice-laptop", "alice-phone"]
+        }),
+    };
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/account-rooms", &second).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let saved: SaveAccountRoomResponse = read_json(response).await;
+    assert!(saved.saved);
+    assert_eq!(
+        post_json(app, "/account-rooms", &first).await.status(),
+        StatusCode::OK
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 1,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms, vec![first.record.clone()]);
+    assert_eq!(page.next_after_room_id.as_deref(), Some("room-a"));
+    assert!(page.has_more);
+
+    let response = post_json(
+        app,
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: Some("room-a".to_owned()),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms, vec![second.record]);
+    assert_eq!(page.next_after_room_id.as_deref(), Some("room-b"));
+    assert!(!page.has_more);
 }
 
 #[tokio::test]

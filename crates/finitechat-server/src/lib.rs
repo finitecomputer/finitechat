@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -11,6 +11,7 @@ use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{GroupId, MemberId, MessageId};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use transport_http_server::{
     HttpClaimedKeyPackage, HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication,
@@ -21,6 +22,7 @@ use transport_http_server::{
 const MAX_HTTP_FANOUT_ROOMS: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
 const MAX_HTTP_FANOUT_ID_BYTES: usize = 128;
 const MAX_HTTP_IDEMPOTENCY_KEY_BYTES: usize = 128;
+const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerState {
@@ -29,6 +31,7 @@ pub struct HttpServerState {
     key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
+    account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -41,6 +44,7 @@ impl HttpServerState {
             key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
+            account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -62,6 +66,7 @@ impl HttpServerState {
             }
         }
         let fanout_plans = store.load_fanout_plans()?;
+        let account_rooms = store.load_account_room_directory()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
@@ -69,6 +74,7 @@ impl HttpServerState {
             key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
+            account_rooms: Arc::new(Mutex::new(account_rooms)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -501,6 +507,75 @@ impl HttpServerState {
         Ok(plan)
     }
 
+    fn save_account_room(
+        &self,
+        request: SaveAccountRoomRequest,
+    ) -> Result<SaveAccountRoomResponse, ServerHttpError> {
+        validate_account_room_id("account_id", &request.account_id)?;
+        validate_account_room_id("room_id", &request.room_id)?;
+
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        directory
+            .entry(request.account_id.clone())
+            .or_default()
+            .insert(request.room_id.clone(), request.record.clone());
+        if let Some(store) = &self.store {
+            store.upsert_account_room(&AccountRoomDirectoryRecord {
+                account_id: request.account_id,
+                room_id: request.room_id,
+                record: request.record,
+            })?;
+        }
+        Ok(SaveAccountRoomResponse { saved: true })
+    }
+
+    fn list_account_rooms(
+        &self,
+        request: ListAccountRoomDirectoryRequest,
+    ) -> Result<ListAccountRoomDirectoryResponse, ServerHttpError> {
+        validate_account_room_id("account_id", &request.account_id)?;
+        if let Some(after_room_id) = &request.after_room_id {
+            validate_account_room_id("after_room_id", after_room_id)?;
+        }
+        if request.limit == 0 || request.limit > MAX_HTTP_SYNC_PAGE_ENTRIES {
+            return Err(ServerHttpError::InvalidAccountRoomListLimit {
+                actual: request.limit,
+                max: MAX_HTTP_SYNC_PAGE_ENTRIES,
+            });
+        }
+
+        let directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        let mut rooms = Vec::new();
+        let mut next_after_room_id = None;
+        let mut has_more = false;
+        if let Some(account_rooms) = directory.get(&request.account_id) {
+            for (room_id, record) in account_rooms {
+                if let Some(after_room_id) = &request.after_room_id
+                    && room_id <= after_room_id
+                {
+                    continue;
+                }
+                if rooms.len() == request.limit {
+                    has_more = true;
+                    break;
+                }
+                rooms.push(record.clone());
+                next_after_room_id = Some(room_id.clone());
+            }
+        }
+        Ok(ListAccountRoomDirectoryResponse {
+            rooms,
+            next_after_room_id,
+            has_more,
+        })
+    }
+
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -602,6 +677,8 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/fanouts/rooms", post(save_fanout_room))
         .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
         .route("/fanouts/rooms/done", post(mark_fanout_done))
+        .route("/account-rooms", post(save_account_room))
+        .route("/account-rooms/list", post(list_account_rooms))
         .route("/welcomes/claim", post(claim_welcomes))
         .route("/welcomes/ack", post(ack_welcome))
         .with_state(state)
@@ -724,6 +801,34 @@ pub enum HttpFanoutRoomStatus {
         prepared_message_id: MessageId,
         accepted_seq: HttpSequence,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SaveAccountRoomRequest {
+    pub account_id: String,
+    pub room_id: String,
+    pub record: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveAccountRoomResponse {
+    pub saved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListAccountRoomDirectoryRequest {
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_room_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListAccountRoomDirectoryResponse {
+    pub rooms: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after_room_id: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,6 +961,22 @@ async fn mark_fanout_done(
     Ok(Json(fanout))
 }
 
+async fn save_account_room(
+    State(state): State<HttpServerState>,
+    Json(request): Json<SaveAccountRoomRequest>,
+) -> Result<Json<SaveAccountRoomResponse>, ServerHttpError> {
+    let response = state.save_account_room(request)?;
+    Ok(Json(response))
+}
+
+async fn list_account_rooms(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ListAccountRoomDirectoryRequest>,
+) -> Result<Json<ListAccountRoomDirectoryResponse>, ServerHttpError> {
+    let page = state.list_account_rooms(request)?;
+    Ok(Json(page))
+}
+
 async fn claim_welcomes(
     State(state): State<HttpServerState>,
     Json(request): Json<ClaimWelcomesRequest>,
@@ -971,6 +1092,13 @@ pub enum WelcomeClaimState {
     Failed,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AccountRoomDirectoryRecord {
+    account_id: String,
+    room_id: String,
+    record: Value,
+}
+
 #[derive(Clone, Debug)]
 struct SqliteHttpDeliveryStore {
     path: Arc<PathBuf>,
@@ -1006,6 +1134,12 @@ impl SqliteHttpDeliveryStore {
             CREATE TABLE IF NOT EXISTS http_fanout_plans (
                 fanout_id TEXT PRIMARY KEY,
                 plan_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_account_rooms (
+                account_id TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY(account_id, room_id)
             );
             CREATE TABLE IF NOT EXISTS http_welcome_claims (
                 message_id_json TEXT PRIMARY KEY,
@@ -1238,6 +1372,52 @@ impl SqliteHttpDeliveryStore {
         Ok(fanouts)
     }
 
+    fn upsert_account_room(
+        &self,
+        record: &AccountRoomDirectoryRecord,
+    ) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_account_rooms (account_id, room_id, record_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, room_id) DO UPDATE SET
+                record_json = excluded.record_json",
+            params![
+                record.account_id,
+                record.room_id,
+                serde_json::to_string(&record.record)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_account_room_directory(
+        &self,
+    ) -> Result<BTreeMap<String, BTreeMap<String, Value>>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT account_id, room_id, record_json
+             FROM http_account_rooms
+             ORDER BY account_id ASC, room_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut directory = BTreeMap::new();
+        for row in rows {
+            let (account_id, room_id, record_json) = row?;
+            directory
+                .entry(account_id)
+                .or_insert_with(BTreeMap::new)
+                .insert(room_id, serde_json::from_str(&record_json)?);
+        }
+        Ok(directory)
+    }
+
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection()?;
         conn.execute(
@@ -1393,6 +1573,17 @@ fn validate_fanout_room_plan(plan: &HttpFanoutRoomPlan) -> Result<(), ServerHttp
     )
 }
 
+fn validate_account_room_id(field: &'static str, value: &str) -> Result<(), ServerHttpError> {
+    if value.is_empty() || value.len() > MAX_HTTP_ACCOUNT_ROOM_ID_BYTES {
+        return Err(ServerHttpError::InvalidAccountRoomRequest {
+            reason: format!(
+                "{field} must contain between 1 and {MAX_HTTP_ACCOUNT_ROOM_ID_BYTES} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<(), ServerHttpError> {
     if value.is_empty() || value.len() > max {
         return Err(ServerHttpError::InvalidFanoutRequest {
@@ -1491,6 +1682,13 @@ pub enum ServerHttpError {
     FanoutRoomNotFound {
         fanout_id: String,
         room_id: GroupId,
+    },
+    InvalidAccountRoomRequest {
+        reason: String,
+    },
+    InvalidAccountRoomListLimit {
+        actual: usize,
+        max: usize,
     },
     InvalidWelcomeClaimLimit {
         actual: usize,
@@ -1592,6 +1790,16 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::NOT_FOUND,
                 "fanout_room_not_found".to_owned(),
                 format!("fanout {fanout_id} has no room {room_id:?}"),
+            ),
+            Self::InvalidAccountRoomRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_account_room_request".to_owned(),
+                reason,
+            ),
+            Self::InvalidAccountRoomListLimit { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_account_room_list_limit".to_owned(),
+                format!("account-room list limit must be between 1 and {max}, got {actual}"),
             ),
             Self::InvalidWelcomeClaimLimit { actual, max } => (
                 StatusCode::BAD_REQUEST,

@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, KeyPackage inventory, and KeyPackage operations",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -101,9 +101,14 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",
         },
         PortFinding {
+            area: "http_account_room_directory_runtime_discovery",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_link_fanout_tick can discover persisted opaque account-room records through Darkmatter HTTP routes after server restart when the target device is already current",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages and durable fanout progress",
+            evidence: "Finite tests require later devices to join existing rooms with distinct per-room KeyPackages, membership-derived account-room discovery, HTTP commit submission, and durable fanout progress",
         },
         PortFinding {
             area: "ordered_delivery_profile",

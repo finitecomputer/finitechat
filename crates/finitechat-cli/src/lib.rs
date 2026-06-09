@@ -6,8 +6,9 @@ use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_server::{
     AckWelcomeRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest,
     GetFanoutRequest, GroupSyncRequest, HttpFanoutRoomPlan, InboxSyncRequest,
-    KeyPackageInventoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    PublishMessageRequest, SaveFanoutRoomRequest,
+    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
+    SaveFanoutRoomRequest,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -39,6 +40,8 @@ pub enum CliError {
     Usage(String),
     #[error("failed to serialize request: {0}")]
     Serialize(serde_json::Error),
+    #[error("failed to parse JSON: {0}")]
+    Json(serde_json::Error),
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("server returned {status}: {body}")]
@@ -54,7 +57,11 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) => 2,
-            Self::Serialize(_) | Self::Http(_) | Self::Server { .. } | Self::Output(_) => 1,
+            Self::Serialize(_)
+            | Self::Json(_)
+            | Self::Http(_)
+            | Self::Server { .. }
+            | Self::Output(_) => 1,
         }
     }
 }
@@ -122,6 +129,8 @@ where
         "fanout-save-room" => fanout_save_room_request(&server, args),
         "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
         "fanout-mark-done" => fanout_mark_done_request(&server, args),
+        "account-room-save" => account_room_save_request(&server, args),
+        "account-rooms-list" => account_rooms_list_request(&server, args),
         "claim-welcomes" => claim_welcomes_request(&server, args),
         "ack-welcome" => ack_welcome_request(&server, args),
         _ => Err(CliError::Usage(http_usage())),
@@ -368,6 +377,40 @@ fn fanout_mark_done_request(
     post_json_request(server, "/fanouts/rooms/done", &request)
 }
 
+fn account_room_save_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let account_id = required_option(&mut args, "--account-id")?;
+    let room_id = required_option(&mut args, "--room-id")?;
+    let record_json = required_option(&mut args, "--record-json")?;
+    reject_extra_args(&args)?;
+
+    let request = SaveAccountRoomRequest {
+        account_id,
+        room_id,
+        record: serde_json::from_str(&record_json).map_err(CliError::Json)?,
+    };
+    post_json_request(server, "/account-rooms", &request)
+}
+
+fn account_rooms_list_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let account_id = required_option(&mut args, "--account-id")?;
+    let after_room_id = take_option(&mut args, "--after-room-id")?;
+    let limit = optional_usize(&mut args, "--limit", DEFAULT_SYNC_LIMIT)?;
+    reject_extra_args(&args)?;
+
+    let request = ListAccountRoomDirectoryRequest {
+        account_id,
+        after_room_id,
+        limit,
+    };
+    post_json_request(server, "/account-rooms/list", &request)
+}
+
 fn claim_welcomes_request(
     server: &str,
     mut args: Vec<String>,
@@ -536,7 +579,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -544,8 +587,9 @@ mod tests {
     use super::*;
     use finitechat_server::{
         AckWelcomeRequest, ClaimKeyPackagesRequest, ClaimWelcomesRequest, GroupSyncRequest,
-        KeyPackageInventoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-        PublishMessageRequest, SaveFanoutRoomRequest,
+        KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest,
+        MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
+        SaveFanoutRoomRequest,
     };
 
     #[test]
@@ -759,6 +803,47 @@ mod tests {
         assert_eq!(body.room_id.as_slice(), b"room-a");
         assert_eq!(body.prepared_message_id.as_slice(), b"commit-b");
         assert_eq!(body.accepted_seq, 9);
+    }
+
+    #[test]
+    fn account_room_commands_build_route_dtos() {
+        let save = prepare_http_request([
+            "account-room-save",
+            "--account-id",
+            "alice",
+            "--room-id",
+            "room-a",
+            "--record-json",
+            r#"{"room_id":"room-a","current_epoch":2}"#,
+        ])
+        .expect("save request");
+
+        assert_eq!(save.method, HttpMethod::Post);
+        assert_eq!(save.url, "http://127.0.0.1:8787/account-rooms");
+        let body: SaveAccountRoomRequest =
+            serde_json::from_value(save.json.expect("json")).expect("account-room save request");
+        assert_eq!(body.account_id, "alice");
+        assert_eq!(body.room_id, "room-a");
+        assert_eq!(body.record["current_epoch"], 2);
+
+        let list = prepare_http_request([
+            "account-rooms-list",
+            "--account-id",
+            "alice",
+            "--after-room-id",
+            "room-a",
+            "--limit",
+            "3",
+        ])
+        .expect("list request");
+
+        assert_eq!(list.method, HttpMethod::Post);
+        assert_eq!(list.url, "http://127.0.0.1:8787/account-rooms/list");
+        let body: ListAccountRoomDirectoryRequest =
+            serde_json::from_value(list.json.expect("json")).expect("account-room list request");
+        assert_eq!(body.account_id, "alice");
+        assert_eq!(body.after_room_id.as_deref(), Some("room-a"));
+        assert_eq!(body.limit, 3);
     }
 
     #[test]

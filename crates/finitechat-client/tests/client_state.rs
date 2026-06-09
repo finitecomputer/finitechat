@@ -12,10 +12,10 @@ use finitechat_client::{
     run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_engine::{
-    AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateRoomRequest, DeliveryService,
-    EngineError, EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
-    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
-    lease_token_for,
+    AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
+    CreateRoomRequest, DeliveryService, EngineError, EventAccepted, KeyPackageInventory,
+    ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest, SyncEventsPage,
+    UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -25,7 +25,9 @@ use finitechat_proto::{
 use finitechat_server::{
     AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
     GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageInventory, HttpServerState,
-    KeyPackageInventoryRequest, PublishKeyPackageResponse, PublishMessageRequest, http_router,
+    KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
+    PublishKeyPackageResponse, PublishMessageRequest, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, http_router,
 };
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -2062,6 +2064,97 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_account_rooms");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_account_rooms");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config).unwrap();
+    let mut source_server = DeliveryService::new();
+    let room_id = "room_http_account_directory";
+    let group_id = "mls_http_account_directory";
+    create_group_room_with_member(
+        &mut source_server,
+        &mut alice,
+        &mut alice_phone,
+        GroupMemberSetup {
+            room_id,
+            mls_group_id: group_id,
+            key_package_id: "kp_phone_http_account_directory",
+            welcome_id: "welcome_phone_http_account_directory",
+            idempotency_key: "commit_phone_http_account_directory",
+        },
+    );
+    let account_id = alice.device_ref().account_id.clone();
+    let account_rooms = source_server
+        .list_account_rooms(ListAccountRoomsRequest {
+            account_id: account_id.clone(),
+            after_room_id: None,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(account_rooms.rooms.len(), 1);
+    assert_eq!(account_rooms.rooms[0].room_id, room_id);
+    assert!(
+        account_rooms.rooms[0]
+            .devices
+            .iter()
+            .any(|device| device.device == *alice_phone.device_ref())
+    );
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    delivery
+        .publish_account_room_record(&account_id, &account_rooms.rooms[0])
+        .unwrap();
+    assert_eq!(
+        delivery
+            .list_account_rooms(ListAccountRoomsRequest {
+                account_id: account_id.clone(),
+                after_room_id: None,
+                limit: 10,
+            })
+            .unwrap(),
+        account_rooms
+    );
+
+    alice_store.save_device_state(&alice).unwrap();
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice,
+            "fanout_http_account_directory",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice,
+        &mut delivery,
+        "fanout_http_account_directory",
+        &RuntimeLinkFanoutOptions {
+            max_discovery_pages_per_tick: 2,
+            max_commit_rooms_per_tick: 1,
+            max_completion_sync_pages_per_room: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.discovery_pages, 1);
+    assert_eq!(report.queued_rooms, 0);
+    assert_eq!(report.claimed_key_packages, 0);
+    assert_eq!(report.prepared_commits, 0);
+    assert_eq!(report.submitted_commits, 0);
+    assert!(report.complete);
+    assert_eq!(
+        alice
+            .link_fanout_room_count("fanout_http_account_directory")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn runtime_sync_tick_retries_key_package_upload_after_response_loss() {
     let dir = tempfile::tempdir().unwrap();
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_runtime_kp_retry");
@@ -3903,6 +3996,21 @@ impl HttpRuntimeDelivery {
         let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
         Ok(())
     }
+
+    fn publish_account_room_record(
+        &self,
+        account_id: &str,
+        record: &AccountRoomRecord,
+    ) -> Result<(), HttpRuntimeDeliveryError> {
+        let request = SaveAccountRoomRequest {
+            account_id: account_id.to_owned(),
+            room_id: record.room_id.clone(),
+            record: serde_json::to_value(record)
+                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+        };
+        let _: SaveAccountRoomResponse = self.post_json("/account-rooms", &request)?;
+        Ok(())
+    }
 }
 
 impl RuntimeDelivery for HttpRuntimeDelivery {
@@ -3985,9 +4093,32 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
 
     fn list_account_rooms(
         &mut self,
-        _request: ListAccountRoomsRequest,
+        request: ListAccountRoomsRequest,
     ) -> Result<ListAccountRoomsPage, Self::Error> {
-        Err(HttpRuntimeDeliveryError::Unsupported("list_account_rooms"))
+        let response: ListAccountRoomDirectoryResponse = self.post_json(
+            "/account-rooms/list",
+            &ListAccountRoomDirectoryRequest {
+                account_id: request.account_id.clone(),
+                after_room_id: request.after_room_id.clone(),
+                limit: request.limit as usize,
+            },
+        )?;
+        let rooms = response
+            .rooms
+            .into_iter()
+            .map(|record| {
+                serde_json::from_value(record)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+            })
+            .collect::<Result<Vec<AccountRoomRecord>, _>>()?;
+        let page = ListAccountRoomsPage {
+            rooms,
+            next_after_room_id: response.next_after_room_id,
+            has_more: response.has_more,
+        };
+        page.validate_limits()
+            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+        Ok(page)
     }
 
     fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
