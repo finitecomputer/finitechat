@@ -16,7 +16,7 @@ Marmot/Darkmatter.
 Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
-- Current Rust tests after Darkmatter HTTP harness additions: `292`
+- Current Rust tests after Darkmatter HTTP harness additions: `293`
 - Python Hermes adapter tests: `7`
 
 Rust test distribution:
@@ -100,6 +100,10 @@ Python test distribution:
   opaque transport messages; the client adapter can decode product-level
   `RoomLogEntry` payloads and reuse the existing encrypted application apply
   path.
+- Runtime KeyPackage metadata mapping. The Darkmatter HTTP KeyPackage store
+  carries opaque bytes; the client adapter can encode the original
+  `UploadKeyPackageRequest` so a later claim reconstructs Finite's package
+  ref, hash, payload, owner, and deterministic lease token.
 - Batch KeyPackage claim replay for the HTTP delivery surface. This wraps
   Darkmatter's owner-scoped `claim_key_package` primitive so fanout callers can
   ask for one package per device owner and safely retry after response loss.
@@ -288,12 +292,17 @@ Dependency note:
 Runtime delivery checkpoint:
 
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-client --test client_state runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
   inventory and uploads zero duplicate KeyPackages on replay.
+- The runtime delivery adapter can claim a KeyPackage through
+  `/key-packages/claim`, recover the original Finite package metadata, compute
+  the same deterministic lease token, and replay after server restart with no
+  duplicate claim.
 - The same worker can claim a valid serialized `WelcomeRecord` carried through
   the Darkmatter HTTP inbox, activate the Welcome locally, ack `/welcomes/ack`,
   and replay after server restart without duplicate claim or ack.
@@ -301,9 +310,10 @@ Runtime delivery checkpoint:
   Darkmatter HTTP `/sync/group`, decrypt an application entry, advance the
   client cursor, and replay without applying the entry twice.
 - This proves the current client runtime harness can be reused above a
-  Darkmatter HTTP adapter for inventory/upload, Welcome claim/ack, and ordered
-  room pull. It does not yet prove account-room discovery, submit-commit, server
-  membership filtering, or later-device fanout over the same adapter.
+  Darkmatter HTTP adapter for KeyPackage inventory/upload/claim, Welcome
+  claim/ack, and ordered room pull. It does not yet prove account-room
+  discovery, submit-commit, server membership filtering, or later-device fanout
+  over the same adapter.
 
 Next meaningful gate: extend the Darkmatter-backed runtime delivery boundary
 from maintenance and room pull into account-room discovery, submit-commit, or

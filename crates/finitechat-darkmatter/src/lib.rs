@@ -91,6 +91,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_runtime_sync_tick replenishes KeyPackages through Darkmatter HTTP inventory/upload routes and replays zero duplicate uploads after server restart",
         },
         PortFinding {
+            area: "http_key_package_claim_runtime_sync",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client RuntimeDelivery claims Darkmatter HTTP KeyPackages with Finite metadata preserved in opaque package bytes and deterministic lease tokens reconstructed",
+        },
+        PortFinding {
             area: "http_fanout_plan_checkpoint",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",

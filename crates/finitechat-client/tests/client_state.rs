@@ -12,9 +12,10 @@ use finitechat_client::{
     run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_engine::{
-    AppendEventRequest, CommitAccepted, CreateRoomRequest, DeliveryService, EngineError,
-    EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
+    AppendEventRequest, ClaimKeyPackageResult, CommitAccepted, CreateRoomRequest, DeliveryService,
+    EngineError, EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
     SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
+    lease_token_for,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -22,9 +23,9 @@ use finitechat_proto::{
     MAX_WELCOME_CLAIMS_PER_REQUEST, ProtocolLimitError, RoomLogEntry, WelcomeState,
 };
 use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, ClaimWelcomesRequest, GroupSyncRequest,
-    HttpClaimedWelcome, HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
-    PublishKeyPackageResponse, PublishMessageRequest, http_router,
+    AckWelcomeRequest, AckWelcomeResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
+    GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageInventory, HttpServerState,
+    KeyPackageInventoryRequest, PublishKeyPackageResponse, PublishMessageRequest, http_router,
 };
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -1855,6 +1856,36 @@ fn runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes() {
     let inventory = delivery.key_package_inventory(alice.device_ref()).unwrap();
     assert_eq!(inventory.available, 2);
     assert_eq!(inventory.leased, 0);
+}
+
+#[test]
+fn runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_key_package_claim");
+    let request = bob.upload_key_package_request("kp_http_claim_bob").unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    delivery.upload_key_package(request.clone()).unwrap();
+    let claimed = delivery
+        .claim_key_package_for_device(&request.owner)
+        .unwrap()
+        .expect("uploaded package can be claimed");
+    assert_eq!(claimed.key_package_id, request.key_package_id);
+    assert_eq!(claimed.owner, request.owner);
+    assert_eq!(claimed.key_package_ref, request.key_package_ref);
+    assert_eq!(claimed.key_package_hash, request.key_package_hash);
+    assert_eq!(claimed.key_package_payload, request.key_package_payload);
+    assert_eq!(
+        claimed.lease_token,
+        lease_token_for(&claimed.key_package_id, &claimed.owner)
+    );
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let replay = delivery
+        .claim_key_package_for_device(&claimed.owner)
+        .unwrap();
+    assert_eq!(replay, None);
 }
 
 #[test]
@@ -3759,6 +3790,14 @@ enum HttpRuntimeDeliveryError {
         expected: DeviceRef,
         actual: DeviceRef,
     },
+    KeyPackageIdMismatch {
+        envelope_id: Vec<u8>,
+        body_id: String,
+    },
+    KeyPackageOwnerMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
     RoomEntryMismatch {
         expected: String,
         actual: String,
@@ -3887,9 +3926,12 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
 
     fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
         let publication = HttpKeyPackagePublication {
-            key_package_id: HttpKeyPackageId::new(request.key_package_id.into_bytes()),
+            key_package_id: HttpKeyPackageId::new(request.key_package_id.as_bytes().to_vec()),
             owner: member_id_for_device(&request.owner)?,
-            key_package: DarkmatterKeyPackage::new(request.key_package_payload),
+            key_package: DarkmatterKeyPackage::new(
+                serde_json::to_vec(&request)
+                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
+            ),
         };
         let _: PublishKeyPackageResponse = self.post_json("/key-packages", &publication)?;
         Ok(())
@@ -3897,11 +3939,41 @@ impl RuntimeDelivery for HttpRuntimeDelivery {
 
     fn claim_key_package_for_device(
         &mut self,
-        _owner: &DeviceRef,
+        owner: &DeviceRef,
     ) -> Result<Option<finitechat_engine::ClaimKeyPackageResult>, Self::Error> {
-        Err(HttpRuntimeDeliveryError::Unsupported(
-            "claim_key_package_for_device",
-        ))
+        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = self.post_json(
+            "/key-packages/claim",
+            &ClaimKeyPackageRequest {
+                owner: member_id_for_device(owner)?,
+            },
+        )?;
+        claimed
+            .map(|claimed| {
+                let request: UploadKeyPackageRequest =
+                    serde_json::from_slice(claimed.key_package.bytes())
+                        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+                if claimed.key_package_id.as_slice() != request.key_package_id.as_bytes() {
+                    return Err(HttpRuntimeDeliveryError::KeyPackageIdMismatch {
+                        envelope_id: claimed.key_package_id.as_slice().to_vec(),
+                        body_id: request.key_package_id,
+                    });
+                }
+                if request.owner != *owner {
+                    return Err(HttpRuntimeDeliveryError::KeyPackageOwnerMismatch {
+                        expected: owner.clone(),
+                        actual: request.owner,
+                    });
+                }
+                Ok(ClaimKeyPackageResult {
+                    lease_token: lease_token_for(&request.key_package_id, &request.owner),
+                    key_package_id: request.key_package_id,
+                    owner: request.owner,
+                    key_package_ref: request.key_package_ref,
+                    key_package_hash: request.key_package_hash,
+                    key_package_payload: request.key_package_payload,
+                })
+            })
+            .transpose()
     }
 
     fn submit_commit(
