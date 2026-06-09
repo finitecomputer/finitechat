@@ -121,9 +121,14 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_link_fanout_tick can page account-room discovery across two rooms, claim distinct target KeyPackages, submit both commits through Darkmatter HTTP, and activate both later-device Welcomes",
         },
         PortFinding {
+            area: "http_later_device_fanout_same_epoch_reprepare",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_link_fanout_tick can recover after an HTTP fanout submit fails before accept, a competing same-epoch commit wins, sync clears the local pending commit, and the worker reprepares at the next epoch",
+        },
+        PortFinding {
             area: "multi_device_later_device_fanout",
             status: PortStatus::ThickOrWonkyLogic,
-            evidence: "Remaining Finite parity requires membership-derived account-room writes, server-side membership validation/filtering, and same-epoch reprepare over the HTTP adapter",
+            evidence: "Remaining Finite parity requires membership-derived account-room writes and server-side membership validation/filtering instead of seeded product wrapper state",
         },
         PortFinding {
             area: "ordered_delivery_profile",
