@@ -146,6 +146,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, and typed rooms reject raw plain commits without membership deltas",
         },
         PortFinding {
+            area: "http_invalid_commit_repair_state",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",
+        },
+        PortFinding {
             area: "http_submit_commit_route",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server /commits accepts a typed SubmitCommitRequest, rejects malformed staged Welcomes before side effects, publishes an ordered group commit projection with membership deltas, derives account-room and room-membership updates from the request, releases derived Welcome inbox messages, replays idempotently after restart, and repairs finite projections when a retry observes a durable commit publish without its projection rows",

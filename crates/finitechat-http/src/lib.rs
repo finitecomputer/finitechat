@@ -198,6 +198,18 @@ pub struct AckWelcomeResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportInvalidCommitRequest {
+    pub room_id: String,
+    pub reporter: DeviceRef,
+    pub offending_seq: HttpSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportInvalidCommitResponse {
+    pub reported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishKeyPackageResponse {
     pub published: bool,
 }

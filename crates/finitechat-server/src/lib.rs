@@ -22,8 +22,9 @@ pub use finitechat_http::{
     HttpFanoutRoomState, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
     InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    PublishKeyPackageResponse, PublishMessageRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    PublishKeyPackageResponse, PublishMessageRequest, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
+    SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
@@ -746,6 +747,93 @@ impl HttpServerState {
         })
     }
 
+    fn report_invalid_commit(
+        &self,
+        request: ReportInvalidCommitRequest,
+    ) -> Result<ReportInvalidCommitResponse, ServerHttpError> {
+        validate_account_room_id("room_id", &request.room_id)?;
+        request.reporter.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidRepairReport {
+                reason: error.to_string(),
+            }
+        })?;
+
+        let mut projection = {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            rooms.get(&request.room_id).cloned().ok_or_else(|| {
+                ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "invalid commit report requires a room-membership projection"
+                        .to_owned(),
+                }
+            })?
+        };
+        if !projection.device_was_member_for_seq(&request.reporter, request.offending_seq) {
+            return Err(ServerHttpError::ReporterNotInInterval {
+                reporter: request.reporter,
+                offending_seq: request.offending_seq,
+            });
+        }
+        projection.status = RoomStatus::NeedsRepair;
+
+        let account_records = self.account_room_repair_records(&request.room_id)?;
+        if let Some(store) = &self.store {
+            store.upsert_room_repair_state(&projection, &account_records)?;
+        }
+
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        rooms.insert(request.room_id.clone(), projection);
+        drop(rooms);
+
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        for record in account_records {
+            directory
+                .entry(record.account_id)
+                .or_default()
+                .insert(record.room_id, record.record);
+        }
+
+        Ok(ReportInvalidCommitResponse { reported: true })
+    }
+
+    fn account_room_repair_records(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<AccountRoomDirectoryRecord>, ServerHttpError> {
+        let directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        let mut records = Vec::new();
+        for (account_id, rooms) in directory.iter() {
+            let Some(value) = rooms.get(room_id) else {
+                continue;
+            };
+            let Some(mut record) = account_scoped_account_room_record(account_id, room_id, value)?
+            else {
+                continue;
+            };
+            record.status = RoomStatus::NeedsRepair;
+            let value = serde_json::to_value(&record)
+                .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+            records.push(AccountRoomDirectoryRecord {
+                account_id: account_id.clone(),
+                room_id: room_id.to_owned(),
+                record: value,
+            });
+        }
+        Ok(records)
+    }
+
     fn bootstrap_room_membership(
         &self,
         request: &BootstrapAccountRoomRequest,
@@ -1266,6 +1354,12 @@ impl HttpServerState {
                 reason: "commit envelope MLS group does not match room projection".to_owned(),
             });
         }
+        if projection.status != RoomStatus::Open {
+            return Err(ServerHttpError::RoomNotOpen {
+                room_id: request.room_id.clone(),
+                status: projection.status,
+            });
+        }
         if request.expected_epoch != projection.current_epoch {
             return Err(ServerHttpError::InvalidCommitRequest {
                 reason: format!(
@@ -1306,6 +1400,12 @@ impl HttpServerState {
             if projection.mls_group_id != request.envelope.mls_group_id {
                 return Err(ServerHttpError::InvalidEventRequest {
                     reason: "event envelope MLS group does not match room projection".to_owned(),
+                });
+            }
+            if projection.status != RoomStatus::Open {
+                return Err(ServerHttpError::RoomNotOpen {
+                    room_id: request.room_id.clone(),
+                    status: projection.status,
                 });
             }
             if request.envelope.epoch != projection.current_epoch {
@@ -1620,6 +1720,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
+        .route("/rooms/report-invalid-commit", post(report_invalid_commit))
         .route("/welcomes/claim", post(claim_welcomes))
         .route("/welcomes/ack", post(ack_welcome))
         .with_state(state)
@@ -1757,6 +1858,14 @@ async fn list_account_rooms(
 ) -> Result<Json<ListAccountRoomDirectoryResponse>, ServerHttpError> {
     let page = state.list_account_rooms(request)?;
     Ok(Json(page))
+}
+
+async fn report_invalid_commit(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ReportInvalidCommitRequest>,
+) -> Result<Json<ReportInvalidCommitResponse>, ServerHttpError> {
+    let response = state.report_invalid_commit(request)?;
+    Ok(Json(response))
 }
 
 async fn claim_welcomes(
@@ -2293,6 +2402,37 @@ impl SqliteHttpDeliveryStore {
                 projection_json = excluded.projection_json",
             params![&projection.room_id, serde_json::to_string(projection)?,],
         )?;
+        Ok(())
+    }
+
+    fn upsert_room_repair_state(
+        &self,
+        projection: &HttpRoomMembershipProjection,
+        account_records: &[AccountRoomDirectoryRecord],
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO http_room_memberships (room_id, projection_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(room_id) DO UPDATE SET
+                projection_json = excluded.projection_json",
+            params![projection.room_id, serde_json::to_string(projection)?],
+        )?;
+        for record in account_records {
+            transaction.execute(
+                "INSERT INTO http_account_rooms (account_id, room_id, record_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id, room_id) DO UPDATE SET
+                    record_json = excluded.record_json",
+                params![
+                    record.account_id,
+                    record.room_id,
+                    serde_json::to_string(&record.record)?,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2910,6 +3050,17 @@ pub enum ServerHttpError {
     SenderNotActive {
         sender: DeviceRef,
     },
+    InvalidRepairReport {
+        reason: String,
+    },
+    ReporterNotInInterval {
+        reporter: DeviceRef,
+        offending_seq: HttpSequence,
+    },
+    RoomNotOpen {
+        room_id: String,
+        status: RoomStatus,
+    },
     InvalidFanoutRequest {
         reason: String,
     },
@@ -3044,6 +3195,24 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::FORBIDDEN,
                 "sender_not_active".to_owned(),
                 format!("sender {sender:?} is not active in the room"),
+            ),
+            Self::InvalidRepairReport { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_repair_report".to_owned(),
+                reason,
+            ),
+            Self::ReporterNotInInterval {
+                reporter,
+                offending_seq,
+            } => (
+                StatusCode::FORBIDDEN,
+                "reporter_not_in_interval".to_owned(),
+                format!("reporter {reporter:?} was not a member for seq {offending_seq}"),
+            ),
+            Self::RoomNotOpen { room_id, status } => (
+                StatusCode::CONFLICT,
+                "room_not_open".to_owned(),
+                format!("room {room_id} is {status:?}"),
             ),
             Self::InvalidFanoutRequest { reason } => (
                 StatusCode::BAD_REQUEST,

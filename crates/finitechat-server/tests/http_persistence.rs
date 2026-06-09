@@ -15,8 +15,9 @@ use finitechat_http::{
     GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomStatus,
     HttpKeyPackageClaim, HttpKeyPackageInventory, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
+    SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomStatus,
@@ -1485,6 +1486,110 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
 }
 
 #[tokio::test]
+async fn sqlite_invalid_commit_report_blocks_typed_mutations_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let carol = DeviceRef::new("carol", "carol-phone");
+    let room_id = "room-invalid-commit-report".to_owned();
+    let mls_group_id = "mls-invalid-commit-report".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-invalid-report-bob",
+        "invalid-report-add-bob",
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+
+    let response = post_json(
+        app.clone(),
+        "/rooms/report-invalid-commit",
+        &ReportInvalidCommitRequest {
+            room_id: room_id.clone(),
+            reporter: carol.clone(),
+            offending_seq: accepted.seq,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "reporter_not_in_interval");
+
+    let response = post_json(
+        app,
+        "/rooms/report-invalid-commit",
+        &ReportInvalidCommitRequest {
+            room_id: room_id.clone(),
+            reporter: alice.clone(),
+            offending_seq: accepted.seq,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reported: ReportInvalidCommitResponse = read_json(response).await;
+    assert!(reported.reported);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "alice".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(page.rooms[0]["status"], "needs_repair");
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            1,
+            b"blocked",
+            "invalid-report-blocked-event",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "room_not_open");
+
+    let blocked_commit =
+        submit_add_device_request_at_epoch(&room_id, &mls_group_id, &alice, &carol, 1);
+    let response = post_json(app, "/commits", &blocked_commit).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "room_not_open");
+}
+
+#[tokio::test]
 async fn sqlite_welcome_activation_marks_account_room_device_active_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -1878,6 +1983,31 @@ fn submit_add_device_request(
         }],
         idempotency_key: idempotency_key.to_owned(),
     }
+}
+
+fn submit_add_device_request_at_epoch(
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    added: &DeviceRef,
+    epoch: u64,
+) -> SubmitCommitRequest {
+    let welcome_id = format!("welcome-{room_id}-{epoch}");
+    let mut request = submit_add_device_request(
+        room_id,
+        mls_group_id,
+        sender,
+        added,
+        &welcome_id,
+        &format!("commit-{room_id}-{epoch}"),
+    );
+    request.expected_epoch = epoch;
+    request.envelope.epoch = epoch;
+    let commit_message_id = request.envelope.message_id().expect("commit message id");
+    request.membership_delta.base_epoch = epoch;
+    request.membership_delta.post_commit_epoch = epoch + 1;
+    request.membership_delta.commit_message_id = commit_message_id;
+    request
 }
 
 fn commit_publish_request_for_test(
