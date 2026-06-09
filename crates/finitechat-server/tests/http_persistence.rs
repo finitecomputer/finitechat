@@ -1467,6 +1467,75 @@ async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_r
 }
 
 #[tokio::test]
+async fn sqlite_welcome_not_released_before_accepted_commit_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let phone = DeviceRef::new("alice", "alice-phone");
+    let room_id = "room-welcome-release-coupling".to_owned();
+    let mls_group_id = "mls-welcome-release-coupling".to_owned();
+    let welcome_id = "welcome-release-coupling-phone".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &phone,
+        &welcome_id,
+        "welcome-release-coupling",
+    );
+    let mut rejected = request.clone();
+    rejected.membership_delta.adds[0].key_package_hash = "wrong-hash".to_owned();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    publish_and_claim_key_package_for_add(&app, &request).await;
+
+    let response = post_json(app.clone(), "/commits", &rejected).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("metadata does not match"));
+    assert_submit_commit_had_no_side_effects(&app, &room_id, &phone).await;
+
+    let app = persistent_app(&db_path);
+    assert_submit_commit_had_no_side_effects(&app, &room_id, &phone).await;
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(accepted.released_welcomes, vec![welcome_id.clone()]);
+
+    let response = post_json(
+        app,
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&phone),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].message.id, id(&welcome_id));
+    let welcome: WelcomeRecord =
+        serde_json::from_slice(&page.entries[0].message.payload).expect("welcome payload");
+    assert_eq!(welcome.state, WelcomeState::Released);
+}
+
+#[tokio::test]
 async fn sqlite_submit_commit_replay_repairs_projection_after_partial_durable_publish() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");

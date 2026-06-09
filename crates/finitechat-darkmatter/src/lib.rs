@@ -106,6 +106,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server typed /commits reject unclaimed KeyPackages and stale Finite KeyPackage metadata before side effects, consume claimed packages atomically with accepted commits, preserve consumed state after restart, and reject consumed-package reuse",
         },
         PortFinding {
+            area: "http_commit_welcome_release_coupling",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server typed /commits reject bad commit metadata without releasing Welcomes, preserve that absence after restart, and release exactly one Welcome only after the corrected commit is durably accepted",
+        },
+        PortFinding {
             area: "http_revoked_device_projection",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists revoked finite DeviceRefs over HTTP, rebuilds revoked state after restart, rejects revoked KeyPackage publish/claim, Welcome claim/activation, typed event senders, typed commit senders, and typed commits that add a revoked device; batch KeyPackage claim skips revoked owners without consuming inventory",

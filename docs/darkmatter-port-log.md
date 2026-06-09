@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `356`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `357`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 19 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 28 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 29 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -61,7 +61,8 @@ Python test distribution:
 Audit state:
 
 - Port code state audited: `codex/darkmatter-port`, including HTTP
-  KeyPackage lease-expiry/reclaim and revoked-device projection coverage
+  KeyPackage lease-expiry/reclaim, Welcome-release coupling, and revoked-device
+  projection coverage
 - Baseline checkout: `/Users/futurepaul/dev/finite/finitechat`,
   `marmot-investigation` at `7e8048d`
 - Baseline untracked docs were ignored because they are outside `crates/` and
@@ -75,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `364` (`356` Rust, `8` Python)
+- Port parsed tests: `365` (`357` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `70`
+- Port-only test names: `71`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -89,7 +90,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 19 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 34 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 35 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -129,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `70` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `71` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -149,11 +150,11 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 19 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 34 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 35 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
-Highest-risk preserved fake/store proofs to port next:
+Highest-risk preserved fake/store proof checkpoints ported to HTTP so far:
 
 | Priority | Preserved tests | Target proof shape |
 | --- | --- | --- |
@@ -183,6 +184,11 @@ Finite leased counts in the runtime adapter. The HTTP wrapper now owns
 Finite-style KeyPackage lease state above Marmot's opaque package bytes: it can
 expire a claimed lease back to available, persist that across restart, reclaim
 the same package, and reject attempts to expire consumed packages.
+
+Current Welcome-release progress: typed HTTP `/commits` now has a focused
+restart proof that bad commit metadata does not release a Welcome, the absence
+of that Welcome survives server restart, and the corrected commit releases
+exactly one Welcome only after it is accepted.
 
 Current revocation progress: the HTTP server now persists revoked finite
 `DeviceRef`s, rebuilds that state after restart, rejects revoked KeyPackage
@@ -311,6 +317,10 @@ Fork-only requirements beyond the current HTTP branch:
   commit persists the new device as pending after restart, and a remove-commit
   HTTP runtime test proves the removed account no longer lists the room after
   restart without a second manual `/account-rooms` write.
+- The typed HTTP `/commits` route keeps Welcome release coupled to accepted
+  commit append: bad commit metadata leaves the group log and recipient Welcome
+  inbox empty across restart, and the corrected commit releases one Welcome only
+  after acceptance.
 - The HTTP Welcome ack wrapper can decode a claimed Finite `WelcomeRecord` on
   activated ack and promote the account-room device from pending to active
   across SQLite restart.
@@ -445,8 +455,9 @@ Fork-only requirements beyond the current HTTP branch:
   submitted request,
   publishes derived `WelcomeRecord`s to recipient inboxes, and returns
   `CommitAccepted` from the accepted HTTP sequence. Malformed staged Welcome
-  inputs are rejected before the route appends delivery side effects, and exact
-  idempotent commit retries replay even after the room head has advanced.
+  inputs and bad commit metadata are rejected before the route appends delivery
+  side effects or releases Welcomes, and exact idempotent commit retries replay
+  even after the room head has advanced.
 - Typed application-event route for the HTTP delivery surface. The route
   accepts a Finite `AppendEventRequest`, checks the requester against the
   server-owned room-membership projection when the projection is complete or
@@ -533,7 +544,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `34`
+- Route/store/engine tests added so far: `35`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -566,6 +577,9 @@ Additional HTTP route checkpoint:
     KeyPackage metadata before side effects
   - typed `/commits` consumes claimed KeyPackages atomically with accepted
     commits, rebuilds consumed state after restart, and rejects consumed reuse
+  - typed `/commits` rejects bad commit metadata without releasing a Welcome,
+    preserves the empty recipient inbox after restart, then releases exactly one
+    Welcome after the corrected commit is accepted
   - revoked device status survives restart; revoked devices cannot publish or
     single-claim KeyPackages, batch claims skip revoked owners without consuming
     inventory, revoked devices cannot claim or activate Welcomes, revoked active
@@ -713,6 +727,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_welcome_not_released_before_accepted_commit_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http`: pass
 - `cargo test -p finitechat-cli expire_key_package_lease_command_builds_expiry_request`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
