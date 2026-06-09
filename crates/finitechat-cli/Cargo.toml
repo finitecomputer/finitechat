@@ -1,0 +1,15 @@
+[package]
+name = "finitechat-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "finitechat-darkmatter"
+path = "src/main.rs"
+
+[dependencies]
+finitechat-darkmatter = { path = "../finitechat-darkmatter" }
+serde_json.workspace = true

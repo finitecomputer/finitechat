@@ -1,0 +1,9 @@
+name: finite-platform
+kind: platform
+version: 0.1.0
+description: >
+  Finite Chat platform adapter for Hermes. Connects Hermes to a Finite Chat
+  room through the finitechat hermes JSON bridge.
+author: finitecomputer
+requires_env:
+  - FINITECHAT_ROOM_ID

@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/finitechat-darkmatter",
+  "crates/finitechat-blob",
+  "crates/finitechat-proto",
+  "crates/finitechat-engine",
+  "crates/finitechat-store",
+  "crates/finitechat-sim",
+  "crates/finitechat-mls",
+  "crates/finitechat-client",
+  "crates/finitechat-hermes",
+  "crates/finitechat-server",
+  "crates/finitechat-cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/finitecomputer/finite-chat-darkmatter"
+rust-version = "1.88"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+openmls = { version = "0.8.1", default-features = false }
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"
+secp256k1 = { version = "0.29.1", default-features = false, features = ["std"] }
+cgka-engine = { path = "../darkmatter/crates/cgka-engine" }
+cgka-traits = { path = "../darkmatter/crates/traits" }
+transport-http-server = { path = "../darkmatter/crates/transport-http-server" }
