@@ -4,10 +4,11 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_server::{
-    ClaimKeyPackageRequest, ErrorResponse, GroupSyncRequest, HealthResponse, HttpServerState,
-    InboxSyncRequest, PublishKeyPackageResponse, PublishMessageRequest, http_router,
+use finitechat_http::{
+    ClaimKeyPackageRequest, ErrorResponse, GroupSyncRequest, HealthResponse, InboxSyncRequest,
+    PublishKeyPackageResponse, PublishMessageRequest,
 };
+use finitechat_server::{HttpServerState, http_router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;

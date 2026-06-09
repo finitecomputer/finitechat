@@ -3,14 +3,14 @@ use std::io::Write;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_proto::DeviceRef;
-use finitechat_server::{
+use finitechat_http::{
     AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackageRequest,
     ClaimKeyPackagesRequest, ClaimWelcomesRequest, GetFanoutRequest, GroupSyncRequest,
     HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
     PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
 };
+use finitechat_proto::DeviceRef;
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -621,7 +621,7 @@ fn http_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_server::{
+    use finitechat_http::{
         AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
         ClaimWelcomesRequest, GroupSyncRequest, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,

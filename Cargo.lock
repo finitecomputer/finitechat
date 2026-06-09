@@ -665,8 +665,8 @@ version = "0.1.0"
 dependencies = [
  "cgka-traits",
  "finitechat-darkmatter",
+ "finitechat-http",
  "finitechat-proto",
- "finitechat-server",
  "reqwest",
  "serde",
  "serde_json",
@@ -681,6 +681,7 @@ dependencies = [
  "axum",
  "cgka-traits",
  "finitechat-engine",
+ "finitechat-http",
  "finitechat-mls",
  "finitechat-proto",
  "finitechat-server",
@@ -730,6 +731,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "finitechat-http"
+version = "0.1.0"
+dependencies = [
+ "cgka-traits",
+ "finitechat-proto",
+ "serde",
+ "serde_json",
+ "transport-http-server",
+]
+
+[[package]]
 name = "finitechat-mls"
 version = "0.1.0"
 dependencies = [
@@ -762,6 +774,7 @@ dependencies = [
  "cgka-traits",
  "finitechat-darkmatter",
  "finitechat-engine",
+ "finitechat-http",
  "finitechat-proto",
  "rusqlite",
  "serde",

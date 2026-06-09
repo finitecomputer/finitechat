@@ -8,20 +8,21 @@ use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEventRequest, CommitAccepted, EventAccepted,
     SubmitCommitRequest, WelcomeRecord,
 };
+use finitechat_http::{
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimWelcomesRequest, ErrorResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
+    GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomStatus,
+    HttpKeyPackageClaim, HttpKeyPackageInventory, InboxSyncRequest, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest,
+};
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, RoomStatus,
     StagedWelcomeV1, WelcomeState,
 };
-use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, FiniteAccountRoomCommitProjection, GroupSyncRequest,
-    HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim,
-    HttpKeyPackageInventory, HttpServerState, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest, http_router,
-};
+use finitechat_server::{HttpServerState, http_router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
@@ -580,12 +581,7 @@ async fn sqlite_fanout_room_plan_survives_restart_and_reprepare() {
     );
 
     let app = persistent_app(&db_path);
-    let response = post_json(
-        app,
-        "/fanouts/get",
-        &finitechat_server::GetFanoutRequest { fanout_id },
-    )
-    .await;
+    let response = post_json(app, "/fanouts/get", &GetFanoutRequest { fanout_id }).await;
     assert_eq!(response.status(), StatusCode::OK);
     let fanout: Option<HttpFanoutPlan> = read_json(response).await;
     assert_eq!(
@@ -636,12 +632,7 @@ async fn sqlite_fanout_room_plan_conflict_does_not_overwrite_existing_plan() {
     assert_eq!(error.kind, "fanout_conflict");
 
     let app = persistent_app(&db_path);
-    let response = post_json(
-        app,
-        "/fanouts/get",
-        &finitechat_server::GetFanoutRequest { fanout_id },
-    )
-    .await;
+    let response = post_json(app, "/fanouts/get", &GetFanoutRequest { fanout_id }).await;
     assert_eq!(response.status(), StatusCode::OK);
     let fanout: Option<HttpFanoutPlan> = read_json(response).await;
     assert_eq!(
@@ -947,7 +938,7 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
     let response = post_json(
         app.clone(),
         "/sync/inbox",
-        &finitechat_server::InboxSyncRequest {
+        &InboxSyncRequest {
             recipient: recipient.clone(),
             after_seq: 0,
             limit: 10,
@@ -1764,8 +1755,8 @@ fn fanout_room_plan(
     key_package_id: &str,
     welcome_id: &str,
     commit_idempotency_key: &str,
-) -> finitechat_server::HttpFanoutRoomPlan {
-    finitechat_server::HttpFanoutRoomPlan {
+) -> HttpFanoutRoomPlan {
+    HttpFanoutRoomPlan {
         room_id: group_id(room_id),
         key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
         welcome_id: id(welcome_id),

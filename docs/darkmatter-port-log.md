@@ -132,6 +132,10 @@ Python test distribution:
   ephemeral localhost listener, exercises KeyPackage upload/claim through
   `RuntimeDelivery`, and verifies non-success HTTP statuses remain visible to
   callers.
+- `finitechat-http` now owns the shared HTTP route DTOs. The server imports
+  those types for handlers and re-exports them for compatibility, while
+  `finitechat-client` and `finitechat-cli` depend on the shared crate instead
+  of the server crate for production DTO mapping.
 - Darkmatter's existing Marmot engine and Nostr peeler can produce real Welcome,
   invite Commit, and application messages that pass through the HTTP delivery
   service core and are ingested by recipients.
@@ -221,9 +225,9 @@ Python test distribution:
   close removed intervals, activated Welcome ack marks the pending interval
   active, and requester-aware group sync filters pages while still advancing
   cursors over hidden messages.
-- Moving route DTOs into a shared protocol crate. The current CLI imports the
-  server crate's DTOs directly so the route client cannot drift, but that is
-  not the right long-term crate boundary.
+- Shared HTTP route DTOs. `finitechat-http` keeps request/response wire types
+  reusable by the Axum server, CLI route builder, and runtime HTTP delivery
+  client without making production clients depend on the server crate.
 - Public byte encoding for opaque IDs and payloads. The current CLI maps string
   arguments directly to bytes for local testing.
 
@@ -512,7 +516,11 @@ Runtime delivery checkpoint:
   `finitechat-client::ReqwestHttpRuntimeTransport` can drive that production
   adapter against an actual localhost Axum server, including successful
   KeyPackage upload/claim and a visible `404` server-status error.
+- The route DTO boundary is now shared through `finitechat-http`: production
+  `finitechat-client` and `finitechat-cli` no longer depend on
+  `finitechat-server`; only test harnesses import the server crate for
+  in-process routers and state.
 
-Next meaningful gate: move route DTOs into a shared protocol crate, or close the
-raw-history compatibility caveat by ensuring imported commits carry membership
-deltas before strict member authorization is enabled for every room.
+Next meaningful gate: close the raw-history compatibility caveat by ensuring
+imported commits carry membership deltas before strict member authorization is
+enabled for every room.

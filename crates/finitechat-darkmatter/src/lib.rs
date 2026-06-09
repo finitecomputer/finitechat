@@ -106,6 +106,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client ReqwestHttpRuntimeTransport drives HttpRuntimeDelivery against a live localhost Axum server and preserves non-success HTTP status errors",
         },
         PortFinding {
+            area: "http_route_dto_boundary",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-http owns shared route DTOs; production finitechat-client and finitechat-cli no longer depend on finitechat-server for wire types",
+        },
+        PortFinding {
             area: "http_fanout_plan_checkpoint",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",

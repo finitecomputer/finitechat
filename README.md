@@ -45,6 +45,8 @@ keeps Finite-owned product behavior above that boundary.
 - `crates/finitechat-sim`: executable scenario tests for protocol invariants.
 - `crates/finitechat-hermes`: typed JSON bridge contract for the Hermes
   platform plugin.
+- `crates/finitechat-http`: shared HTTP route DTOs used by the server, CLI, and
+  runtime delivery client.
 - `crates/finitechat-darkmatter`: small adapter layer that records which
   Darkmatter primitives are already usable from this repo.
 - `crates/finitechat-server`: Axum HTTP route layer over Darkmatter's delivery

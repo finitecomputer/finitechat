@@ -10,6 +10,14 @@ use finitechat_engine::{
     KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
     SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
+use finitechat_http::{
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
+    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
+    HttpKeyPackageInventory, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse, PublishMessageRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse,
+};
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
     NostrPublicKey, NostrSecretKey,
@@ -25,14 +33,6 @@ use finitechat_proto::{
     RoomLogEntry, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
     validate_bytes_non_empty, validate_idempotency_key, validate_item_count, validate_mls_group_id,
     validate_room_id, validate_string_bytes,
-};
-use finitechat_server::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
-    HttpKeyPackageInventory, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse, PublishMessageRequest,
-    SaveAccountRoomRequest, SaveAccountRoomResponse,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{

@@ -6,9 +6,8 @@ use cgka_conformance_simulator::{ClientBuilder, HarnessClient, TransportBus};
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{EpochId, GroupId};
-use finitechat_server::{
-    GroupSyncRequest, HttpServerState, InboxSyncRequest, PublishMessageRequest, http_router,
-};
+use finitechat_http::{GroupSyncRequest, InboxSyncRequest, PublishMessageRequest};
+use finitechat_server::{HttpServerState, http_router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
