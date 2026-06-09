@@ -97,6 +97,86 @@ adds Darkmatter-specific coverage. This audit does not prove every baseline test
 body is byte-identical or that every product workflow is now driven only through
 process binaries; those are tracked separately below.
 
+## Process-Level Coverage Decision
+
+Decision: no additional process-level runtime/client binary coverage is needed
+for the current repo shape.
+
+Evidence:
+
+- The only production binaries currently exposed by this workspace are
+  `finitechat-darkmatter-server` and `finitechat-darkmatter`.
+- `finitechat-darkmatter-server` exposes `smoke` and `serve [addr] [--sqlite
+  PATH]`.
+- `finitechat-darkmatter` exposes `compat-report`, `http-smoke`, and
+  route-oriented `http` commands.
+- The process-level smoke builds both binaries, starts the server binary with
+  SQLite, drives the CLI binary through health, publish, sync, exact idempotent
+  replay, conflict rejection, server restart, and persisted sync.
+- Runtime sync and later-device fanout are library/client workflows, not binary
+  entrypoints in this repo. They are covered by client-state tests over
+  `HttpRuntimeDelivery`, deterministic in-process HTTP/failure-injection
+  transports, and `ReqwestHttpRuntimeTransport` against live Axum servers.
+
+Process coverage should grow when the product exposes a daemon/runtime binary
+that owns `run_runtime_sync_tick` or `run_link_fanout_tick`. Until then, adding
+a process wrapper solely for tests would create a new product surface rather
+than prove an existing one.
+
+## Darkmatter-Facing Delta Buckets
+
+Darkmatter source state:
+
+- Branch: `/Users/futurepaul/dev/finite/darkmatter`,
+  `codex/http-delivery-service-spike` at `8449fee`
+- Base: `origin/master` at `add4fc7`
+- Delta: `7` commits, `12` files, about `1,557` insertions over upstream
+  master.
+
+Upstreamable HTTP transport work:
+
+- `crates/transport-http-server`: the prototype single-server HTTP delivery
+  state for opaque Marmot `TransportMessage`s, commit admission by source
+  epoch, bounded group/inbox sync pages, and owner-scoped KeyPackage
+  publication/claim.
+- Workspace registration and conformance-simulator integration for
+  HTTP-delivery compatibility tests.
+- This is upstreamable as a transport-adapter/service crate because it stays
+  below CGKA, does not decrypt payloads, and does not encode Finite application
+  policy.
+
+Upstreamable ordered-delivery profile work:
+
+- `crates/cgka-engine/src/delivery_profile.rs`
+- `EngineBuilder::delivery_profile`
+- The `message_processor` convergence gate that lets a server-admitted next
+  Commit fall through to OpenMLS processing under the explicit
+  `DangerouslyTrustServerOrdering` profile.
+- This needs upstream design review and probably a less alarming public API
+  name. Until Marmot accepts an ordered-delivery profile, this remains the only
+  Darkmatter fork-required item.
+
+Finite-owned adapter/application logic:
+
+- `finitechat-http` shared route DTOs.
+- `finitechat-server` Axum routes, SQLite operation log, idempotency wrappers,
+  Welcome claim/ack state, KeyPackage inventory/batch-claim wrappers, fanout
+  checkpoints, account-room projection, room-membership projection, typed
+  submit-commit, and typed application-event routes.
+- `finitechat-client` runtime HTTP adapter, reqwest transport, local state,
+  link-fanout retry/reprepare, and product-level payload decoding.
+- `finitechat-cli` route client and compatibility report.
+- Product DTOs and application policy for conversations, topics, Hermes bridge,
+  push/unread/command inbox, runtime state, activity, and attachments.
+
+Fork-only requirements beyond the current HTTP spike branch:
+
+- None identified beyond the ordered-delivery profile if Marmot accepts an
+  equivalent upstream design.
+- If Marmot rejects any transport/server-ordering influence on canonical branch
+  processing, Finite would need to keep a fork or carry a compatibility layer
+  with weaker/more expensive convergence behavior.
+
 ## What Works Out Of The Box
 
 - Darkmatter's HTTP delivery service core can sequence opaque group
@@ -607,10 +687,10 @@ Runtime delivery checkpoint:
   `/Users/futurepaul/dev/finite/finitechat` checkout: compare test files and
   test names, then document every intentionally reshaped, added, or still
   missing acceptance case.
-- [ ] Decide whether any runtime/client flow still needs process-level binary
+- [x] Decide whether any runtime/client flow still needs process-level binary
   coverage beyond the current library-level runtime tests, live Axum tests, and
   CLI binary smoke.
-- [ ] Split the Darkmatter-facing delta into maintainable buckets: upstreamable
+- [x] Split the Darkmatter-facing delta into maintainable buckets: upstreamable
   HTTP transport work, upstreamable ordered-delivery profile work, Finite-owned
   adapter/application logic, and fork-only requirements.
 - [ ] Refresh the compatibility report after the next Darkmatter branch update
