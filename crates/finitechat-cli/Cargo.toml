@@ -20,3 +20,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 transport-http-server.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+finitechat-engine = { path = "../finitechat-engine" }
+finitechat-server = { path = "../finitechat-server" }
+tempfile.workspace = true
+tokio.workspace = true

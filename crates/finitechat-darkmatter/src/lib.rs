@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, KeyPackage, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive typed submit-commit plus Welcome claim/ack against a live Axum server",
         },
         PortFinding {
             area: "http_sqlite_operation_log",

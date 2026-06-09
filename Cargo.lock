@@ -663,14 +663,19 @@ dependencies = [
 name = "finitechat-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "cgka-traits",
  "finitechat-darkmatter",
+ "finitechat-engine",
  "finitechat-http",
  "finitechat-proto",
+ "finitechat-server",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "transport-http-server",
 ]
 

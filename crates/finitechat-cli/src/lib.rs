@@ -621,12 +621,18 @@ fn http_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use finitechat_engine::{CommitAccepted, SubmitCommitRequest, WelcomeRecord};
     use finitechat_http::{
         AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
-        ClaimWelcomesRequest, GroupSyncRequest, KeyPackageInventoryRequest,
+        ClaimWelcomesRequest, GroupSyncRequest, HttpClaimedWelcome, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
         PublishMessageRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
     };
+    use finitechat_proto::{
+        FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
+        WelcomeState,
+    };
+    use transport_http_server::HttpSyncPage;
 
     #[test]
     fn publish_group_command_builds_route_dto() {
@@ -965,8 +971,271 @@ mod tests {
     }
 
     #[test]
+    fn live_cli_submit_commit_claim_and_ack_welcome_over_http_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server_db = dir.path().join("cli-live-submit.sqlite3");
+        let server_url = spawn_live_cli_server(&server_db);
+        let creator = DeviceRef::new("alice", "alice-laptop");
+        let phone = DeviceRef::new("alice", "alice-phone");
+        let room_id = "room-cli-live-submit";
+        let mls_group_id = "mls-cli-live-submit";
+        let welcome_id = "welcome-cli-live-phone";
+        let submit = submit_add_device_request(
+            room_id,
+            mls_group_id,
+            &creator,
+            &phone,
+            welcome_id,
+            "commit-cli-live-idempotency",
+        );
+        let submit_json = serde_json::to_string(&submit).expect("submit json");
+
+        let bootstrap = run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "account-room-bootstrap",
+            "--room-id",
+            room_id,
+            "--mls-group-id",
+            mls_group_id,
+            "--account-id",
+            &creator.account_id,
+            "--device-id",
+            &creator.device_id,
+        ]);
+        assert_eq!(bootstrap["bootstrapped"], true);
+
+        let accepted: CommitAccepted = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "submit-commit",
+            "--request-json",
+            &submit_json,
+        ]))
+        .expect("commit accepted");
+        let expected_message_id = submit.envelope.message_id().expect("submit message id");
+        assert_eq!(accepted.seq, 1);
+        assert_eq!(accepted.message_id, expected_message_id);
+        assert_eq!(accepted.released_welcomes, vec![welcome_id.to_owned()]);
+
+        let replayed: CommitAccepted = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "submit-commit",
+            "--request-json",
+            &submit_json,
+        ]))
+        .expect("commit replay");
+        assert_eq!(replayed, accepted);
+
+        let group_page: HttpSyncPage = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "sync-group",
+            "--group-id",
+            room_id,
+            "--limit",
+            "10",
+        ]))
+        .expect("group sync");
+        assert_eq!(group_page.entries.len(), 1);
+        assert_eq!(group_page.entries[0].seq, accepted.seq);
+        assert_eq!(
+            group_page.entries[0].message.id.as_slice(),
+            accepted.message_id.as_bytes()
+        );
+
+        let recipient = member_for_device(&phone);
+        let claimed: Vec<HttpClaimedWelcome> = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "claim-welcomes",
+            "--recipient",
+            std::str::from_utf8(recipient.as_slice()).expect("recipient json"),
+            "--limit",
+            "10",
+        ]))
+        .expect("claimed welcomes");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].seq, 1);
+        assert_eq!(claimed[0].message.id.as_slice(), welcome_id.as_bytes());
+        let welcome: WelcomeRecord =
+            serde_json::from_slice(&claimed[0].message.payload).expect("welcome record");
+        assert_eq!(welcome.welcome_id, welcome_id);
+        assert_eq!(welcome.commit_seq, accepted.seq);
+        assert_eq!(welcome.recipient, phone);
+        assert_eq!(welcome.state, WelcomeState::Released);
+
+        let duplicate_claim: Vec<HttpClaimedWelcome> = serde_json::from_value(run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "claim-welcomes",
+            "--recipient",
+            std::str::from_utf8(recipient.as_slice()).expect("recipient json"),
+            "--limit",
+            "10",
+        ]))
+        .expect("duplicate claim");
+        assert!(duplicate_claim.is_empty());
+
+        let acked = run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "ack-welcome",
+            "--message-id",
+            welcome_id,
+            "--activated",
+            "true",
+        ]);
+        assert_eq!(acked["acked"], true);
+
+        let acked_again = run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "ack-welcome",
+            "--message-id",
+            welcome_id,
+            "--activated",
+            "true",
+        ]);
+        assert_eq!(acked_again["acked"], true);
+
+        let conflict = run(
+            [
+                "http",
+                "--server",
+                &server_url,
+                "ack-welcome",
+                "--message-id",
+                welcome_id,
+                "--activated",
+                "false",
+            ],
+            &mut Vec::new(),
+        )
+        .expect_err("conflicting ack fails");
+        assert!(matches!(
+            conflict,
+            CliError::Server {
+                status: reqwest::StatusCode::CONFLICT,
+                ..
+            }
+        ));
+
+        let listed = run_cli_json([
+            "http",
+            "--server",
+            &server_url,
+            "account-rooms-list",
+            "--account-id",
+            "alice",
+            "--limit",
+            "10",
+        ]);
+        assert_eq!(listed["rooms"][0]["devices"][1]["active"], true);
+    }
+
+    #[test]
     fn unknown_option_is_usage_error() {
         let error = prepare_http_request(["health", "--wat"]).expect_err("usage error");
         assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    fn run_cli_json<const N: usize>(args: [&str; N]) -> Value {
+        let mut output = Vec::new();
+        run(args, &mut output).expect("cli run");
+        serde_json::from_slice(&output).expect("cli json output")
+    }
+
+    fn spawn_live_cli_server(path: &std::path::Path) -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = finitechat_server::http_router(
+            finitechat_server::HttpServerState::from_sqlite_path(path).unwrap(),
+        );
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let server_url = format!("http://{addr}");
+        wait_for_live_cli_server(&server_url);
+        server_url
+    }
+
+    fn wait_for_live_cli_server(server_url: &str) {
+        let health_url = format!("{}/health", server_url.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(&health_url)
+                .send()
+                .map(|response| response.status().is_success())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("live CLI test server did not become healthy at {health_url}");
+    }
+
+    fn member_for_device(device: &DeviceRef) -> MemberId {
+        MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+    }
+
+    fn submit_add_device_request(
+        room_id: &str,
+        mls_group_id: &str,
+        sender: &DeviceRef,
+        added: &DeviceRef,
+        welcome_id: &str,
+        idempotency_key: &str,
+    ) -> SubmitCommitRequest {
+        let envelope = FiniteEnvelope {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            epoch: 0,
+            sender: sender.clone(),
+            kind: LogEntryKind::Commit,
+            payload: b"commit-add-device".to_vec(),
+        };
+        let commit_message_id = envelope.message_id().expect("commit message id");
+        SubmitCommitRequest {
+            room_id: room_id.to_owned(),
+            sender: sender.clone(),
+            expected_epoch: 0,
+            envelope,
+            membership_delta: MembershipDeltaV1 {
+                base_epoch: 0,
+                post_commit_epoch: 1,
+                commit_message_id,
+                adds: vec![MembershipAddV1 {
+                    device: added.clone(),
+                    key_package_id: "key-package-add-device".to_owned(),
+                    key_package_ref: "key-package-ref-add-device".to_owned(),
+                    key_package_hash: "key-package-hash-add-device".to_owned(),
+                    welcome_id: welcome_id.to_owned(),
+                }],
+                removes: Vec::new(),
+            },
+            staged_welcomes: vec![StagedWelcomeV1 {
+                welcome_id: welcome_id.to_owned(),
+                welcome_payload: b"welcome-add-device".to_vec(),
+                ratchet_tree_payload: b"ratchet-tree-add-device".to_vec(),
+            }],
+            idempotency_key: idempotency_key.to_owned(),
+        }
     }
 }

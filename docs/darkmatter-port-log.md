@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `342`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `343`
 - Python Hermes adapter tests: `7`
 
 Copied/application Rust test distribution:
@@ -41,7 +41,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 
 | File | Count |
 | --- | ---: |
-| `crates/finitechat-cli/src/lib.rs` | 13 |
+| `crates/finitechat-cli/src/lib.rs` | 14 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
 | `crates/finitechat-server/tests/http_persistence.rs` | 20 |
@@ -288,14 +288,16 @@ workspace members:
 - `finitechat-darkmatter` compiles against the local Darkmatter branch and
   proves the HTTP delivery core orders one admitted Commit followed by one app
   message.
-- `finitechat-cli` exposes `compat-report` and `http-smoke` commands.
+- `finitechat-cli` exposes `compat-report`, `http-smoke`, and route-specific
+  HTTP commands.
 - `finitechat-server` exposes in-process HTTP routes over the in-memory
   Darkmatter delivery core and keeps `serve` as an explicit binary mode. It can
   optionally rebuild state from a SQLite operation log with
   `serve [addr] --sqlite PATH`. Auth and production server behavior remain
   unported.
 - `finitechat-cli` can now call the HTTP delivery routes for health, group
-  publish/sync, inbox publish/sync, KeyPackage publish, and KeyPackage claim.
+  publish/sync, inbox publish/sync, typed submit-commit, KeyPackage publish and
+  claim, fanout checkpoints, account-room projections, and Welcome claim/ack.
 
 Verified after adding the Darkmatter dependency graph:
 
@@ -406,12 +408,12 @@ Important test caveat:
   Chat implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
   adapter smoke test plus the HTTP route, persistence, real-engine route, and
-  KeyPackage/Welcome/room-pull runtime-delivery tests above.
+  KeyPackage/Welcome/room-pull runtime-delivery and live CLI tests above.
 
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `13`
+- New CLI tests added: `14`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
@@ -427,6 +429,11 @@ Additional CLI checkpoint:
   - account-room bootstrap, save, and list commands build the route DTOs
   - Welcome claim and ack build the route DTOs
   - unknown CLI flags fail as usage errors
+- Automated live-server CLI coverage now drives account-room bootstrap,
+  typed `/commits`, idempotent submit replay, group sync, Welcome claim,
+  duplicate claim hiding, idempotent activated ack, conflicting failed ack
+  rejection, and account-room activation through `finitechat_cli::run`
+  against a localhost Axum server.
 - Live localhost smoke verified with a temporary server on `127.0.0.1:18787`:
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 health`
   - `finitechat-darkmatter http --server http://127.0.0.1:18787 publish-group --group-id cli-room --transport-group-id cli-transport --message-id cli-commit-1 --payload commit-bytes --commit-epoch 1`
@@ -536,5 +543,6 @@ Runtime delivery checkpoint:
   `finitechat-server`; only test harnesses import the server crate for
   in-process routers and state.
 
-Next meaningful gate: run the CLI against a live server for the typed
-submit-commit and Welcome claim/ack surfaces, not just publish/sync smoke.
+Next meaningful gate: automate the remaining manually documented live CLI smoke
+paths for persistent publish/sync, idempotency conflict, batch KeyPackage
+claim, and fanout checkpoints.
