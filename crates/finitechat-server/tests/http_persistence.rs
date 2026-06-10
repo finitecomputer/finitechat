@@ -27,10 +27,11 @@ use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
-    DeviceRef, DurableAppEventKind, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
-    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MembershipAddV1, MembershipDeltaV1,
-    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
+    ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
+    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus,
+    StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -3409,6 +3410,174 @@ async fn sqlite_application_delivery_policy_matrix_survives_restart_over_http() 
         assert!(!effect.delivery_policy.creates_unread());
         assert!(!effect.delivery_policy.creates_command_inbox_work());
     }
+}
+
+#[tokio::test]
+async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-runtime-command-policy".to_owned();
+    let mls_group_id = "mls-runtime-command-policy".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let status_refresh_policy = ApplicationDeliveryPolicy {
+        push: PushPolicy::Never,
+        unread: UnreadPolicy::Never,
+        command_inbox: CommandInboxPolicy::Create,
+    };
+    let status_refresh = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"runtime.command.request","command":"finitecomputer.runtime.status.refresh"}"#,
+        "runtime-status-refresh",
+    );
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: status_refresh,
+            delivery_policy: status_refresh_policy,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status_refresh: EventAccepted = read_json(response).await;
+    assert_eq!(status_refresh.seq, 1);
+
+    let first_command = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","body":{"attempt":1}}"#,
+        "runtime-command-visible-id-1",
+    );
+    let duplicate_message_id = first_command
+        .envelope
+        .message_id()
+        .expect("duplicate message id");
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: first_command.clone(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_command_accepted: EventAccepted = read_json(response).await;
+    assert_eq!(first_command_accepted.seq, 2);
+
+    let second_command = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","body":{"attempt":2}}"#,
+        "runtime-command-visible-id-2",
+    );
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: second_command,
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let second_command_accepted: EventAccepted = read_json(response).await;
+    assert_eq!(second_command_accepted.seq, 3);
+    assert_ne!(
+        first_command_accepted.message_id,
+        second_command_accepted.message_id
+    );
+
+    let duplicate_command = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"runtime.command.request","request_id":"restart_1","body":{"attempt":1}}"#,
+        "runtime-command-duplicate-idempotency",
+    );
+    assert_eq!(
+        duplicate_command.envelope.message_id().expect("message id"),
+        duplicate_message_id
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: duplicate_command,
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "duplicate_message_id");
+
+    assert_eq!(
+        application_effect_counts(&app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 2,
+            unread: 0,
+            command_inbox: 3,
+        }
+    );
+    let status_effect = application_effect(&app, &status_refresh.message_id)
+        .await
+        .expect("status refresh effect");
+    assert!(!status_effect.delivery_policy.creates_push());
+    assert!(!status_effect.delivery_policy.creates_unread());
+    assert!(status_effect.delivery_policy.creates_command_inbox_work());
+
+    for message_id in [
+        first_command_accepted.message_id,
+        second_command_accepted.message_id,
+    ] {
+        let effect = application_effect(&app, &message_id)
+            .await
+            .expect("runtime command effect");
+        assert!(effect.delivery_policy.creates_push());
+        assert!(!effect.delivery_policy.creates_unread());
+        assert!(effect.delivery_policy.creates_command_inbox_work());
+    }
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.next_after_seq, 3);
 }
 
 #[tokio::test]

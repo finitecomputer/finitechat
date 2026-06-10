@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_application_delivery_effect_projection",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server /application-events records caller-supplied ApplicationDeliveryPolicy as delivery-effect projection state in the same SQLite transaction as the ordered event append, preserves push/unread/command-inbox counts and non-notifying event policies after restart, rejects same-event replays with conflicting policy, and rolls back trigger-injected write failures without decrypting payloads",
+            evidence: "finitechat-server /application-events records caller-supplied ApplicationDeliveryPolicy as delivery-effect projection state in the same SQLite transaction as the ordered event append, preserves push/unread/command-inbox counts, non-notifying event policies, custom no-push command policies, and opaque runtime command request ids after restart, rejects same-event replays with conflicting policy, and rolls back trigger-injected write failures without decrypting payloads",
         },
         PortFinding {
             area: "http_cli_route_client",
