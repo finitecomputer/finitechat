@@ -370,6 +370,14 @@ Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
 coverage. The remaining implementation work is no longer an obvious missing
 core protocol bucket; it is final verification against the current source.
 
+Final verification checkpoint:
+
+- Parsed parity after the mixed HTTP fuzzer: baseline `294` tests (`287` Rust,
+  `7` Python), port `405` tests (`397` Rust, `8` Python), `0` missing
+  baseline test names, `111` port-only test names.
+- `cargo test --workspace`: pass
+- `python3 -m unittest discover -v`: pass (`8` Python tests)
+
 ## Darkmatter-Facing Delta Buckets
 
 Darkmatter source state:
@@ -1372,5 +1380,5 @@ Watch list for the remaining gate:
   reopen invariant not already covered by the Darkmatter HTTP operation log.
 - [x] Add a mixed HTTP operation fuzzer as a hardening
   successor to `sqlite_operation_fuzz_matches_in_memory_delivery_service`.
-- [ ] Refresh the parity counts and run the final targeted/full test set after
+- [x] Refresh the parity counts and run the final targeted/full test set after
   the remaining classifications are complete.
