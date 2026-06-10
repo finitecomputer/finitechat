@@ -281,9 +281,9 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "Typed bootstrap/commit/event flows now have server-owned room-membership projection, filtered sync, pending-send rejection, Welcome ack activation, and rejection of raw plain commits that would otherwise weaken typed room membership",
         },
         PortFinding {
-            area: "ordered_delivery_profile",
-            status: PortStatus::RequiresDarkmatterFork,
-            evidence: "DangerouslyTrustServerOrdering is currently branch-local until Marmot accepts an ordered-delivery profile",
+            area: "http_delivery_conformance_suite",
+            status: PortStatus::WorksOutOfBox,
+            evidence: "transport-http-server exports the HttpDelivery contract plus an executable conformance suite; the finitechat durable SQLite-backed server runs the same checks, including restart survival",
         },
     ]
 }
@@ -374,7 +374,8 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .any(|finding| finding.status == PortStatus::RequiresDarkmatterFork)
+                .all(|finding| finding.status != PortStatus::RequiresDarkmatterFork),
+            "the upstream branch needs no engine changes; nothing requires a Darkmatter fork"
         );
     }
 }

@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_engine::{
+use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, DeviceMembership,
     EphemeralActivityAccepted, EphemeralActivityRecord, EventAccepted, MembershipInterval,
@@ -161,7 +161,9 @@ impl HttpServerState {
         Ok(result)
     }
 
-    fn publish_message(
+    /// Raw delivery-contract publish, also used by the upstream
+    /// `transport-http-server` conformance suite against this durable server.
+    pub fn publish_message(
         &self,
         request: PublishMessageRequest,
     ) -> Result<HttpPublishReceipt, ServerHttpError> {
@@ -315,7 +317,7 @@ impl HttpServerState {
         Ok(())
     }
 
-    fn publish_key_package(
+    pub fn publish_key_package(
         &self,
         publication: HttpKeyPackagePublication,
     ) -> Result<PublishKeyPackageResponse, ServerHttpError> {
@@ -336,7 +338,7 @@ impl HttpServerState {
         Ok(PublishKeyPackageResponse { published: true })
     }
 
-    fn claim_key_package(
+    pub fn claim_key_package(
         &self,
         request: ClaimKeyPackageRequest,
     ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
@@ -2097,7 +2099,7 @@ impl HttpServerState {
             }
         }
 
-        let route_key = finitechat_engine::ephemeral_activity_route_key(
+        let route_key = finitechat_proto::ephemeral_activity_route_key(
             &request.room_id,
             request.conversation_id.as_deref(),
             &request.sender,
@@ -2323,7 +2325,17 @@ impl HttpServerState {
         Ok(())
     }
 
-    fn sync_group(&self, request: GroupSyncRequest) -> Result<HttpSyncPage, ServerHttpError> {
+    pub fn sync_inbox(
+        &self,
+        recipient: &MemberId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<HttpSyncPage, ServerHttpError> {
+        let service = self.service.lock().expect("HTTP delivery service mutex");
+        Ok(service.sync_inbox(recipient, after_seq, limit)?)
+    }
+
+    pub fn sync_group(&self, request: GroupSyncRequest) -> Result<HttpSyncPage, ServerHttpError> {
         if request.limit == 0 || request.limit > MAX_HTTP_SYNC_PAGE_ENTRIES {
             return Err(ServerHttpError::InvalidGroupSyncLimit {
                 actual: request.limit,
@@ -2514,8 +2526,7 @@ async fn sync_inbox(
     State(state): State<HttpServerState>,
     Json(request): Json<InboxSyncRequest>,
 ) -> Result<Json<HttpSyncPage>, ServerHttpError> {
-    let service = state.service.lock().expect("HTTP delivery service mutex");
-    let page = service.sync_inbox(&request.recipient, request.after_seq, request.limit)?;
+    let page = state.sync_inbox(&request.recipient, request.after_seq, request.limit)?;
     Ok(Json(page))
 }
 

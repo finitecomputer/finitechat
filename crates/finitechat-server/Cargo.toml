@@ -14,7 +14,6 @@ path = "src/main.rs"
 axum.workspace = true
 cgka-traits.workspace = true
 finitechat-darkmatter = { path = "../finitechat-darkmatter" }
-finitechat-engine = { path = "../finitechat-engine" }
 finitechat-http = { path = "../finitechat-http" }
 finitechat-proto = { path = "../finitechat-proto" }
 rusqlite.workspace = true

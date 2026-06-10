@@ -666,7 +666,6 @@ dependencies = [
  "axum",
  "cgka-traits",
  "finitechat-darkmatter",
- "finitechat-engine",
  "finitechat-http",
  "finitechat-proto",
  "finitechat-server",
@@ -685,11 +684,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "cgka-traits",
- "finitechat-engine",
  "finitechat-http",
  "finitechat-mls",
  "finitechat-proto",
  "finitechat-server",
+ "finitechat-testkit",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
@@ -712,17 +711,6 @@ dependencies = [
  "cgka-traits",
  "serde",
  "transport-http-server",
-]
-
-[[package]]
-name = "finitechat-engine"
-version = "0.1.0"
-dependencies = [
- "finitechat-proto",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
 ]
 
 [[package]]
@@ -778,7 +766,6 @@ dependencies = [
  "cgka-conformance-simulator",
  "cgka-traits",
  "finitechat-darkmatter",
- "finitechat-engine",
  "finitechat-http",
  "finitechat-proto",
  "rusqlite",
@@ -792,25 +779,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "finitechat-sim"
+name = "finitechat-testkit"
 version = "0.1.0"
 dependencies = [
- "finitechat-blob",
- "finitechat-engine",
  "finitechat-proto",
- "serde_json",
-]
-
-[[package]]
-name = "finitechat-store"
-version = "0.1.0"
-dependencies = [
- "finitechat-engine",
- "finitechat-proto",
- "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
+ "sha2",
  "thiserror",
 ]
 

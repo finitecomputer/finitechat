@@ -4,9 +4,9 @@ use cgka_traits::{
     EpochId as HttpEpochId, GroupId as HttpGroupId, MemberId as HttpMemberId,
     MessageId as HttpMessageId,
 };
-use finitechat_engine::{
+use finitechat_proto::{
     AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
-    CreateDirectRoomRequest, CreateRoomRequest, DeliveryService, EngineError, EventAccepted,
+    CreateDirectRoomRequest, CreateRoomRequest, EngineError, EventAccepted,
     KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
     SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
@@ -3258,58 +3258,6 @@ fn http_transport_group_id_for_room(room_id: &str) -> Vec<u8> {
     room_id.as_bytes().to_vec()
 }
 
-impl RuntimeDelivery for DeliveryService {
-    type Error = EngineError;
-
-    fn key_package_inventory(
-        &mut self,
-        owner: &DeviceRef,
-    ) -> Result<KeyPackageInventory, Self::Error> {
-        DeliveryService::key_package_inventory(self, owner)
-    }
-
-    fn upload_key_package(&mut self, request: UploadKeyPackageRequest) -> Result<(), Self::Error> {
-        DeliveryService::upload_key_package(self, request)
-    }
-
-    fn claim_key_package_for_device(
-        &mut self,
-        owner: &DeviceRef,
-    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error> {
-        DeliveryService::claim_key_package_for_device(self, owner)
-    }
-
-    fn submit_commit(
-        &mut self,
-        request: SubmitCommitRequest,
-    ) -> Result<CommitAccepted, Self::Error> {
-        DeliveryService::submit_commit(self, request)
-    }
-
-    fn list_account_rooms(
-        &mut self,
-        request: ListAccountRoomsRequest,
-    ) -> Result<ListAccountRoomsPage, Self::Error> {
-        DeliveryService::list_account_rooms(self, request)
-    }
-
-    fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error> {
-        DeliveryService::claim_welcomes(self, device)
-    }
-
-    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
-        DeliveryService::ack_welcome(self, welcome_id, activated)
-    }
-
-    fn sync_events(
-        &mut self,
-        room_id: &str,
-        requester: &DeviceRef,
-        after_seq: u64,
-    ) -> Result<SyncEventsPage, Self::Error> {
-        DeliveryService::sync_events(self, room_id, requester, after_seq)
-    }
-}
 
 pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
     store: &mut SqliteClientStore,

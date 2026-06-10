@@ -1382,3 +1382,64 @@ Watch list for the remaining gate:
   successor to `sqlite_operation_fuzz_matches_in_memory_delivery_service`.
 - [x] Refresh the parity counts and run the final targeted/full test set after
   the remaining classifications are complete.
+
+## Upstream Reshape And Legacy Deletion Checkpoint
+
+Darkmatter branch reshape (`../darkmatter`, branch `http-delivery-upstream`):
+
+- The upstream PR branch was rebuilt from `origin/master` with two commits and
+  zero `cgka-engine` changes: `transport-http-server` (contract trait,
+  in-memory reference implementation, exported `conformance` module with a
+  restart hook) and the conformance-simulator HTTP compatibility scenarios.
+- `DeliveryProfile::DangerouslyTrustServerOrdering` was dropped from the
+  upstream branch entirely. The real-engine compatibility test
+  (`http_delivery_server_carries_real_marmot_invite_and_app_messages`) passes
+  on the default distributed profile, so server-ordered HTTP delivery needs no
+  engine fork. The profile remains a possible future upstream conversation if
+  Marmot-engine clients ever need to skip convergence on server-admitted
+  commits; finitechat's own client never used it.
+- The old spike branch `codex/http-delivery-service-spike` is preserved
+  untouched for reference.
+
+Conformance proof in this repo:
+
+- `crates/finitechat-server/tests/http_conformance.rs` adapts the durable
+  SQLite-backed `HttpServerState` to the upstream `HttpDelivery` contract and
+  passes `conformance::check_all`, including the restart-survival checks the
+  in-memory reference skips. The five raw contract methods on
+  `HttpServerState` are now `pub` for this purpose.
+- `finitechat-darkmatter` compat report now has zero `RequiresDarkmatterFork`
+  findings; `cargo run -p finitechat-cli -- compat-report` confirms.
+
+Legacy implementation deletion:
+
+- Deleted crates: `finitechat-engine` (old in-memory reducer),
+  `finitechat-store` (old SQLite reducer store), `finitechat-sim` (fake-MLS
+  scenario/survival/boundary suites). The Darkmatter HTTP route, persistence,
+  runtime-delivery, and live-server tests are now the only delivery-service
+  acceptance surface, per the preserved fake/sim and SQLite reducer audits
+  above.
+- Shared runtime DTOs and pure helpers (SubmitCommitRequest, WelcomeRecord,
+  AccountRoomRecord, RoomSyncProjection, EngineError, staged_welcomes_by_id,
+  lease_token_for, direct_room_key, validate_activity_expiry,
+  ephemeral_activity_route_key, envelope, and friends) moved to
+  `finitechat_proto::runtime` and are re-exported from the proto crate root.
+  Production crates no longer reference the old engine.
+- The old `DeliveryService` survives only as `finitechat-testkit`, a
+  dev-dependency of `finitechat-client`, where it acts as an MLS message
+  factory for 13 runtime HTTP tests (real devices author commits/Welcomes that
+  are then replayed through the Darkmatter HTTP path). Its delete condition is
+  recorded in `docs/technical-debt-ledger.md`.
+- 30 legacy client tests that proved behavior only through the old delivery
+  service were deleted; every family has a Darkmatter HTTP equivalent recorded
+  in the audits above. The `client_state.rs` suite now holds 21 tests, all
+  exercising the HTTP path or client-local state.
+
+Verification after the reshape:
+
+- `cargo test --workspace`: pass (222 tests)
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass
+- `python3 -m unittest discover -s tests -p '*test*.py'`: pass (8 tests)
+- Darkmatter branch: `cargo test -p transport-http-server -p
+  cgka-conformance-simulator --test http_delivery_compatibility` and focused
+  clippy: pass

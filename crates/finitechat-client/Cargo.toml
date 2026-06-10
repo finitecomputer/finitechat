@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 cgka-traits.workspace = true
-finitechat-engine = { path = "../finitechat-engine" }
 finitechat-http = { path = "../finitechat-http" }
 finitechat-mls = { path = "../finitechat-mls" }
 finitechat-proto = { path = "../finitechat-proto" }
@@ -23,6 +22,7 @@ thiserror.workspace = true
 transport-http-server.workspace = true
 
 [dev-dependencies]
+finitechat-testkit = { path = "../finitechat-testkit" }
 axum.workspace = true
 finitechat-server = { path = "../finitechat-server" }
 tempfile.workspace = true

@@ -894,7 +894,7 @@ fn http_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_engine::{
+    use finitechat_proto::{
         CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
     };
     use finitechat_http::{

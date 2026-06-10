@@ -5,7 +5,7 @@ use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_engine::{
+use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
     EventAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
@@ -4722,7 +4722,7 @@ async fn sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequenc
     assert_eq!(accepted.cached_events_for_route, 1);
     assert_eq!(
         accepted.route_key,
-        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-activity"), &alice)
+        finitechat_proto::ephemeral_activity_route_key(&room_id, Some("topic-activity"), &alice)
     );
 
     let response = post_json(
@@ -4786,7 +4786,7 @@ async fn sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let topic_1_key =
-        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-1"), &alice);
+        finitechat_proto::ephemeral_activity_route_key(&room_id, Some("topic-1"), &alice);
     for (index, payload) in [
         br#"{"kind":"typing","activity_id":"same-id"}"#.as_slice(),
         br#"{"kind":"working","activity_id":"same-id"}"#.as_slice(),
@@ -4821,7 +4821,7 @@ async fn sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http() {
     let accepted: EphemeralActivityAccepted = read_json(response).await;
     assert_eq!(
         accepted.route_key,
-        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-2"), &alice)
+        finitechat_proto::ephemeral_activity_route_key(&room_id, Some("topic-2"), &alice)
     );
     assert_eq!(accepted.cached_events_for_route, 1);
 
@@ -4832,7 +4832,7 @@ async fn sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http() {
     let accepted: EphemeralActivityAccepted = read_json(response).await;
     assert_eq!(
         accepted.route_key,
-        finitechat_engine::ephemeral_activity_route_key(&room_id, None, &alice)
+        finitechat_proto::ephemeral_activity_route_key(&room_id, None, &alice)
     );
     assert_eq!(accepted.cached_events_for_route, 1);
 
