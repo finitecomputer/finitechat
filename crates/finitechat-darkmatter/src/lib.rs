@@ -223,7 +223,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_invalid_commit_repair_state",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",
+            evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, including removed reporters at their removal seq, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",
         },
         PortFinding {
             area: "http_submit_commit_route",

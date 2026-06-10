@@ -3266,7 +3266,7 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
     assert_eq!(error.kind, "sender_not_active");
 
     let response = post_json(
-        app,
+        app.clone(),
         "/sync/group",
         &GroupSyncRequest {
             group_id: group_id(&room_id),
@@ -3281,6 +3281,38 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
     assert!(hidden_after_removal.entries.is_empty());
     assert_eq!(hidden_after_removal.next_after_seq, after_removal.seq);
     assert!(!hidden_after_removal.has_more);
+
+    let response = post_json(
+        app.clone(),
+        "/rooms/report-invalid-commit",
+        &ReportInvalidCommitRequest {
+            room_id: room_id.clone(),
+            reporter: bob.clone(),
+            offending_seq: removal.seq,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reported: ReportInvalidCommitResponse = read_json(response).await;
+    assert!(reported.reported);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            2,
+            b"blocked after repair",
+            "alice-after-removal-repair-idempotency",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "room_not_open");
 }
 
 #[tokio::test]

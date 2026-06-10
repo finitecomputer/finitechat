@@ -216,8 +216,9 @@ commits that try to add a revoked device.
 
 Current room-membership removal progress: the HTTP server now persists removal
 intervals across restart. A removed device can sync the commit that removes it,
-cannot send later typed events or commits, and later requester-filtered sync
-advances over hidden post-removal messages without exposing them.
+can report that removal commit as invalid, cannot send later typed events or
+commits, and later requester-filtered sync advances over hidden post-removal
+messages without exposing them.
 
 Current account-device cap progress: typed HTTP `/commits` now enforce the
 per-account device cap for a room before durable append. Filling a room to
@@ -852,8 +853,9 @@ Additional HTTP route checkpoint:
     `has_more` when another entry remains, and continues from the returned
     cursor after SQLite restart
   - removed-device membership intervals survive restart; removed devices can
-    sync through their removal commit, cannot send later typed events or
-    commits, and advance cursors over hidden post-removal messages
+    sync through their removal commit, report that removal commit as invalid,
+    cannot send later typed events or commits, and advance cursors over hidden
+    post-removal messages
   - account device cap enforcement survives SQLite reload; filling a typed
     room to `MAX_ACCOUNT_DEVICES_PER_ROOM` succeeds, the next same-account add
     fails before durable append, no overflow Welcome is released, the
