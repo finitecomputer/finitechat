@@ -258,6 +258,20 @@ pub struct BootstrapAccountRoomResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDirectRoomRequest {
+    pub room_id: String,
+    pub mls_group_id: String,
+    pub creator: DeviceRef,
+    pub other_account_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateDirectRoomResponse {
+    pub room_id: String,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListAccountRoomDirectoryRequest {
     pub account_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

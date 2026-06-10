@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `373`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `374`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 40 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 41 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -76,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `381` (`373` Rust, `8` Python)
+- Port parsed tests: `382` (`374` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `87`
+- Port-only test names: `88`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +90,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 46 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 47 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -130,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `87` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `88` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -150,7 +150,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 46 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 47 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -166,7 +166,7 @@ Highest-risk preserved fake/store proof checkpoints ported to HTTP so far:
 Current P0 progress: typed HTTP `/commits` now proves successful
 lost-response replay after restart, replayed rejection after a same-epoch loser
 is retried after restart, repair after legacy commit publish/idempotency rows
-survive without finite projection rows, and SQLite crash-matrix rollback/retry
+survive without adapter projection rows, and SQLite crash-matrix rollback/retry
 convergence across commit delivery, commit idempotency, Welcome delivery,
 Welcome idempotency, account-room projection, room-membership projection, and
 KeyPackage consumed-projection write points. The HTTP server also has an
@@ -177,21 +177,21 @@ fake/in-memory reducer and SQLite store surface that still needs to be audited
 for route/runtime equivalents.
 
 Current KeyPackage progress: typed HTTP `/commits` now rejects unclaimed
-KeyPackages and stale Finite KeyPackage metadata before side effects, consumes
-claimed packages atomically with accepted commits, rebuilds consumed state after
+KeyPackages and stale KeyPackage metadata before side effects, consumes claimed
+packages atomically with accepted commits, rebuilds consumed state after
 restart, rejects consumed-package reuse, and maps HTTP claimed inventory back to
-Finite leased counts in the runtime adapter. The HTTP wrapper now owns
-Finite-style KeyPackage lease state above Marmot's opaque package bytes: it can
-expire a claimed lease back to available, persist that across restart, reclaim
-the same package, and reject attempts to expire consumed packages.
+leased counts in the runtime adapter. The HTTP wrapper now owns KeyPackage
+lease state above Marmot's opaque package bytes: it can expire a claimed lease
+back to available, persist that across restart, reclaim the same package, and
+reject attempts to expire consumed packages.
 
 Current Welcome-release progress: typed HTTP `/commits` now has a focused
 restart proof that bad commit metadata does not release a Welcome, the absence
 of that Welcome survives server restart, and the corrected commit releases
 exactly one Welcome only after it is accepted.
 
-Current revocation progress: the HTTP server now persists revoked finite
-`DeviceRef`s, rebuilds that state after restart, rejects revoked KeyPackage
+Current revocation progress: the HTTP server now persists revoked `DeviceRef`s,
+rebuilds that state after restart, rejects revoked KeyPackage
 publish and single-owner claim, skips revoked owners in batch KeyPackage claim
 without consuming inventory, rejects revoked Welcome claim and activated ack,
 rejects revoked typed application-event and commit senders, and rejects typed
@@ -202,17 +202,22 @@ intervals across restart. A removed device can sync the commit that removes it,
 cannot send later typed events or commits, and later requester-filtered sync
 advances over hidden post-removal messages without exposing them.
 
-Current account-device cap progress: typed HTTP `/commits` now enforce
-Finite's per-account device cap for a room before durable append. Filling a
-room to `MAX_ACCOUNT_DEVICES_PER_ROOM` succeeds, the next same-account add is
-rejected, and SQLite restart proves there is no overflow commit, no released
-Welcome, no account-room projection leak, and the overflow KeyPackage remains
-claimed.
+Current account-device cap progress: typed HTTP `/commits` now enforce the
+per-account device cap for a room before durable append. Filling a room to
+`MAX_ACCOUNT_DEVICES_PER_ROOM` succeeds, the next same-account add is rejected,
+and SQLite restart proves there is no overflow commit, no released Welcome, no
+account-room projection leak, and the overflow KeyPackage remains claimed.
 
 Current duplicate-device add progress: typed HTTP `/commits` now reject a
 current or pending device being added again before durable append. The retry
 KeyPackage remains claimed, only the original Welcome is visible, and the
 account-room projection still contains one pending device after SQLite restart.
+
+Current direct-room progress: the HTTP server now exposes direct-room
+create-or-get as wrapper-owned room-membership projection state. The sorted
+account pair survives SQLite restart, reversed account order returns the
+existing room, and typed `/commits` reject third-account adds before delivery
+append, Welcome release, or account-room projection side effects.
 
 Current membership-delta validation progress: typed HTTP `/commits` now prove
 the structural matrix at the route boundary. Wrong base epoch, wrong
@@ -227,10 +232,10 @@ the next page after SQLite restart returns the remaining entry with the correct
 cursor.
 
 Current typed-event progress: the HTTP `/events` route now preserves stricter
-Finite typed-event semantics above the looser Darkmatter transport duplicate
-rule. It rejects oversized application payloads before durable append, replays
-the exact original response for the same idempotency key after restart, rejects
-a duplicate typed event message id when retried with a new idempotency key, and
+typed-event semantics above the looser Darkmatter transport duplicate rule. It
+rejects oversized application payloads before durable append, replays the exact
+original response for the same idempotency key after restart, rejects a
+duplicate typed event message id when retried with a new idempotency key, and
 leaves the durable group log with a single entry.
 
 Current idempotency-capacity progress: typed HTTP publishes now derive
@@ -287,7 +292,7 @@ Upstreamable HTTP transport work:
 - Workspace registration and conformance-simulator integration for
   HTTP-delivery compatibility tests.
 - This is upstreamable as a transport-adapter/service crate because it stays
-  below CGKA, does not decrypt payloads, and does not encode Finite application
+  below CGKA, does not decrypt payloads, and does not encode application
   policy.
 
 Upstreamable ordered-delivery profile work:
@@ -301,7 +306,7 @@ Upstreamable ordered-delivery profile work:
   name. Until Marmot accepts an ordered-delivery profile, this remains the only
   Darkmatter fork-required item.
 
-Finite-owned adapter/application logic:
+Adapter/application logic:
 
 - `finitechat-http` shared route DTOs.
 - `finitechat-server` Axum routes, SQLite operation log, idempotency wrappers,
@@ -320,8 +325,8 @@ Fork-only requirements beyond the current HTTP branch:
 - None identified beyond the ordered-delivery profile if Marmot accepts an
   equivalent upstream design.
 - If Marmot rejects any transport/server-ordering influence on canonical branch
-  processing, Finite would need to keep a fork or carry a compatibility layer
-  with weaker/more expensive convergence behavior.
+  processing, downstream adopters would need to keep a fork or carry a
+  compatibility layer with weaker/more expensive convergence behavior.
 
 ## What Works Out Of The Box
 
@@ -348,9 +353,9 @@ Fork-only requirements beyond the current HTTP branch:
   restart.
 - The HTTP KeyPackage wrapper can also expose available/claimed inventory for
   an owner. This lets the runtime KeyPackage replenishment worker run over the
-  Darkmatter HTTP boundary without teaching the server Finite-specific device
+  Darkmatter HTTP boundary without teaching the server application-specific device
   structure.
-- The HTTP revoked-device wrapper can persist terminal finite device status,
+- The HTTP revoked-device wrapper can persist terminal device status,
   rebuild it after restart, block revoked devices from server-mediated
   KeyPackage, Welcome, event, and Commit paths, and skip revoked owners during
   batch KeyPackage claim without consuming inventory.
@@ -366,9 +371,9 @@ Fork-only requirements beyond the current HTTP branch:
   loop a Darkmatter HTTP boundary while preventing arbitrary room-membership
   JSON from becoming discovery output.
 - The HTTP account-room bootstrap wrapper can derive the creator's initial
-  active account-room record from typed Finite room metadata, persist it, replay
+  active account-room record from typed room metadata, persist it, replay
   it idempotently after restart, and reject conflicting bootstrap attempts.
-- The HTTP route layer can also project accepted Finite add/remove commits into
+- The HTTP route layer can also project accepted typed add/remove commits into
   the account-room directory. Typed `/commits` derives this projection from the
   submitted request, while raw `/messages` keeps compatibility with an explicit
   projection wrapper. The later-device HTTP fanout test proves an accepted add
@@ -379,7 +384,7 @@ Fork-only requirements beyond the current HTTP branch:
   commit append: bad commit metadata leaves the group log and recipient Welcome
   inbox empty across restart, and the corrected commit releases one Welcome only
   after acceptance.
-- The HTTP Welcome ack wrapper can decode a claimed Finite `WelcomeRecord` on
+- The HTTP Welcome ack wrapper can decode a claimed `WelcomeRecord` on
   activated ack and promote the account-room device from pending to active
   across SQLite restart.
 - The HTTP room-membership projection can derive server-owned membership
@@ -393,15 +398,20 @@ Fork-only requirements beyond the current HTTP branch:
   raw `/messages` commit imports for typed rooms must carry the same projection
   wrapper; plain raw commits are rejected before append instead of weakening
   strict membership filtering.
-- The typed HTTP `/commits` route now preserves Finite's per-account room
-  device cap: it rejects an add commit that would exceed
+- The typed HTTP `/commits` route now preserves the per-account room device
+  cap: it rejects an add commit that would exceed
   `MAX_ACCOUNT_DEVICES_PER_ROOM` before durable append, Welcome release,
   KeyPackage consumption, or account-room projection update.
-- The typed HTTP `/commits` route also preserves Finite's duplicate current or
+- The typed HTTP `/commits` route also preserves the duplicate current or
   pending device rule: a fresh add for a device already pending in the room is
   rejected before durable append, duplicate Welcome release, KeyPackage
   consumption, or account-room projection duplication.
-- The typed HTTP `/commits` route rejects malformed Finite membership deltas
+- The HTTP direct-room wrapper preserves the two-account direct-room admission
+  rule: create-or-get stores a sorted account pair in the
+  room-membership projection, reversed account order returns the existing room
+  after restart, and typed `/commits` reject third-account adds before durable
+  append.
+- The typed HTTP `/commits` route rejects malformed typed membership deltas
   before touching ordered delivery state: base epoch mismatch, post-commit
   epoch mismatch, commit id mismatch, duplicate add/remove entries, add/remove
   overlap, and incomplete add metadata all leave the group log, Welcome inbox,
@@ -441,7 +451,7 @@ Fork-only requirements beyond the current HTTP branch:
   payloads before durable append, replays the exact response for the same
   idempotency key across restart, and rejects duplicate typed event message ids
   submitted with a new idempotency key without appending a second group entry.
-- The typed HTTP publish wrapper now enforces Finite's scoped idempotency
+- The typed HTTP publish wrapper now enforces the scoped idempotency
   capacity rule above Darkmatter's opaque transport: fresh typed events for a
   full room/sender bucket are rejected, but exact replay remains available
   across SQLite restart.
@@ -469,7 +479,7 @@ Fork-only requirements beyond the current HTTP branch:
 - The `finitechat-server` Axum route layer can carry those real Marmot Welcome,
   invite Commit, and application messages end to end when driven by
   Darkmatter's conformance simulator clients.
-- The copied Finite Chat application-policy tests can remain above the encrypted
+- The copied application-policy tests can remain above the encrypted
   application payload boundary. Push, unread, command-inbox, runtime-state, and
   activity projection logic does not need the server to decrypt payloads.
 
@@ -493,7 +503,7 @@ Fork-only requirements beyond the current HTTP branch:
   `RoomLogEntry` payloads and reuse the existing encrypted application apply
   path.
 - Group sync pagination for the HTTP delivery surface. Darkmatter owns the
-  bounded ordered group pages; the Finite route wrapper adds typed
+  bounded ordered group pages; the route wrapper adds typed
   requester-aware filtering, typed payload decoding expectations, and SQLite
   restart coverage for cursor continuation.
 - Runtime HTTP delivery adapter boundary. The production client can own the DTO
@@ -505,7 +515,7 @@ Fork-only requirements beyond the current HTTP branch:
   inject a different transport for deterministic response-loss scenarios.
 - Runtime KeyPackage metadata mapping. The Darkmatter HTTP KeyPackage store
   carries opaque bytes; the client adapter can encode the original
-  `UploadKeyPackageRequest` so a later claim reconstructs Finite's package
+  `UploadKeyPackageRequest` so a later claim reconstructs the package
   ref, hash, payload, owner, and deterministic lease token.
 - Batch KeyPackage claim replay for the HTTP delivery surface. This wraps
   Darkmatter's owner-scoped `claim_key_package` primitive so fanout callers can
@@ -514,10 +524,10 @@ Fork-only requirements beyond the current HTTP branch:
   Darkmatter's available/consumed package state as available/claimed counts, so
   runtime clients can replenish toward a target without listing package bytes.
 - KeyPackage lease expiry/reclaim for the HTTP delivery surface. This keeps
-  Finite's claimed/available/consumed lease state in wrapper-owned durable
+  claimed/available/consumed lease state in wrapper-owned durable
   inventory while reusing Marmot's opaque KeyPackage publication payloads.
 - Revoked-device projection for the HTTP delivery surface. This is
-  Finite-owned server state keyed by the finite `DeviceRef`; it gates
+  wrapper-owned server state keyed by `DeviceRef`; it gates
   server-mediated KeyPackage, Welcome, typed event, and typed commit operations
   without requiring Marmot's transport core to understand product device
   lifecycle policy.
@@ -546,11 +556,11 @@ Fork-only requirements beyond the current HTTP branch:
   is still a query-side account-room projection rather than Darkmatter becoming
   the MLS membership authority.
 - Welcome-ack-derived account-room activation for the HTTP delivery surface. The
-  server can decode a claimed Finite `WelcomeRecord` on activated ack and flip
-  the matching pending account-room device to active, matching the original
-  Finite store's Welcome activation rule.
+  server can decode a claimed `WelcomeRecord` on activated ack and flip the
+  matching pending account-room device to active, matching the existing store
+  activation rule.
 - Typed submit-commit route for the HTTP delivery surface. The route accepts a
-  Finite `SubmitCommitRequest`, validates its structural commit metadata,
+  typed `SubmitCommitRequest`, validates its structural commit metadata,
   publishes a `FiniteAccountRoomCommitProjection` into the ordered Darkmatter
   group queue, derives account-room and room-membership updates from the
   submitted request,
@@ -560,7 +570,7 @@ Fork-only requirements beyond the current HTTP branch:
   side effects or releases Welcomes, and exact idempotent commit retries replay
   even after the room head has advanced.
 - Typed application-event route for the HTTP delivery surface. The route
-  accepts a Finite `AppendEventRequest`, checks the requester against the
+  accepts a typed `AppendEventRequest`, checks the requester against the
   server-owned room-membership projection when the projection is complete or
   tracks that sender, rejects oversized payloads before durable append,
   preserves exact idempotent replay, maps duplicate typed event message ids
@@ -568,7 +578,7 @@ Fork-only requirements beyond the current HTTP branch:
   publishes a plain `RoomLogEntry`, and persists the room head across restart.
 - Scoped idempotency capacity for the HTTP delivery surface. The wrapper
   derives room/sender scope from typed `RoomLogEntry` payloads, applies
-  Finite's `MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE` cap to fresh typed
+  `MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE` to fresh typed
   publishes, and checks replay/conflict first so existing requests remain
   replayable after the cap is reached.
 - Ephemeral activity cache for the HTTP delivery surface. The route accepts
@@ -576,7 +586,7 @@ Fork-only requirements beyond the current HTTP branch:
   server-owned typed room-membership projection, and keeps the cache bounded and
   volatile instead of making activity part of the durable ordered group log.
 - Server-owned room-membership projection for typed HTTP rooms. This remains a
-  Finite-owned projection over Darkmatter's ordered transport: typed bootstrap
+  wrapper-owned projection over Darkmatter's ordered transport: typed bootstrap
   creates the active creator interval, typed commits add pending intervals and
   close removed intervals, activated Welcome ack marks the pending interval
   active, and requester-aware group sync filters pages while still advancing
@@ -589,10 +599,15 @@ Fork-only requirements beyond the current HTTP branch:
   The wrapper rejects typed add commits for devices that already have an open
   membership interval in the room, keeping duplicate-add policy above
   Darkmatter's ordered transport.
+- Direct-room account-pair constraints for the HTTP delivery surface. The
+  wrapper stores direct-room account pairs in server-owned room-membership
+  projection state and rejects typed add commits for devices outside that pair,
+  while Darkmatter still only sequences the opaque commit payload.
 - Membership-delta structural validation for the HTTP delivery surface. The
   wrapper rejects malformed typed commit metadata before appending the opaque
   Marmot commit, so Darkmatter remains responsible for ordered transport while
-  Finite keeps its product-specific membership semantics at the adapter layer.
+  the wrapper keeps its product-specific membership semantics at the adapter
+  layer.
 - Shared HTTP route DTOs. `finitechat-http` keeps request/response wire types
   reusable by the Axum server, CLI route builder, and runtime HTTP delivery
   client without making production clients depend on the server crate.
@@ -601,7 +616,7 @@ Fork-only requirements beyond the current HTTP branch:
 
 ## Thick Or Wonky Logic
 
-- Later-device fanout into existing rooms. Finite tests require distinct
+- Later-device fanout into existing rooms. The preserved tests require distinct
   KeyPackages per room, persistent fanout plans, response-loss retry, and
   reprepare after same-epoch loss. The HTTP batch claim wrapper now covers the
   server-side package response-loss piece, the HTTP fanout wrapper now covers
@@ -620,7 +635,7 @@ Fork-only requirements beyond the current HTTP branch:
   active, typed room-membership projection now filters sync and rejects pending
   sends, and typed rooms reject raw plain Commit imports that do not include
   membership deltas.
-- Mapping Finite's server cursor, repair states, and full crash-atomic
+- Mapping the server cursor, repair states, and full crash-atomic
   transaction model onto Darkmatter's engine/storage model without duplicating
   protocol state. The SQLite operation log now proves basic restart replay for
   accepted Darkmatter HTTP operations and `/messages` idempotency, but not the
@@ -656,7 +671,7 @@ workspace members:
   publish/sync, requester-aware sync, inbox publish/sync, typed submit-commit,
   typed application events, ephemeral activity, invalid-commit reporting,
   KeyPackage publish and claim, fanout checkpoints, account-room projections,
-  and Welcome claim/ack.
+  direct-room create-or-get, and Welcome claim/ack.
 
 Verified after adding the Darkmatter dependency graph:
 
@@ -671,7 +686,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `46`
+- Route/store/engine tests added so far: `47`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -696,6 +711,7 @@ Additional HTTP route checkpoint:
   - `POST /link-sessions/ack`
   - `POST /link-sessions/release`
   - `POST /link-sessions/expire`
+  - `POST /direct-rooms`
   - `POST /account-rooms/bootstrap`
   - `POST /account-rooms`
   - `POST /account-rooms/list`
@@ -708,8 +724,8 @@ Additional HTTP route checkpoint:
   - consumed KeyPackage state rebuilds after restart
   - KeyPackage available/claimed inventory survives restart and idempotent
     publish replay does not resurrect claimed inventory
-  - typed `/commits` rejects unclaimed KeyPackages and stale Finite
-    KeyPackage metadata before side effects
+  - typed `/commits` rejects unclaimed KeyPackages and stale KeyPackage
+    metadata before side effects
   - typed `/commits` consumes claimed KeyPackages atomically with accepted
     commits, rebuilds consumed state after restart, and rejects consumed reuse
   - typed `/commits` rejects bad commit metadata without releasing a Welcome,
@@ -743,7 +759,7 @@ Additional HTTP route checkpoint:
   - account-room directory normalizes typed records to the requested account's
     devices, rejects records with no devices for that account, pages by room id,
     and survives restart
-  - activated Finite Welcome ack promotes the pending account-room device to
+  - activated Welcome ack promotes the pending account-room device to
     active and the projection survives restart
   - requester-aware group sync filters through a persisted room-membership
     projection, advances cursors over hidden messages, admits pending members
@@ -765,6 +781,11 @@ Additional HTTP route checkpoint:
     group log cursor stays at the original add, the duplicate Welcome is not
     released, the account-room projection keeps one pending device, and the
     retry KeyPackage remains claimed after SQLite restart
+  - direct-room create-or-get state survives restart; reversed account order
+    returns the original room, direct account pairs stay attached to the
+    room-membership projection, and typed `/commits` reject third-account adds
+    before group append, Welcome release, or account-room projection side
+    effects
   - malformed membership deltas fail at typed `/commits` validation before
     side effects; wrong epochs, wrong commit id, duplicate add/remove entries,
     add/remove overlap, and incomplete add metadata leave the group log,
@@ -822,8 +843,8 @@ Additional HTTP route checkpoint:
 
 Important test caveat:
 
-- The copied Rust and Python suites still mostly exercise the original Finite
-  Chat implementation. They are preserved here as the acceptance surface. The
+- The copied Rust and Python suites still mostly exercise the original
+  implementation. They are preserved here as the acceptance surface. The
   Darkmatter-backed behavior directly proven in this repo is currently the
   adapter smoke test plus the HTTP route, persistence, real-engine route, and
   KeyPackage/Welcome/room-pull runtime-delivery and live CLI tests above.
@@ -850,6 +871,7 @@ Additional CLI checkpoint:
     DTOs
   - link-session create/get/upload/claim/release/ack/expire commands build the
     route DTOs
+  - direct-room create-or-get builds the `/direct-rooms` DTO
   - account-room bootstrap, save, and list commands build the route DTOs
   - invalid-commit reporting builds the `/rooms/report-invalid-commit` DTO
   - Welcome claim and ack build the route DTOs
@@ -876,7 +898,7 @@ Additional CLI checkpoint:
 
 Dependency note:
 
-- The copied Finite Chat workspace used `rusqlite 0.37`. Adding Darkmatter
+- The copied workspace used `rusqlite 0.37`. Adding Darkmatter
   pulls the workspace toward `rusqlite 0.32` through OpenMLS/Darkmatter's
   SQLite dependency graph, so this port repo aligns its workspace `rusqlite`
   version to `0.32` to avoid two `libsqlite3-sys` packages linking `sqlite3`.
@@ -913,6 +935,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-cli link_session_commands_build_route_dtos`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_link_session_state_machine_survives_restart_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_create_or_get_and_third_account_rejection_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_duplicate_pending_device_before_side_effects`: pass
@@ -934,7 +957,7 @@ Runtime delivery checkpoint:
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
   inventory and uploads zero duplicate KeyPackages on replay.
 - The runtime delivery adapter can claim a KeyPackage through
-  `/key-packages/claim`, recover the original Finite package metadata, compute
+  `/key-packages/claim`, recover the original package metadata, compute
   the same deterministic lease token, and replay after server restart with no
   duplicate claim.
 - The same worker can claim a valid serialized `WelcomeRecord` carried through
@@ -974,9 +997,9 @@ Runtime delivery checkpoint:
   leaves exactly one new group Commit and one claimed Welcome.
 - A server persistence test now covers the narrower interrupted-server window
   where the commit publish operation and idempotency receipt are durable, but
-  finite account-room and room-membership projections were not written. Retrying
-  typed `/commits` repairs the projections, replays the accepted commit response,
-  and releases one Welcome.
+  adapter account-room and room-membership projections were not written.
+  Retrying typed `/commits` repairs the projections, replays the accepted
+  commit response, and releases one Welcome.
 - A server persistence test now covers rejected same-epoch submit replay. After
   one typed `/commits` request advances the room to epoch 1, a losing epoch-0
   add-device request is rejected before side effects, the same rejection is
@@ -1030,6 +1053,10 @@ Runtime delivery checkpoint:
   terminal closed states follow the old reducer rules, release/reclaim keeps
   the deterministic claim token stable, ack tokens are validated, and
   create/get/upload/claim/release/ack/expire all have CLI route DTO coverage.
+- Direct-room constraints are now proven over the HTTP wrapper and SQLite
+  rebuild: create-or-get persists the sorted account pair, reversed account
+  order returns the same room after restart, and typed commits cannot add a
+  third account to that direct room.
 - Removed-device sync is now proven over the HTTP wrapper and SQLite rebuild:
   removed devices can pull their own removal commit, cannot send later typed
   events or commits, and requester-filtered sync advances over hidden
@@ -1078,13 +1105,13 @@ Runtime delivery checkpoint:
   coverage beyond the current library-level runtime tests, live Axum tests, and
   CLI binary smoke.
 - [x] Split the Darkmatter-facing delta into maintainable buckets: upstreamable
-  HTTP transport work, upstreamable ordered-delivery profile work, Finite-owned
+  HTTP transport work, upstreamable ordered-delivery profile work,
   adapter/application logic, and fork-only requirements.
 - [x] Refresh the compatibility report after the next Darkmatter branch update
   and verify that `RequiresDarkmatterFork` still only names the ordered
   delivery profile.
 - [x] Audit which preserved baseline tests still prove behavior only through
-  the original fake/in-memory Finite delivery service instead of a Darkmatter
-  engine or HTTP route path, then classify them by risk and owner.
+  the original fake/in-memory delivery service instead of a Darkmatter engine
+  or HTTP route path, then classify them by risk and owner.
 - [ ] Continue porting preserved fake/in-memory reducer proofs that still lack
   Darkmatter-backed engine, HTTP route, or runtime-delivery equivalents.

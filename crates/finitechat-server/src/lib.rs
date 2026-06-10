@@ -14,13 +14,14 @@ use finitechat_engine::{
     AccountRoomDevice, AccountRoomRecord, AppendEphemeralActivityRequest, AppendEventRequest,
     CommitAccepted, DeviceMembership, EphemeralActivityAccepted, EphemeralActivityRecord,
     EventAccepted, MembershipInterval, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
+    direct_room_key, lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
 };
 pub use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
     BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
     ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
-    ClaimWelcomesRequest, CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ClaimWelcomesRequest, CreateDirectRoomRequest, CreateDirectRoomResponse,
+    CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
     FiniteAccountRoomCommitProjection, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
     HealthResponse, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomState,
@@ -33,7 +34,7 @@ pub use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
     RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
@@ -1075,6 +1076,120 @@ impl HttpServerState {
         Ok(BootstrapAccountRoomResponse { bootstrapped })
     }
 
+    fn create_or_get_direct_room(
+        &self,
+        request: CreateDirectRoomRequest,
+    ) -> Result<CreateDirectRoomResponse, ServerHttpError> {
+        validate_account_room_id("room_id", &request.room_id)?;
+        validate_account_room_id("mls_group_id", &request.mls_group_id)?;
+        request.creator.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        validate_account_room_id("other_account_id", &request.other_account_id)?;
+
+        let direct_accounts =
+            direct_room_key(&request.creator.account_id, &request.other_account_id);
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            if let Some(existing) = rooms
+                .values()
+                .find(|projection| projection.direct_accounts.as_ref() == Some(&direct_accounts))
+            {
+                return Ok(CreateDirectRoomResponse {
+                    room_id: existing.room_id.clone(),
+                    created: false,
+                });
+            }
+            if rooms.contains_key(&request.room_id) {
+                return Err(ServerHttpError::DirectRoomConflict {
+                    room_id: request.room_id,
+                    reason: "room id already exists with different direct-room accounts".to_owned(),
+                });
+            }
+        }
+
+        let account_id = request.creator.account_id.clone();
+        let record = AccountRoomRecord {
+            room_id: request.room_id.clone(),
+            mls_group_id: request.mls_group_id.clone(),
+            current_epoch: 0,
+            last_seq: 0,
+            status: RoomStatus::Open,
+            devices: vec![AccountRoomDevice {
+                device: request.creator.clone(),
+                active: true,
+            }],
+        };
+        record
+            .validate_limits()
+            .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            })?;
+        let value = serde_json::to_value(&record)
+            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
+        {
+            let directory = self
+                .account_rooms
+                .lock()
+                .expect("HTTP account-room directory mutex");
+            if directory
+                .get(&account_id)
+                .and_then(|rooms| rooms.get(&request.room_id))
+                .is_some()
+            {
+                return Err(ServerHttpError::DirectRoomConflict {
+                    room_id: request.room_id,
+                    reason: "account-room record already exists without matching direct room"
+                        .to_owned(),
+                });
+            }
+        }
+
+        let projection = initial_room_membership_projection(
+            &request.room_id,
+            &request.mls_group_id,
+            &request.creator,
+            0,
+            0,
+            true,
+            Some(direct_accounts),
+        );
+        if let Some(store) = &self.store {
+            store.upsert_account_room(&AccountRoomDirectoryRecord {
+                account_id: account_id.clone(),
+                room_id: request.room_id.clone(),
+                record: value.clone(),
+            })?;
+            store.upsert_room_membership(&projection)?;
+        }
+
+        let mut directory = self
+            .account_rooms
+            .lock()
+            .expect("HTTP account-room directory mutex");
+        directory
+            .entry(account_id)
+            .or_default()
+            .insert(request.room_id.clone(), value);
+        drop(directory);
+
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        rooms.insert(request.room_id.clone(), projection);
+
+        Ok(CreateDirectRoomResponse {
+            room_id: request.room_id,
+            created: true,
+        })
+    }
+
     fn list_account_rooms(
         &self,
         request: ListAccountRoomDirectoryRequest,
@@ -1255,6 +1370,7 @@ impl HttpServerState {
             observed.current_epoch,
             observed.last_seq,
             true,
+            None,
         );
         rooms.insert(request.room_id.clone(), projection.clone());
         drop(rooms);
@@ -1700,6 +1816,7 @@ impl HttpServerState {
                 sender: request.sender.clone(),
             });
         }
+        validate_membership_adds_for_projection(projection, &request.membership_delta.adds)?;
         Ok(())
     }
 
@@ -2141,6 +2258,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/link-sessions/ack", post(ack_link_payload))
         .route("/link-sessions/release", post(release_link_claim))
         .route("/link-sessions/expire", post(expire_link_session))
+        .route("/direct-rooms", post(create_direct_room))
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
@@ -2336,6 +2454,14 @@ async fn expire_link_session(
     Json(request): Json<ExpireLinkSessionRequest>,
 ) -> Result<Json<ExpireLinkSessionResponse>, ServerHttpError> {
     let response = state.expire_link_session(request)?;
+    Ok(Json(response))
+}
+
+async fn create_direct_room(
+    State(state): State<HttpServerState>,
+    Json(request): Json<CreateDirectRoomRequest>,
+) -> Result<Json<CreateDirectRoomResponse>, ServerHttpError> {
+    let response = state.create_or_get_direct_room(request)?;
     Ok(Json(response))
 }
 
@@ -2569,6 +2695,8 @@ struct HttpRoomMembershipProjection {
     status: RoomStatus,
     #[serde(default = "default_membership_complete")]
     membership_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_accounts: Option<(String, String)>,
     membership: BTreeMap<String, DeviceMembership>,
 }
 
@@ -3410,6 +3538,59 @@ fn apply_account_room_membership_delta(
     Ok(mutation)
 }
 
+fn validate_membership_adds_for_projection(
+    projection: &HttpRoomMembershipProjection,
+    adds: &[MembershipAddV1],
+) -> Result<(), ServerHttpError> {
+    let mut added_devices_by_account = BTreeMap::<String, usize>::new();
+    for add in adds {
+        if let Some((left, right)) = &projection.direct_accounts
+            && add.device.account_id.as_str() != left.as_str()
+            && add.device.account_id.as_str() != right.as_str()
+        {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "direct room cannot add third account {}",
+                    add.device.account_id
+                ),
+            });
+        }
+
+        let current_devices =
+            projection.current_or_pending_device_count_for_account(&add.device.account_id);
+        let added_devices = added_devices_by_account
+            .entry(add.device.account_id.clone())
+            .or_insert(0);
+        *added_devices += 1;
+        let proposed = current_devices + *added_devices;
+        if proposed > MAX_ACCOUNT_DEVICES_PER_ROOM as usize {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "room.devices_per_account has {proposed} items, max {MAX_ACCOUNT_DEVICES_PER_ROOM}"
+                ),
+            });
+        }
+        if projection.direct_accounts.is_some()
+            && proposed > MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize
+        {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "direct_room.devices_per_account has {proposed} items, max {MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT}"
+                ),
+            });
+        }
+        if projection.device_current_or_pending_at_head(&add.device) {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "device {:?} is already current or pending in room",
+                    add.device
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn apply_room_membership_delta(
     rooms: &mut BTreeMap<String, HttpRoomMembershipProjection>,
     room_id: &str,
@@ -3427,6 +3608,7 @@ fn apply_room_membership_delta(
             expected_epoch,
             0,
             expected_epoch == 0,
+            None,
         )
     });
     if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
@@ -3445,31 +3627,7 @@ fn apply_room_membership_delta(
         });
     }
 
-    let mut added_devices_by_account = BTreeMap::<String, usize>::new();
-    for add in &membership_delta.adds {
-        let current_devices =
-            projection.current_or_pending_device_count_for_account(&add.device.account_id);
-        let added_devices = added_devices_by_account
-            .entry(add.device.account_id.clone())
-            .or_insert(0);
-        *added_devices += 1;
-        let proposed = current_devices + *added_devices;
-        if proposed > MAX_ACCOUNT_DEVICES_PER_ROOM as usize {
-            return Err(ServerHttpError::InvalidCommitRequest {
-                reason: format!(
-                    "room.devices_per_account has {proposed} items, max {MAX_ACCOUNT_DEVICES_PER_ROOM}"
-                ),
-            });
-        }
-        if projection.device_current_or_pending_at_head(&add.device) {
-            return Err(ServerHttpError::InvalidCommitRequest {
-                reason: format!(
-                    "device {:?} is already current or pending in room",
-                    add.device
-                ),
-            });
-        }
-    }
+    validate_membership_adds_for_projection(projection, &membership_delta.adds)?;
 
     for remove in &membership_delta.removes {
         if let Some(membership) = projection
@@ -4068,6 +4226,7 @@ fn initial_room_membership_projection(
     current_epoch: u64,
     last_seq: HttpSequence,
     membership_complete: bool,
+    direct_accounts: Option<(String, String)>,
 ) -> HttpRoomMembershipProjection {
     let mut membership = BTreeMap::new();
     membership.insert(
@@ -4088,6 +4247,7 @@ fn initial_room_membership_projection(
         last_seq,
         status: RoomStatus::Open,
         membership_complete,
+        direct_accounts,
         membership,
     }
 }
@@ -4432,6 +4592,10 @@ pub enum ServerHttpError {
         room_id: String,
         reason: String,
     },
+    DirectRoomConflict {
+        room_id: String,
+        reason: String,
+    },
     ProjectionJson(String),
     InvalidGroupSyncRequest {
         reason: String,
@@ -4679,6 +4843,11 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::CONFLICT,
                 "account_room_bootstrap_conflict".to_owned(),
                 format!("account-room bootstrap conflict for {account_id}/{room_id}: {reason}"),
+            ),
+            Self::DirectRoomConflict { room_id, reason } => (
+                StatusCode::CONFLICT,
+                "direct_room_conflict".to_owned(),
+                format!("direct-room conflict for {room_id}: {reason}"),
             ),
             Self::ProjectionJson(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

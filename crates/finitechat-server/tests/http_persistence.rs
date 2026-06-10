@@ -13,7 +13,8 @@ use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
     BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
     ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
-    ClaimWelcomesRequest, CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ClaimWelcomesRequest, CreateDirectRoomRequest, CreateDirectRoomResponse,
+    CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
     GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
     HttpFanoutRoomPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
@@ -1426,6 +1427,88 @@ async fn sqlite_account_room_bootstrap_rejects_raw_commit_history_without_member
             .error
             .contains("existing raw commit history to carry membership_delta")
     );
+}
+
+#[tokio::test]
+async fn sqlite_direct_room_create_or_get_and_third_account_rejection_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let app = persistent_app(&db_path);
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let charlie = DeviceRef::new("charlie", "charlie-phone");
+    let room_id = "direct-http-ab";
+    let mls_group_id = "mls-direct-http-ab";
+
+    let response = post_json(
+        app.clone(),
+        "/direct-rooms",
+        &CreateDirectRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: alice.clone(),
+            other_account_id: bob.account_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let created: CreateDirectRoomResponse = read_json(response).await;
+    assert_eq!(created.room_id, room_id);
+    assert!(created.created);
+
+    let listed = account_room_page(&app, &alice.account_id).await;
+    assert_eq!(listed.rooms.len(), 1);
+    assert_eq!(listed.rooms[0]["room_id"], room_id);
+    assert_eq!(
+        listed.rooms[0]["devices"][0]["device"]["device_id"],
+        "alice-laptop"
+    );
+    assert_eq!(listed.rooms[0]["devices"][0]["active"], true);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/direct-rooms",
+        &CreateDirectRoomRequest {
+            room_id: "direct-http-ba-should-not-create".to_owned(),
+            mls_group_id: "mls-direct-http-ba".to_owned(),
+            creator: bob.clone(),
+            other_account_id: alice.account_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let existing: CreateDirectRoomResponse = read_json(response).await;
+    assert_eq!(existing.room_id, room_id);
+    assert!(!existing.created);
+
+    let add_charlie = submit_add_device_request(
+        room_id,
+        mls_group_id,
+        &alice,
+        &charlie,
+        "welcome-direct-charlie",
+        "direct-add-charlie",
+    );
+    publish_and_claim_key_package_for_add(&app, &add_charlie).await;
+
+    let response = post_json(app.clone(), "/commits", &add_charlie).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("direct room cannot add third account"));
+    assert_submit_commit_had_no_side_effects(&app, room_id, &charlie).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &add_charlie).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("direct room cannot add third account"));
+    assert_submit_commit_had_no_side_effects(&app, room_id, &charlie).await;
+
+    let listed = account_room_page(&app, &charlie.account_id).await;
+    assert!(listed.rooms.is_empty());
 }
 
 #[tokio::test]
