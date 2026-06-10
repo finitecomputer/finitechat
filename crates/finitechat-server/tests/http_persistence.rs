@@ -5860,6 +5860,301 @@ async fn sqlite_welcome_failed_ack_keeps_membership_inactive_after_restart() {
     assert_eq!(error.kind, "welcome_ack_conflict");
 }
 
+#[tokio::test]
+async fn sqlite_mixed_http_operation_fuzzer_survives_restarts() {
+    for seed in 1..=4 {
+        run_mixed_http_operation_fuzz(seed).await;
+    }
+}
+
+async fn run_mixed_http_operation_fuzz(seed: u64) {
+    const STEPS: usize = 32;
+
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join(format!("mixed-http-fuzz-{seed}.sqlite3"));
+    let room_id = format!("room-http-fuzz-{seed}");
+    let mls_group_id = format!("mls-http-fuzz-{seed}");
+    let alice = DeviceRef::new("alice", format!("alice-http-fuzz-{seed}"));
+    let bob = DeviceRef::new("bob", format!("bob-http-fuzz-{seed}"));
+    let mut rng = HttpFuzzRng::new(seed);
+    let mut last_seq: u64;
+    let mut effectful_events = 0u32;
+    let mut first_raw_event: Option<(AppendEventRequest, EventAccepted)> = None;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let welcome_id = format!("welcome-http-fuzz-bob-{seed}");
+    let add_bob = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        &welcome_id,
+        "add-bob",
+    );
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let add_accepted: CommitAccepted = read_json(response).await;
+    last_seq = add_accepted.seq;
+    assert_eq!(last_seq, 1);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed_add: CommitAccepted = read_json(response).await;
+    assert_eq!(replayed_add, add_accepted);
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+
+    let response = post_json(
+        app,
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id(&welcome_id),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for step in 0..STEPS {
+        let app = persistent_app(&db_path);
+        match rng.next_usize(8) {
+            0 => {
+                let sender = if rng.next_bool() { &alice } else { &bob };
+                let request = append_application_request(
+                    &room_id,
+                    &mls_group_id,
+                    sender,
+                    1,
+                    format!(r#"{{"type":"chat.message","seed":{seed},"step":{step}}}"#).as_bytes(),
+                    &format!("mixed-http-fuzz-raw-{seed}-{step}"),
+                );
+                let response = post_json(app, "/events", &request).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let accepted: EventAccepted = read_json(response).await;
+                assert_eq!(accepted.seq, last_seq + 1);
+                last_seq = accepted.seq;
+                if first_raw_event.is_none() {
+                    first_raw_event = Some((request, accepted));
+                }
+            }
+            1 => {
+                let sender = if rng.next_bool() { &alice } else { &bob };
+                let request = append_application_request(
+                    &room_id,
+                    &mls_group_id,
+                    sender,
+                    1,
+                    format!(r#"{{"type":"chat.message","effect":{seed},"step":{step}}}"#)
+                        .as_bytes(),
+                    &format!("mixed-http-fuzz-effect-{seed}-{step}"),
+                );
+                let response = post_json(
+                    app.clone(),
+                    "/application-events",
+                    &AppendApplicationEventRequest {
+                        event: request,
+                        delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+                    },
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let accepted: EventAccepted = read_json(response).await;
+                assert_eq!(accepted.seq, last_seq + 1);
+                last_seq = accepted.seq;
+                effectful_events += 1;
+                assert!(
+                    application_effect(&app, &accepted.message_id)
+                        .await
+                        .is_some()
+                );
+            }
+            2 => {
+                let sender = if rng.next_bool() { &alice } else { &bob };
+                let response = post_json(
+                    app,
+                    "/activities",
+                    &ephemeral_activity_request(
+                        &room_id,
+                        &mls_group_id,
+                        sender,
+                        1,
+                        Some("mixed-http-fuzz-topic"),
+                        1_800_000_000 + step as u64,
+                    ),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            3 => {
+                let after_seq = rng.next_u64(last_seq + 1);
+                let response = post_json(
+                    app,
+                    "/sync/group",
+                    &GroupSyncRequest {
+                        group_id: group_id(&room_id),
+                        after_seq,
+                        limit: 7,
+                        requester: None,
+                    },
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let page: HttpSyncPage = read_json(response).await;
+                assert!(page.next_after_seq >= after_seq);
+                assert!(page.next_after_seq <= last_seq);
+                assert!(page.entries.len() <= 7);
+            }
+            4 => {
+                let response = post_json(
+                    app,
+                    "/welcomes/claim",
+                    &ClaimWelcomesRequest {
+                        recipient: member_for_device(&bob),
+                        limit: 10,
+                    },
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+                assert!(claimed.is_empty());
+            }
+            5 => {
+                let observed_at_ms = 1_900_000_000 + step as u64;
+                let response = post_json(
+                    app.clone(),
+                    "/devices/liveness",
+                    &ObserveDeviceLivenessRequest {
+                        device: bob.clone(),
+                        observed_at_ms,
+                        expires_at_ms: observed_at_ms + 1_000,
+                    },
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let response = post_json(
+                    app,
+                    "/devices/liveness/get",
+                    &GetDeviceLivenessRequest {
+                        device: bob.clone(),
+                        now_ms: observed_at_ms,
+                    },
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let liveness: GetDeviceLivenessResponse = read_json(response).await;
+                assert!(liveness.live);
+            }
+            6 => {
+                let response = post_json(app, "/commits", &add_bob).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let replayed: CommitAccepted = read_json(response).await;
+                assert_eq!(replayed, add_accepted);
+            }
+            _ => {
+                if let Some((request, accepted)) = &first_raw_event {
+                    let response = post_json(app, "/events", request).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let replayed: EventAccepted = read_json(response).await;
+                    assert_eq!(&replayed, accepted);
+                } else {
+                    let response = post_json(
+                        app,
+                        "/sync/group",
+                        &GroupSyncRequest {
+                            group_id: group_id(&room_id),
+                            after_seq: 0,
+                            limit: 7,
+                            requester: None,
+                        },
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                }
+            }
+        }
+    }
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 50,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.next_after_seq, last_seq);
+    assert_eq!(page.entries.len(), last_seq as usize);
+
+    let counts = application_effect_counts(&app).await;
+    assert_eq!(counts.push_outbox, effectful_events);
+    assert_eq!(counts.unread, effectful_events);
+    assert_eq!(counts.command_inbox, 0);
+
+    let page = account_room_page(&app, &bob.account_id).await;
+    assert!(account_room_device_active(&page, &bob));
+}
+
+struct HttpFuzzRng {
+    state: u64,
+}
+
+impl HttpFuzzRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn next_u64(&mut self, upper_bound: u64) -> u64 {
+        assert!(upper_bound > 0);
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        self.state % upper_bound
+    }
+
+    fn next_usize(&mut self, upper_bound: usize) -> usize {
+        self.next_u64(upper_bound as u64) as usize
+    }
+
+    fn next_bool(&mut self) -> bool {
+        self.next_u64(2) == 0
+    }
+}
+
 fn persistent_app(path: &std::path::Path) -> Router {
     http_router(HttpServerState::from_sqlite_path(path).expect("persistent server state"))
 }
