@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `388`
+  `303`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `389`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -28,7 +28,7 @@ Copied/application Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 46 |
+| `crates/finitechat-client/tests/client_state.rs` | 47 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `396` (`388` Rust, `8` Python)
+- Port parsed tests: `397` (`389` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `102`
+- Port-only test names: `103`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +90,7 @@ Port-only test buckets:
 | Bucket | Count | Files |
 | --- | ---: | --- |
 | HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
-| Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
+| Runtime client over Darkmatter HTTP routes/live reqwest | 16 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
 | Server HTTP route, persistence, and real-engine route coverage | 60 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `102` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `103` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -151,7 +151,7 @@ Port-only Darkmatter coverage added so far:
 | Class | Count | Meaning |
 | --- | ---: | --- |
 | CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
-| Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
+| Runtime HTTP coverage | 16 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
 | Server HTTP coverage | 60 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
@@ -248,7 +248,9 @@ Current group-sync pagination progress: typed HTTP `/events` plus `/sync/group`
 now prove bounded requester-aware pages over persisted Darkmatter group logs.
 The first full page returns `MAX_HTTP_SYNC_PAGE_ENTRIES`, sets `has_more`, and
 the next page after SQLite restart returns the remaining entry with the correct
-cursor.
+cursor. The runtime HTTP worker also now proves a partial-pull repair path:
+with a one-page-per-tick budget, it persists the first full page cursor and a
+later tick reloads local state and pulls the remaining Darkmatter HTTP page.
 
 Current typed-event progress: the HTTP `/events` route now preserves stricter
 typed-event semantics above the looser Darkmatter transport duplicate rule. It
@@ -1044,6 +1046,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-client --test client_state runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass

@@ -24,6 +24,7 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
+use transport_http_server::MAX_HTTP_SYNC_PAGE_ENTRIES;
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -2192,6 +2193,158 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
         alice.last_applied_seq(ROOM_ID).unwrap(),
         message_accepted.seq
     );
+}
+
+#[test]
+fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-partial-pull.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_partial_pull");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_partial_pull");
+    let mut source_server = DeliveryService::new();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 1,
+    };
+
+    source_server
+        .create_or_get_direct_room(alice.create_direct_room_request(
+            ROOM_ID,
+            MLS_GROUP_ID,
+            bob.device_ref().account_id.clone(),
+        ))
+        .unwrap();
+    alice.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    source_server
+        .upload_key_package(
+            bob.upload_key_package_request("kp_http_partial_pull_bob")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = source_server
+        .claim_key_package("kp_http_partial_pull_bob")
+        .unwrap();
+    let prepared = alice
+        .prepare_add_member_commit(
+            ROOM_ID,
+            &claimed_key_package,
+            "welcome_http_partial_pull_bob",
+            "commit_http_partial_pull_bob",
+        )
+        .unwrap();
+    let add_accepted = source_server.submit_commit(prepared.request).unwrap();
+    let commit_page = source_server
+        .sync_events(ROOM_ID, alice.device_ref(), 0)
+        .unwrap();
+    assert_eq!(commit_page.entries.len(), 1);
+    alice
+        .merge_pending_commit_from_log(ROOM_ID, &commit_page.entries, &prepared.message_id)
+        .unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice, ROOM_ID, add_accepted.seq)
+        .unwrap();
+
+    let claimed_welcomes = source_server.claim_welcomes(bob.device_ref()).unwrap();
+    assert_eq!(claimed_welcomes.len(), 1);
+    bob.activate_welcome(
+        ROOM_ID,
+        &claimed_welcomes[0].welcome_payload,
+        &claimed_welcomes[0].ratchet_tree_payload,
+    )
+    .unwrap();
+    source_server
+        .ack_welcome("welcome_http_partial_pull_bob", true)
+        .unwrap();
+
+    let mut sent_plaintexts = Vec::new();
+    let mut next_message_index = 0;
+    send_bob_messages(
+        &mut source_server,
+        &mut bob,
+        90,
+        &mut next_message_index,
+        MAX_HTTP_SYNC_PAGE_ENTRIES + 1,
+        &mut sent_plaintexts,
+    );
+    assert_eq!(sent_plaintexts.len(), MAX_HTTP_SYNC_PAGE_ENTRIES + 1);
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    delivery
+        .publish_room_log_entry(&commit_page.entries[0])
+        .unwrap();
+    let mut after_seq = add_accepted.seq;
+    let mut published_application_entries = 0usize;
+    loop {
+        let page = source_server
+            .sync_events(ROOM_ID, alice.device_ref(), after_seq)
+            .unwrap();
+        for entry in &page.entries {
+            delivery.publish_room_log_entry(entry).unwrap();
+            published_application_entries += 1;
+        }
+        if !page.has_more {
+            break;
+        }
+        assert!(page.next_after_seq > after_seq);
+        after_seq = page.next_after_seq;
+    }
+    assert_eq!(
+        published_application_entries,
+        MAX_HTTP_SYNC_PAGE_ENTRIES + 1
+    );
+
+    let first_report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(first_report.sync_pages, 1);
+    assert_eq!(
+        first_report.applied_entries.len(),
+        MAX_HTTP_SYNC_PAGE_ENTRIES
+    );
+    assert_eq!(first_report.applied_entries[0].seq, sent_plaintexts[0].seq);
+    assert_eq!(
+        first_report.applied_entries[0].entry,
+        AppliedLogEntry::Application(sent_plaintexts[0].plaintext.clone())
+    );
+    assert_eq!(
+        first_report.applied_entries.last().unwrap().seq,
+        sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES - 1].seq
+    );
+    assert_eq!(
+        alice.last_applied_seq(ROOM_ID).unwrap(),
+        sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES - 1].seq
+    );
+
+    let mut alice = alice_store.load_device(alice_config.clone()).unwrap();
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let repair_report =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(repair_report.sync_pages, 1);
+    assert_eq!(repair_report.applied_entries.len(), 1);
+    assert_eq!(
+        repair_report.applied_entries[0].seq,
+        sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES].seq
+    );
+    assert_eq!(
+        repair_report.applied_entries[0].entry,
+        AppliedLogEntry::Application(
+            sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES]
+                .plaintext
+                .clone()
+        )
+    );
+    assert_eq!(
+        alice.last_applied_seq(ROOM_ID).unwrap(),
+        sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES].seq
+    );
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let replay =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(replay.sync_pages, 1);
+    assert!(replay.applied_entries.is_empty());
 }
 
 #[test]
