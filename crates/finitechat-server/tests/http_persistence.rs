@@ -31,8 +31,9 @@ use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
     LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ENVELOPE_PAYLOAD_BYTES,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
-    PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy, WelcomeState,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
+    MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy,
+    WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -410,6 +411,153 @@ async fn sqlite_key_package_inventory_tracks_available_and_claimed_after_restart
         StatusCode::OK
     );
     assert_inventory(app, owner, 1, 1).await;
+}
+
+#[tokio::test]
+async fn sqlite_key_package_inventory_cap_counts_claimed_and_consumed_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-key-package-inventory-cap".to_owned();
+    let mls_group_id = "mls-key-package-inventory-cap".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-inventory-cap-00",
+        "kp-inventory-cap-00",
+    );
+    let add = request
+        .membership_delta
+        .adds
+        .first()
+        .expect("add-device request has one add");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for index in 0..MAX_KEY_PACKAGES_PER_DEVICE {
+        let (key_package_id, key_package_ref, key_package_hash) = if index == 0 {
+            (
+                add.key_package_id.clone(),
+                add.key_package_ref.clone(),
+                add.key_package_hash.clone(),
+            )
+        } else {
+            (
+                format!("kp-inventory-cap-{index:02}"),
+                format!("ref-kp-inventory-cap-{index:02}"),
+                format!("hash-kp-inventory-cap-{index:02}"),
+            )
+        };
+        let response = post_json(
+            app.clone(),
+            "/key-packages",
+            &finite_key_package_publication(
+                &bob,
+                &key_package_id,
+                &key_package_ref,
+                &key_package_hash,
+                format!("payload-kp-inventory-cap-{index:02}").as_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE);
+    assert_eq!(inventory.claimed, 0);
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages",
+        &finite_key_package_publication(
+            &bob,
+            "kp-inventory-cap-overflow",
+            "ref-kp-inventory-cap-overflow",
+            "hash-kp-inventory-cap-overflow",
+            b"payload-kp-inventory-cap-overflow",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "key_package_inventory_full");
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: member_for_device(&bob),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(
+        claimed.expect("first package claimed").key_package_id,
+        HttpKeyPackageId::new(add.key_package_id.as_bytes().to_vec())
+    );
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.claimed, 1);
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages",
+        &finite_key_package_publication(
+            &bob,
+            "kp-inventory-cap-still-full",
+            "ref-kp-inventory-cap-still-full",
+            "hash-kp-inventory-cap-still-full",
+            b"payload-kp-inventory-cap-still-full",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "key_package_inventory_full");
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.claimed, 0);
+
+    let app = persistent_app(&db_path);
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE - 1);
+    assert_eq!(inventory.claimed, 0);
+    let response = post_json(
+        app.clone(),
+        "/key-packages",
+        &finite_key_package_publication(
+            &bob,
+            "kp-inventory-cap-replacement",
+            "ref-kp-inventory-cap-replacement",
+            "hash-kp-inventory-cap-replacement",
+            b"payload-kp-inventory-cap-replacement",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, MAX_KEY_PACKAGES_PER_DEVICE);
+    assert_eq!(inventory.claimed, 0);
 }
 
 #[tokio::test]
@@ -5626,6 +5774,27 @@ fn key_package_publication(
         key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
         owner,
         key_package: KeyPackage::new(bytes.to_vec()),
+    }
+}
+
+fn finite_key_package_publication(
+    owner: &DeviceRef,
+    key_package_id: &str,
+    key_package_ref: &str,
+    key_package_hash: &str,
+    payload: &[u8],
+) -> HttpKeyPackagePublication {
+    let upload = UploadKeyPackageRequest {
+        key_package_id: key_package_id.to_owned(),
+        owner: owner.clone(),
+        key_package_ref: key_package_ref.to_owned(),
+        key_package_hash: key_package_hash.to_owned(),
+        key_package_payload: payload.to_vec(),
+    };
+    HttpKeyPackagePublication {
+        key_package_id: HttpKeyPackageId::new(key_package_id.as_bytes().to_vec()),
+        owner: member_for_device(owner),
+        key_package: KeyPackage::new(serde_json::to_vec(&upload).expect("upload json")),
     }
 }
 

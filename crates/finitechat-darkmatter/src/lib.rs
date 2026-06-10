@@ -101,6 +101,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server claims KeyPackages by route owner metadata rather than untrusted opaque package bytes; payload identity claims do not authorize the wrong owner, and the original package bytes survive SQLite restart unchanged",
         },
         PortFinding {
+            area: "http_key_package_inventory_capacity",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server enforces MAX_KEY_PACKAGES_PER_DEVICE over wrapper-owned available/claimed/consumed KeyPackage inventory; claimed packages still count against capacity, accepted commits consume claimed packages, and consumed packages free replacement upload space after SQLite restart",
+        },
+        PortFinding {
             area: "http_key_package_publish_retry",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-server replays exact KeyPackage publication retries after restart and rejects conflicting same-id packages without creating extra claimable inventory",

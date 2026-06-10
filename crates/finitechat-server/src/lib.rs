@@ -38,8 +38,9 @@ pub use finitechat_http::{
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
-    RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len,
+    validate_string_bytes,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -314,16 +315,19 @@ impl HttpServerState {
         publication: HttpKeyPackagePublication,
     ) -> Result<PublishKeyPackageResponse, ServerHttpError> {
         self.ensure_member_not_revoked(&publication.owner)?;
-        self.apply_mutation(|service| {
-            service.publish_key_package(publication.clone())?;
-            Ok((
-                PublishKeyPackageResponse { published: true },
-                Some(PersistedOperation::PublishKeyPackage {
-                    publication: publication.clone(),
-                }),
-            ))
-        })?;
-        self.record_key_package_publication(&publication)?;
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut candidate = inventory.clone();
+        let Some(record) = record_key_package_publication(&mut candidate, &publication)? else {
+            return Ok(PublishKeyPackageResponse { published: true });
+        };
+        let operation = PersistedOperation::PublishKeyPackage { publication };
+        if let Some(store) = &self.store {
+            store.append_key_package_inventory_operation(&operation, &record)?;
+        }
+        *inventory = candidate;
         Ok(PublishKeyPackageResponse { published: true })
     }
 
@@ -552,41 +556,6 @@ impl HttpServerState {
             available: usize_to_u32("available", available)?,
             claimed: usize_to_u32("claimed", claimed)?,
         })
-    }
-
-    fn record_key_package_publication(
-        &self,
-        publication: &HttpKeyPackagePublication,
-    ) -> Result<(), ServerHttpError> {
-        let mut inventory = self
-            .key_package_inventory
-            .lock()
-            .expect("HTTP KeyPackage inventory mutex");
-        let record = inventory
-            .entry(publication.key_package_id.clone())
-            .or_insert_with(|| KeyPackageInventoryRecord {
-                key_package_id: publication.key_package_id.clone(),
-                owner: publication.owner.clone(),
-                key_package: publication.key_package.clone(),
-                state: KeyPackageInventoryState::Available,
-                finite_metadata: finite_key_package_metadata(publication),
-            });
-        if record.owner != publication.owner {
-            return Err(ServerHttpError::InventoryConflict {
-                key_package_id: publication.key_package_id.clone(),
-            });
-        }
-        if record.finite_metadata.is_none() {
-            record.finite_metadata = finite_key_package_metadata(publication);
-        }
-        if record.key_package.bytes().is_empty() {
-            record.key_package = publication.key_package.clone();
-        }
-        let record = record.clone();
-        if let Some(store) = &self.store {
-            store.upsert_key_package_inventory(&record)?;
-        }
-        Ok(())
     }
 
     fn save_fanout_room(
@@ -4029,9 +3998,9 @@ fn replay_operation(
         } => {
             service.publish(target, message)?;
         }
-        PersistedOperation::PublishKeyPackage { publication } => {
-            service.publish_key_package(publication)?;
-        }
+        // KeyPackage lease/reclaim/consume state is rebuilt in the finite wrapper
+        // inventory; Darkmatter's core store has no claimed lease state.
+        PersistedOperation::PublishKeyPackage { .. } => {}
         PersistedOperation::RevokeDevice { .. } => {}
         PersistedOperation::ClaimKeyPackage { .. }
         | PersistedOperation::ClaimKeyPackages { .. }
@@ -4759,6 +4728,53 @@ fn claim_key_packages_from_inventory(
             }
         })
         .collect()
+}
+
+fn record_key_package_publication(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    publication: &HttpKeyPackagePublication,
+) -> Result<Option<KeyPackageInventoryRecord>, ServerHttpError> {
+    if let Some(record) = inventory.get_mut(&publication.key_package_id) {
+        if record.owner != publication.owner || record.key_package != publication.key_package {
+            return Err(HttpServerError::ConflictingKeyPackage {
+                key_package_id: publication.key_package_id.clone(),
+            }
+            .into());
+        }
+        if record.finite_metadata.is_none() {
+            record.finite_metadata = finite_key_package_metadata(publication);
+            return Ok(Some(record.clone()));
+        }
+        return Ok(None);
+    }
+
+    let unconsumed = inventory
+        .values()
+        .filter(|record| {
+            record.owner == publication.owner
+                && matches!(
+                    record.state,
+                    KeyPackageInventoryState::Available | KeyPackageInventoryState::Claimed
+                )
+        })
+        .count();
+    if unconsumed >= MAX_KEY_PACKAGES_PER_DEVICE as usize {
+        return Err(HttpServerError::KeyPackageInventoryFull {
+            owner: publication.owner.clone(),
+            max: MAX_KEY_PACKAGES_PER_DEVICE as usize,
+        }
+        .into());
+    }
+
+    let record = KeyPackageInventoryRecord {
+        key_package_id: publication.key_package_id.clone(),
+        owner: publication.owner.clone(),
+        key_package: publication.key_package.clone(),
+        state: KeyPackageInventoryState::Available,
+        finite_metadata: finite_key_package_metadata(publication),
+    };
+    inventory.insert(publication.key_package_id.clone(), record.clone());
+    Ok(Some(record))
 }
 
 fn claim_next_key_package_from_inventory(
