@@ -11,20 +11,22 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, AppendEphemeralActivityRequest, AppendEventRequest,
-    CommitAccepted, DeviceMembership, EphemeralActivityAccepted, EphemeralActivityRecord,
-    EventAccepted, MembershipInterval, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    direct_room_key, lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
+    AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
+    AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, DeviceMembership,
+    EphemeralActivityAccepted, EphemeralActivityRecord, EventAccepted, MembershipInterval,
+    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, direct_room_key, lease_token_for,
+    staged_welcomes_by_id, validate_activity_expiry,
 };
 pub use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
-    BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
-    ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
-    ClaimWelcomesRequest, CreateDirectRoomRequest, CreateDirectRoomResponse,
-    CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
-    FiniteAccountRoomCommitProjection, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
-    HealthResponse, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomState,
+    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
+    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest, ErrorResponse,
+    ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest,
+    ExpireLinkSessionResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
+    GetLinkSessionRequest, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
+    HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomState,
     HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
     HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
@@ -65,6 +67,7 @@ pub struct HttpServerState {
     link_sessions: Arc<Mutex<BTreeMap<String, HttpLinkSessionRecord>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
+    application_effects: Arc<Mutex<BTreeMap<String, HttpApplicationDeliveryEffect>>>,
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
@@ -82,6 +85,7 @@ impl HttpServerState {
             link_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
+            application_effects: Arc::new(Mutex::new(BTreeMap::new())),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
@@ -111,6 +115,7 @@ impl HttpServerState {
         let link_sessions = store.load_link_sessions()?;
         let account_rooms = store.load_account_room_directory()?;
         let room_memberships = store.load_room_memberships()?;
+        let application_effects = store.load_application_effects()?;
         let welcome_claims = store.load_welcome_claims()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
@@ -122,6 +127,7 @@ impl HttpServerState {
             link_sessions: Arc::new(Mutex::new(link_sessions)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
+            application_effects: Arc::new(Mutex::new(application_effects)),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
@@ -1877,6 +1883,103 @@ impl HttpServerState {
         })
     }
 
+    fn append_application_event(
+        &self,
+        request: AppendApplicationEventRequest,
+    ) -> Result<EventAccepted, ServerHttpError> {
+        request
+            .validate_limits()
+            .map_err(|error| ServerHttpError::InvalidEventRequest {
+                reason: error.to_string(),
+            })?;
+        if request.event.envelope.kind != LogEntryKind::Application {
+            return Err(ServerHttpError::InvalidEventRequest {
+                reason: "application-event route only accepts application envelopes".to_owned(),
+            });
+        }
+
+        let accepted = self.append_event(request.event.clone())?;
+        let effect = HttpApplicationDeliveryEffect {
+            room_id: request.event.room_id,
+            seq: accepted.seq,
+            message_id: accepted.message_id.clone(),
+            sender: request.event.sender,
+            delivery_policy: request.delivery_policy,
+        };
+        self.record_application_delivery_effect(effect, &request.event.idempotency_key)?;
+        Ok(accepted)
+    }
+
+    fn record_application_delivery_effect(
+        &self,
+        effect: HttpApplicationDeliveryEffect,
+        idempotency_key: &str,
+    ) -> Result<(), ServerHttpError> {
+        let mut effects = self
+            .application_effects
+            .lock()
+            .expect("HTTP application-effects mutex");
+        if let Some(existing) = effects.get(&effect.message_id) {
+            if existing == &effect {
+                return Ok(());
+            }
+            return Err(ServerHttpError::IdempotencyConflict {
+                idempotency_key: idempotency_key.to_owned(),
+            });
+        }
+        effects.insert(effect.message_id.clone(), effect.clone());
+        drop(effects);
+
+        if let Some(store) = &self.store {
+            store.upsert_application_effect(&effect)?;
+        }
+        Ok(())
+    }
+
+    fn application_effect(
+        &self,
+        request: ApplicationEffectRequest,
+    ) -> Result<Option<HttpApplicationDeliveryEffect>, ServerHttpError> {
+        validate_string_bytes("message_id", &request.message_id, MAX_OBJECT_ID_BYTES).map_err(
+            |error| ServerHttpError::InvalidEventRequest {
+                reason: error.to_string(),
+            },
+        )?;
+        let effects = self
+            .application_effects
+            .lock()
+            .expect("HTTP application-effects mutex");
+        Ok(effects.get(&request.message_id).cloned())
+    }
+
+    fn application_effect_counts(
+        &self,
+    ) -> Result<ApplicationEffectCountsResponse, ServerHttpError> {
+        let effects = self
+            .application_effects
+            .lock()
+            .expect("HTTP application-effects mutex");
+        let mut push_outbox = 0usize;
+        let mut unread = 0usize;
+        let mut command_inbox = 0usize;
+        for effect in effects.values() {
+            if effect.delivery_policy.creates_push() {
+                push_outbox += 1;
+            }
+            if effect.delivery_policy.creates_unread() {
+                unread += 1;
+            }
+            if effect.delivery_policy.creates_command_inbox_work() {
+                command_inbox += 1;
+            }
+        }
+        Ok(ApplicationEffectCountsResponse {
+            push_outbox: usize_to_u32("push_outbox", push_outbox)?,
+            unread: usize_to_u32("unread", unread)?,
+            command_inbox: usize_to_u32("command_inbox", command_inbox)?,
+        })
+    }
+
     fn append_ephemeral_activity(
         &self,
         request: AppendEphemeralActivityRequest,
@@ -2234,6 +2337,12 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/health", get(health))
         .route("/messages", post(publish_message))
         .route("/events", post(append_event))
+        .route("/application-events", post(append_application_event))
+        .route("/application-effects/get", post(get_application_effect))
+        .route(
+            "/application-effects/counts",
+            post(get_application_effect_counts),
+        )
         .route("/activities", post(append_ephemeral_activity))
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
@@ -2289,6 +2398,26 @@ async fn append_event(
     Json(request): Json<AppendEventRequest>,
 ) -> Result<Json<EventAccepted>, ServerHttpError> {
     Ok(Json(state.append_event(request)?))
+}
+
+async fn append_application_event(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AppendApplicationEventRequest>,
+) -> Result<Json<EventAccepted>, ServerHttpError> {
+    Ok(Json(state.append_application_event(request)?))
+}
+
+async fn get_application_effect(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ApplicationEffectRequest>,
+) -> Result<Json<Option<HttpApplicationDeliveryEffect>>, ServerHttpError> {
+    Ok(Json(state.application_effect(request)?))
+}
+
+async fn get_application_effect_counts(
+    State(state): State<HttpServerState>,
+) -> Result<Json<ApplicationEffectCountsResponse>, ServerHttpError> {
+    Ok(Json(state.application_effect_counts()?))
 }
 
 async fn append_ephemeral_activity(
@@ -2827,6 +2956,13 @@ impl SqliteHttpDeliveryStore {
                 room_id TEXT PRIMARY KEY,
                 projection_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS http_application_delivery_effects (
+                message_id TEXT PRIMARY KEY,
+                room_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                sender_json TEXT NOT NULL,
+                delivery_policy_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS http_welcome_claims (
                 message_id_json TEXT PRIMARY KEY,
                 recipient_json TEXT NOT NULL,
@@ -3300,6 +3436,66 @@ impl SqliteHttpDeliveryStore {
             rooms.insert(room_id, serde_json::from_str(&projection_json)?);
         }
         Ok(rooms)
+    }
+
+    fn upsert_application_effect(
+        &self,
+        effect: &HttpApplicationDeliveryEffect,
+    ) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_application_delivery_effects (
+                message_id,
+                room_id,
+                seq,
+                sender_json,
+                delivery_policy_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(message_id) DO NOTHING",
+            params![
+                &effect.message_id,
+                &effect.room_id,
+                effect.seq,
+                serde_json::to_string(&effect.sender)?,
+                serde_json::to_string(&effect.delivery_policy)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_application_effects(
+        &self,
+    ) -> Result<BTreeMap<String, HttpApplicationDeliveryEffect>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT message_id, room_id, seq, sender_json, delivery_policy_json
+             FROM http_application_delivery_effects
+             ORDER BY message_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut effects = BTreeMap::new();
+        for row in rows {
+            let (message_id, room_id, seq, sender_json, delivery_policy_json) = row?;
+            effects.insert(
+                message_id.clone(),
+                HttpApplicationDeliveryEffect {
+                    room_id,
+                    seq,
+                    message_id,
+                    sender: serde_json::from_str(&sender_json)?,
+                    delivery_policy: serde_json::from_str(&delivery_policy_json)?,
+                },
+            );
+        }
+        Ok(effects)
     }
 
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {

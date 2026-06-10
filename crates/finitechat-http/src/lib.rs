@@ -1,6 +1,6 @@
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::{GroupId, MemberId, MessageId};
-use finitechat_proto::{DeviceRef, MembershipDeltaV1, RoomLogEntry};
+use finitechat_proto::{ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use transport_http_server::{
@@ -24,6 +24,27 @@ pub struct PublishMessageRequest {
 pub struct FiniteAccountRoomCommitProjection {
     pub entry: RoomLogEntry,
     pub membership_delta: MembershipDeltaV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationEffectRequest {
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpApplicationDeliveryEffect {
+    pub room_id: String,
+    pub seq: HttpSequence,
+    pub message_id: String,
+    pub sender: DeviceRef,
+    pub delivery_policy: ApplicationDeliveryPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationEffectCountsResponse {
+    pub push_outbox: u32,
+    pub unread: u32,
+    pub command_inbox: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

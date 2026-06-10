@@ -51,9 +51,14 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "application event push/unread/command policy can stay above opaque Marmot application payloads",
         },
         PortFinding {
+            area: "http_application_delivery_effect_projection",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server /application-events records caller-supplied ApplicationDeliveryPolicy as delivery-effect projection state, preserves push/unread/command-inbox counts after SQLite restart, and rejects same-event replays with conflicting policy without decrypting payloads",
+        },
+        PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, direct-room create-or-get, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, application delivery effects, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, direct-room create-or-get, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",

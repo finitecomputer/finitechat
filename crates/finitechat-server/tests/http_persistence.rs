@@ -5,20 +5,21 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_engine::{
-    AccountRoomDevice, AccountRoomRecord, AppendEphemeralActivityRequest, AppendEventRequest,
-    CommitAccepted, EphemeralActivityAccepted, EventAccepted, SubmitCommitRequest,
-    UploadKeyPackageRequest, WelcomeRecord,
+    AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
+    AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
+    EventAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
-    BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
-    ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
-    ClaimWelcomesRequest, CreateDirectRoomRequest, CreateDirectRoomResponse,
-    CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
-    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
-    HttpFanoutRoomPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
-    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
+    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
+    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest, ErrorResponse,
+    ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest,
+    FiniteAccountRoomCommitProjection, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
+    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
     MarkFanoutPreparedRequest, PublishKeyPackageResponse, PublishMessageRequest,
     ReleaseLinkClaimRequest, ReleaseLinkClaimResponse, ReportInvalidCommitRequest,
@@ -26,7 +27,7 @@ use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
-    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    DeviceRef, DurableAppEventKind, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
     MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MembershipAddV1, MembershipDeltaV1,
     MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
@@ -3170,6 +3171,154 @@ async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_confli
 }
 
 #[tokio::test]
+async fn sqlite_application_delivery_effects_survive_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-application-effects".to_owned();
+    let mls_group_id = "mls-application-effects".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let chat = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"chat.message","text":"hello"}"#,
+        "application-effect-chat",
+    );
+    let command = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"runtime.command.request","command":"restart"}"#,
+        "application-effect-command",
+    );
+    let receipt = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        br#"{"type":"chat.receipt","message_id":"m1"}"#,
+        "application-effect-receipt",
+    );
+    let chat_message_id = chat.envelope.message_id().expect("chat message id");
+    let command_message_id = command.envelope.message_id().expect("command message id");
+    let receipt_message_id = receipt.envelope.message_id().expect("receipt message id");
+
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: chat.clone(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted_chat: EventAccepted = read_json(response).await;
+    assert_eq!(accepted_chat.seq, 1);
+    assert_eq!(accepted_chat.message_id, chat_message_id);
+
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: chat.clone(),
+            delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed_chat: EventAccepted = read_json(response).await;
+    assert_eq!(replayed_chat, accepted_chat);
+
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: command.clone(),
+            delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted_command: EventAccepted = read_json(response).await;
+    assert_eq!(accepted_command.seq, 2);
+    assert_eq!(accepted_command.message_id, command_message_id);
+
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: receipt.clone(),
+            delivery_policy: DurableAppEventKind::ChatReceipt.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted_receipt: EventAccepted = read_json(response).await;
+    assert_eq!(accepted_receipt.seq, 3);
+    assert_eq!(accepted_receipt.message_id, receipt_message_id);
+
+    let app = persistent_app(&db_path);
+    let counts = application_effect_counts(&app).await;
+    assert_eq!(counts.push_outbox, 2);
+    assert_eq!(counts.unread, 1);
+    assert_eq!(counts.command_inbox, 1);
+
+    let chat_effect = application_effect(&app, &accepted_chat.message_id)
+        .await
+        .expect("chat effect");
+    assert_eq!(chat_effect.seq, 1);
+    assert_eq!(chat_effect.sender, alice);
+    assert!(chat_effect.delivery_policy.creates_push());
+    assert!(chat_effect.delivery_policy.creates_unread());
+    assert!(!chat_effect.delivery_policy.creates_command_inbox_work());
+
+    let command_effect = application_effect(&app, &accepted_command.message_id)
+        .await
+        .expect("command effect");
+    assert!(command_effect.delivery_policy.creates_push());
+    assert!(!command_effect.delivery_policy.creates_unread());
+    assert!(command_effect.delivery_policy.creates_command_inbox_work());
+
+    let receipt_effect = application_effect(&app, &accepted_receipt.message_id)
+        .await
+        .expect("receipt effect");
+    assert!(!receipt_effect.delivery_policy.creates_push());
+    assert!(!receipt_effect.delivery_policy.creates_unread());
+    assert!(!receipt_effect.delivery_policy.creates_command_inbox_work());
+
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: chat,
+            delivery_policy: DurableAppEventKind::ChatReceipt.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "idempotency_conflict");
+    assert_eq!(application_effect_counts(&app).await, counts);
+}
+
+#[tokio::test]
 async fn sqlite_typed_event_idempotency_capacity_rejects_new_keys_but_replays_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -3995,6 +4144,33 @@ async fn assert_inventory(app: Router, owner: MemberId, available: u32, claimed:
     assert_eq!(inventory.owner, owner);
     assert_eq!(inventory.available, available);
     assert_eq!(inventory.claimed, claimed);
+}
+
+async fn application_effect_counts(app: &Router) -> ApplicationEffectCountsResponse {
+    let response = post_json(
+        app.clone(),
+        "/application-effects/counts",
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    read_json(response).await
+}
+
+async fn application_effect(
+    app: &Router,
+    message_id: &str,
+) -> Option<HttpApplicationDeliveryEffect> {
+    let response = post_json(
+        app.clone(),
+        "/application-effects/get",
+        &ApplicationEffectRequest {
+            message_id: message_id.to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    read_json(response).await
 }
 
 async fn revoke_device(app: &Router, device: &DeviceRef) {
