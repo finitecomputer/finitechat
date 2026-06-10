@@ -196,6 +196,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can decode a claimed WelcomeRecord on activated ack, mark the pending account-room device active, and reload that active projection after restart",
         },
         PortFinding {
+            area: "http_delayed_welcome_forward_sync",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server persists a typed event appended after an add commit but before the recipient claims and acks the Welcome, then lets the activated device sync forward from the add-commit seq after SQLite restart",
+        },
+        PortFinding {
             area: "http_room_membership_projection",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, removed devices can sync through their removal but not later entries after restart, stale removed devices cannot send events or commits, and typed rooms reject raw plain commits without membership deltas",

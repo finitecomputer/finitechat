@@ -4662,6 +4662,106 @@ async fn sqlite_welcome_activation_marks_account_room_device_active_after_restar
 }
 
 #[tokio::test]
+async fn sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-delayed-welcome-sync".to_owned();
+    let mls_group_id = "mls-delayed-welcome-sync".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let add_bob = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-delayed-sync-bob",
+        "commit-delayed-sync-bob",
+    );
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted_add: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted_add.seq, 1);
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            1,
+            b"later-before-welcome-ack",
+            "delayed-welcome-later-event",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let later: EventAccepted = read_json(response).await;
+    assert_eq!(later.seq, 2);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&bob),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].message.id, id("welcome-delayed-sync-bob"));
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-delayed-sync-bob"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: accepted_add.seq,
+            limit: 10,
+            requester: Some(member_for_device(&bob)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, later.seq);
+    assert_eq!(page.entries[0].message.id, id(&later.message_id));
+    assert_eq!(page.next_after_seq, later.seq);
+    assert!(!page.has_more);
+}
+
+#[tokio::test]
 async fn sqlite_welcome_claim_survives_restart_before_ack() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");

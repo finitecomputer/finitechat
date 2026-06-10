@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `383`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `384`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 50 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 51 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `391` (`383` Rust, `8` Python)
+- Port parsed tests: `392` (`384` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `97`
+- Port-only test names: `98`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 56 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 57 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `97` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `98` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 56 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 57 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -200,6 +200,12 @@ Current Welcome-release progress: typed HTTP `/commits` now has a focused
 restart proof that bad commit metadata does not release a Welcome, the absence
 of that Welcome survives server restart, and the corrected commit releases
 exactly one Welcome only after it is accepted.
+
+Current delayed Welcome sync progress: typed HTTP `/commits`, `/events`,
+`/welcomes/claim`, `/welcomes/ack`, and `/sync/group` now prove that a later
+typed event appended before the recipient claims and activates its Welcome is
+delivered when that activated device syncs forward from its add-commit sequence
+after SQLite restart.
 
 Current revocation progress: the HTTP server now persists revoked `DeviceRef`s,
 rebuilds that state after restart, rejects revoked KeyPackage
@@ -428,7 +434,8 @@ Fork-only requirements beyond the current HTTP branch:
   after acceptance.
 - The HTTP Welcome ack wrapper can decode a claimed `WelcomeRecord` on
   activated ack and promote the account-room device from pending to active
-  across SQLite restart.
+  across SQLite restart. Requester-aware sync then lets that activated device
+  pull later room entries from its add-commit cursor after restart.
 - The HTTP room-membership projection can derive server-owned membership
   intervals from typed bootstrap, typed `/commits`, and activated Welcome acks,
   persist them, filter group sync pages by requester, and reject typed
@@ -744,7 +751,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `56`
+- Route/store/engine tests added so far: `57`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -832,6 +839,10 @@ Additional HTTP route checkpoint:
     and survives restart
   - activated Welcome ack promotes the pending account-room device to
     active and the projection survives restart
+  - delayed Welcome activation preserves forward sync: if a later typed event
+    is already in the group log before Welcome claim and ack, the activated
+    device can sync from its add-commit sequence after SQLite restart and
+    receive that later entry with the correct cursor
   - requester-aware group sync filters through a persisted room-membership
     projection, advances cursors over hidden messages, admits pending members
     after typed commits, rejects pending typed application events and tracked
@@ -1055,6 +1066,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequence`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http`: pass
 - `cargo test -p finitechat-cli revoke_device_command_builds_revoke_request`: pass
 - `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
 - `cargo test -p finitechat-client --test client_state reqwest`: pass
