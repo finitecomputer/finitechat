@@ -2348,6 +2348,86 @@ fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir
+        .path()
+        .join("darkmatter-http-pending-observation.sqlite3");
+    let room_id = "room_http_pending_observation";
+    let mls_group_id = "mls_http_pending_observation";
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let mut alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_pending_observation");
+    let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_pending_observation");
+
+    alice.create_group_state(room_id, mls_group_id).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+    delivery
+        .upload_key_package(
+            bob.upload_key_package_request("kp_bob_http_pending_observation")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = delivery
+        .claim_key_package_for_device(bob.device_ref())
+        .unwrap()
+        .expect("bob key package");
+    let prepared = alice
+        .prepare_add_member_commit(
+            room_id,
+            &claimed_key_package,
+            "welcome_bob_http_pending_observation",
+            "commit_bob_http_pending_observation",
+        )
+        .unwrap();
+    assert!(alice.has_pending_commit(room_id).unwrap());
+    assert!(matches!(
+        alice.create_application_request(room_id, b"too early", "alice_too_early_http_pending"),
+        Err(ClientError::PendingCommitMustBeMerged(rejected_room)) if rejected_room == room_id
+    ));
+
+    let accepted = delivery.submit_commit(prepared.request.clone()).unwrap();
+    assert_eq!(accepted.seq, 1);
+    assert_eq!(accepted.message_id, prepared.message_id);
+    let unobserved = alice
+        .merge_pending_commit_from_log(room_id, &[], &prepared.message_id)
+        .unwrap_err();
+    assert!(matches!(
+        unobserved,
+        ClientError::PendingCommitNotObserved(message_id) if message_id == prepared.message_id
+    ));
+    assert_eq!(alice.group_epoch(room_id).unwrap(), 0);
+    assert!(alice.has_pending_commit(room_id).unwrap());
+
+    let page = delivery
+        .sync_events(room_id, alice.device_ref(), 0)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, accepted.seq);
+    assert_eq!(page.entries[0].message_id, prepared.message_id);
+    alice
+        .merge_pending_commit_from_log(room_id, &page.entries, &prepared.message_id)
+        .unwrap();
+    assert_eq!(alice.group_epoch(room_id).unwrap(), 1);
+    assert!(!alice.has_pending_commit(room_id).unwrap());
+
+    let request = alice
+        .create_application_request(
+            room_id,
+            b"after observed commit",
+            "alice_after_http_pending_observation",
+        )
+        .unwrap();
+    let accepted_event = delivery.append_event(&request).unwrap();
+    assert_eq!(accepted_event.seq, 2);
+}
+
+#[test]
 fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
