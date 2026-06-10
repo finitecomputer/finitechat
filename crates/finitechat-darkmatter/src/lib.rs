@@ -181,6 +181,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server rejects typed /commits that re-add a current or pending device before durable append, preserving the original Welcome, account-room projection, and claimed retry KeyPackage across SQLite restart",
         },
         PortFinding {
+            area: "http_membership_delta_structural_validation",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server rejects malformed typed /commits membership deltas before durable append, Welcome release, account-room projection, or claimed KeyPackage consumption across the base epoch, post-commit epoch, commit id, duplicate add/remove, add/remove overlap, and incomplete add matrix",
+        },
+        PortFinding {
             area: "http_invalid_commit_repair_state",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",

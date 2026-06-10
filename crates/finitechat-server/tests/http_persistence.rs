@@ -2183,6 +2183,116 @@ async fn submit_commit_route_rejects_missing_staged_welcome_before_side_effects(
 }
 
 #[tokio::test]
+async fn sqlite_submit_commit_rejects_membership_delta_structural_matrix_before_side_effects() {
+    struct Case {
+        label: &'static str,
+        mutate: fn(&mut SubmitCommitRequest),
+        expected_error: &'static str,
+    }
+
+    let cases = [
+        Case {
+            label: "wrong-base-epoch",
+            mutate: |request| request.membership_delta.base_epoch = 9,
+            expected_error: "base epoch",
+        },
+        Case {
+            label: "wrong-post-commit-epoch",
+            mutate: |request| request.membership_delta.post_commit_epoch = 3,
+            expected_error: "post-commit epoch",
+        },
+        Case {
+            label: "wrong-commit-message-id",
+            mutate: |request| request.membership_delta.commit_message_id = "wrong".to_owned(),
+            expected_error: "commit message id",
+        },
+        Case {
+            label: "duplicate-add",
+            mutate: |request| {
+                let add = request
+                    .membership_delta
+                    .adds
+                    .first()
+                    .expect("base request has add")
+                    .clone();
+                request.membership_delta.adds.push(add);
+            },
+            expected_error: "adds device more than once",
+        },
+        Case {
+            label: "duplicate-remove",
+            mutate: |request| {
+                request.membership_delta.adds.clear();
+                let remove = MembershipRemoveV1 {
+                    device: DeviceRef::new("bob", "bob-phone"),
+                    removed_leaf_index: 1,
+                };
+                request.membership_delta.removes = vec![remove.clone(), remove];
+            },
+            expected_error: "removes device more than once",
+        },
+        Case {
+            label: "add-and-remove-same-device",
+            mutate: |request| {
+                request.membership_delta.removes = vec![MembershipRemoveV1 {
+                    device: request.membership_delta.adds[0].device.clone(),
+                    removed_leaf_index: 1,
+                }];
+            },
+            expected_error: "adds and removes same device",
+        },
+        Case {
+            label: "incomplete-add",
+            mutate: |request| {
+                request.membership_delta.adds[0].key_package_id.clear();
+            },
+            expected_error: "missing key package or welcome fields",
+        },
+    ];
+
+    let temp = TempDir::new().expect("tempdir");
+    for case in cases {
+        let db_path = temp.path().join(format!("{}.sqlite3", case.label));
+        let room_id = format!("room-structural-{}", case.label);
+        let mls_group_id = format!("mls-structural-{}", case.label);
+        let creator = DeviceRef::new("alice", "alice-laptop");
+        let bob = DeviceRef::new("bob", "bob-phone");
+        let app = persistent_app(&db_path);
+        let mut request = submit_add_device_request(
+            &room_id,
+            &mls_group_id,
+            &creator,
+            &bob,
+            &format!("welcome-structural-{}", case.label),
+            &format!("commit-structural-{}", case.label),
+        );
+        publish_and_claim_key_package_for_add(&app, &request).await;
+        (case.mutate)(&mut request);
+
+        let response = post_json(app.clone(), "/commits", &request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{}", case.label);
+        let error: ErrorResponse = read_json(response).await;
+        assert_eq!(error.kind, "invalid_commit_request", "{}", case.label);
+        assert!(
+            error.error.contains(case.expected_error),
+            "case {} returned unexpected error: {}",
+            case.label,
+            error.error
+        );
+
+        let app = persistent_app(&db_path);
+        assert_submit_commit_had_no_side_effects(&app, &room_id, &bob).await;
+
+        let account_page = account_room_page(&app, "bob").await;
+        assert!(account_page.rooms.is_empty(), "{}", case.label);
+
+        let inventory = key_package_inventory_for_device(&app, &bob).await;
+        assert_eq!(inventory.available, 0, "{}", case.label);
+        assert_eq!(inventory.claimed, 1, "{}", case.label);
+    }
+}
+
+#[tokio::test]
 async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
