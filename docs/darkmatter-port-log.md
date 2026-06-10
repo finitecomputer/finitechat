@@ -1359,7 +1359,7 @@ Runtime delivery checkpoint:
 - [x] Audit which preserved baseline tests still prove behavior only through
   the original fake/in-memory delivery service instead of a Darkmatter engine
   or HTTP route path, then classify them by risk and owner.
-- [ ] Continue porting preserved fake/in-memory reducer proofs that still lack
+- [x] Continue porting preserved fake/in-memory reducer proofs that still lack
   Darkmatter-backed engine, HTTP route, or runtime-delivery equivalents.
 
 Watch list for the remaining gate:
