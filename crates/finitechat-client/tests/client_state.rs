@@ -3146,6 +3146,235 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
 }
 
 #[test]
+fn runtime_link_fanout_retries_only_failed_room_over_darkmatter_http_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_partial_link");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_partial_link");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut alice_browser = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_partial_link");
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_http_partial_link");
+    let mut source_server = DeliveryService::new();
+    let room_a = "room_http_partial_link_a";
+    let group_a = "mls_http_partial_link_a";
+    let room_b = "room_http_partial_link_b";
+    let group_b = "mls_http_partial_link_b";
+
+    let bob_join = create_group_room_with_member_and_request(
+        &mut source_server,
+        &mut alice_browser,
+        &mut bob,
+        GroupMemberSetup {
+            room_id: room_a,
+            mls_group_id: group_a,
+            key_package_id: "kp_bob_http_partial_link_a",
+            welcome_id: "welcome_bob_http_partial_link_a",
+            idempotency_key: "add_bob_http_partial_link_a",
+        },
+    );
+    let dana_join = create_group_room_with_member_and_request(
+        &mut source_server,
+        &mut alice_browser,
+        &mut dana,
+        GroupMemberSetup {
+            room_id: room_b,
+            mls_group_id: group_b,
+            key_package_id: "kp_dana_http_partial_link_b",
+            welcome_id: "welcome_dana_http_partial_link_b",
+            idempotency_key: "add_dana_http_partial_link_b",
+        },
+    );
+    alice_store.save_device_state(&alice_browser).unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_a, bob_join.join_seq)
+        .unwrap();
+    alice_store
+        .advance_room_cursor_and_save(&mut alice_browser, room_b, dana_join.join_seq)
+        .unwrap();
+    phone_store.save_device_state(&alice_phone).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let initial_a = source_server
+        .sync_events(room_a, alice_browser.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_a.entries.len(), 1);
+    delivery
+        .publish_commit_projection(&bob_join.request, &initial_a.entries[0])
+        .unwrap();
+    let initial_b = source_server
+        .sync_events(room_b, alice_browser.device_ref(), 0)
+        .unwrap();
+    assert_eq!(initial_b.entries.len(), 1);
+    delivery
+        .publish_commit_projection(&dana_join.request, &initial_b.entries[0])
+        .unwrap();
+
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_a.to_owned(),
+            mls_group_id: group_a.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_b.to_owned(),
+            mls_group_id: group_b.to_owned(),
+            creator: alice_browser.device_ref().clone(),
+        })
+        .unwrap();
+
+    let phone_replenish = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 2,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_replenish.uploaded_key_packages, 2);
+
+    alice_store
+        .start_link_fanout_and_save(
+            &mut alice_browser,
+            "fanout_http_partial_phone",
+            alice_phone.device_ref().clone(),
+        )
+        .unwrap();
+    let one_room_options = RuntimeLinkFanoutOptions {
+        max_discovery_pages_per_tick: 4,
+        max_commit_rooms_per_tick: 1,
+        max_completion_sync_pages_per_room: 2,
+    };
+
+    let first_report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_partial_phone",
+        &one_room_options,
+    )
+    .unwrap();
+    assert_eq!(first_report.discovery_pages, 2);
+    assert_eq!(first_report.queued_rooms, 2);
+    assert_eq!(first_report.submitted_commits, 1);
+    assert_eq!(first_report.completed_rooms, 1);
+    assert!(!first_report.complete);
+
+    let status_a = alice_browser
+        .link_fanout_room_status("fanout_http_partial_phone", room_a)
+        .unwrap();
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: accepted_a_seq,
+    } = status_a
+    else {
+        panic!("HTTP partial fanout did not complete room a");
+    };
+    assert_eq!(accepted_a_seq, bob_join.join_seq + 1);
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_http_partial_phone", room_b)
+            .unwrap(),
+        LinkFanoutRoomStatus::Pending
+    ));
+
+    let mut delivery =
+        HttpRuntimeDelivery::with_submit_before_accept_failure_from_sqlite_path(&server_db);
+    let err = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_partial_phone",
+        &one_room_options,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeWorkerError::Delivery(HttpRuntimeDeliveryError::Transport(
+            InProcessHttpTransportError::InjectedSubmitBeforeAccept
+        ))
+    ));
+
+    let mut alice_browser = alice_store.load_device(alice_config.clone()).unwrap();
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_http_partial_phone", room_a)
+            .unwrap(),
+        LinkFanoutRoomStatus::Done { .. }
+    ));
+    assert!(matches!(
+        alice_browser
+            .link_fanout_room_status("fanout_http_partial_phone", room_b)
+            .unwrap(),
+        LinkFanoutRoomStatus::Prepared { .. }
+    ));
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let retry_report = run_link_fanout_tick(
+        &mut alice_store,
+        &mut alice_browser,
+        &mut delivery,
+        "fanout_http_partial_phone",
+        &one_room_options,
+    )
+    .unwrap();
+    assert_eq!(retry_report.submitted_commits, 1);
+    assert_eq!(retry_report.completed_rooms, 1);
+    assert!(retry_report.complete);
+
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: retry_accepted_a_seq,
+    } = alice_browser
+        .link_fanout_room_status("fanout_http_partial_phone", room_a)
+        .unwrap()
+    else {
+        panic!("room a lost Done status after room b retry");
+    };
+    assert_eq!(retry_accepted_a_seq, accepted_a_seq);
+    let LinkFanoutRoomStatus::Done {
+        accepted_seq: accepted_b_seq,
+    } = alice_browser
+        .link_fanout_room_status("fanout_http_partial_phone", room_b)
+        .unwrap()
+    else {
+        panic!("room b fanout did not complete after retry");
+    };
+    assert_eq!(accepted_b_seq, dana_join.join_seq + 1);
+
+    let room_a_page = delivery
+        .sync_events(room_a, bob.device_ref(), bob_join.join_seq)
+        .unwrap();
+    assert_eq!(room_a_page.entries.len(), 1);
+    assert_eq!(room_a_page.entries[0].seq, accepted_a_seq);
+    let room_b_page = delivery
+        .sync_events(room_b, dana.device_ref(), dana_join.join_seq)
+        .unwrap();
+    assert_eq!(room_b_page.entries.len(), 1);
+    assert_eq!(room_b_page.entries[0].seq, accepted_b_seq);
+
+    let mut alice_phone = phone_store.load_device(phone_config).unwrap();
+    let phone_join = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(phone_join.claimed_welcomes, 2);
+    assert_eq!(phone_join.activated_welcome_acks_sent, 2);
+    assert_eq!(alice_phone.group_epoch(room_a).unwrap(), 2);
+    assert_eq!(alice_phone.group_epoch(room_b).unwrap(), 2);
+}
+
+#[test]
 fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");

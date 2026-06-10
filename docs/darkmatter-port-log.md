@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `367`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `368`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -28,7 +28,7 @@ Copied/application Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 45 |
+| `crates/finitechat-client/tests/client_state.rs` | 46 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -76,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `375` (`367` Rust, `8` Python)
+- Port parsed tests: `376` (`368` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `81`
+- Port-only test names: `82`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -88,7 +88,7 @@ Port-only test buckets:
 | Bucket | Count | Files |
 | --- | ---: | --- |
 | HTTP CLI request/live-server coverage | 19 | `crates/finitechat-cli/src/lib.rs` |
-| Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
+| Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
 | Server HTTP route, persistence, and real-engine route coverage | 45 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
@@ -130,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `81` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `82` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -149,7 +149,7 @@ Port-only Darkmatter coverage added so far:
 | Class | Count | Meaning |
 | --- | ---: | --- |
 | CLI HTTP route coverage | 19 | Request building and live-server route calls through `finitechat_cli::run`. |
-| Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
+| Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
 | Server HTTP coverage | 45 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
@@ -410,6 +410,10 @@ Fork-only requirements beyond the current HTTP branch:
   bootstrap discovery: paged account-room discovery across two rooms, two
   distinct target KeyPackage claims, two submitted commits, two completion
   syncs, and two later-device Welcome activations.
+- The multi-room HTTP fanout path also preserves partial-progress isolation:
+  after one room is already `Done`, a before-accept failure in a later room
+  leaves the completed room terminal, reloads the failed room as prepared, and
+  retries only that room against the persisted Darkmatter HTTP server.
 - The HTTP fanout path can reprepare from typed bootstrap discovery after a
   same-epoch race: a fanout submit fails before accept, a competing member
   commit wins the epoch, the client syncs that winner and clears its pending
@@ -593,7 +597,8 @@ Fork-only requirements beyond the current HTTP branch:
   account-room membership updates from the submitted request, and releases
   derived Welcomes, including response-loss retry after the typed submit is
   accepted; the runtime adapter covers that path across one-room and two-room
-  fanout ticks.
+  fanout ticks, including partial retry where completed rooms stay terminal
+  while only the failed prepared room is resubmitted.
   Commit-derived account-room updates are now proven for add-device and
   remove-device commits, typed bootstrap projection is proven for the creator's
   initial active device, account-room save/list now normalizes records to the
@@ -870,6 +875,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-cli expire_key_package_lease_command_builds_expiry_request`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
+- `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_only_failed_room_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass
@@ -949,6 +955,10 @@ Runtime delivery checkpoint:
   discovery one room at a time, claims two distinct target-device KeyPackages,
   submits and completes both room commits, and the later device activates both
   released Welcomes.
+- If one room in a multi-room fanout is already complete and a later room's
+  submit fails before HTTP accept, the worker reloads room A as `Done`, room B
+  as prepared, retries only room B, and then the later device activates both
+  Welcomes from the persisted Darkmatter HTTP server.
 - If the fanout submit fails before HTTP accept and a competing same-epoch
   member commit wins, the worker starts from typed bootstrap discovery, syncing
   that winning commit clears the local pending commit, and the next worker tick
@@ -958,8 +968,9 @@ Runtime delivery checkpoint:
   submit-commit, typed application events, Welcome claim/ack, requester-filtered
   ordered room pull, account-room discovery, commit-derived account-room
   updates for add/remove commits, and later-device fanout from typed bootstrap
-  across the happy path, submit response-loss retry, multi-room fanout, and
-  same-epoch reprepare. Typed bootstrap/commit/event flows now have
+  across the happy path, submit response-loss retry, multi-room fanout,
+  partial failed-room retry, and same-epoch reprepare. Typed
+  bootstrap/commit/event flows now have
   server-owned room-membership projection, and typed rooms reject raw plain
   Commit imports that lack membership deltas before they can weaken strict
   membership filtering.

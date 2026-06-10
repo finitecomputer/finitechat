@@ -226,6 +226,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-client run_link_fanout_tick can page typed bootstrap account-room discovery across two rooms, claim distinct target KeyPackages, submit both commits through Darkmatter HTTP, and activate both later-device Welcomes",
         },
         PortFinding {
+            area: "http_later_device_fanout_partial_retry",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-client run_link_fanout_tick keeps a completed room Done while a later room fails before HTTP accept, then retries only the prepared failed room over the persisted Darkmatter HTTP server and activates both Welcomes",
+        },
+        PortFinding {
             area: "http_later_device_fanout_same_epoch_reprepare",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-client run_link_fanout_tick can recover from typed bootstrap discovery after an HTTP fanout submit fails before accept, a competing same-epoch commit wins, sync clears the local pending commit, and the worker reprepares at the next epoch",
