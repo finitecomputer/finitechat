@@ -17,8 +17,8 @@ Current copied acceptance surface:
 
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
-  `304`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `390`
+  `305`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `391`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -28,7 +28,7 @@ Copied/application Rust test distribution:
 | File | Count |
 | --- | ---: |
 | `crates/finitechat-blob/src/lib.rs` | 17 |
-| `crates/finitechat-client/tests/client_state.rs` | 48 |
+| `crates/finitechat-client/tests/client_state.rs` | 49 |
 | `crates/finitechat-engine/src/lib.rs` | 7 |
 | `crates/finitechat-hermes/src/lib.rs` | 9 |
 | `crates/finitechat-mls/src/lib.rs` | 14 |
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `398` (`390` Rust, `8` Python)
+- Port parsed tests: `399` (`391` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `104`
+- Port-only test names: `105`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +90,7 @@ Port-only test buckets:
 | Bucket | Count | Files |
 | --- | ---: | --- |
 | HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
-| Runtime client over Darkmatter HTTP routes/live reqwest | 17 | `crates/finitechat-client/tests/client_state.rs` |
+| Runtime client over Darkmatter HTTP routes/live reqwest | 18 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
 | Server HTTP route, persistence, and real-engine route coverage | 60 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `104` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `105` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -151,7 +151,7 @@ Port-only Darkmatter coverage added so far:
 | Class | Count | Meaning |
 | --- | ---: | --- |
 | CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
-| Runtime HTTP coverage | 17 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
+| Runtime HTTP coverage | 18 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
 | Server HTTP coverage | 60 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
@@ -213,6 +213,13 @@ Current delayed Welcome sync progress: typed HTTP `/commits`, `/events`,
 typed event appended before the recipient claims and activates its Welcome is
 delivered when that activated device syncs forward from its add-commit sequence
 after SQLite restart.
+
+Current later-device history progress: a real later device over
+`HttpRuntimeDelivery` now starts from a typed HTTP Welcome, activates through
+the runtime sync worker, applies only post-add application history, and a
+requester-aware `/sync/group` page from cursor 0 proves the pre-invite message
+is hidden while the add Commit and post-invite application entry remain
+available.
 
 Current revocation progress: the HTTP server now persists revoked `DeviceRef`s,
 rebuilds that state after restart, rejects revoked KeyPackage
@@ -1055,6 +1062,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state client_merges_pending_commit_only_after_darkmatter_http_log_observation`: pass
+- `cargo test -p finitechat-client --test client_state runtime_later_device_history_starts_at_add_commit_over_darkmatter_http`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_submit_commit_removes_account_room_over_darkmatter_http_routes`: pass

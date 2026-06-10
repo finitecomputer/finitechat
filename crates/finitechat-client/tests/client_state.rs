@@ -2428,6 +2428,114 @@ fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
 }
 
 #[test]
+fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-history-policy.sqlite3");
+    let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_history_phone");
+    let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
+    let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_history");
+    let room_id = "room_http_history_policy";
+    let mls_group_id = "mls_http_history_policy";
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+
+    bob.create_group_state(room_id, mls_group_id).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: bob.device_ref().clone(),
+        })
+        .unwrap();
+    let prior_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"before http invite"}}"#;
+    let prior = bob
+        .create_application_request(room_id, prior_plaintext, "history_http_before_invite")
+        .unwrap();
+    let prior = delivery.append_event(&prior).unwrap();
+    assert_eq!(prior.seq, 1);
+
+    phone_store.save_device_state(&alice_phone).unwrap();
+    delivery
+        .upload_key_package(
+            alice_phone
+                .upload_key_package_request("kp_history_http_alice_phone")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = delivery
+        .claim_key_package_for_device(alice_phone.device_ref())
+        .unwrap()
+        .expect("alice phone key package");
+    let prepared = bob
+        .prepare_add_member_commit(
+            room_id,
+            &claimed_key_package,
+            "welcome_history_http_alice_phone",
+            "history_http_add_alice_phone",
+        )
+        .unwrap();
+    let accepted = delivery.submit_commit(prepared.request).unwrap();
+    assert_eq!(accepted.seq, 2);
+
+    let bob_page = delivery.sync_events(room_id, bob.device_ref(), 0).unwrap();
+    assert_eq!(bob_page.entries.len(), 2);
+    bob.merge_pending_commit_from_log(room_id, &bob_page.entries, &prepared.message_id)
+        .unwrap();
+    assert_eq!(bob.group_epoch(room_id).unwrap(), 1);
+
+    let post_plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"after http invite"}}"#;
+    let post = bob
+        .create_application_request(room_id, post_plaintext, "history_http_after_invite")
+        .unwrap();
+    let post = delivery.append_event(&post).unwrap();
+    assert_eq!(post.seq, 3);
+
+    let report = run_runtime_sync_tick(
+        &mut phone_store,
+        &mut alice_phone,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.claimed_welcomes, 1);
+    assert_eq!(report.activated_welcome_acks_sent, 1);
+    assert_eq!(report.applied_entries.len(), 1);
+    assert_eq!(report.applied_entries[0].seq, post.seq);
+    assert_eq!(
+        report.applied_entries[0].entry,
+        AppliedLogEntry::Application(post_plaintext.to_vec())
+    );
+    assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 1);
+    assert_eq!(alice_phone.last_applied_seq(room_id).unwrap(), post.seq);
+
+    let full_page = delivery
+        .sync_events(room_id, alice_phone.device_ref(), 0)
+        .unwrap();
+    assert!(
+        full_page
+            .entries
+            .iter()
+            .all(|entry| entry.seq >= accepted.seq)
+    );
+    assert!(
+        !full_page
+            .entries
+            .iter()
+            .any(|entry| entry.message_id == prior.message_id)
+    );
+    assert_eq!(full_page.entries.len(), 2);
+    assert_eq!(full_page.entries[0].kind, LogEntryKind::Commit);
+    assert_eq!(full_page.entries[0].seq, accepted.seq);
+    assert_eq!(full_page.entries[1].kind, LogEntryKind::Application);
+    assert_eq!(full_page.entries[1].message_id, post.message_id);
+}
+
+#[test]
 fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
