@@ -290,6 +290,73 @@ async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
 }
 
 #[tokio::test]
+async fn sqlite_key_package_claim_uses_route_owner_and_preserves_opaque_payload() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let route_owner = member("bob-device");
+    let untrusted_payload_owner = member("mallory-device");
+    let payload_with_untrusted_claim =
+        br#"{"claimed_owner":"mallory-device","claimed_device":"phone"}"#.to_vec();
+    let publication = key_package_publication(
+        "kp-untrusted-payload-identity",
+        route_owner.clone(),
+        &payload_with_untrusted_claim,
+    );
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        post_json(app.clone(), "/key-packages", &publication)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_inventory(app.clone(), route_owner.clone(), 1, 0).await;
+    assert_inventory(app, untrusted_payload_owner.clone(), 0, 0).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: untrusted_payload_owner,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(claimed, None);
+    assert_inventory(app.clone(), route_owner.clone(), 1, 0).await;
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: route_owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed = claimed.expect("route owner claims package");
+    assert_eq!(claimed.owner, route_owner.clone());
+    assert_eq!(claimed.key_package_id, publication.key_package_id);
+    assert_eq!(claimed.key_package.bytes, payload_with_untrusted_claim);
+    assert_inventory(app, route_owner.clone(), 0, 1).await;
+
+    let app = persistent_app(&db_path);
+    assert_inventory(app.clone(), route_owner.clone(), 0, 1).await;
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest { owner: route_owner },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(claimed, None);
+}
+
+#[tokio::test]
 async fn sqlite_key_package_inventory_tracks_available_and_claimed_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");

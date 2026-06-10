@@ -96,6 +96,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
         },
         PortFinding {
+            area: "http_key_package_payload_opacity",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server claims KeyPackages by route owner metadata rather than untrusted opaque package bytes; payload identity claims do not authorize the wrong owner, and the original package bytes survive SQLite restart unchanged",
+        },
+        PortFinding {
             area: "http_key_package_publish_retry",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-server replays exact KeyPackage publication retries after restart and rejects conflicting same-id packages without creating extra claimable inventory",

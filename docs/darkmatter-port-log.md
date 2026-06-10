@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `380`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `381`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 47 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 48 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `388` (`380` Rust, `8` Python)
+- Port parsed tests: `389` (`381` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `94`
+- Port-only test names: `95`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 53 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 54 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `94` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `95` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 53 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 54 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -187,7 +187,10 @@ lease state above Marmot's opaque package bytes: it can expire a claimed lease
 back to available, persist that across restart, reclaim the same package, and
 reject attempts to expire consumed packages. Exact KeyPackage publication
 retries now replay safely after restart, while conflicting same-id packages are
-rejected without creating extra claimable inventory.
+rejected without creating extra claimable inventory. The HTTP route also now
+proves KeyPackage payload opacity: route owner metadata, not untrusted bytes in
+the opaque package, decides who can claim a package, and those bytes survive
+SQLite restart unchanged.
 
 Current Welcome-release progress: typed HTTP `/commits` now has a focused
 restart proof that bad commit metadata does not release a Welcome, the absence
@@ -385,6 +388,9 @@ Fork-only requirements beyond the current HTTP branch:
 - The HTTP KeyPackage publication path replays exact same-id package retries
   after restart and rejects conflicting same-id bytes without creating another
   claimable package.
+- The HTTP KeyPackage claim path treats package bytes as opaque. A package whose
+  payload claims a different identity is still claimable only by the route
+  owner, and the untrusted bytes are returned unchanged after SQLite restart.
 - The HTTP revoked-device wrapper can persist terminal device status,
   rebuild it after restart, block revoked devices from server-mediated
   KeyPackage, Welcome, event, and Commit paths, and skip revoked owners during
@@ -730,7 +736,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `53`
+- Route/store/engine tests added so far: `54`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -773,6 +779,9 @@ Additional HTTP route checkpoint:
     publish replay does not resurrect claimed inventory
   - exact KeyPackage publication retry survives restart and conflicting
     same-id package bytes reject without creating extra claimable inventory
+  - KeyPackage claim ownership is taken from route metadata rather than opaque
+    package bytes; an untrusted identity claim inside the payload cannot claim
+    the package, while the route owner receives the same bytes after restart
   - typed `/commits` rejects unclaimed KeyPackages and stale KeyPackage
     metadata before side effects
   - typed `/commits` consumes claimed KeyPackages atomically with accepted
@@ -1002,6 +1011,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_publish_retry_and_conflict_survive_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_key_package_claim_uses_route_owner_and_preserves_opaque_payload`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_welcome_not_released_before_accepted_commit_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http`: pass
 - `cargo test -p finitechat-cli expire_key_package_lease_command_builds_expiry_request`: pass
