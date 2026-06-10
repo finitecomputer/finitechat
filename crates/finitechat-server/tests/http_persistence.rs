@@ -3319,6 +3319,99 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 }
 
 #[tokio::test]
+async fn sqlite_application_delivery_policy_matrix_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-application-policy-matrix".to_owned();
+    let mls_group_id = "mls-application-policy-matrix".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let non_notifying_kinds = [
+        DurableAppEventKind::ChatEdit,
+        DurableAppEventKind::ChatReaction,
+        DurableAppEventKind::ChatReceipt,
+        DurableAppEventKind::RuntimeStateSnapshot,
+        DurableAppEventKind::RuntimeCommandResult,
+        DurableAppEventKind::RuntimeCommandCancel,
+        DurableAppEventKind::ConversationSegmentStart,
+    ];
+    let mut accepted_message_ids = Vec::new();
+    for (index, kind) in non_notifying_kinds.iter().enumerate() {
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            format!(r#"{{"event_index":{index},"kind":"{kind:?}"}}"#).as_bytes(),
+            &format!("application-policy-matrix-{index}"),
+        );
+        let response = post_json(
+            app.clone(),
+            "/application-events",
+            &AppendApplicationEventRequest {
+                event: request,
+                delivery_policy: kind.delivery_policy(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EventAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, u64::try_from(index).unwrap() + 1);
+        accepted_message_ids.push(accepted.message_id);
+    }
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        application_effect_counts(&app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 0,
+            unread: 0,
+            command_inbox: 0,
+        }
+    );
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), accepted_message_ids.len());
+    assert_eq!(
+        page.next_after_seq,
+        u64::try_from(accepted_message_ids.len()).unwrap()
+    );
+
+    for message_id in accepted_message_ids {
+        let effect = application_effect(&app, &message_id)
+            .await
+            .expect("policy effect");
+        assert!(!effect.delivery_policy.creates_push());
+        assert!(!effect.delivery_policy.creates_unread());
+        assert!(!effect.delivery_policy.creates_command_inbox_work());
+    }
+}
+
+#[tokio::test]
 async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_converges() {
     let temp = TempDir::new().expect("tempdir");
     for point in HttpApplicationEventCrashPoint::ALL {
