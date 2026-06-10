@@ -183,7 +183,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_direct_room_constraints",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server persists direct-room account pairs in the room-membership projection, create-or-get returns the same room for reversed account order after restart, and typed /commits reject third-account adds before delivery side effects",
+            evidence: "finitechat-server persists direct-room account pairs in the room-membership projection, create-or-get returns the same room for reversed account order after restart, and typed /commits reject third-account adds and direct-room per-account device overflow before delivery side effects",
         },
         PortFinding {
             area: "http_account_room_commit_projection",

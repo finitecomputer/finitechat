@@ -29,11 +29,11 @@ use finitechat_http::{
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
-    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
-    MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy,
-    WelcomeState,
+    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
+    PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -1835,6 +1835,116 @@ async fn sqlite_direct_room_create_or_get_and_third_account_rejection_over_http(
 
     let listed = account_room_page(&app, &charlie.account_id).await;
     assert!(listed.rooms.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_direct_room_rejects_per_account_device_cap_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let app = persistent_app(&db_path);
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let room_id = "direct-http-device-cap";
+    let mls_group_id = "mls-direct-http-device-cap";
+
+    let response = post_json(
+        app.clone(),
+        "/direct-rooms",
+        &CreateDirectRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: alice.clone(),
+            other_account_id: "bob".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for index in 0..MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT {
+        let bob = DeviceRef::new("bob", format!("bob-direct-{index}"));
+        let request = submit_add_device_request_at_epoch_with_ids(
+            room_id,
+            mls_group_id,
+            &alice,
+            &bob,
+            u64::from(index),
+            &format!("welcome-direct-cap-{index}"),
+            &format!("commit-direct-cap-{index}"),
+        );
+        publish_and_claim_key_package_for_add(&app, &request).await;
+        let response = post_json(app.clone(), "/commits", &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: CommitAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, u64::from(index) + 1);
+    }
+
+    let overflow = DeviceRef::new("bob", "bob-direct-overflow");
+    let overflow_request = submit_add_device_request_at_epoch_with_ids(
+        room_id,
+        mls_group_id,
+        &alice,
+        &overflow,
+        u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
+        "welcome-direct-cap-overflow",
+        "commit-direct-cap-overflow",
+    );
+    publish_and_claim_key_package_for_add(&app, &overflow_request).await;
+    let response = post_json(app.clone(), "/commits", &overflow_request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("direct_room.devices_per_account"));
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
+            limit: 10,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(
+        page.next_after_seq,
+        u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT)
+    );
+
+    let page = account_room_page(&app, "bob").await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(
+        page.rooms[0]["devices"].as_array().expect("devices").len(),
+        MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize
+    );
+    assert!(
+        !page.rooms[0]["devices"]
+            .as_array()
+            .expect("devices")
+            .iter()
+            .any(|device| device["device"]["device_id"] == "bob-direct-overflow")
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&overflow),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+
+    let inventory = key_package_inventory_for_device(&app, &overflow).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
 }
 
 #[tokio::test]

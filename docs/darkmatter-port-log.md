@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `384`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `385`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 51 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 52 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `392` (`384` Rust, `8` Python)
+- Port parsed tests: `393` (`385` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `98`
+- Port-only test names: `99`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 57 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 58 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `98` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `99` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 57 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 58 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -234,8 +234,9 @@ account-room projection still contains one pending device after SQLite restart.
 Current direct-room progress: the HTTP server now exposes direct-room
 create-or-get as wrapper-owned room-membership projection state. The sorted
 account pair survives SQLite restart, reversed account order returns the
-existing room, and typed `/commits` reject third-account adds before delivery
-append, Welcome release, or account-room projection side effects.
+existing room, typed `/commits` reject third-account adds before delivery
+append, Welcome release, or account-room projection side effects, and direct
+rooms enforce their stricter per-account device cap before those side effects.
 
 Current membership-delta validation progress: typed HTTP `/commits` now prove
 the structural matrix at the route boundary. Wrong base epoch, wrong
@@ -752,7 +753,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `57`
+- Route/store/engine tests added so far: `58`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -867,9 +868,11 @@ Additional HTTP route checkpoint:
     retry KeyPackage remains claimed after SQLite restart
   - direct-room create-or-get state survives restart; reversed account order
     returns the original room, direct account pairs stay attached to the
-    room-membership projection, and typed `/commits` reject third-account adds
+    room-membership projection, typed `/commits` reject third-account adds
     before group append, Welcome release, or account-room projection side
-    effects
+    effects, and direct rooms enforce `MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT`
+    before overflow append, Welcome release, projection update, or KeyPackage
+    consumption
   - malformed membership deltas fail at typed `/commits` validation before
     side effects; wrong epochs, wrong commit id, duplicate add/remove entries,
     add/remove overlap, and incomplete add metadata leave the group log,
@@ -1050,6 +1053,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_link_session_state_machine_survives_restart_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_link_session_payload_limit_rejects_without_persisting_payload`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_create_or_get_and_third_account_rejection_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_rejects_per_account_device_cap_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_duplicate_pending_device_before_side_effects`: pass
