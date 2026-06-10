@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `376`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `377`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 43 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 44 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -63,7 +63,8 @@ Audit state:
 - Port code state audited: `codex/darkmatter-port`, including HTTP
   KeyPackage publish retry/conflict, KeyPackage lease-expiry/reclaim,
   Welcome-release coupling, revoked-device projection, ephemeral activity
-  route/cache coverage, and application delivery-effect projection
+  route/cache coverage, and crash-atomic application delivery-effect
+  projection
 - Baseline checkout: `/Users/futurepaul/dev/finite/finitechat`,
   `marmot-investigation` at `7e8048d`
 - Baseline untracked docs were ignored because they are outside `crates/` and
@@ -77,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `384` (`376` Rust, `8` Python)
+- Port parsed tests: `385` (`377` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `90`
+- Port-only test names: `91`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -91,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 49 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 50 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -131,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `90` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `91` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -151,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 49 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 50 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -252,15 +253,11 @@ Current application delivery-effect progress: the HTTP server now exposes
 server-side delivery-effect projection. The projection stores the
 caller-supplied `ApplicationDeliveryPolicy` by message id, reloads it from
 SQLite, reports aggregate push/unread/command-inbox counts, replays exact
-idempotent publishes, and rejects a conflicting replay that tries to attach a
-different delivery policy to the same durable event.
-
-Remaining application delivery-effect hardening: this projection is currently a
-post-append wrapper write, not part of the stronger `/commits` candidate
-snapshot transaction. A later pass should either persist the event append and
-delivery-effect projection in one SQLite mutation or repair the missing
-projection from a replayed `/application-events` request after an interrupted
-server window.
+idempotent publishes, rejects a conflicting replay that tries to attach a
+different delivery policy to the same durable event, and now persists the event
+append, publish idempotency, room-membership observation, and effect projection
+in one SQLite transaction. A trigger-backed crash matrix proves rollback before
+retry convergence at each write boundary.
 
 Current ephemeral activity progress: the HTTP server now accepts opaque
 ephemeral activity through `/activities` only for active, non-revoked senders at
@@ -480,7 +477,8 @@ Fork-only requirements beyond the current HTTP branch:
   `ApplicationDeliveryPolicy` to an accepted typed application event and store
   the derived delivery-effect projection by message id. This keeps
   push/unread/command-inbox routing above opaque Marmot payloads while making
-  the server-side counts durable and replay-safe.
+  the server-side counts durable, replay-safe, and crash-atomic with the
+  ordered event append.
 - The HTTP `/activities` route accepts opaque ephemeral activity for active
   non-revoked members at the current typed room epoch, rejects pending,
   revoked, wrong-epoch, and expired requests, caps per-route volatile cache
@@ -605,9 +603,9 @@ Fork-only requirements beyond the current HTTP branch:
 - Application delivery-effect projection for the HTTP delivery surface. The
   wrapper accepts a typed application-event request plus an
   `ApplicationDeliveryPolicy`, records the derived push/unread/command-inbox
-  effect by message id after the ordered event append is accepted, reloads that
-  projection from SQLite, and rejects exact event replays that try to change
-  the caller-supplied policy.
+  effect by message id in the same SQLite transaction as the ordered event
+  append and publish idempotency row, reloads that projection from SQLite, and
+  rejects exact event replays that try to change the caller-supplied policy.
 - Scoped idempotency capacity for the HTTP delivery surface. The wrapper
   derives room/sender scope from typed `RoomLogEntry` payloads, applies
   `MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE` to fresh typed
@@ -718,7 +716,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `49`
+- Route/store/engine tests added so far: `50`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -840,6 +838,10 @@ Additional HTTP route checkpoint:
     push/unread/command-inbox counts are rebuilt from stored policies, and
     reusing the same idempotency key with a conflicting delivery policy fails
     without changing the projection
+  - application delivery-effect transactions roll back cleanly when SQLite
+    triggers fail after event delivery, publish idempotency, room-membership
+    observation, or effect-projection writes; retry then converges with one
+    durable event and one durable effect
   - ephemeral activity is accepted for active members, rejects pending,
     revoked, wrong-epoch, and expired requests, caps the per-route volatile
     cache, does not advance the durable group sequence, and does not persist
@@ -993,6 +995,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_rejects_oversized_payload_without_persisting_log`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_conflicts`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_application_delivery_effects_survive_restart_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_converges`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequence`: pass
@@ -1138,8 +1141,9 @@ Runtime delivery checkpoint:
 - Application delivery effects are now proven over the HTTP wrapper and SQLite
   rebuild: typed application-event publishes record caller-supplied delivery
   policy, push/unread/command-inbox counts survive restart, exact replay
-  succeeds, and conflicting policy replay fails without changing the
-  projection.
+  succeeds, conflicting policy replay fails without changing the projection,
+  and trigger-backed crash points inside the combined append/effect transaction
+  roll back before retry convergence.
 - Scoped idempotency capacity is now proven over the HTTP wrapper and SQLite
   rebuild: typed publish records count by room and sender, fresh overflow is
   rejected, exact replay remains available after the cap is reached, and the

@@ -1834,45 +1834,7 @@ impl HttpServerState {
                 reason: error.to_string(),
             }
         })?;
-        {
-            let rooms = self
-                .room_memberships
-                .lock()
-                .expect("HTTP room-membership mutex");
-            let projection = rooms.get(&request.room_id).ok_or_else(|| {
-                ServerHttpError::RoomMembershipConflict {
-                    room_id: request.room_id.clone(),
-                    reason: "typed event requires a room-membership projection".to_owned(),
-                }
-            })?;
-            if projection.mls_group_id != request.envelope.mls_group_id {
-                return Err(ServerHttpError::InvalidEventRequest {
-                    reason: "event envelope MLS group does not match room projection".to_owned(),
-                });
-            }
-            if projection.status != RoomStatus::Open {
-                return Err(ServerHttpError::RoomNotOpen {
-                    room_id: request.room_id.clone(),
-                    status: projection.status,
-                });
-            }
-            if request.envelope.epoch != projection.current_epoch {
-                return Err(ServerHttpError::InvalidEventRequest {
-                    reason: format!(
-                        "event envelope epoch {} does not match room epoch {}",
-                        request.envelope.epoch, projection.current_epoch
-                    ),
-                });
-            }
-            let tracks_sender = projection.tracks_device(&request.sender);
-            if (tracks_sender || projection.membership_complete)
-                && !projection.device_active_at_head(&request.sender)
-            {
-                return Err(ServerHttpError::SenderNotActive {
-                    sender: request.sender,
-                });
-            }
-        }
+        self.validate_event_room_membership(&request)?;
 
         let event_publish = event_publish_request(&request, &message_id)?;
         let receipt = self.publish_typed_event_message(event_publish, &message_id)?;
@@ -1887,51 +1849,122 @@ impl HttpServerState {
         &self,
         request: AppendApplicationEventRequest,
     ) -> Result<EventAccepted, ServerHttpError> {
-        request
-            .validate_limits()
-            .map_err(|error| ServerHttpError::InvalidEventRequest {
-                reason: error.to_string(),
-            })?;
+        validate_append_event_request(&request.event)?;
         if request.event.envelope.kind != LogEntryKind::Application {
             return Err(ServerHttpError::InvalidEventRequest {
                 reason: "application-event route only accepts application envelopes".to_owned(),
             });
         }
+        self.ensure_device_not_revoked(&request.event.sender)?;
+        self.validate_event_room_membership(&request.event)?;
+        let message_id = request.event.envelope.message_id().map_err(|error| {
+            ServerHttpError::InvalidEventRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let event_publish = event_publish_request(&request.event, &message_id)?;
 
-        let accepted = self.append_event(request.event.clone())?;
-        let effect = HttpApplicationDeliveryEffect {
-            room_id: request.event.room_id,
-            seq: accepted.seq,
-            message_id: accepted.message_id.clone(),
-            sender: request.event.sender,
-            delivery_policy: request.delivery_policy,
-        };
-        self.record_application_delivery_effect(effect, &request.event.idempotency_key)?;
-        Ok(accepted)
-    }
-
-    fn record_application_delivery_effect(
-        &self,
-        effect: HttpApplicationDeliveryEffect,
-        idempotency_key: &str,
-    ) -> Result<(), ServerHttpError> {
-        let mut effects = self
+        let mut service = self.service.lock().expect("HTTP delivery service mutex");
+        let mut idempotency = self
+            .publish_idempotency
+            .lock()
+            .expect("HTTP publish idempotency mutex");
+        let mut room_memberships = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let mut application_effects = self
             .application_effects
             .lock()
             .expect("HTTP application-effects mutex");
-        if let Some(existing) = effects.get(&effect.message_id) {
-            if existing == &effect {
-                return Ok(());
-            }
-            return Err(ServerHttpError::IdempotencyConflict {
-                idempotency_key: idempotency_key.to_owned(),
-            });
-        }
-        effects.insert(effect.message_id.clone(), effect.clone());
-        drop(effects);
+
+        let mut candidate_service = service.clone();
+        let mut candidate_idempotency = idempotency.clone();
+        let mut candidate_room_memberships = room_memberships.clone();
+        let mut candidate_application_effects = application_effects.clone();
+        let (receipt, publish_mutation) = publish_typed_event_request_to_candidate(
+            &mut candidate_service,
+            &mut candidate_idempotency,
+            event_publish,
+            &message_id,
+        )?;
+        let room_membership_projection = apply_room_event_acceptance(
+            &mut candidate_room_memberships,
+            &request.event.room_id,
+            receipt.seq,
+        );
+        let effect = HttpApplicationDeliveryEffect {
+            room_id: request.event.room_id,
+            seq: receipt.seq,
+            message_id: message_id.clone(),
+            sender: request.event.sender,
+            delivery_policy: request.delivery_policy,
+        };
+        let effect_mutation = apply_application_delivery_effect(
+            &mut candidate_application_effects,
+            effect,
+            &request.event.idempotency_key,
+        )?;
 
         if let Some(store) = &self.store {
-            store.upsert_application_effect(&effect)?;
+            store.append_application_event_mutation(
+                publish_mutation.as_ref(),
+                room_membership_projection.as_ref(),
+                effect_mutation.as_ref(),
+            )?;
+        }
+
+        *service = candidate_service;
+        *idempotency = candidate_idempotency;
+        *room_memberships = candidate_room_memberships;
+        *application_effects = candidate_application_effects;
+        Ok(EventAccepted {
+            seq: receipt.seq,
+            message_id,
+        })
+    }
+
+    fn validate_event_room_membership(
+        &self,
+        request: &AppendEventRequest,
+    ) -> Result<(), ServerHttpError> {
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let projection =
+            rooms
+                .get(&request.room_id)
+                .ok_or_else(|| ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "typed event requires a room-membership projection".to_owned(),
+                })?;
+        if projection.mls_group_id != request.envelope.mls_group_id {
+            return Err(ServerHttpError::InvalidEventRequest {
+                reason: "event envelope MLS group does not match room projection".to_owned(),
+            });
+        }
+        if projection.status != RoomStatus::Open {
+            return Err(ServerHttpError::RoomNotOpen {
+                room_id: request.room_id.clone(),
+                status: projection.status,
+            });
+        }
+        if request.envelope.epoch != projection.current_epoch {
+            return Err(ServerHttpError::InvalidEventRequest {
+                reason: format!(
+                    "event envelope epoch {} does not match room epoch {}",
+                    request.envelope.epoch, projection.current_epoch
+                ),
+            });
+        }
+        let tracks_sender = projection.tracks_device(&request.sender);
+        if (tracks_sender || projection.membership_complete)
+            && !projection.device_active_at_head(&request.sender)
+        {
+            return Err(ServerHttpError::SenderNotActive {
+                sender: request.sender.clone(),
+            });
         }
         Ok(())
     }
@@ -2068,14 +2101,10 @@ impl HttpServerState {
             .room_memberships
             .lock()
             .expect("HTTP room-membership mutex");
-        let Some(projection) = rooms.get_mut(room_id) else {
+        let Some(projection) = apply_room_event_acceptance(&mut rooms, room_id, accepted_seq)
+        else {
             return Ok(());
         };
-        if projection.last_seq >= accepted_seq {
-            return Ok(());
-        }
-        projection.last_seq = accepted_seq;
-        let projection = projection.clone();
         drop(rooms);
 
         if let Some(store) = &self.store {
@@ -3080,6 +3109,50 @@ impl SqliteHttpDeliveryStore {
         Ok(())
     }
 
+    fn append_application_event_mutation(
+        &self,
+        publish_mutation: Option<&PublishMutation>,
+        room_membership_projection: Option<&HttpRoomMembershipProjection>,
+        effect: Option<&HttpApplicationDeliveryEffect>,
+    ) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if let Some(mutation) = publish_mutation {
+            if let Some(operation) = &mutation.operation {
+                transaction.execute(
+                    "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
+                    params![operation.kind(), serde_json::to_string(operation)?],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO http_publish_idempotency (
+                    idempotency_key,
+                    fingerprint_json,
+                    receipt_json
+                ) VALUES (?1, ?2, ?3)",
+                params![
+                    mutation.idempotency_key,
+                    serde_json::to_string(&mutation.record.fingerprint)?,
+                    serde_json::to_string(&mutation.record.receipt)?,
+                ],
+            )?;
+        }
+        if let Some(projection) = room_membership_projection {
+            transaction.execute(
+                "INSERT INTO http_room_memberships (room_id, projection_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(room_id) DO UPDATE SET
+                    projection_json = excluded.projection_json",
+                params![projection.room_id, serde_json::to_string(projection)?],
+            )?;
+        }
+        if let Some(effect) = effect {
+            upsert_application_effect_in_transaction(&transaction, effect)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn append_key_package_claim_mutation(
         &self,
         operation: Option<&PersistedOperation>,
@@ -3438,31 +3511,6 @@ impl SqliteHttpDeliveryStore {
         Ok(rooms)
     }
 
-    fn upsert_application_effect(
-        &self,
-        effect: &HttpApplicationDeliveryEffect,
-    ) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO http_application_delivery_effects (
-                message_id,
-                room_id,
-                seq,
-                sender_json,
-                delivery_policy_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(message_id) DO NOTHING",
-            params![
-                &effect.message_id,
-                &effect.room_id,
-                effect.seq,
-                serde_json::to_string(&effect.sender)?,
-                serde_json::to_string(&effect.delivery_policy)?,
-            ],
-        )?;
-        Ok(())
-    }
-
     fn load_application_effects(
         &self,
     ) -> Result<BTreeMap<String, HttpApplicationDeliveryEffect>, DurableStoreError> {
@@ -3585,6 +3633,30 @@ fn upsert_key_package_inventory_in_transaction(
     Ok(())
 }
 
+fn upsert_application_effect_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    effect: &HttpApplicationDeliveryEffect,
+) -> Result<(), DurableStoreError> {
+    transaction.execute(
+        "INSERT INTO http_application_delivery_effects (
+            message_id,
+            room_id,
+            seq,
+            sender_json,
+            delivery_policy_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(message_id) DO NOTHING",
+        params![
+            &effect.message_id,
+            &effect.room_id,
+            effect.seq,
+            serde_json::to_string(&effect.sender)?,
+            serde_json::to_string(&effect.delivery_policy)?,
+        ],
+    )?;
+    Ok(())
+}
+
 fn publish_request_to_candidate(
     service: &mut HttpDeliveryService,
     idempotency: &mut HashMap<String, PublishIdempotencyRecord>,
@@ -3627,6 +3699,95 @@ fn publish_request_to_candidate(
             record,
         }),
     ))
+}
+
+fn publish_typed_event_request_to_candidate(
+    service: &mut HttpDeliveryService,
+    idempotency: &mut HashMap<String, PublishIdempotencyRecord>,
+    request: PublishMessageRequest,
+    message_id: &str,
+) -> Result<(HttpPublishReceipt, Option<PublishMutation>), ServerHttpError> {
+    let Some(idempotency_key) = request.idempotency_key.clone() else {
+        return Err(ServerHttpError::InvalidIdempotencyKey);
+    };
+    if idempotency_key.is_empty() {
+        return Err(ServerHttpError::InvalidIdempotencyKey);
+    }
+
+    let fingerprint = PublishMessageFingerprint::from_request(&request);
+    if let Some(record) = idempotency.get(&idempotency_key) {
+        if record.fingerprint == fingerprint {
+            return Ok((record.receipt.clone(), None));
+        }
+        return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
+    }
+    ensure_publish_idempotency_capacity(idempotency, &request)?;
+
+    let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
+    let receipt = match service.publish(request.target.clone(), request.message.clone()) {
+        Ok(receipt) => receipt,
+        Err(HttpServerError::ConflictingMessageId { .. }) => {
+            return Err(ServerHttpError::DuplicateMessageId {
+                message_id: typed_message_id,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if receipt.duplicate {
+        return Err(ServerHttpError::DuplicateMessageId {
+            message_id: typed_message_id,
+        });
+    }
+
+    let operation = PersistedOperation::PublishMessage {
+        target: request.target,
+        message: request.message,
+        idempotency_key: Some(idempotency_key.clone()),
+    };
+    let record = PublishIdempotencyRecord {
+        fingerprint,
+        receipt: receipt.clone(),
+    };
+    idempotency.insert(idempotency_key.clone(), record.clone());
+
+    Ok((
+        receipt,
+        Some(PublishMutation {
+            operation: Some(operation),
+            idempotency_key,
+            record,
+        }),
+    ))
+}
+
+fn apply_room_event_acceptance(
+    rooms: &mut BTreeMap<String, HttpRoomMembershipProjection>,
+    room_id: &str,
+    accepted_seq: HttpSequence,
+) -> Option<HttpRoomMembershipProjection> {
+    let projection = rooms.get_mut(room_id)?;
+    if projection.last_seq >= accepted_seq {
+        return None;
+    }
+    projection.last_seq = accepted_seq;
+    Some(projection.clone())
+}
+
+fn apply_application_delivery_effect(
+    effects: &mut BTreeMap<String, HttpApplicationDeliveryEffect>,
+    effect: HttpApplicationDeliveryEffect,
+    idempotency_key: &str,
+) -> Result<Option<HttpApplicationDeliveryEffect>, ServerHttpError> {
+    if let Some(existing) = effects.get(&effect.message_id) {
+        if existing == &effect {
+            return Ok(None);
+        }
+        return Err(ServerHttpError::IdempotencyConflict {
+            idempotency_key: idempotency_key.to_owned(),
+        });
+    }
+    effects.insert(effect.message_id.clone(), effect.clone());
+    Ok(Some(effect))
 }
 
 fn apply_account_room_membership_delta(

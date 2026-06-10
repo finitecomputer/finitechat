@@ -3319,6 +3319,93 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 }
 
 #[tokio::test]
+async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_converges() {
+    let temp = TempDir::new().expect("tempdir");
+    for point in HttpApplicationEventCrashPoint::ALL {
+        let db_path = temp
+            .path()
+            .join(format!("application-event-{point:?}.sqlite3"));
+        let room_id = "room-application-effect-crash".to_owned();
+        let mls_group_id = "mls-application-effect-crash".to_owned();
+        let alice = DeviceRef::new("alice", "alice-laptop");
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            br#"{"type":"chat.message","text":"application-effect-crash"}"#,
+            "application-effect-crash",
+        );
+        let message_id = request.envelope.message_id().expect("message id");
+        let policy = DurableAppEventKind::ChatMessage.delivery_policy();
+
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app,
+            "/account-rooms/bootstrap",
+            &BootstrapAccountRoomRequest {
+                room_id: room_id.clone(),
+                mls_group_id: mls_group_id.clone(),
+                creator: alice.clone(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        install_http_application_event_crash_trigger(&db_path, point);
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app,
+            "/application-events",
+            &AppendApplicationEventRequest {
+                event: request.clone(),
+                delivery_policy: policy,
+            },
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{point:?}"
+        );
+        clear_http_application_event_crash_triggers(&db_path);
+
+        let app = persistent_app(&db_path);
+        assert_application_event_rolled_back(&app, &room_id, &message_id).await;
+
+        let response = post_json(
+            app.clone(),
+            "/application-events",
+            &AppendApplicationEventRequest {
+                event: request.clone(),
+                delivery_policy: policy,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{point:?}");
+        let accepted: EventAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, 1);
+        assert_eq!(accepted.message_id, message_id);
+
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app.clone(),
+            "/application-events",
+            &AppendApplicationEventRequest {
+                event: request,
+                delivery_policy: policy,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{point:?}");
+        let replayed: EventAccepted = read_json(response).await;
+        assert_eq!(replayed, accepted);
+
+        assert_application_event_converged(&app, &room_id, &accepted.message_id).await;
+    }
+}
+
+#[tokio::test]
 async fn sqlite_typed_event_idempotency_capacity_rejects_new_keys_but_replays_after_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -4173,6 +4260,66 @@ async fn application_effect(
     read_json(response).await
 }
 
+async fn assert_application_event_rolled_back(app: &Router, room_id: &str, message_id: &str) {
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+
+    assert_eq!(
+        application_effect_counts(app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 0,
+            unread: 0,
+            command_inbox: 0,
+        }
+    );
+    assert_eq!(application_effect(app, message_id).await, None);
+}
+
+async fn assert_application_event_converged(app: &Router, room_id: &str, message_id: &str) {
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].message.id, id(message_id));
+
+    assert_eq!(
+        application_effect_counts(app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 1,
+            unread: 1,
+            command_inbox: 0,
+        }
+    );
+    let effect = application_effect(app, message_id).await.expect("effect");
+    assert_eq!(effect.seq, 1);
+    assert_eq!(effect.message_id, message_id);
+    assert!(effect.delivery_policy.creates_push());
+    assert!(effect.delivery_policy.creates_unread());
+    assert!(!effect.delivery_policy.creates_command_inbox_work());
+}
+
 async fn revoke_device(app: &Router, device: &DeviceRef) {
     let response = post_json(
         app.clone(),
@@ -4537,6 +4684,93 @@ fn clear_http_submit_commit_crash_triggers(db_path: &std::path::Path) {
         "#,
     )
     .expect("clear HTTP commit crash triggers");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HttpApplicationEventCrashPoint {
+    EventDeliveryOperation,
+    EventIdempotencyRecord,
+    RoomMembershipProjection,
+    ApplicationEffectProjection,
+}
+
+impl HttpApplicationEventCrashPoint {
+    const ALL: [Self; 4] = [
+        Self::EventDeliveryOperation,
+        Self::EventIdempotencyRecord,
+        Self::RoomMembershipProjection,
+        Self::ApplicationEffectProjection,
+    ];
+
+    fn trigger_sql(self) -> &'static str {
+        match self {
+            Self::EventDeliveryOperation => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_application_event_delivery
+                AFTER INSERT ON http_delivery_ops
+                WHEN NEW.kind = 'publish_message'
+                  AND NEW.body_json LIKE '%application-effect-crash%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after application-event delivery');
+                END;
+                "#
+            }
+            Self::EventIdempotencyRecord => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_application_event_idempotency
+                AFTER INSERT ON http_publish_idempotency
+                WHEN NEW.idempotency_key = 'event:room-application-effect-crash:application-effect-crash'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after application-event idempotency');
+                END;
+                "#
+            }
+            Self::RoomMembershipProjection => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_application_event_room_membership
+                AFTER UPDATE OF projection_json ON http_room_memberships
+                WHEN NEW.room_id = 'room-application-effect-crash'
+                  AND NEW.projection_json LIKE '%"last_seq":1%'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after application-event room membership');
+                END;
+                "#
+            }
+            Self::ApplicationEffectProjection => {
+                r#"
+                CREATE TRIGGER finitechat_http_test_crash_after_application_effect_projection
+                AFTER INSERT ON http_application_delivery_effects
+                WHEN NEW.room_id = 'room-application-effect-crash'
+                BEGIN
+                  SELECT RAISE(ROLLBACK, 'finitechat http test crash after application-effect projection');
+                END;
+                "#
+            }
+        }
+    }
+}
+
+fn install_http_application_event_crash_trigger(
+    db_path: &std::path::Path,
+    point: HttpApplicationEventCrashPoint,
+) {
+    clear_http_application_event_crash_triggers(db_path);
+    let conn = Connection::open(db_path).expect("sqlite connection");
+    conn.execute_batch(point.trigger_sql())
+        .expect("install HTTP application-event crash trigger");
+}
+
+fn clear_http_application_event_crash_triggers(db_path: &std::path::Path) {
+    let conn = Connection::open(db_path).expect("sqlite connection");
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_application_event_delivery;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_application_event_idempotency;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_application_event_room_membership;
+        DROP TRIGGER IF EXISTS finitechat_http_test_crash_after_application_effect_projection;
+        "#,
+    )
+    .expect("clear HTTP application-event crash triggers");
 }
 
 async fn assert_http_crash_commit_rolled_back(
