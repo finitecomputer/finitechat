@@ -10,8 +10,8 @@ use finitechat_http::{
     GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpFanoutRoomPlan,
     InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
-    ReleaseLinkClaimRequest, RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
-    UploadLinkPayloadRequest,
+    ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
+    SaveAccountRoomRequest, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::DeviceRef;
 use serde::Serialize;
@@ -124,6 +124,8 @@ where
         "publish-group" => publish_group_request(&server, args),
         "publish-inbox" => publish_inbox_request(&server, args),
         "submit-commit" => submit_commit_request(&server, args),
+        "append-event" => append_event_request(&server, args),
+        "append-activity" => append_activity_request(&server, args),
         "sync-group" => sync_group_request(&server, args),
         "sync-inbox" => sync_inbox_request(&server, args),
         "revoke-device" => revoke_device_request(&server, args),
@@ -146,6 +148,7 @@ where
         "account-room-bootstrap" => account_room_bootstrap_request(&server, args),
         "account-room-save" => account_room_save_request(&server, args),
         "account-rooms-list" => account_rooms_list_request(&server, args),
+        "report-invalid-commit" => report_invalid_commit_request(&server, args),
         "claim-welcomes" => claim_welcomes_request(&server, args),
         "ack-welcome" => ack_welcome_request(&server, args),
         _ => Err(CliError::Usage(http_usage())),
@@ -216,15 +219,19 @@ fn publish_inbox_request(
     post_json_request(server, "/messages", &request)
 }
 
-fn submit_commit_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let request_json = required_option(&mut args, "--request-json")?;
-    reject_extra_args(&args)?;
+fn submit_commit_request(server: &str, args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
+    request_json_passthrough(server, "/commits", args)
+}
 
-    let request: Value = serde_json::from_str(&request_json).map_err(CliError::Json)?;
-    post_json_request(server, "/commits", &request)
+fn append_event_request(server: &str, args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
+    request_json_passthrough(server, "/events", args)
+}
+
+fn append_activity_request(
+    server: &str,
+    args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    request_json_passthrough(server, "/activities", args)
 }
 
 fn sync_group_request(
@@ -234,13 +241,14 @@ fn sync_group_request(
     let group_id = required_option(&mut args, "--group-id")?;
     let after_seq = optional_u64(&mut args, "--after-seq", 0)?;
     let limit = optional_usize(&mut args, "--limit", DEFAULT_SYNC_LIMIT)?;
+    let requester = take_option(&mut args, "--requester")?;
     reject_extra_args(&args)?;
 
     let request = GroupSyncRequest {
         group_id: GroupId::new(group_id.into_bytes()),
         after_seq,
         limit,
-        requester: None,
+        requester: requester.map(|requester| MemberId::new(requester.into_bytes())),
     };
     post_json_request(server, "/sync/group", &request)
 }
@@ -578,6 +586,27 @@ fn account_rooms_list_request(
     post_json_request(server, "/account-rooms/list", &request)
 }
 
+fn report_invalid_commit_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let room_id = required_option(&mut args, "--room-id")?;
+    let account_id = required_option(&mut args, "--account-id")?;
+    let device_id = required_option(&mut args, "--device-id")?;
+    let offending_seq = required_option(&mut args, "--offending-seq")?;
+    reject_extra_args(&args)?;
+
+    let request = ReportInvalidCommitRequest {
+        room_id,
+        reporter: DeviceRef {
+            account_id,
+            device_id,
+        },
+        offending_seq: parse_u64("--offending-seq", &offending_seq)?,
+    };
+    post_json_request(server, "/rooms/report-invalid-commit", &request)
+}
+
 fn claim_welcomes_request(
     server: &str,
     mut args: Vec<String>,
@@ -606,6 +635,18 @@ fn ack_welcome_request(
         activated: parse_bool("--activated", &activated)?,
     };
     post_json_request(server, "/welcomes/ack", &request)
+}
+
+fn request_json_passthrough(
+    server: &str,
+    path: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let request_json = required_option(&mut args, "--request-json")?;
+    reject_extra_args(&args)?;
+
+    let request: Value = serde_json::from_str(&request_json).map_err(CliError::Json)?;
+    post_json_request(server, path, &request)
 }
 
 fn post_json_request<T: Serialize>(
@@ -746,7 +787,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -763,8 +804,8 @@ mod tests {
         HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
         PublishKeyPackageResponse, PublishMessageRequest, ReleaseLinkClaimRequest,
-        RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
-        UploadLinkPayloadRequest,
+        ReportInvalidCommitRequest, RevokeDeviceRequest, SaveAccountRoomRequest,
+        SaveFanoutRoomRequest, UploadLinkPayloadRequest,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
@@ -830,6 +871,33 @@ mod tests {
         assert_eq!(body.group_id.as_slice(), b"room-a");
         assert_eq!(body.after_seq, 0);
         assert_eq!(body.limit, DEFAULT_SYNC_LIMIT);
+        assert!(body.requester.is_none());
+    }
+
+    #[test]
+    fn sync_group_command_accepts_requester() {
+        let request = prepare_http_request([
+            "sync-group",
+            "--group-id",
+            "room-a",
+            "--after-seq",
+            "7",
+            "--limit",
+            "3",
+            "--requester",
+            "alice-phone",
+        ])
+        .expect("prepared request");
+
+        let body: GroupSyncRequest =
+            serde_json::from_value(request.json.expect("json")).expect("sync request");
+        assert_eq!(body.group_id.as_slice(), b"room-a");
+        assert_eq!(body.after_seq, 7);
+        assert_eq!(body.limit, 3);
+        assert_eq!(
+            body.requester.expect("requester").as_slice(),
+            b"alice-phone"
+        );
     }
 
     #[test]
@@ -872,6 +940,37 @@ mod tests {
         let body = request.json.expect("json");
         assert_eq!(body["room_id"], "room-a");
         assert_eq!(body["idempotency_key"], "idem-a");
+    }
+
+    #[test]
+    fn event_and_activity_commands_post_request_json() {
+        let event = prepare_http_request([
+            "append-event",
+            "--request-json",
+            r#"{"room_id":"room-a","sender":"alice-phone","event":{"message_id":"event-a"}}"#,
+        ])
+        .expect("event request");
+
+        assert_eq!(event.method, HttpMethod::Post);
+        assert_eq!(event.url, "http://127.0.0.1:8787/events");
+        let body = event.json.expect("json");
+        assert_eq!(body["room_id"], "room-a");
+        assert_eq!(body["sender"], "alice-phone");
+        assert_eq!(body["event"]["message_id"], "event-a");
+
+        let activity = prepare_http_request([
+            "append-activity",
+            "--request-json",
+            r#"{"room_id":"room-a","sender":"alice-phone","activity_id":"typing-a"}"#,
+        ])
+        .expect("activity request");
+
+        assert_eq!(activity.method, HttpMethod::Post);
+        assert_eq!(activity.url, "http://127.0.0.1:8787/activities");
+        let body = activity.json.expect("json");
+        assert_eq!(body["room_id"], "room-a");
+        assert_eq!(body["sender"], "alice-phone");
+        assert_eq!(body["activity_id"], "typing-a");
     }
 
     #[test]
@@ -1180,6 +1279,33 @@ mod tests {
         assert_eq!(body.account_id, "alice");
         assert_eq!(body.after_room_id.as_deref(), Some("room-a"));
         assert_eq!(body.limit, 3);
+    }
+
+    #[test]
+    fn report_invalid_commit_command_builds_route_dto() {
+        let request = prepare_http_request([
+            "report-invalid-commit",
+            "--room-id",
+            "room-a",
+            "--account-id",
+            "alice",
+            "--device-id",
+            "alice-phone",
+            "--offending-seq",
+            "12",
+        ])
+        .expect("report request");
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(
+            request.url,
+            "http://127.0.0.1:8787/rooms/report-invalid-commit"
+        );
+        let body: ReportInvalidCommitRequest =
+            serde_json::from_value(request.json.expect("json")).expect("report body");
+        assert_eq!(body.room_id, "room-a");
+        assert_eq!(body.reporter, DeviceRef::new("alice", "alice-phone"));
+        assert_eq!(body.offending_seq, 12);
     }
 
     #[test]

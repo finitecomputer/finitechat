@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `370`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `373`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -43,7 +43,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 
 | File | Count |
 | --- | ---: |
-| `crates/finitechat-cli/src/lib.rs` | 20 |
+| `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
 | `crates/finitechat-server/tests/http_persistence.rs` | 40 |
@@ -76,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `378` (`370` Rust, `8` Python)
+- Port parsed tests: `381` (`373` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `84`
+- Port-only test names: `87`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -87,7 +87,7 @@ Port-only test buckets:
 
 | Bucket | Count | Files |
 | --- | ---: | --- |
-| HTTP CLI request/live-server coverage | 20 | `crates/finitechat-cli/src/lib.rs` |
+| HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
 | Server HTTP route, persistence, and real-engine route coverage | 46 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
@@ -130,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `84` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `87` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -148,7 +148,7 @@ Port-only Darkmatter coverage added so far:
 
 | Class | Count | Meaning |
 | --- | ---: | --- |
-| CLI HTTP route coverage | 20 | Request building and live-server route calls through `finitechat_cli::run`. |
+| CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
 | Server HTTP coverage | 46 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
@@ -653,8 +653,10 @@ workspace members:
   `serve [addr] --sqlite PATH`. Auth and production server behavior remain
   unported.
 - `finitechat-cli` can now call the HTTP delivery routes for health, group
-  publish/sync, inbox publish/sync, typed submit-commit, KeyPackage publish and
-  claim, fanout checkpoints, account-room projections, and Welcome claim/ack.
+  publish/sync, requester-aware sync, inbox publish/sync, typed submit-commit,
+  typed application events, ephemeral activity, invalid-commit reporting,
+  KeyPackage publish and claim, fanout checkpoints, account-room projections,
+  and Welcome claim/ack.
 
 Verified after adding the Darkmatter dependency graph:
 
@@ -829,14 +831,17 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `19`
+- New CLI tests added: `22`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
   - typed submit-commit posts caller-provided JSON to `/commits`
   - device revoke builds the `/devices/revoke` DTO
-  - group sync defaults to `after_seq = 0` and `limit = 50`
+  - group sync defaults to `after_seq = 0` and `limit = 50`, and can include a
+    requester for membership-filtered sync
+  - typed event and ephemeral activity commands post caller-provided JSON to
+    `/events` and `/activities`
   - KeyPackage inventory builds the route DTO
   - KeyPackage claim builds the route DTO
   - batch KeyPackage claim builds the route DTO with repeated owners and an
@@ -846,6 +851,7 @@ Additional CLI checkpoint:
   - link-session create/get/upload/claim/release/ack/expire commands build the
     route DTOs
   - account-room bootstrap, save, and list commands build the route DTOs
+  - invalid-commit reporting builds the `/rooms/report-invalid-commit` DTO
   - Welcome claim and ack build the route DTOs
   - unknown CLI flags fail as usage errors
 - Automated live-server CLI coverage now drives account-room bootstrap,
