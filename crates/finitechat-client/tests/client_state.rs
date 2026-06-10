@@ -2536,6 +2536,161 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
 }
 
 #[test]
+fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-removed-device.sqlite3");
+    let charlie_config = test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_http_removed");
+    let mut charlie_store =
+        sqlite_client_store(dir.path().join("charlie.sqlite3"), &charlie_config);
+    let mut bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_removed");
+    let mut charlie = FiniteChatDevice::new(charlie_config.clone()).unwrap();
+    let room_id = "room_http_removed_device";
+    let mls_group_id = "mls_http_removed_device";
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+
+    bob.create_group_state(room_id, mls_group_id).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: bob.device_ref().clone(),
+        })
+        .unwrap();
+    charlie_store.save_device_state(&charlie).unwrap();
+    delivery
+        .upload_key_package(
+            charlie
+                .upload_key_package_request("kp_charlie_http_removed")
+                .unwrap(),
+        )
+        .unwrap();
+    let claimed_key_package = delivery
+        .claim_key_package_for_device(charlie.device_ref())
+        .unwrap()
+        .expect("charlie key package");
+    let add_charlie = bob
+        .prepare_add_member_commit(
+            room_id,
+            &claimed_key_package,
+            "welcome_charlie_http_removed",
+            "add_charlie_http_removed",
+        )
+        .unwrap();
+    let add_acceptance = delivery.submit_commit(add_charlie.request).unwrap();
+    assert_eq!(add_acceptance.seq, 1);
+    let bob_add_page = delivery.sync_events(room_id, bob.device_ref(), 0).unwrap();
+    bob.merge_pending_commit_from_log(room_id, &bob_add_page.entries, &add_charlie.message_id)
+        .unwrap();
+
+    let join_report = run_runtime_sync_tick(
+        &mut charlie_store,
+        &mut charlie,
+        &mut delivery,
+        &RuntimeSyncOptions {
+            key_package_target_available: 0,
+            max_sync_pages_per_room: 4,
+        },
+    )
+    .unwrap();
+    assert_eq!(join_report.claimed_welcomes, 1);
+    assert_eq!(join_report.activated_welcome_acks_sent, 1);
+    assert_eq!(charlie.group_epoch(room_id).unwrap(), 1);
+    let stale_charlie_state = charlie.export_state().unwrap();
+    let mut stale_charlie =
+        FiniteChatDevice::from_state(charlie_config, stale_charlie_state).unwrap();
+
+    let remove_charlie = bob
+        .prepare_remove_member_commit(room_id, stale_charlie.device_ref(), "remove_charlie_http")
+        .unwrap();
+    let remove_acceptance = delivery.submit_commit(remove_charlie.request).unwrap();
+    assert_eq!(remove_acceptance.seq, 2);
+    let bob_remove_page = delivery
+        .sync_events(room_id, bob.device_ref(), add_acceptance.seq)
+        .unwrap();
+    bob.merge_pending_commit_from_log(
+        room_id,
+        &bob_remove_page.entries,
+        &remove_charlie.message_id,
+    )
+    .unwrap();
+    assert_eq!(bob.group_epoch(room_id).unwrap(), 2);
+
+    let stale_page = delivery
+        .sync_events(room_id, stale_charlie.device_ref(), add_acceptance.seq)
+        .unwrap();
+    assert_eq!(stale_page.entries.len(), 1);
+    assert_eq!(stale_page.entries[0].seq, remove_acceptance.seq);
+    let stale_old_epoch_send = stale_charlie
+        .create_application_request(room_id, b"stale", "charlie_removed_old_epoch_http")
+        .unwrap();
+    let err = delivery.append_event(&stale_old_epoch_send).unwrap_err();
+    assert!(matches!(
+        err,
+        HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
+            StatusCode::BAD_REQUEST,
+            body,
+        ))
+            if body.contains("invalid_event_request")
+    ));
+    assert_eq!(
+        stale_charlie
+            .apply_log_entry(room_id, &stale_page.entries[0])
+            .unwrap(),
+        AppliedLogEntry::Commit {
+            sender: bob.device_ref().clone(),
+            epoch: 2,
+        }
+    );
+    assert!(matches!(
+        stale_charlie.create_application_request(room_id, b"removed", "charlie_removed_http"),
+        Err(ClientError::CreateApplicationMessage)
+    ));
+    let forged_new_epoch_send = AppendEventRequest {
+        room_id: room_id.to_owned(),
+        sender: stale_charlie.device_ref().clone(),
+        envelope: envelope(
+            room_id.to_owned(),
+            mls_group_id.to_owned(),
+            stale_charlie.device_ref().clone(),
+            2,
+            LogEntryKind::Application,
+            b"forged removed sender".to_vec(),
+        ),
+        idempotency_key: "charlie_removed_new_epoch_http".to_owned(),
+    };
+    let err = delivery.append_event(&forged_new_epoch_send).unwrap_err();
+    assert!(matches!(
+        err,
+        HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
+            StatusCode::FORBIDDEN,
+            body,
+        ))
+            if body.contains("sender_not_active")
+    ));
+
+    let plaintext =
+        br#"{"type":"finitecomputer.command.v1","body":{"text":"not for removed over http"}}"#;
+    let post_removal = bob
+        .create_application_request(room_id, plaintext, "bob_after_http_remove")
+        .unwrap();
+    let post_removal = delivery.append_event(&post_removal).unwrap();
+    assert_eq!(post_removal.seq, 3);
+    let bob_post_page = delivery
+        .sync_events(room_id, bob.device_ref(), remove_acceptance.seq)
+        .unwrap();
+    assert_eq!(bob_post_page.entries.len(), 1);
+    assert!(matches!(
+        stale_charlie.decrypt_application_entry(room_id, &bob_post_page.entries[0]),
+        Err(ClientError::ProcessMessage)
+    ));
+    let stale_future_page = delivery
+        .sync_events(room_id, stale_charlie.device_ref(), remove_acceptance.seq)
+        .unwrap();
+    assert!(stale_future_page.entries.is_empty());
+    assert_eq!(stale_future_page.next_after_seq, post_removal.seq);
+}
+
+#[test]
 fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("darkmatter-http.sqlite3");
