@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `306`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `392`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `393`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 24 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 54 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 55 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `400` (`392` Rust, `8` Python)
+- Port parsed tests: `401` (`393` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `106`
+- Port-only test names: `107`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 19 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 60 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 61 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `106` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `107` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 19 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 60 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 61 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -206,7 +206,10 @@ uploads after restart.
 Current Welcome-release progress: typed HTTP `/commits` now has a focused
 restart proof that bad commit metadata does not release a Welcome, the absence
 of that Welcome survives server restart, and the corrected commit releases
-exactly one Welcome only after it is accepted.
+exactly one Welcome only after it is accepted. A typed HTTP failed-ack test now
+also proves the old inactive-membership rule: a failed Welcome ack survives
+restart, keeps the added device listed as inactive rather than promoted, blocks
+that device from typed sends, and rejects a later activated ack.
 
 Current delayed Welcome sync progress: typed HTTP `/commits`, `/events`,
 `/welcomes/claim`, `/welcomes/ack`, and `/sync/group` now prove that a later
@@ -781,7 +784,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `60`
+- Route/store/engine tests added so far: `61`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -850,7 +853,8 @@ Additional HTTP route checkpoint:
     second append
   - claimed Welcome inbox messages are not claimed twice before ack
   - activated Welcome ack is idempotent after restart
-  - failed Welcome ack is terminal after restart
+  - failed Welcome ack is terminal after restart, and typed failed activation
+    keeps the added device inactive and unable to send after restart
   - idempotent batch KeyPackage claim replays the exact original claims after
     restart
   - conflicting batch KeyPackage claim idempotency key has no package side
@@ -1084,6 +1088,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_publish_retry_and_conflict_survive_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_claim_uses_route_owner_and_preserves_opaque_payload`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_welcome_not_released_before_accepted_commit_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_welcome_failed_ack_keeps_membership_inactive_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http`: pass
 - `cargo test -p finitechat-cli expire_key_package_lease_command_builds_expiry_request`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_retries_http_submit_response_loss_without_duplicates`: pass
