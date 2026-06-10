@@ -22,7 +22,6 @@ thiserror.workspace = true
 transport-http-server.workspace = true
 
 [dev-dependencies]
-finitechat-testkit = { path = "../finitechat-testkit" }
 axum.workspace = true
 finitechat-server = { path = "../finitechat-server" }
 tempfile.workspace = true

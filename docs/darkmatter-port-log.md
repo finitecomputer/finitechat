@@ -1443,3 +1443,28 @@ Verification after the reshape:
 - Darkmatter branch: `cargo test -p transport-http-server -p
   cgka-conformance-simulator --test http_delivery_compatibility` and focused
   clippy: pass
+
+## Single Implementation Checkpoint
+
+The retired reducer no longer exists anywhere in the repo:
+
+- The 13 runtime-client tests that used `finitechat-testkit` as an MLS message
+  factory now bootstrap their groups over the Darkmatter HTTP routes
+  themselves: `create_group_room_with_member` does typed account-room
+  bootstrap, KeyPackage upload/claim, typed `/commits` submit (server-side
+  Welcome release), creator merge from the ordered log, and member Welcome
+  claim/activate/ack against the same `HttpRuntimeDelivery` the assertions
+  use. Failure-injection tests build their group on a plain transport first so
+  the injected `/commits` failure still fires on the fanout submit under test.
+- This made the tests stricter, not weaker: setup itself now exercises the
+  typed routes, and account-room assertions reflect real typed projections
+  (`current_epoch`/`last_seq` from the accepted add commit rather than a
+  bridged bootstrap record).
+- `finitechat-testkit` is deleted, along with its workspace entry and
+  dev-dependency. Its technical-debt ledger row is removed because the delete
+  condition was met. `transport-http-server` (the upstream contract, in-memory
+  reference, and conformance suite) is now the single delivery implementation
+  in the dependency graph.
+
+Verification: `cargo test --workspace` pass (215 tests), `cargo clippy
+--workspace --all-targets -- -D warnings` pass, Python suite pass (8 tests).

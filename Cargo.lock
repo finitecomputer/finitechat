@@ -688,7 +688,6 @@ dependencies = [
  "finitechat-mls",
  "finitechat-proto",
  "finitechat-server",
- "finitechat-testkit",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
@@ -776,17 +775,6 @@ dependencies = [
  "tokio",
  "tower",
  "transport-http-server",
-]
-
-[[package]]
-name = "finitechat-testkit"
-version = "0.1.0"
-dependencies = [
- "finitechat-proto",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
 ]
 
 [[package]]

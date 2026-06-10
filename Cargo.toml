@@ -4,7 +4,6 @@ members = [
   "crates/finitechat-darkmatter",
   "crates/finitechat-blob",
   "crates/finitechat-proto",
-  "crates/finitechat-testkit",
   "crates/finitechat-mls",
   "crates/finitechat-client",
   "crates/finitechat-hermes",
