@@ -74,6 +74,33 @@ pub struct RevokeDeviceResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveDeviceLivenessRequest {
+    pub device: DeviceRef,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceLivenessRecord {
+    pub device: DeviceRef,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetDeviceLivenessRequest {
+    pub device: DeviceRef,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetDeviceLivenessResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<DeviceLivenessRecord>,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
 }

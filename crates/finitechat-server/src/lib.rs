@@ -22,25 +22,27 @@ pub use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest, ErrorResponse,
-    ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest,
-    ExpireLinkSessionResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
-    GetLinkSessionRequest, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
-    HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomState,
-    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
-    HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
+    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest,
+    DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
+    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
+    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HealthResponse,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
+    HttpFanoutRoomState, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
+    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishKeyPackageResponse, PublishMessageRequest,
-    ReleaseLinkClaimRequest, ReleaseLinkClaimResponse, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
+    MarkFanoutPreparedRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+    PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
+    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len,
-    validate_string_bytes,
+    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
+    RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -70,6 +72,7 @@ pub struct HttpServerState {
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
     application_effects: Arc<Mutex<BTreeMap<String, HttpApplicationDeliveryEffect>>>,
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
+    device_liveness: Arc<Mutex<BTreeMap<String, DeviceLivenessRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -88,6 +91,7 @@ impl HttpServerState {
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
             application_effects: Arc::new(Mutex::new(BTreeMap::new())),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
+            device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             store: None,
         }
@@ -130,6 +134,7 @@ impl HttpServerState {
             room_memberships: Arc::new(Mutex::new(room_memberships)),
             application_effects: Arc::new(Mutex::new(application_effects)),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
+            device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             store: Some(store),
         })
@@ -510,6 +515,70 @@ impl HttpServerState {
             revoked_devices.insert(device_key);
         }
         Ok(RevokeDeviceResponse { revoked: true })
+    }
+
+    fn observe_device_liveness(
+        &self,
+        request: ObserveDeviceLivenessRequest,
+    ) -> Result<DeviceLivenessRecord, ServerHttpError> {
+        validate_device_liveness_request(&request)?;
+        self.ensure_device_not_revoked(&request.device)?;
+        if !self.device_active_in_any_room(&request.device) {
+            return Err(ServerHttpError::DeviceNotActive {
+                device: request.device,
+            });
+        }
+
+        let key = DeviceMembership::key(&request.device);
+        let mut records = self
+            .device_liveness
+            .lock()
+            .expect("HTTP device-liveness mutex");
+        if let Some(current) = records.get(&key)
+            && request.observed_at_ms <= current.observed_at_ms
+        {
+            return Ok(current.clone());
+        }
+
+        let record = DeviceLivenessRecord {
+            device: request.device,
+            observed_at_ms: request.observed_at_ms,
+            expires_at_ms: request.expires_at_ms,
+        };
+        records.insert(key, record.clone());
+        Ok(record)
+    }
+
+    fn get_device_liveness(
+        &self,
+        request: GetDeviceLivenessRequest,
+    ) -> Result<GetDeviceLivenessResponse, ServerHttpError> {
+        request.device.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidDeviceLivenessRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let key = DeviceMembership::key(&request.device);
+        let record = self
+            .device_liveness
+            .lock()
+            .expect("HTTP device-liveness mutex")
+            .get(&key)
+            .cloned();
+        let live = record
+            .as_ref()
+            .is_some_and(|record| request.now_ms < record.expires_at_ms)
+            && self.device_active_in_any_room(&request.device)
+            && self.ensure_device_not_revoked(&request.device).is_ok();
+        Ok(GetDeviceLivenessResponse { record, live })
+    }
+
+    fn device_active_in_any_room(&self, device: &DeviceRef) -> bool {
+        self.room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex")
+            .values()
+            .any(|projection| projection.device_active_at_head(device))
     }
 
     fn revoked_device_keys(&self) -> BTreeSet<String> {
@@ -2346,6 +2415,8 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
         .route("/devices/revoke", post(revoke_device))
+        .route("/devices/liveness", post(observe_device_liveness))
+        .route("/devices/liveness/get", post(get_device_liveness))
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
@@ -2453,6 +2524,22 @@ async fn revoke_device(
     Json(request): Json<RevokeDeviceRequest>,
 ) -> Result<Json<RevokeDeviceResponse>, ServerHttpError> {
     let response = state.revoke_device(request)?;
+    Ok(Json(response))
+}
+
+async fn observe_device_liveness(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ObserveDeviceLivenessRequest>,
+) -> Result<Json<DeviceLivenessRecord>, ServerHttpError> {
+    let response = state.observe_device_liveness(request)?;
+    Ok(Json(response))
+}
+
+async fn get_device_liveness(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetDeviceLivenessRequest>,
+) -> Result<Json<GetDeviceLivenessResponse>, ServerHttpError> {
+    let response = state.get_device_liveness(request)?;
     Ok(Json(response))
 }
 
@@ -4340,6 +4427,32 @@ fn validate_append_ephemeral_activity_request(
     })
 }
 
+fn validate_device_liveness_request(
+    request: &ObserveDeviceLivenessRequest,
+) -> Result<(), ServerHttpError> {
+    request.device.validate_limits().map_err(|error| {
+        ServerHttpError::InvalidDeviceLivenessRequest {
+            reason: error.to_string(),
+        }
+    })?;
+    if request.expires_at_ms <= request.observed_at_ms {
+        return Err(ServerHttpError::InvalidDeviceLivenessRequest {
+            reason:
+                "device_liveness.expires_at_ms must be greater than device_liveness.observed_at_ms"
+                    .to_owned(),
+        });
+    }
+    let window = request.expires_at_ms - request.observed_at_ms;
+    if window > MAX_DEVICE_LIVENESS_EXPIRY_MILLIS {
+        return Err(ServerHttpError::InvalidDeviceLivenessRequest {
+            reason: format!(
+                "device_liveness.expiry_window_millis has {window} ms, max {MAX_DEVICE_LIVENESS_EXPIRY_MILLIS}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn commit_publish_request(
     request: &SubmitCommitRequest,
     message_id: &str,
@@ -4875,6 +4988,12 @@ pub enum ServerHttpError {
     DeviceRevoked {
         device: DeviceRef,
     },
+    InvalidDeviceLivenessRequest {
+        reason: String,
+    },
+    DeviceNotActive {
+        device: DeviceRef,
+    },
     DuplicateKeyPackageClaimOwner {
         owner: MemberId,
     },
@@ -5067,6 +5186,16 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::FORBIDDEN,
                 "device_revoked".to_owned(),
                 format!("device {device:?} is revoked"),
+            ),
+            Self::InvalidDeviceLivenessRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_device_liveness_request".to_owned(),
+                reason,
+            ),
+            Self::DeviceNotActive { device } => (
+                StatusCode::FORBIDDEN,
+                "device_not_active".to_owned(),
+                format!("device {device:?} is not active in any room"),
             ),
             Self::DuplicateKeyPackageClaimOwner { owner } => (
                 StatusCode::BAD_REQUEST,

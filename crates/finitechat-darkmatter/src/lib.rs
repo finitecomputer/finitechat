@@ -58,7 +58,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, application delivery effects, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, direct-room create-or-get, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, application delivery effects, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke/liveness, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, direct-room create-or-get, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -244,6 +244,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_ephemeral_activity_cache",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-server accepts opaque ephemeral activity over HTTP for active members, rejects pending, revoked, wrong-epoch, and expired activity, caps per-route volatile cache entries, keeps conversation-scoped topic and room-wide route keys distinct while treating repeated activity ids as opaque additive events, and does not append durable group messages or persist scoped cache state across SQLite restart",
+        },
+        PortFinding {
+            area: "http_device_liveness",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server exposes volatile device-liveness heartbeats over HTTP for active non-revoked devices, rejects invalid expiry windows plus pending/unknown/revoked devices, replays stale observations without shortening freshness, keeps liveness out of ordered group sync and application effects, and clears it on SQLite restart",
         },
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",

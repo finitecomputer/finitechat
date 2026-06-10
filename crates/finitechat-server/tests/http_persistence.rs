@@ -15,25 +15,28 @@ use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest, ErrorResponse,
-    ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest,
-    FiniteAccountRoomCommitProjection, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
-    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
-    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
-    HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
+    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest,
+    DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
+    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetFanoutRequest, GetLinkSessionRequest,
+    GroupSyncRequest, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpFanoutPlan,
+    HttpFanoutRoomPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
+    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishKeyPackageResponse, PublishMessageRequest,
-    ReleaseLinkClaimRequest, ReleaseLinkClaimResponse, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RevokeDeviceRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
+    MarkFanoutPreparedRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+    PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
-    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT,
-    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MAX_KEY_PACKAGES_PER_DEVICE,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
-    PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy, WelcomeState,
+    LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
+    MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy,
+    WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -4559,6 +4562,276 @@ async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache
     let page: HttpSyncPage = read_json(response).await;
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.next_after_seq, 1);
+}
+
+#[tokio::test]
+async fn sqlite_device_liveness_is_volatile_and_does_not_advance_room_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-device-liveness".to_owned();
+    let mls_group_id = "mls-device-liveness".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: alice.clone(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let heartbeat: DeviceLivenessRecord = read_json(response).await;
+    assert_eq!(heartbeat.device, alice);
+    assert_eq!(heartbeat.observed_at_ms, 1_000);
+    assert_eq!(
+        heartbeat.expires_at_ms,
+        1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: alice.clone(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stale_replay: DeviceLivenessRecord = read_json(response).await;
+    assert_eq!(stale_replay, heartbeat);
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness/get",
+        &GetDeviceLivenessRequest {
+            device: alice.clone(),
+            now_ms: 60_999,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let live: GetDeviceLivenessResponse = read_json(response).await;
+    assert_eq!(live.record, Some(heartbeat.clone()));
+    assert!(live.live);
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness/get",
+        &GetDeviceLivenessRequest {
+            device: alice.clone(),
+            now_ms: 61_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired: GetDeviceLivenessResponse = read_json(response).await;
+    assert_eq!(expired.record, Some(heartbeat));
+    assert!(!expired.live);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+    assert_eq!(
+        application_effect_counts(&app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 0,
+            unread: 0,
+            command_inbox: 0,
+        }
+    );
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness/get",
+        &GetDeviceLivenessRequest {
+            device: alice.clone(),
+            now_ms: 1_001,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_restart: GetDeviceLivenessResponse = read_json(response).await;
+    assert_eq!(
+        after_restart,
+        GetDeviceLivenessResponse {
+            record: None,
+            live: false,
+        }
+    );
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&alice)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+}
+
+#[tokio::test]
+async fn sqlite_device_liveness_rejects_bad_observations_without_room_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-device-liveness-reject".to_owned();
+    let mls_group_id = "mls-device-liveness-reject".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let charlie = DeviceRef::new("charlie", "charlie-phone");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let add_bob = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-liveness-bob",
+        "commit-liveness-bob",
+    );
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: alice.clone(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_000 + MAX_DEVICE_LIVENESS_EXPIRY_MILLIS + 1,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_device_liveness_request");
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: bob.clone(),
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_not_active");
+
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: charlie,
+            observed_at_ms: 1_000,
+            expires_at_ms: 1_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_not_active");
+
+    let response = post_json(
+        app.clone(),
+        "/devices/revoke",
+        &RevokeDeviceRequest {
+            device: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/devices/liveness",
+        &ObserveDeviceLivenessRequest {
+            device: alice,
+            observed_at_ms: 2_000,
+            expires_at_ms: 2_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "device_revoked");
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: accepted.seq,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, accepted.seq);
+    assert_eq!(
+        application_effect_counts(&app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 0,
+            unread: 0,
+            command_inbox: 0,
+        }
+    );
 }
 
 #[tokio::test]

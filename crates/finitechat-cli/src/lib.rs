@@ -8,11 +8,12 @@ use finitechat_http::{
     BootstrapAccountRoomRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimWelcomesRequest, CreateDirectRoomRequest,
     CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest,
-    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpFanoutRoomPlan,
-    InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-    MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
-    ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
-    SaveAccountRoomRequest, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
+    GetDeviceLivenessRequest, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
+    HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
+    ObserveDeviceLivenessRequest, PublishMessageRequest, ReleaseLinkClaimRequest,
+    ReportInvalidCommitRequest, RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+    UploadLinkPayloadRequest,
 };
 use finitechat_proto::DeviceRef;
 use serde::Serialize;
@@ -133,6 +134,8 @@ where
         "sync-group" => sync_group_request(&server, args),
         "sync-inbox" => sync_inbox_request(&server, args),
         "revoke-device" => revoke_device_request(&server, args),
+        "observe-device-liveness" => observe_device_liveness_request(&server, args),
+        "get-device-liveness" => get_device_liveness_request(&server, args),
         "publish-key-package" => publish_key_package_request(&server, args),
         "key-package-inventory" => key_package_inventory_request(&server, args),
         "claim-key-package" => claim_key_package_request(&server, args),
@@ -320,6 +323,46 @@ fn revoke_device_request(
         },
     };
     post_json_request(server, "/devices/revoke", &request)
+}
+
+fn observe_device_liveness_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let account_id = required_option(&mut args, "--account-id")?;
+    let device_id = required_option(&mut args, "--device-id")?;
+    let observed_at_ms = required_option(&mut args, "--observed-at-ms")?;
+    let expires_at_ms = required_option(&mut args, "--expires-at-ms")?;
+    reject_extra_args(&args)?;
+
+    let request = ObserveDeviceLivenessRequest {
+        device: DeviceRef {
+            account_id,
+            device_id,
+        },
+        observed_at_ms: parse_u64("--observed-at-ms", &observed_at_ms)?,
+        expires_at_ms: parse_u64("--expires-at-ms", &expires_at_ms)?,
+    };
+    post_json_request(server, "/devices/liveness", &request)
+}
+
+fn get_device_liveness_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let account_id = required_option(&mut args, "--account-id")?;
+    let device_id = required_option(&mut args, "--device-id")?;
+    let now_ms = required_option(&mut args, "--now-ms")?;
+    reject_extra_args(&args)?;
+
+    let request = GetDeviceLivenessRequest {
+        device: DeviceRef {
+            account_id,
+            device_id,
+        },
+        now_ms: parse_u64("--now-ms", &now_ms)?,
+    };
+    post_json_request(server, "/devices/liveness/get", &request)
 }
 
 fn publish_key_package_request(
@@ -845,7 +888,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] append-application-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] append-application-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -858,13 +901,13 @@ mod tests {
         AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
         BootstrapAccountRoomRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
         ClaimWelcomesRequest, CreateDirectRoomRequest, CreateLinkSessionRequest,
-        ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest, GetLinkSessionRequest,
-        GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomStatus,
-        HttpKeyPackageClaim, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-        MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishKeyPackageResponse,
-        PublishMessageRequest, ReleaseLinkClaimRequest, ReportInvalidCommitRequest,
-        RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
-        UploadLinkPayloadRequest,
+        ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest, GetDeviceLivenessRequest,
+        GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
+        HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
+        ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
+        ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest,
+        ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
+        SaveAccountRoomRequest, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
@@ -1083,6 +1126,48 @@ mod tests {
         let body: RevokeDeviceRequest =
             serde_json::from_value(request.json.expect("json")).expect("revoke request");
         assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
+    }
+
+    #[test]
+    fn device_liveness_commands_build_route_dtos() {
+        let observe = prepare_http_request([
+            "observe-device-liveness",
+            "--account-id",
+            "alice",
+            "--device-id",
+            "alice-phone",
+            "--observed-at-ms",
+            "1000",
+            "--expires-at-ms",
+            "61000",
+        ])
+        .expect("observe request");
+
+        assert_eq!(observe.method, HttpMethod::Post);
+        assert_eq!(observe.url, "http://127.0.0.1:8787/devices/liveness");
+        let body: ObserveDeviceLivenessRequest =
+            serde_json::from_value(observe.json.expect("json")).expect("liveness observe request");
+        assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
+        assert_eq!(body.observed_at_ms, 1000);
+        assert_eq!(body.expires_at_ms, 61000);
+
+        let get = prepare_http_request([
+            "get-device-liveness",
+            "--account-id",
+            "alice",
+            "--device-id",
+            "alice-phone",
+            "--now-ms",
+            "60000",
+        ])
+        .expect("get request");
+
+        assert_eq!(get.method, HttpMethod::Post);
+        assert_eq!(get.url, "http://127.0.0.1:8787/devices/liveness/get");
+        let body: GetDeviceLivenessRequest =
+            serde_json::from_value(get.json.expect("json")).expect("liveness get request");
+        assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
+        assert_eq!(body.now_ms, 60000);
     }
 
     #[test]

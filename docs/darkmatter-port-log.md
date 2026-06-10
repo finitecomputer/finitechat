@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `385`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `388`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -43,10 +43,10 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 
 | File | Count |
 | --- | ---: |
-| `crates/finitechat-cli/src/lib.rs` | 23 |
+| `crates/finitechat-cli/src/lib.rs` | 24 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 52 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 54 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `393` (`385` Rust, `8` Python)
+- Port parsed tests: `396` (`388` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `99`
+- Port-only test names: `102`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -89,10 +89,10 @@ Port-only test buckets:
 
 | Bucket | Count | Files |
 | --- | ---: | --- |
-| HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
+| HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 58 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 60 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `99` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `102` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -150,9 +150,9 @@ Port-only Darkmatter coverage added so far:
 
 | Class | Count | Meaning |
 | --- | ---: | --- |
-| CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
+| CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 58 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 60 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -291,6 +291,14 @@ proves conversation-scoped route keys: separate topics and room-wide activity
 keep distinct cache counts, multiple opaque payloads with the same
 activity id remain separate events in one route, and the volatile scoped cache
 starts empty after restart.
+
+Current runtime liveness progress: the HTTP server now exposes volatile
+device-liveness heartbeats through `/devices/liveness` and
+`/devices/liveness/get`. Heartbeats require an active, non-revoked device,
+reject invalid expiry windows, replay stale observations without shortening the
+freshness window, do not advance the ordered group log or application-effect
+counts, and intentionally clear on SQLite restart so they remain separate from
+durable encrypted runtime-state snapshots.
 
 Current link-session progress: the HTTP server now exposes link-session
 pairing as wrapper-owned rendezvous state. Create/upload/claim/release/ack and
@@ -753,7 +761,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `58`
+- Route/store/engine tests added so far: `60`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -766,6 +774,8 @@ Additional HTTP route checkpoint:
   - `POST /sync/group`
   - `POST /sync/inbox`
   - `POST /devices/revoke`
+  - `POST /devices/liveness`
+  - `POST /devices/liveness/get`
   - `POST /key-packages`
   - `POST /key-packages/inventory`
   - `POST /key-packages/claim`
@@ -911,6 +921,11 @@ Additional HTTP route checkpoint:
     topics and room-wide activity keep separate cache counts, same-route
     payloads remain opaque and additive, and route-scoped cache state resets
     after SQLite restart
+  - runtime device liveness is volatile adapter state: valid active-device
+    heartbeats replay stale observations without shortening the freshness
+    window, query live/expired state by timestamp, reject pending, unknown,
+    revoked, and overlong observations, do not append group entries or
+    application effects, and clear on SQLite restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -962,13 +977,15 @@ Important test caveat:
 Additional CLI checkpoint:
 
 - `cargo test -p finitechat-cli`: pass
-- New CLI tests added: `22`
+- New CLI tests added: `23`
 - Request construction coverage proven:
   - group publish builds the `/messages` DTO with optional commit admission
     and optional idempotency key
   - inbox publish builds a Welcome envelope
   - typed submit-commit posts caller-provided JSON to `/commits`
   - device revoke builds the `/devices/revoke` DTO
+  - device liveness observe/get commands build the `/devices/liveness` and
+    `/devices/liveness/get` DTOs
   - group sync defaults to `after_seq = 0` and `limit = 50`, and can include a
     requester for membership-filtered sync
   - typed event and ephemeral activity commands post caller-provided JSON to
@@ -1072,8 +1089,11 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequence`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_device_liveness_is_volatile_and_does_not_advance_room_state`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_device_liveness_rejects_bad_observations_without_room_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http`: pass
 - `cargo test -p finitechat-cli revoke_device_command_builds_revoke_request`: pass
+- `cargo test -p finitechat-cli device_liveness_commands_build_route_dtos`: pass
 - `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
 - `cargo test -p finitechat-client --test client_state reqwest`: pass
 - The real `run_runtime_sync_tick` worker can replenish KeyPackages through the
