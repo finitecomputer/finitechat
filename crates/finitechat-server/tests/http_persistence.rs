@@ -35,8 +35,9 @@ use finitechat_proto::{
     MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
     MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
-    MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy,
-    WelcomeState,
+    MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, RuntimeStateProjection,
+    RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
+    StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -4110,6 +4111,139 @@ async fn sqlite_application_delivery_policy_matrix_survives_restart_over_http() 
         assert!(!effect.delivery_policy.creates_unread());
         assert!(!effect.delivery_policy.creates_command_inbox_work());
     }
+}
+
+#[tokio::test]
+async fn sqlite_runtime_state_snapshot_projects_from_http_log_after_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-runtime-state-projection".to_owned();
+    let mls_group_id = "mls-runtime-state-projection".to_owned();
+    let runtime = DeviceRef::new("runtime", "runtime-host");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: runtime.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let snapshot = RuntimeStateSnapshotV1 {
+        state_key: "runtime.gateway".to_owned(),
+        schema: "finitecomputer.runtime.gateway.status.v1".to_owned(),
+        revision: 1,
+        observed_at_ms: 1_000,
+        expires_at_ms: 2_000,
+        status_payload: br#"{"status":"live"}"#.to_vec(),
+    };
+    snapshot.validate_limits().expect("snapshot limits");
+    let request = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &runtime,
+        0,
+        &serde_json::to_vec(&snapshot).expect("snapshot json"),
+        "runtime-state-projection-snapshot",
+    );
+    let response = post_json(
+        app.clone(),
+        "/application-events",
+        &AppendApplicationEventRequest {
+            event: request,
+            delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EventAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+
+    let app = persistent_app(&db_path);
+    assert_eq!(
+        application_effect_counts(&app).await,
+        ApplicationEffectCountsResponse {
+            push_outbox: 0,
+            unread: 0,
+            command_inbox: 0,
+        }
+    );
+    let effect = application_effect(&app, &accepted.message_id)
+        .await
+        .expect("runtime state effect");
+    assert!(!effect.delivery_policy.creates_push());
+    assert!(!effect.delivery_policy.creates_unread());
+    assert!(!effect.delivery_policy.creates_command_inbox_work());
+
+    let response = post_json(
+        app,
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&runtime)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].seq, accepted.seq);
+    assert_eq!(
+        page.entries[0].message.id.as_slice(),
+        accepted.message_id.as_bytes()
+    );
+
+    let entry: finitechat_proto::RoomLogEntry =
+        serde_json::from_slice(&page.entries[0].message.payload).expect("room log entry");
+    assert_eq!(entry.kind, LogEntryKind::Application);
+    assert_eq!(entry.sender, runtime);
+    let synced_snapshot: RuntimeStateSnapshotV1 =
+        serde_json::from_slice(&entry.envelope.payload).expect("runtime snapshot");
+    let mut projection = RuntimeStateProjection::default();
+    projection
+        .apply(RuntimeStateProjectionEntry {
+            room_id: entry.room_id,
+            source: entry.sender,
+            accepted_seq: page.entries[0].seq,
+            snapshot: synced_snapshot,
+        })
+        .expect("projection apply");
+
+    let status: serde_json::Value = projection
+        .require_fresh_json(
+            &room_id,
+            &DeviceRef::new("runtime", "runtime-host"),
+            "runtime.gateway",
+            "finitecomputer.runtime.gateway.status.v1",
+            1_500,
+        )
+        .expect("fresh runtime status");
+    assert_eq!(status["status"], "live");
+
+    let err = projection
+        .require_fresh(
+            &room_id,
+            &DeviceRef::new("runtime", "runtime-host"),
+            "runtime.gateway",
+            "finitecomputer.runtime.gateway.status.v1",
+            2_000,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeStateProjectionError::Expired {
+            now_ms: 2_000,
+            expires_at_ms: 2_000,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

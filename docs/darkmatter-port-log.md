@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `306`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `394`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `395`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 24 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 56 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 57 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `402` (`394` Rust, `8` Python)
+- Port parsed tests: `403` (`395` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `108`
+- Port-only test names: `109`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 19 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 62 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 63 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `108` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `109` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 19 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 62 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 63 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -311,7 +311,11 @@ without creating push, unread, or command-inbox work. Runtime command requests
 now also prove the custom status-refresh policy shape: command-inbox work
 without push, opaque request ids that do not collapse distinct command payloads,
 duplicate message-id rejection with a new idempotency key, and count durability
-after restart.
+after restart. Runtime state snapshots are now also proven as product
+projection inputs from the ordered HTTP log: after SQLite restart, a client can
+sync the opaque application entry, decode the `RuntimeStateSnapshotV1`, rebuild
+`RuntimeStateProjection`, read fresh dashboard status, and observe stale expiry
+without any push/unread/command-inbox side effects.
 
 Current ephemeral activity progress: the HTTP server now accepts opaque
 ephemeral activity through `/activities` only for active, non-revoked senders at
@@ -792,7 +796,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `62`
+- Route/store/engine tests added so far: `63`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -940,6 +944,9 @@ Additional HTTP route checkpoint:
     over `/application-events`; chat edits/reactions/receipts, runtime state
     snapshots, runtime command result/cancel, and conversation segment starts
     append durable events without creating push, unread, or command-inbox work
+  - runtime state snapshots survive SQLite reload as ordered HTTP log entries;
+    product projection code can rebuild dashboard status, enforce freshness,
+    and expire stale snapshots from the synced payload without notifying users
   - runtime command delivery policies survive SQLite reload over
     `/application-events`; default command requests create push plus
     command-inbox work, status refresh can create command-inbox work without
@@ -1124,6 +1131,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_conflicts`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_application_delivery_effects_survive_restart_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_application_delivery_policy_matrix_survives_restart_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_runtime_state_snapshot_projects_from_http_log_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_converges`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http`: pass
