@@ -575,6 +575,20 @@ V1 transport should prove streams are hints and pull sync is authoritative:
 this rule: stream/SSE/push hints only set `needs_pull`; only bounded
 `sync_events` pages can advance the cursor or apply room-log entries.
 
+Darkmatter HTTP port status:
+
+| Scenario | Status |
+| --- | --- |
+| `http_post_append_retries_are_idempotent` | Covered by raw `/messages`, typed `/events`, live-server CLI, and process-level replay tests over SQLite. |
+| `sync_projection_advances_only_from_pull_pages_not_stream_hints` | Covered by the projection unit test and by `sync_projection_advances_only_from_darkmatter_http_pull_pages` against the SQLite-backed Darkmatter HTTP adapter. |
+| `sse_drop_duplicate_reorder_repairs_by_pull_sync` | Covered at the transport rule level by projection and partial-pull repair tests. A concrete SSE drop/reorder route test should wait until an SSE hint adapter exists. |
+| `sync_projection_rejects_replayed_or_wrong_room_pages` | Covered at the projection layer; the HTTP runtime adapter also rejects decoded room entries whose embedded room id does not match the requested sync room. |
+| `sync_projection_rebuilds_same_view_after_restart` | Covered at the projection layer and by HTTP/runtime restart tests that rebuild state from pulled ordered log pages. |
+| `stream_callback_never_executes_command_directly` | Product runtime callback behavior. The current repo has fake-daemon coverage but no production stream callback entrypoint to drive through Darkmatter HTTP. |
+| `runtime_stream_callback_only_triggers_sync` | Product runtime callback behavior. The current HTTP proof is that only pull pages advance state; daemon callback coverage should move when a production runtime daemon exists. |
+| `websocket_transport_not_required_for_v1` | Covered by the HTTP-only route, CLI, live-server, process-binary, and runtime-delivery tests; no WebSocket path is needed for the current V1 port. |
+| `push_wake_and_sse_share_hint_only_semantics` | Covered at the shared projection primitive. Concrete push/SSE adapter tests should wait until those hint adapters exist. |
+
 ## Runtime Status Snapshot Scenarios
 
 Runtime status is encrypted application state, not request/response RPC:

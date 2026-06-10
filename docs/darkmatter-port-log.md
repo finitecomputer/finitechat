@@ -1338,9 +1338,13 @@ Watch list for the remaining gate:
 
 - [x] Prove the transport-authority rule against the Darkmatter HTTP adapter:
   stream-style hints do not advance local state; pulled `/sync/group` pages do.
-- [ ] Review the remaining transport/runtime scenario names in
-  `docs/scenario-coverage.md` and either port them to Darkmatter HTTP/runtime
-  tests or classify them as product-layer behavior above the encrypted payload.
+- [x] Classify the remaining V1 transport scenarios in
+  `docs/scenario-coverage.md` as covered by HTTP/projection tests or deferred
+  until a concrete SSE/push/stream adapter exists.
+- [ ] Review the remaining Command/RPC and Runtime Status Snapshot scenario
+  names in `docs/scenario-coverage.md` and either port them to Darkmatter
+  HTTP/runtime tests or classify them as product-layer behavior above the
+  encrypted payload.
 - [ ] Review preserved `finitechat-engine` and `finitechat-sim` fake-delivery
   tests for any reducer invariants not already covered by typed HTTP route,
   SQLite replay, or runtime-delivery tests.
