@@ -11,8 +11,8 @@ use finitechat_client::{
 use finitechat_engine::{
     AppendEventRequest, CommitAccepted, CreateRoomRequest, DeliveryService, EngineError,
     EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
-    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
-    lease_token_for,
+    RoomSyncProjection, SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest,
+    WelcomeRecord, envelope, lease_token_for,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -2345,6 +2345,99 @@ fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
         run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
     assert_eq!(replay.sync_pages, 1);
     assert!(replay.applied_entries.is_empty());
+}
+
+#[test]
+fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http-sync-projection.sqlite3");
+    let room_id = "room_http_sync_projection";
+    let mls_group_id = "mls_http_sync_projection";
+    let alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_sync_projection");
+    let mut source_server = DeliveryService::new();
+
+    source_server
+        .create_room(CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: alice.device_ref().clone(),
+        })
+        .unwrap();
+
+    for index in 1..=3 {
+        let idempotency_key = format!("http_sync_projection_msg_{index}");
+        source_server
+            .append_event(AppendEventRequest {
+                room_id: room_id.to_owned(),
+                sender: alice.device_ref().clone(),
+                envelope: envelope(
+                    room_id.to_owned(),
+                    mls_group_id.to_owned(),
+                    alice.device_ref().clone(),
+                    0,
+                    LogEntryKind::Application,
+                    format!(r#"{{"body":"message {index}"}}"#).into_bytes(),
+                ),
+                idempotency_key,
+            })
+            .unwrap();
+    }
+
+    let source_page = source_server
+        .sync_events(room_id, alice.device_ref(), 0)
+        .unwrap();
+    assert_eq!(source_page.entries.len(), 3);
+    let expected_message_ids = source_page
+        .entries
+        .iter()
+        .map(|entry| entry.message_id.clone())
+        .collect::<Vec<_>>();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    for entry in &source_page.entries {
+        delivery.publish_room_log_entry(entry).unwrap();
+    }
+
+    let mut projection = RoomSyncProjection::default();
+    assert!(
+        projection
+            .observe_stream_hint(room_id, source_page.entries[1].seq)
+            .unwrap()
+    );
+    assert!(
+        projection
+            .observe_stream_hint(room_id, source_page.entries[0].seq)
+            .unwrap()
+    );
+    assert!(
+        projection
+            .observe_stream_hint(room_id, source_page.entries[2].seq)
+            .unwrap()
+    );
+    assert_eq!(projection.server_cursor(), 0);
+    assert_eq!(projection.highest_stream_hint(), source_page.next_after_seq);
+    assert!(projection.applied_message_ids().is_empty());
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let pulled_page = delivery
+        .sync_events(room_id, alice.device_ref(), 0)
+        .unwrap();
+    let applied = projection.apply_page(room_id, &pulled_page).unwrap();
+    assert_eq!(applied.applied_entries, 3);
+    assert_eq!(applied.server_cursor, source_page.next_after_seq);
+    assert!(!applied.needs_more_pull);
+    assert_eq!(projection.server_cursor(), source_page.next_after_seq);
+    assert_eq!(
+        projection.applied_message_ids(),
+        expected_message_ids.as_slice()
+    );
+
+    assert!(
+        !projection
+            .observe_stream_hint(room_id, source_page.entries[0].seq)
+            .unwrap()
+    );
+    assert_eq!(projection.server_cursor(), source_page.next_after_seq);
 }
 
 #[test]
