@@ -3247,6 +3247,297 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
 }
 
 #[tokio::test]
+async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-multi-device-pending-invite".to_owned();
+    let mls_group_id = "mls-multi-device-pending-invite".to_owned();
+    let bob = DeviceRef::new("bob", "bob-runtime");
+    let alice_devices = [
+        DeviceRef::new("alice", "alice-browser"),
+        DeviceRef::new("alice", "alice-phone"),
+        DeviceRef::new("alice", "alice-tablet"),
+    ];
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: bob.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for device in &alice_devices {
+        let key_package_id = format!("kp-multi-{}", device.device_id);
+        let response = post_json(
+            app.clone(),
+            "/key-packages",
+            &finite_key_package_publication(
+                device,
+                &key_package_id,
+                &format!("ref-{key_package_id}"),
+                &format!("hash-{key_package_id}"),
+                format!("payload-{key_package_id}").as_bytes(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let owners = alice_devices
+        .iter()
+        .map(member_for_device)
+        .collect::<Vec<_>>();
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claims",
+        &ClaimKeyPackagesRequest {
+            owners: owners.clone(),
+            idempotency_key: Some("multi-device-pending-invite-claim".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpKeyPackageClaim> = read_json(response).await;
+    assert_eq!(claimed.len(), alice_devices.len());
+    for (claim, owner) in claimed.iter().zip(&owners) {
+        assert_eq!(&claim.owner, owner);
+        assert!(claim.claimed.is_some());
+    }
+
+    let envelope = FiniteEnvelope {
+        room_id: room_id.clone(),
+        mls_group_id: mls_group_id.clone(),
+        epoch: 0,
+        sender: bob.clone(),
+        kind: LogEntryKind::Commit,
+        payload: b"multi-device-pending-invite".to_vec(),
+    };
+    let commit_message_id = envelope.message_id().expect("commit message id");
+    let request = SubmitCommitRequest {
+        room_id: room_id.clone(),
+        sender: bob.clone(),
+        expected_epoch: 0,
+        envelope,
+        membership_delta: MembershipDeltaV1 {
+            base_epoch: 0,
+            post_commit_epoch: 1,
+            commit_message_id,
+            adds: alice_devices
+                .iter()
+                .map(|device| {
+                    let key_package_id = format!("kp-multi-{}", device.device_id);
+                    MembershipAddV1 {
+                        device: device.clone(),
+                        key_package_id: key_package_id.clone(),
+                        key_package_ref: format!("ref-{key_package_id}"),
+                        key_package_hash: format!("hash-{key_package_id}"),
+                        welcome_id: format!("welcome-multi-{}", device.device_id),
+                    }
+                })
+                .collect(),
+            removes: Vec::new(),
+        },
+        staged_welcomes: alice_devices
+            .iter()
+            .map(|device| StagedWelcomeV1 {
+                welcome_id: format!("welcome-multi-{}", device.device_id),
+                welcome_payload: format!("welcome-{}", device.device_id).into_bytes(),
+                ratchet_tree_payload: format!("ratchet-{}", device.device_id).into_bytes(),
+            })
+            .collect(),
+        idempotency_key: "multi-device-pending-invite-commit".to_owned(),
+    };
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+
+    let app = persistent_app(&db_path);
+    let account_page = account_room_page(&app, &alice_devices[0].account_id).await;
+    assert_eq!(account_page.rooms.len(), 1);
+    for device in &alice_devices {
+        assert!(!account_room_device_active(&account_page, device));
+    }
+
+    for device in &alice_devices {
+        let response = post_json(
+            app.clone(),
+            "/welcomes/claim",
+            &ClaimWelcomesRequest {
+                recipient: member_for_device(device),
+                limit: 10,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].message.id,
+            id(&format!("welcome-multi-{}", device.device_id))
+        );
+    }
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-multi-alice-phone"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let account_page = account_room_page(&app, &alice_devices[0].account_id).await;
+    assert!(!account_room_device_active(
+        &account_page,
+        &alice_devices[0]
+    ));
+    assert!(account_room_device_active(&account_page, &alice_devices[1]));
+    assert!(!account_room_device_active(
+        &account_page,
+        &alice_devices[2]
+    ));
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice_devices[1],
+            1,
+            b"phone active",
+            "multi-device-phone-active",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let phone_accepted: EventAccepted = read_json(response).await;
+
+    for (device, idempotency_key) in [
+        (&alice_devices[0], "multi-device-browser-pending"),
+        (&alice_devices[2], "multi-device-tablet-pending"),
+    ] {
+        let response = post_json(
+            app.clone(),
+            "/events",
+            &append_application_request(
+                &room_id,
+                &mls_group_id,
+                device,
+                1,
+                b"still pending",
+                idempotency_key,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error: ErrorResponse = read_json(response).await;
+        assert_eq!(error.kind, "sender_not_active");
+    }
+
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &bob,
+            1,
+            b"bob after invite",
+            "multi-device-bob-after-invite",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_accepted: EventAccepted = read_json(response).await;
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: accepted.seq,
+            limit: 10,
+            requester: Some(member_for_device(&alice_devices[2])),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let tablet_page: HttpSyncPage = read_json(response).await;
+    assert_eq!(tablet_page.entries.len(), 2);
+    assert_eq!(
+        tablet_page.entries[0].message.id.as_slice(),
+        phone_accepted.message_id.as_bytes()
+    );
+    assert_eq!(
+        tablet_page.entries[1].message.id.as_slice(),
+        bob_accepted.message_id.as_bytes()
+    );
+    assert_eq!(tablet_page.next_after_seq, bob_accepted.seq);
+
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id("welcome-multi-alice-browser"),
+            activated: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice_devices[0],
+            1,
+            b"browser active",
+            "multi-device-browser-active",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let account_page = account_room_page(&app, &alice_devices[0].account_id).await;
+    assert!(account_room_device_active(&account_page, &alice_devices[0]));
+    assert!(account_room_device_active(&account_page, &alice_devices[1]));
+    assert!(!account_room_device_active(
+        &account_page,
+        &alice_devices[2]
+    ));
+
+    let response = post_json(
+        app,
+        "/events",
+        &append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice_devices[2],
+            1,
+            b"tablet still pending",
+            "multi-device-tablet-still-pending",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "sender_not_active");
+}
+
+#[tokio::test]
 async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -6138,6 +6429,24 @@ async fn account_room_page(app: &Router, account_id: &str) -> ListAccountRoomDir
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     read_json(response).await
+}
+
+fn account_room_device_active(page: &ListAccountRoomDirectoryResponse, device: &DeviceRef) -> bool {
+    page.rooms
+        .iter()
+        .flat_map(|room| {
+            room["devices"]
+                .as_array()
+                .expect("account room devices")
+                .iter()
+        })
+        .find(|entry| {
+            entry["device"]["account_id"] == device.account_id
+                && entry["device"]["device_id"] == device.device_id
+        })
+        .unwrap_or_else(|| panic!("missing account room device: {device:?}"))["active"]
+        .as_bool()
+        .expect("active flag")
 }
 
 fn commit_publish_request_for_test(

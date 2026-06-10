@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `306`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `393`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `394`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 24 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 55 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 56 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `401` (`393` Rust, `8` Python)
+- Port parsed tests: `402` (`394` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `107`
+- Port-only test names: `108`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 24 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 19 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 61 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 62 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `107` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `108` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 24 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 19 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 61 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 62 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -216,6 +216,14 @@ Current delayed Welcome sync progress: typed HTTP `/commits`, `/events`,
 typed event appended before the recipient claims and activates its Welcome is
 delivered when that activated device syncs forward from its add-commit sequence
 after SQLite restart.
+
+Current multi-device pending invite progress: typed HTTP `/commits` now has a
+deterministic version of the old pending-invite action-order proof. One commit
+can add three devices for the same account from a batch KeyPackage claim; all
+start as persisted inactive devices, each Welcome claim is independent,
+activated devices can send after restart, still-pending devices cannot send,
+and a pending device can sync post-add application history without becoming
+active.
 
 Current later-device history progress: a real later device over
 `HttpRuntimeDelivery` now starts from a typed HTTP Welcome, activates through
@@ -784,7 +792,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `61`
+- Route/store/engine tests added so far: `62`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -859,6 +867,10 @@ Additional HTTP route checkpoint:
     restart
   - conflicting batch KeyPackage claim idempotency key has no package side
     effects
+  - a multi-device pending invite can add three devices for one account from a
+    batch KeyPackage claim; Welcome activation is tracked per device, active
+    devices can send, and still-pending devices remain unable to send after
+    SQLite restart
   - fanout room plan, prepared state, reprepare state, and done state survive
     restart
   - conflicting fanout room plan update does not overwrite the stored plan
@@ -1101,6 +1113,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_create_or_get_and_third_account_rejection_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_rejects_per_account_device_cap_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_multi_device_pending_invite_roles_stay_separate_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_duplicate_pending_device_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_membership_delta_structural_matrix_before_side_effects`: pass
