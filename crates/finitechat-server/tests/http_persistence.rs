@@ -1,5 +1,6 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, Request, Response, StatusCode};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
@@ -30,8 +31,8 @@ use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
     LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ENVELOPE_PAYLOAD_BYTES,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus,
-    StagedWelcomeV1, UnreadPolicy, WelcomeState,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1,
+    PushPolicy, RoomStatus, StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -1299,6 +1300,54 @@ async fn sqlite_link_session_state_machine_survives_restart_over_http() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "link_session_closed");
+}
+
+#[tokio::test]
+async fn sqlite_link_session_payload_limit_rejects_without_persisting_payload() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let link_session_id = "link-http-payload-limit".to_owned();
+    // Raise the harness body limit so this test reaches the adapter limit.
+    let body_limit = (MAX_LINK_SESSION_PAYLOAD_BYTES as usize + 1) * 4;
+    let app = persistent_app(&db_path).layer(DefaultBodyLimit::max(body_limit));
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions",
+        &CreateLinkSessionRequest {
+            link_session_id: link_session_id.clone(),
+            pairing_public_key: "pairing-limit".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            encrypted_payload: vec![0; MAX_LINK_SESSION_PAYLOAD_BYTES as usize + 1],
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_link_session_request");
+    assert!(error.error.contains("link_session.encrypted_payload"));
+
+    let app = persistent_app(&db_path).layer(DefaultBodyLimit::max(body_limit));
+    let response = post_json(
+        app,
+        "/link-sessions/get",
+        &GetLinkSessionRequest { link_session_id },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: Option<HttpLinkSessionRecord> = read_json(response).await;
+    let record = record.expect("created link session survives failed upload");
+    assert_eq!(record.state, HttpLinkSessionState::Created);
+    assert!(record.encrypted_payload.is_none());
 }
 
 #[tokio::test]

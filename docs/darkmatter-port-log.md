@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `381`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `382`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 48 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 49 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `389` (`381` Rust, `8` Python)
+- Port parsed tests: `390` (`382` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `95`
+- Port-only test names: `96`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 54 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 55 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `95` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `96` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 54 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 55 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -283,8 +283,8 @@ starts empty after restart.
 Current link-session progress: the HTTP server now exposes link-session
 pairing as wrapper-owned rendezvous state. Create/upload/claim/release/ack and
 expire survive SQLite restart, same-payload upload is idempotent, conflicting
-payloads and late uploads reject, and CLI route DTO coverage exists for every
-link-session route.
+payloads, oversized payloads, and late uploads reject without replacing the
+stored payload, and CLI route DTO coverage exists for every link-session route.
 
 Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
 coverage, but the migration is not complete. The remaining implementation work
@@ -399,8 +399,9 @@ Fork-only requirements beyond the current HTTP branch:
   prepared message ids, reprepare checkpoints, and accepted sequence markers
   across restart without teaching the server MLS semantics.
 - The HTTP link-session wrapper can persist opaque encrypted pairing payloads,
-  claim/release/ack/expire state, and deterministic claim tokens across restart
-  without interpreting the payload or joining it to room membership state.
+  claim/release/ack/expire state, deterministic claim tokens, and bounded
+  payload rejection across restart without interpreting the payload or joining
+  it to room membership state.
 - The HTTP account-room directory wrapper can persist typed account-room
   records, normalize them to the requested account's devices, page them by room
   id, and reload them from SQLite. This gives the runtime link-fanout discovery
@@ -582,7 +583,7 @@ Fork-only requirements beyond the current HTTP branch:
 - Opaque link-session pairing for the HTTP delivery surface. This is
   wrapper-owned rendezvous state for encrypted pairing payloads; Darkmatter
   does not need to understand the payload, only the HTTP adapter's
-  duplicate/conflict/claim/release/ack/expiry lifecycle.
+  duplicate/conflict/size-limit/claim/release/ack/expiry lifecycle.
 - Account-room discovery projection for the HTTP delivery surface. This stores
   typed current-room membership snapshots keyed by account and room id,
   normalizes saved records to the requested account's devices, and rejects
@@ -736,7 +737,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `54`
+- Route/store/engine tests added so far: `55`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -809,9 +810,10 @@ Additional HTTP route checkpoint:
   - conflicting fanout room plan update does not overwrite the stored plan
   - link-session pairing state survives restart; duplicate session creation
     conflicts, same-payload upload is idempotent, different payload conflicts,
-    encrypted payload bytes stay opaque, release/reclaim keeps the deterministic
-    claim token stable, bad ack tokens reject, delivered/expired sessions reject
-    late uploads, and terminal states survive SQLite reopen
+    oversized encrypted payloads reject without being stored, encrypted payload
+    bytes stay opaque, release/reclaim keeps the deterministic claim token
+    stable, bad ack tokens reject, delivered/expired sessions reject late
+    uploads, and terminal states survive SQLite reopen
   - typed account-room bootstrap survives restart, replays idempotently, and
     rejects a conflicting creator device
   - account-room directory normalizes typed records to the requested account's
@@ -1021,6 +1023,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-cli link_session_commands_build_route_dtos`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_link_session_state_machine_survives_restart_over_http`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_link_session_payload_limit_rejects_without_persisting_payload`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_direct_room_create_or_get_and_third_account_rejection_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass

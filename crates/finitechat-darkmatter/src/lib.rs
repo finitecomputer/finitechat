@@ -158,7 +158,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_link_session_pairing",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server exposes link-session pairing over HTTP with opaque encrypted payload storage, duplicate/conflict/closed-state rules, deterministic claim tokens across release/reclaim, ack validation, expiry, and SQLite restart recovery; finitechat-cli builds DTOs for every link-session route",
+            evidence: "finitechat-server exposes link-session pairing over HTTP with opaque encrypted payload storage, duplicate/conflict/size-limit/closed-state rules, deterministic claim tokens across release/reclaim, ack validation, expiry, and SQLite restart recovery; oversized payloads reject without being stored, and finitechat-cli builds DTOs for every link-session route",
         },
         PortFinding {
             area: "http_account_room_directory_runtime_discovery",
