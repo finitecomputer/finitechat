@@ -4,11 +4,14 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_http::{
-    AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackageRequest,
-    ClaimKeyPackagesRequest, ClaimWelcomesRequest, ExpireKeyPackageLeaseRequest, GetFanoutRequest,
-    GroupSyncRequest, HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    PublishMessageRequest, RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+    AckLinkPayloadRequest, AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackageRequest,
+    ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimWelcomesRequest,
+    CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest,
+    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpFanoutRoomPlan,
+    InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
+    MarkFanoutDoneRequest, MarkFanoutPreparedRequest, PublishMessageRequest,
+    ReleaseLinkClaimRequest, RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+    UploadLinkPayloadRequest,
 };
 use finitechat_proto::DeviceRef;
 use serde::Serialize;
@@ -133,6 +136,13 @@ where
         "fanout-save-room" => fanout_save_room_request(&server, args),
         "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
         "fanout-mark-done" => fanout_mark_done_request(&server, args),
+        "link-session-create" => link_session_create_request(&server, args),
+        "link-session-get" => link_session_get_request(&server, args),
+        "link-session-upload" => link_session_upload_request(&server, args),
+        "link-session-claim" => link_session_claim_request(&server, args),
+        "link-session-release" => link_session_release_request(&server, args),
+        "link-session-ack" => link_session_ack_request(&server, args),
+        "link-session-expire" => link_session_expire_request(&server, args),
         "account-room-bootstrap" => account_room_bootstrap_request(&server, args),
         "account-room-save" => account_room_save_request(&server, args),
         "account-rooms-list" => account_rooms_list_request(&server, args),
@@ -424,6 +434,95 @@ fn fanout_mark_done_request(
     post_json_request(server, "/fanouts/rooms/done", &request)
 }
 
+fn link_session_create_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    let pairing_public_key = required_option(&mut args, "--pairing-public-key")?;
+    reject_extra_args(&args)?;
+
+    let request = CreateLinkSessionRequest {
+        link_session_id,
+        pairing_public_key,
+    };
+    post_json_request(server, "/link-sessions", &request)
+}
+
+fn link_session_get_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    reject_extra_args(&args)?;
+
+    let request = GetLinkSessionRequest { link_session_id };
+    post_json_request(server, "/link-sessions/get", &request)
+}
+
+fn link_session_upload_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    let encrypted_payload = required_option(&mut args, "--payload")?;
+    reject_extra_args(&args)?;
+
+    let request = UploadLinkPayloadRequest {
+        link_session_id,
+        encrypted_payload: encrypted_payload.into_bytes(),
+    };
+    post_json_request(server, "/link-sessions/payload", &request)
+}
+
+fn link_session_claim_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    reject_extra_args(&args)?;
+
+    let request = ClaimLinkPayloadRequest { link_session_id };
+    post_json_request(server, "/link-sessions/claim", &request)
+}
+
+fn link_session_release_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    reject_extra_args(&args)?;
+
+    let request = ReleaseLinkClaimRequest { link_session_id };
+    post_json_request(server, "/link-sessions/release", &request)
+}
+
+fn link_session_ack_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    let claim_token = required_option(&mut args, "--claim-token")?;
+    reject_extra_args(&args)?;
+
+    let request = AckLinkPayloadRequest {
+        link_session_id,
+        claim_token,
+    };
+    post_json_request(server, "/link-sessions/ack", &request)
+}
+
+fn link_session_expire_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
+    let link_session_id = required_option(&mut args, "--link-session-id")?;
+    reject_extra_args(&args)?;
+
+    let request = ExpireLinkSessionRequest { link_session_id };
+    post_json_request(server, "/link-sessions/expire", &request)
+}
+
 fn account_room_save_request(
     server: &str,
     mut args: Vec<String>,
@@ -647,7 +746,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
 }
 
 #[cfg(test)]
@@ -657,12 +756,15 @@ mod tests {
         CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
     };
     use finitechat_http::{
-        AckWelcomeRequest, BootstrapAccountRoomRequest, ClaimKeyPackagesRequest,
-        ClaimWelcomesRequest, ExpireKeyPackageLeaseRequest, GroupSyncRequest, HttpClaimedWelcome,
-        HttpFanoutPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
+        AckLinkPayloadRequest, AckWelcomeRequest, BootstrapAccountRoomRequest,
+        ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimWelcomesRequest,
+        CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest,
+        GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
+        HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-        PublishKeyPackageResponse, PublishMessageRequest, RevokeDeviceRequest,
-        SaveAccountRoomRequest, SaveFanoutRoomRequest,
+        PublishKeyPackageResponse, PublishMessageRequest, ReleaseLinkClaimRequest,
+        RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+        UploadLinkPayloadRequest,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
@@ -936,6 +1038,81 @@ mod tests {
         assert_eq!(body.room_id.as_slice(), b"room-a");
         assert_eq!(body.prepared_message_id.as_slice(), b"commit-b");
         assert_eq!(body.accepted_seq, 9);
+    }
+
+    #[test]
+    fn link_session_commands_build_route_dtos() {
+        let create = prepare_http_request([
+            "link-session-create",
+            "--link-session-id",
+            "link-a",
+            "--pairing-public-key",
+            "pairing-a",
+        ])
+        .expect("create request");
+
+        assert_eq!(create.method, HttpMethod::Post);
+        assert_eq!(create.url, "http://127.0.0.1:8787/link-sessions");
+        let body: CreateLinkSessionRequest =
+            serde_json::from_value(create.json.expect("json")).expect("create body");
+        assert_eq!(body.link_session_id, "link-a");
+        assert_eq!(body.pairing_public_key, "pairing-a");
+
+        let get = prepare_http_request(["link-session-get", "--link-session-id", "link-a"])
+            .expect("get request");
+        assert_eq!(get.url, "http://127.0.0.1:8787/link-sessions/get");
+        let body: GetLinkSessionRequest =
+            serde_json::from_value(get.json.expect("json")).expect("get body");
+        assert_eq!(body.link_session_id, "link-a");
+
+        let upload = prepare_http_request([
+            "link-session-upload",
+            "--link-session-id",
+            "link-a",
+            "--payload",
+            "ciphertext",
+        ])
+        .expect("upload request");
+        assert_eq!(upload.url, "http://127.0.0.1:8787/link-sessions/payload");
+        let body: UploadLinkPayloadRequest =
+            serde_json::from_value(upload.json.expect("json")).expect("upload body");
+        assert_eq!(body.link_session_id, "link-a");
+        assert_eq!(body.encrypted_payload, b"ciphertext");
+
+        let claim = prepare_http_request(["link-session-claim", "--link-session-id", "link-a"])
+            .expect("claim request");
+        assert_eq!(claim.url, "http://127.0.0.1:8787/link-sessions/claim");
+        let body: ClaimLinkPayloadRequest =
+            serde_json::from_value(claim.json.expect("json")).expect("claim body");
+        assert_eq!(body.link_session_id, "link-a");
+
+        let release = prepare_http_request(["link-session-release", "--link-session-id", "link-a"])
+            .expect("release request");
+        assert_eq!(release.url, "http://127.0.0.1:8787/link-sessions/release");
+        let body: ReleaseLinkClaimRequest =
+            serde_json::from_value(release.json.expect("json")).expect("release body");
+        assert_eq!(body.link_session_id, "link-a");
+
+        let ack = prepare_http_request([
+            "link-session-ack",
+            "--link-session-id",
+            "link-a",
+            "--claim-token",
+            "token-a",
+        ])
+        .expect("ack request");
+        assert_eq!(ack.url, "http://127.0.0.1:8787/link-sessions/ack");
+        let body: AckLinkPayloadRequest =
+            serde_json::from_value(ack.json.expect("json")).expect("ack body");
+        assert_eq!(body.link_session_id, "link-a");
+        assert_eq!(body.claim_token, "token-a");
+
+        let expire = prepare_http_request(["link-session-expire", "--link-session-id", "link-a"])
+            .expect("expire request");
+        assert_eq!(expire.url, "http://127.0.0.1:8787/link-sessions/expire");
+        let body: ExpireLinkSessionRequest =
+            serde_json::from_value(expire.json.expect("json")).expect("expire body");
+        assert_eq!(body.link_session_id, "link-a");
     }
 
     #[test]

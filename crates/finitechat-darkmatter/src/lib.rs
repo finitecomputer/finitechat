@@ -53,7 +53,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyFiniteOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, sync, device revoke, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -139,6 +139,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_fanout_plan_checkpoint",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",
+        },
+        PortFinding {
+            area: "http_link_session_pairing",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server exposes link-session pairing over HTTP with opaque encrypted payload storage, duplicate/conflict/closed-state rules, deterministic claim tokens across release/reclaim, ack validation, expiry, and SQLite restart recovery; finitechat-cli builds DTOs for every link-session route",
         },
         PortFinding {
             area: "http_account_room_directory_runtime_discovery",

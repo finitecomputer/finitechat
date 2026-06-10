@@ -154,6 +154,85 @@ pub enum HttpFanoutRoomStatus {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateLinkSessionRequest {
+    pub link_session_id: String,
+    pub pairing_public_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetLinkSessionRequest {
+    pub link_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadLinkPayloadRequest {
+    pub link_session_id: String,
+    pub encrypted_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimLinkPayloadRequest {
+    pub link_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimLinkPayloadResponse {
+    pub encrypted_payload: Vec<u8>,
+    pub claim_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckLinkPayloadRequest {
+    pub link_session_id: String,
+    pub claim_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckLinkPayloadResponse {
+    pub acked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseLinkClaimRequest {
+    pub link_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseLinkClaimResponse {
+    pub released: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireLinkSessionRequest {
+    pub link_session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireLinkSessionResponse {
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpLinkSessionRecord {
+    pub link_session_id: String,
+    pub pairing_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_payload: Option<Vec<u8>>,
+    pub state: HttpLinkSessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpLinkSessionState {
+    Created,
+    PayloadUploaded,
+    Claimed,
+    Delivered,
+    Expired,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SaveAccountRoomRequest {
     pub account_id: String,

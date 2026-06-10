@@ -17,22 +17,26 @@ use finitechat_engine::{
     lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
 };
 pub use finitechat_http::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
-    GroupSyncRequest, HealthResponse, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
-    HttpFanoutRoomState, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
-    InboxSyncRequest, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    PublishKeyPackageResponse, PublishMessageRequest, ReportInvalidCommitRequest,
+    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
+    BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
+    ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
+    ClaimWelcomesRequest, CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
+    FiniteAccountRoomCommitProjection, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
+    HealthResponse, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomState,
+    HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
+    MarkFanoutPreparedRequest, PublishKeyPackageResponse, PublishMessageRequest,
+    ReleaseLinkClaimRequest, ReleaseLinkClaimResponse, ReportInvalidCommitRequest,
     ReportInvalidCommitResponse, RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
+    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
+    RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -57,6 +61,7 @@ pub struct HttpServerState {
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     revoked_devices: Arc<Mutex<BTreeSet<String>>>,
     fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
+    link_sessions: Arc<Mutex<BTreeMap<String, HttpLinkSessionRecord>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
@@ -73,6 +78,7 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             revoked_devices: Arc::new(Mutex::new(BTreeSet::new())),
             fanout_plans: Arc::new(Mutex::new(HashMap::new())),
+            link_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
@@ -101,6 +107,7 @@ impl HttpServerState {
             }
         }
         let fanout_plans = store.load_fanout_plans()?;
+        let link_sessions = store.load_link_sessions()?;
         let account_rooms = store.load_account_room_directory()?;
         let room_memberships = store.load_room_memberships()?;
         let welcome_claims = store.load_welcome_claims()?;
@@ -111,6 +118,7 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             revoked_devices: Arc::new(Mutex::new(revoked_devices)),
             fanout_plans: Arc::new(Mutex::new(fanout_plans)),
+            link_sessions: Arc::new(Mutex::new(link_sessions)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
@@ -740,6 +748,207 @@ impl HttpServerState {
             store.upsert_fanout_plan(&plan)?;
         }
         Ok(plan)
+    }
+
+    fn create_link_session(
+        &self,
+        request: CreateLinkSessionRequest,
+    ) -> Result<HttpLinkSessionRecord, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        validate_link_pairing_public_key(&request.pairing_public_key)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        if sessions.contains_key(&request.link_session_id) {
+            return Err(ServerHttpError::LinkSessionAlreadyExists {
+                link_session_id: request.link_session_id,
+            });
+        }
+        let record = HttpLinkSessionRecord {
+            link_session_id: request.link_session_id,
+            pairing_public_key: request.pairing_public_key,
+            encrypted_payload: None,
+            state: HttpLinkSessionState::Created,
+            claim_token: None,
+        };
+        sessions.insert(record.link_session_id.clone(), record.clone());
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(record)
+    }
+
+    fn get_link_session(
+        &self,
+        request: GetLinkSessionRequest,
+    ) -> Result<Option<HttpLinkSessionRecord>, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        let sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        Ok(sessions.get(&request.link_session_id).cloned())
+    }
+
+    fn upload_link_payload(
+        &self,
+        request: UploadLinkPayloadRequest,
+    ) -> Result<HttpLinkSessionRecord, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        validate_link_payload(&request.encrypted_payload)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        let session = sessions.get_mut(&request.link_session_id).ok_or_else(|| {
+            ServerHttpError::LinkSessionNotFound {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        match session.state {
+            HttpLinkSessionState::Created => {
+                session.encrypted_payload = Some(request.encrypted_payload);
+                session.state = HttpLinkSessionState::PayloadUploaded;
+            }
+            HttpLinkSessionState::PayloadUploaded
+                if session.encrypted_payload.as_deref()
+                    == Some(request.encrypted_payload.as_slice()) => {}
+            HttpLinkSessionState::PayloadUploaded => {
+                return Err(ServerHttpError::LinkSessionConflict {
+                    link_session_id: request.link_session_id,
+                    reason: "encrypted payload differs from existing payload".to_owned(),
+                });
+            }
+            HttpLinkSessionState::Claimed
+            | HttpLinkSessionState::Delivered
+            | HttpLinkSessionState::Expired => {
+                return Err(ServerHttpError::LinkSessionClosed {
+                    link_session_id: request.link_session_id,
+                });
+            }
+        }
+        let record = session.clone();
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(record)
+    }
+
+    fn claim_link_payload(
+        &self,
+        request: ClaimLinkPayloadRequest,
+    ) -> Result<ClaimLinkPayloadResponse, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        let session = sessions.get_mut(&request.link_session_id).ok_or_else(|| {
+            ServerHttpError::LinkSessionNotFound {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        if session.state != HttpLinkSessionState::PayloadUploaded {
+            return Err(ServerHttpError::LinkSessionNotReady {
+                link_session_id: request.link_session_id,
+            });
+        }
+        let encrypted_payload = session.encrypted_payload.clone().ok_or_else(|| {
+            ServerHttpError::LinkSessionNotReady {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        let claim_token = link_session_claim_token(session);
+        session.state = HttpLinkSessionState::Claimed;
+        session.claim_token = Some(claim_token.clone());
+        let record = session.clone();
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(ClaimLinkPayloadResponse {
+            encrypted_payload,
+            claim_token,
+        })
+    }
+
+    fn ack_link_payload(
+        &self,
+        request: AckLinkPayloadRequest,
+    ) -> Result<AckLinkPayloadResponse, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        validate_link_claim_token(&request.claim_token)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        let session = sessions.get_mut(&request.link_session_id).ok_or_else(|| {
+            ServerHttpError::LinkSessionNotFound {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        if session.state != HttpLinkSessionState::Claimed {
+            return Err(ServerHttpError::LinkSessionNotReady {
+                link_session_id: request.link_session_id,
+            });
+        }
+        if session.claim_token.as_deref() != Some(request.claim_token.as_str()) {
+            return Err(ServerHttpError::BadLinkSessionClaimToken {
+                link_session_id: request.link_session_id,
+            });
+        }
+        session.state = HttpLinkSessionState::Delivered;
+        let record = session.clone();
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(AckLinkPayloadResponse { acked: true })
+    }
+
+    fn release_link_claim(
+        &self,
+        request: ReleaseLinkClaimRequest,
+    ) -> Result<ReleaseLinkClaimResponse, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        let session = sessions.get_mut(&request.link_session_id).ok_or_else(|| {
+            ServerHttpError::LinkSessionNotFound {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        if session.state != HttpLinkSessionState::Claimed {
+            return Err(ServerHttpError::LinkSessionNotReady {
+                link_session_id: request.link_session_id,
+            });
+        }
+        session.state = HttpLinkSessionState::PayloadUploaded;
+        session.claim_token = None;
+        let record = session.clone();
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(ReleaseLinkClaimResponse { released: true })
+    }
+
+    fn expire_link_session(
+        &self,
+        request: ExpireLinkSessionRequest,
+    ) -> Result<ExpireLinkSessionResponse, ServerHttpError> {
+        validate_link_session_id(&request.link_session_id)?;
+        let mut sessions = self.link_sessions.lock().expect("HTTP link-session mutex");
+        let session = sessions.get_mut(&request.link_session_id).ok_or_else(|| {
+            ServerHttpError::LinkSessionNotFound {
+                link_session_id: request.link_session_id.clone(),
+            }
+        })?;
+        if session.state == HttpLinkSessionState::Delivered {
+            return Err(ServerHttpError::LinkSessionClosed {
+                link_session_id: request.link_session_id,
+            });
+        }
+        session.state = HttpLinkSessionState::Expired;
+        let record = session.clone();
+        drop(sessions);
+
+        if let Some(store) = &self.store {
+            store.upsert_link_session(&record)?;
+        }
+        Ok(ExpireLinkSessionResponse { expired: true })
     }
 
     fn save_account_room(
@@ -1925,6 +2134,13 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/fanouts/rooms", post(save_fanout_room))
         .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
         .route("/fanouts/rooms/done", post(mark_fanout_done))
+        .route("/link-sessions", post(create_link_session))
+        .route("/link-sessions/get", post(get_link_session))
+        .route("/link-sessions/payload", post(upload_link_payload))
+        .route("/link-sessions/claim", post(claim_link_payload))
+        .route("/link-sessions/ack", post(ack_link_payload))
+        .route("/link-sessions/release", post(release_link_claim))
+        .route("/link-sessions/expire", post(expire_link_session))
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
@@ -2065,6 +2281,62 @@ async fn mark_fanout_done(
 ) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
     let fanout = state.mark_fanout_done(request)?;
     Ok(Json(fanout))
+}
+
+async fn create_link_session(
+    State(state): State<HttpServerState>,
+    Json(request): Json<CreateLinkSessionRequest>,
+) -> Result<Json<HttpLinkSessionRecord>, ServerHttpError> {
+    let record = state.create_link_session(request)?;
+    Ok(Json(record))
+}
+
+async fn get_link_session(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetLinkSessionRequest>,
+) -> Result<Json<Option<HttpLinkSessionRecord>>, ServerHttpError> {
+    let record = state.get_link_session(request)?;
+    Ok(Json(record))
+}
+
+async fn upload_link_payload(
+    State(state): State<HttpServerState>,
+    Json(request): Json<UploadLinkPayloadRequest>,
+) -> Result<Json<HttpLinkSessionRecord>, ServerHttpError> {
+    let record = state.upload_link_payload(request)?;
+    Ok(Json(record))
+}
+
+async fn claim_link_payload(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ClaimLinkPayloadRequest>,
+) -> Result<Json<ClaimLinkPayloadResponse>, ServerHttpError> {
+    let response = state.claim_link_payload(request)?;
+    Ok(Json(response))
+}
+
+async fn ack_link_payload(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AckLinkPayloadRequest>,
+) -> Result<Json<AckLinkPayloadResponse>, ServerHttpError> {
+    let response = state.ack_link_payload(request)?;
+    Ok(Json(response))
+}
+
+async fn release_link_claim(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ReleaseLinkClaimRequest>,
+) -> Result<Json<ReleaseLinkClaimResponse>, ServerHttpError> {
+    let response = state.release_link_claim(request)?;
+    Ok(Json(response))
+}
+
+async fn expire_link_session(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ExpireLinkSessionRequest>,
+) -> Result<Json<ExpireLinkSessionResponse>, ServerHttpError> {
+    let response = state.expire_link_session(request)?;
+    Ok(Json(response))
 }
 
 async fn save_account_room(
@@ -2413,6 +2685,10 @@ impl SqliteHttpDeliveryStore {
                 fanout_id TEXT PRIMARY KEY,
                 plan_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS http_link_sessions (
+                link_session_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS http_account_rooms (
                 account_id TEXT NOT NULL,
                 room_id TEXT NOT NULL,
@@ -2739,6 +3015,38 @@ impl SqliteHttpDeliveryStore {
             fanouts.insert(fanout_id, serde_json::from_str(&plan_json)?);
         }
         Ok(fanouts)
+    }
+
+    fn upsert_link_session(&self, record: &HttpLinkSessionRecord) -> Result<(), DurableStoreError> {
+        let conn = self.connection()?;
+        conn.execute(
+            "INSERT INTO http_link_sessions (link_session_id, record_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(link_session_id) DO UPDATE SET
+                record_json = excluded.record_json",
+            params![record.link_session_id, serde_json::to_string(record)?],
+        )?;
+        Ok(())
+    }
+
+    fn load_link_sessions(
+        &self,
+    ) -> Result<BTreeMap<String, HttpLinkSessionRecord>, DurableStoreError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT link_session_id, record_json
+             FROM http_link_sessions
+             ORDER BY link_session_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut sessions = BTreeMap::new();
+        for row in rows {
+            let (link_session_id, record_json) = row?;
+            sessions.insert(link_session_id, serde_json::from_str(&record_json)?);
+        }
+        Ok(sessions)
     }
 
     fn upsert_account_room(
@@ -3805,6 +4113,54 @@ fn validate_fanout_room_plan(plan: &HttpFanoutRoomPlan) -> Result<(), ServerHttp
     )
 }
 
+fn validate_link_session_id(link_session_id: &str) -> Result<(), ServerHttpError> {
+    validate_string_bytes("link_session_id", link_session_id, MAX_OBJECT_ID_BYTES).map_err(
+        |error| ServerHttpError::InvalidLinkSessionRequest {
+            reason: error.to_string(),
+        },
+    )
+}
+
+fn validate_link_pairing_public_key(pairing_public_key: &str) -> Result<(), ServerHttpError> {
+    validate_string_bytes(
+        "pairing_public_key",
+        pairing_public_key,
+        MAX_OBJECT_ID_BYTES,
+    )
+    .map_err(|error| ServerHttpError::InvalidLinkSessionRequest {
+        reason: error.to_string(),
+    })
+}
+
+fn validate_link_payload(payload: &[u8]) -> Result<(), ServerHttpError> {
+    validate_bytes_len(
+        "link_session.encrypted_payload",
+        payload.len(),
+        MAX_LINK_SESSION_PAYLOAD_BYTES,
+    )
+    .map_err(|error| ServerHttpError::InvalidLinkSessionRequest {
+        reason: error.to_string(),
+    })
+}
+
+fn validate_link_claim_token(claim_token: &str) -> Result<(), ServerHttpError> {
+    validate_string_bytes("link_session.claim_token", claim_token, MAX_OBJECT_ID_BYTES).map_err(
+        |error| ServerHttpError::InvalidLinkSessionRequest {
+            reason: error.to_string(),
+        },
+    )
+}
+
+fn link_session_claim_token(session: &HttpLinkSessionRecord) -> String {
+    lease_token_for(
+        &session.link_session_id,
+        &DeviceRef {
+            account_id: "link".to_owned(),
+            device_id: session.pairing_public_key.clone(),
+        },
+    )
+}
+
 fn validate_account_room_id(field: &'static str, value: &str) -> Result<(), ServerHttpError> {
     if value.is_empty() || value.len() > MAX_HTTP_ACCOUNT_ROOM_ID_BYTES {
         return Err(ServerHttpError::InvalidAccountRoomRequest {
@@ -4046,6 +4402,28 @@ pub enum ServerHttpError {
         fanout_id: String,
         room_id: GroupId,
     },
+    InvalidLinkSessionRequest {
+        reason: String,
+    },
+    LinkSessionAlreadyExists {
+        link_session_id: String,
+    },
+    LinkSessionNotFound {
+        link_session_id: String,
+    },
+    LinkSessionConflict {
+        link_session_id: String,
+        reason: String,
+    },
+    LinkSessionClosed {
+        link_session_id: String,
+    },
+    LinkSessionNotReady {
+        link_session_id: String,
+    },
+    BadLinkSessionClaimToken {
+        link_session_id: String,
+    },
     InvalidAccountRoomRequest {
         reason: String,
     },
@@ -4249,6 +4627,44 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::NOT_FOUND,
                 "fanout_room_not_found".to_owned(),
                 format!("fanout {fanout_id} has no room {room_id:?}"),
+            ),
+            Self::InvalidLinkSessionRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_link_session_request".to_owned(),
+                reason,
+            ),
+            Self::LinkSessionAlreadyExists { link_session_id } => (
+                StatusCode::CONFLICT,
+                "link_session_already_exists".to_owned(),
+                format!("link session {link_session_id} already exists"),
+            ),
+            Self::LinkSessionNotFound { link_session_id } => (
+                StatusCode::NOT_FOUND,
+                "link_session_not_found".to_owned(),
+                format!("link session {link_session_id} was not found"),
+            ),
+            Self::LinkSessionConflict {
+                link_session_id,
+                reason,
+            } => (
+                StatusCode::CONFLICT,
+                "link_session_conflict".to_owned(),
+                format!("link session {link_session_id} conflict: {reason}"),
+            ),
+            Self::LinkSessionClosed { link_session_id } => (
+                StatusCode::BAD_REQUEST,
+                "link_session_closed".to_owned(),
+                format!("link session {link_session_id} is closed"),
+            ),
+            Self::LinkSessionNotReady { link_session_id } => (
+                StatusCode::BAD_REQUEST,
+                "link_session_not_ready".to_owned(),
+                format!("link session {link_session_id} is not ready"),
+            ),
+            Self::BadLinkSessionClaimToken { link_session_id } => (
+                StatusCode::BAD_REQUEST,
+                "bad_link_session_claim_token".to_owned(),
+                format!("link session {link_session_id} claim token does not match"),
             ),
             Self::InvalidAccountRoomRequest { reason } => (
                 StatusCode::BAD_REQUEST,

@@ -10,16 +10,19 @@ use finitechat_engine::{
     UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_http::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimWelcomesRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, FiniteAccountRoomCommitProjection, GetFanoutRequest,
-    GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan, HttpFanoutRoomStatus,
-    HttpKeyPackageClaim, HttpKeyPackageInventory, InboxSyncRequest, KeyPackageInventoryRequest,
+    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
+    BootstrapAccountRoomRequest, BootstrapAccountRoomResponse, ClaimKeyPackageRequest,
+    ClaimKeyPackagesRequest, ClaimLinkPayloadRequest, ClaimLinkPayloadResponse,
+    ClaimWelcomesRequest, CreateLinkSessionRequest, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
+    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
+    HttpFanoutRoomPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
+    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RevokeDeviceRequest, SaveAccountRoomRequest,
-    SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    MarkFanoutPreparedRequest, PublishMessageRequest, ReleaseLinkClaimRequest,
+    ReleaseLinkClaimResponse, ReportInvalidCommitRequest, ReportInvalidCommitResponse,
+    RevokeDeviceRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
+    UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
@@ -966,6 +969,206 @@ async fn sqlite_fanout_room_plan_conflict_does_not_overwrite_existing_plan() {
             .as_slice(),
         b"kp-original"
     );
+}
+
+#[tokio::test]
+async fn sqlite_link_session_state_machine_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let link_session_id = "link-http-session".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions",
+        &CreateLinkSessionRequest {
+            link_session_id: link_session_id.clone(),
+            pairing_public_key: "pairing-key-http".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: HttpLinkSessionRecord = read_json(response).await;
+    assert_eq!(record.state, HttpLinkSessionState::Created);
+    assert!(record.encrypted_payload.is_none());
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions",
+        &CreateLinkSessionRequest {
+            link_session_id: link_session_id.clone(),
+            pairing_public_key: "pairing-key-http".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "link_session_already_exists");
+
+    let payload = b"ciphertext:server-list-and-authorization".to_vec();
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            encrypted_payload: payload.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: HttpLinkSessionRecord = read_json(response).await;
+    assert_eq!(record.state, HttpLinkSessionState::PayloadUploaded);
+    assert_eq!(record.encrypted_payload, Some(payload.clone()));
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            encrypted_payload: payload.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            encrypted_payload: b"different".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "link_session_conflict");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/claim",
+        &ClaimLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claim: ClaimLinkPayloadResponse = read_json(response).await;
+    assert_eq!(claim.encrypted_payload, payload);
+    assert!(!claim.claim_token.is_empty());
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/release",
+        &ReleaseLinkClaimRequest {
+            link_session_id: link_session_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let release: ReleaseLinkClaimResponse = read_json(response).await;
+    assert!(release.released);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/claim",
+        &ClaimLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let retry_claim: ClaimLinkPayloadResponse = read_json(response).await;
+    assert_eq!(retry_claim.claim_token, claim.claim_token);
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/ack",
+        &AckLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            claim_token: "wrong-token".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "bad_link_session_claim_token");
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/ack",
+        &AckLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            claim_token: retry_claim.claim_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: AckLinkPayloadResponse = read_json(response).await;
+    assert!(ack.acked);
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: link_session_id.clone(),
+            encrypted_payload: b"late".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "link_session_closed");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/get",
+        &GetLinkSessionRequest {
+            link_session_id: link_session_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: Option<HttpLinkSessionRecord> = read_json(response).await;
+    let record = record.expect("stored link session");
+    assert_eq!(record.state, HttpLinkSessionState::Delivered);
+    assert_eq!(record.claim_token, Some(retry_claim.claim_token));
+
+    let response = post_json(
+        app.clone(),
+        "/link-sessions",
+        &CreateLinkSessionRequest {
+            link_session_id: "link-http-expired".to_owned(),
+            pairing_public_key: "pairing-expired".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/link-sessions/expire",
+        &ExpireLinkSessionRequest {
+            link_session_id: "link-http-expired".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/link-sessions/payload",
+        &UploadLinkPayloadRequest {
+            link_session_id: "link-http-expired".to_owned(),
+            encrypted_payload: b"late".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "link_session_closed");
 }
 
 #[tokio::test]
