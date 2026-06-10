@@ -3931,6 +3931,107 @@ async fn sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequenc
 }
 
 #[tokio::test]
+async fn sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let room_id = "room-ephemeral-activity-scope".to_owned();
+    let mls_group_id = "mls-ephemeral-activity-scope".to_owned();
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let topic_1_key =
+        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-1"), &alice);
+    for (index, payload) in [
+        br#"{"kind":"typing","activity_id":"same-id"}"#.as_slice(),
+        br#"{"kind":"working","activity_id":"same-id"}"#.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = ephemeral_activity_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            Some("topic-1"),
+            1_000 + u64::try_from(index).unwrap(),
+        );
+        request.payload = payload.to_vec();
+        let response = post_json(app.clone(), "/activities", &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EphemeralActivityAccepted = read_json(response).await;
+        assert_eq!(accepted.route_key, topic_1_key);
+        assert_eq!(
+            accepted.cached_events_for_route,
+            u32::try_from(index + 1).unwrap()
+        );
+    }
+
+    let mut topic_2 =
+        ephemeral_activity_request(&room_id, &mls_group_id, &alice, 0, Some("topic-2"), 2_000);
+    topic_2.payload = br#"{"kind":"typing","activity_id":"same-id"}"#.to_vec();
+    let response = post_json(app.clone(), "/activities", &topic_2).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EphemeralActivityAccepted = read_json(response).await;
+    assert_eq!(
+        accepted.route_key,
+        finitechat_engine::ephemeral_activity_route_key(&room_id, Some("topic-2"), &alice)
+    );
+    assert_eq!(accepted.cached_events_for_route, 1);
+
+    let mut room_wide = ephemeral_activity_request(&room_id, &mls_group_id, &alice, 0, None, 3_000);
+    room_wide.payload = br#"{"kind":"typing","activity_id":"same-id"}"#.to_vec();
+    let response = post_json(app.clone(), "/activities", &room_wide).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EphemeralActivityAccepted = read_json(response).await;
+    assert_eq!(
+        accepted.route_key,
+        finitechat_engine::ephemeral_activity_route_key(&room_id, None, &alice)
+    );
+    assert_eq!(accepted.cached_events_for_route, 1);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, 0);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/activities",
+        &ephemeral_activity_request(&room_id, &mls_group_id, &alice, 0, Some("topic-1"), 4_000),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EphemeralActivityAccepted = read_json(response).await;
+    assert_eq!(accepted.route_key, topic_1_key);
+    assert_eq!(accepted.cached_events_for_route, 1);
+}
+
+#[tokio::test]
 async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");

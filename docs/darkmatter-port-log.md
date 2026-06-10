@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `379`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `380`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 46 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 47 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -78,9 +78,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `387` (`379` Rust, `8` Python)
+- Port parsed tests: `388` (`380` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `93`
+- Port-only test names: `94`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -92,7 +92,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 52 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 53 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `93` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `94` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -152,7 +152,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 52 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 53 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -271,7 +271,11 @@ Current ephemeral activity progress: the HTTP server now accepts opaque
 ephemeral activity through `/activities` only for active, non-revoked senders at
 the current typed room epoch. It rejects pending, revoked, wrong-epoch, and
 expired activity, caps per-route volatile cache entries, does not append durable
-group messages, and does not persist activity across SQLite restart.
+group messages, and does not persist activity across SQLite restart. It also
+proves conversation-scoped route keys: separate topics and room-wide activity
+keep distinct cache counts, multiple opaque payloads with the same
+activity id remain separate events in one route, and the volatile scoped cache
+starts empty after restart.
 
 Current link-session progress: the HTTP server now exposes link-session
 pairing as wrapper-owned rendezvous state. Create/upload/claim/release/ack and
@@ -490,7 +494,9 @@ Fork-only requirements beyond the current HTTP branch:
 - The HTTP `/activities` route accepts opaque ephemeral activity for active
   non-revoked members at the current typed room epoch, rejects pending,
   revoked, wrong-epoch, and expired requests, caps per-route volatile cache
-  entries, and keeps the group log sequence unchanged across restart.
+  entries, keeps conversation-scoped topic and room-wide routes separate, treats
+  repeated activity ids as opaque additive payloads, and keeps the group log
+  sequence unchanged across restart.
 - `finitechat-client` now owns a generic `HttpRuntimeDelivery<T>` adapter over
   a small `HttpRuntimeTransport` trait. The adapter maps runtime KeyPackage,
   Welcome, account-room, typed commit, typed event, and ordered room-sync calls
@@ -724,7 +730,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `52`
+- Route/store/engine tests added so far: `53`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -863,6 +869,10 @@ Additional HTTP route checkpoint:
     revoked, wrong-epoch, and expired requests, caps the per-route volatile
     cache, does not advance the durable group sequence, and does not persist
     across restart
+  - ephemeral activity route keys are conversation-scoped over HTTP; distinct
+    topics and room-wide activity keep separate cache counts, same-route
+    payloads remain opaque and additive, and route-scoped cache state resets
+    after SQLite restart
 - Real Marmot engine coverage proven:
   - `cargo test -p finitechat-server --test http_engine_routes`: pass
   - route layer carries a real create Welcome, invite Commit, invite Welcome,
@@ -1018,6 +1028,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequence`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache`: pass
 - `cargo test -p finitechat-cli revoke_device_command_builds_revoke_request`: pass
 - `cargo test -p finitechat-client --test client_state http_runtime_delivery_filters_membership_and_rejects_pending_sends`: pass
@@ -1175,7 +1186,9 @@ Runtime delivery checkpoint:
   rejected overflow does not append to the group log.
 - Ephemeral activity is now proven over the HTTP wrapper: it is authorized
   against typed room membership and revocation state, bounded per route,
-  omitted from durable ordered group sync, and cleared by server restart.
+  scoped by conversation id or room-wide route, opaque to server payload
+  semantics, omitted from durable ordered group sync, and cleared by server
+  restart.
 
 ## Remaining Gates
 

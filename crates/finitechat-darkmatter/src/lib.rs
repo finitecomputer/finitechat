@@ -228,7 +228,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_ephemeral_activity_cache",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server accepts opaque ephemeral activity over HTTP for active members, rejects pending, revoked, wrong-epoch, and expired activity, caps per-route volatile cache entries, and does not append durable group messages or persist activity across SQLite restart",
+            evidence: "finitechat-server accepts opaque ephemeral activity over HTTP for active members, rejects pending, revoked, wrong-epoch, and expired activity, caps per-route volatile cache entries, keeps conversation-scoped topic and room-wide route keys distinct while treating repeated activity ids as opaque additive events, and does not append durable group messages or persist scoped cache state across SQLite restart",
         },
         PortFinding {
             area: "http_later_device_fanout_runtime_happy_path",
