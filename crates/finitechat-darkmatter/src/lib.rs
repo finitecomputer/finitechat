@@ -171,6 +171,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server derives persisted room-membership intervals from typed bootstrap, typed /commits, raw commit projection wrappers, and Welcome ack activation; requester-aware sync filters hidden entries while advancing cursors, removed devices can sync through their removal but not later entries after restart, stale removed devices cannot send events or commits, and typed rooms reject raw plain commits without membership deltas",
         },
         PortFinding {
+            area: "http_account_device_cap",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server enforces MAX_ACCOUNT_DEVICES_PER_ROOM during typed /commits, rejects overflow before durable append, and preserves claimed KeyPackage/no-Welcome/no-account-room side effects across SQLite restart",
+        },
+        PortFinding {
             area: "http_invalid_commit_repair_state",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",

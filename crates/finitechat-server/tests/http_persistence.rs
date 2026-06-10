@@ -22,10 +22,10 @@ use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
-    MembershipAddV1, MembershipDeltaV1, MembershipRemoveV1, RoomStatus, StagedWelcomeV1,
-    WelcomeState,
+    DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MembershipAddV1, MembershipDeltaV1,
+    MembershipRemoveV1, RoomStatus, StagedWelcomeV1, WelcomeState,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -1467,6 +1467,115 @@ async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_r
     assert_eq!(response.status(), StatusCode::OK);
     let page: HttpSyncPage = read_json(response).await;
     assert!(page.entries.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_submit_commit_rejects_account_device_cap_before_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let room_id = "room-account-device-cap".to_owned();
+    let mls_group_id = "mls-account-device-cap".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for index in 0..(MAX_ACCOUNT_DEVICES_PER_ROOM - 1) {
+        let device = DeviceRef::new("alice", format!("alice-extra-{index}"));
+        let request = submit_add_device_request_at_epoch_with_ids(
+            &room_id,
+            &mls_group_id,
+            &creator,
+            &device,
+            u64::from(index),
+            &format!("welcome-account-cap-{index}"),
+            &format!("commit-account-cap-{index}"),
+        );
+        publish_and_claim_key_package_for_add(&app, &request).await;
+        let response = post_json(app.clone(), "/commits", &request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: CommitAccepted = read_json(response).await;
+        assert_eq!(accepted.seq, u64::from(index) + 1);
+    }
+
+    let overflow = DeviceRef::new("alice", "alice-extra-overflow");
+    let overflow_request = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &overflow,
+        u64::from(MAX_ACCOUNT_DEVICES_PER_ROOM - 1),
+        "welcome-account-cap-overflow",
+        "commit-account-cap-overflow",
+    );
+    publish_and_claim_key_package_for_add(&app, &overflow_request).await;
+    let response = post_json(app.clone(), "/commits", &overflow_request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("room.devices_per_account"));
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: u64::from(MAX_ACCOUNT_DEVICES_PER_ROOM - 1),
+            limit: 10,
+            requester: Some(member_for_device(&creator)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(
+        page.next_after_seq,
+        u64::from(MAX_ACCOUNT_DEVICES_PER_ROOM - 1)
+    );
+
+    let page = account_room_page(&app, "alice").await;
+    assert_eq!(page.rooms.len(), 1);
+    assert_eq!(
+        page.rooms[0]["devices"].as_array().expect("devices").len(),
+        MAX_ACCOUNT_DEVICES_PER_ROOM as usize
+    );
+    assert!(
+        !page.rooms[0]["devices"]
+            .as_array()
+            .expect("devices")
+            .iter()
+            .any(|device| device["device"]["device_id"] == "alice-extra-overflow")
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&overflow),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+
+    let inventory = key_package_inventory_for_device(&app, &overflow).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
 }
 
 #[tokio::test]

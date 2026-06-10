@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `364`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `365`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 19 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 36 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 37 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -76,9 +76,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `372` (`364` Rust, `8` Python)
+- Port parsed tests: `373` (`365` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `78`
+- Port-only test names: `79`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +90,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 19 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 14 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 42 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 43 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -130,7 +130,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `78` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `79` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -150,7 +150,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 19 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 14 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 42 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 43 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -201,6 +201,13 @@ Current room-membership removal progress: the HTTP server now persists removal
 intervals across restart. A removed device can sync the commit that removes it,
 cannot send later typed events or commits, and later requester-filtered sync
 advances over hidden post-removal messages without exposing them.
+
+Current account-device cap progress: typed HTTP `/commits` now enforce
+Finite's per-account device cap for a room before durable append. Filling a
+room to `MAX_ACCOUNT_DEVICES_PER_ROOM` succeeds, the next same-account add is
+rejected, and SQLite restart proves there is no overflow commit, no released
+Welcome, no account-room projection leak, and the overflow KeyPackage remains
+claimed.
 
 Current group-sync pagination progress: typed HTTP `/events` plus `/sync/group`
 now prove bounded requester-aware pages over persisted Darkmatter group logs.
@@ -365,6 +372,10 @@ Fork-only requirements beyond the current HTTP branch:
   raw `/messages` commit imports for typed rooms must carry the same projection
   wrapper; plain raw commits are rejected before append instead of weakening
   strict membership filtering.
+- The typed HTTP `/commits` route now preserves Finite's per-account room
+  device cap: it rejects an add commit that would exceed
+  `MAX_ACCOUNT_DEVICES_PER_ROOM` before durable append, Welcome release,
+  KeyPackage consumption, or account-room projection update.
 - The runtime link-fanout worker can complete a one-room later-device happy
   path over the HTTP adapter when the initial room log is published and
   account-room discovery starts from typed bootstrap projection: discover the
@@ -532,6 +543,10 @@ Fork-only requirements beyond the current HTTP branch:
   close removed intervals, activated Welcome ack marks the pending interval
   active, and requester-aware group sync filters pages while still advancing
   cursors over hidden messages.
+- Account device caps for the HTTP delivery surface. The wrapper counts current
+  and pending devices per account in the room-membership projection and rejects
+  typed add commits that would exceed `MAX_ACCOUNT_DEVICES_PER_ROOM`, leaving
+  Darkmatter's transport core unaware of product-specific room cardinality.
 - Shared HTTP route DTOs. `finitechat-http` keeps request/response wire types
   reusable by the Axum server, CLI route builder, and runtime HTTP delivery
   client without making production clients depend on the server crate.
@@ -607,7 +622,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `42`
+- Route/store/engine tests added so far: `43`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -680,6 +695,11 @@ Additional HTTP route checkpoint:
   - removed-device membership intervals survive restart; removed devices can
     sync through their removal commit, cannot send later typed events or
     commits, and advance cursors over hidden post-removal messages
+  - account device cap enforcement survives SQLite reload; filling a typed
+    room to `MAX_ACCOUNT_DEVICES_PER_ROOM` succeeds, the next same-account add
+    fails before durable append, no overflow Welcome is released, the
+    account-room projection stays capped, and the overflow KeyPackage remains
+    claimed
   - typed `/events` rejects oversized application payloads before durable
     append, replays exact idempotent responses after restart, rejects duplicate
     typed event message ids submitted with new idempotency keys, and leaves the
@@ -816,6 +836,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes`: pass
 - `cargo test -p finitechat-client --test client_state runtime_link_fanout_reprepares_after_http_same_epoch_loss`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_group_sync_filters_by_persisted_room_membership_projection`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_rejects_account_device_cap_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_sync_returns_bounded_pages_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_typed_event_idempotency_capacity_rejects_new_keys_but_replays_after_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http`: pass
@@ -923,6 +944,11 @@ Runtime delivery checkpoint:
   removed devices can pull their own removal commit, cannot send later typed
   events or commits, and requester-filtered sync advances over hidden
   post-removal messages without exposing them.
+- Account device caps are now proven over the HTTP wrapper and SQLite rebuild:
+  typed room membership counts current and pending devices by account, rejects
+  fresh add commits that exceed `MAX_ACCOUNT_DEVICES_PER_ROOM`, and keeps the
+  group log, Welcome inbox, account-room projection, and KeyPackage consumed
+  state unchanged after rejection.
 - Revoked-device status is now proven over the HTTP wrapper and SQLite rebuild:
   it blocks KeyPackage publish/claim, Welcome claim/activation, typed event and
   commit senders, and typed commits that add a revoked device while preserving

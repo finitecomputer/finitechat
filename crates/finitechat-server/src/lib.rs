@@ -30,9 +30,9 @@ pub use finitechat_http::{
     SaveAccountRoomResponse, SaveFanoutRoomRequest,
 };
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE, MembershipAddV1, MembershipDeltaV1, RoomLogEntry,
-    RoomStatus, WelcomeState,
+    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_IDEMPOTENCY_RECORDS_PER_ROOM_DEVICE,
+    MembershipAddV1, MembershipDeltaV1, RoomLogEntry, RoomStatus, WelcomeState,
 };
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -2336,6 +2336,19 @@ impl HttpRoomMembershipProjection {
             .unwrap_or(false)
     }
 
+    fn current_or_pending_device_count_for_account(&self, account_id: &str) -> usize {
+        self.membership
+            .values()
+            .filter(|membership| membership.device.account_id == account_id)
+            .filter(|membership| {
+                membership
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.end_seq.is_none())
+            })
+            .count()
+    }
+
     fn activate_interval(&mut self, device: &DeviceRef, start_seq: HttpSequence) -> bool {
         let Some(membership) = self.membership.get_mut(&DeviceMembership::key(device)) else {
             return false;
@@ -3110,6 +3123,24 @@ fn apply_room_membership_delta(
                 projection.current_epoch
             ),
         });
+    }
+
+    let mut added_devices_by_account = BTreeMap::<String, usize>::new();
+    for add in &membership_delta.adds {
+        let current_devices =
+            projection.current_or_pending_device_count_for_account(&add.device.account_id);
+        let added_devices = added_devices_by_account
+            .entry(add.device.account_id.clone())
+            .or_insert(0);
+        *added_devices += 1;
+        let proposed = current_devices + *added_devices;
+        if proposed > MAX_ACCOUNT_DEVICES_PER_ROOM as usize {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "room.devices_per_account has {proposed} items, max {MAX_ACCOUNT_DEVICES_PER_ROOM}"
+                ),
+            });
+        }
     }
 
     for remove in &membership_delta.removes {
