@@ -2349,6 +2349,18 @@ impl HttpRoomMembershipProjection {
             .count()
     }
 
+    fn device_current_or_pending_at_head(&self, device: &DeviceRef) -> bool {
+        self.membership
+            .get(&DeviceMembership::key(device))
+            .map(|membership| {
+                membership
+                    .intervals
+                    .iter()
+                    .any(|interval| interval.end_seq.is_none())
+            })
+            .unwrap_or(false)
+    }
+
     fn activate_interval(&mut self, device: &DeviceRef, start_seq: HttpSequence) -> bool {
         let Some(membership) = self.membership.get_mut(&DeviceMembership::key(device)) else {
             return false;
@@ -3138,6 +3150,14 @@ fn apply_room_membership_delta(
             return Err(ServerHttpError::InvalidCommitRequest {
                 reason: format!(
                     "room.devices_per_account has {proposed} items, max {MAX_ACCOUNT_DEVICES_PER_ROOM}"
+                ),
+            });
+        }
+        if projection.device_current_or_pending_at_head(&add.device) {
+            return Err(ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "device {:?} is already current or pending in room",
+                    add.device
                 ),
             });
         }

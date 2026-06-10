@@ -1579,6 +1579,107 @@ async fn sqlite_submit_commit_rejects_account_device_cap_before_side_effects() {
 }
 
 #[tokio::test]
+async fn sqlite_submit_commit_rejects_duplicate_pending_device_before_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let creator = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-duplicate-pending-add".to_owned();
+    let mls_group_id = "mls-duplicate-pending-add".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: creator.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let add_bob = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &bob,
+        "welcome-duplicate-pending-bob",
+        "commit-duplicate-pending-bob",
+    );
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.seq, 1);
+
+    let duplicate = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &bob,
+        1,
+        "welcome-duplicate-pending-bob-retry",
+        "commit-duplicate-pending-bob-retry",
+    );
+    publish_and_claim_key_package_for_add(&app, &duplicate).await;
+    let response = post_json(app.clone(), "/commits", &duplicate).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_commit_request");
+    assert!(error.error.contains("already current or pending"));
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: accepted.seq,
+            limit: 10,
+            requester: Some(member_for_device(&creator)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert!(page.entries.is_empty());
+    assert_eq!(page.next_after_seq, accepted.seq);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/inbox",
+        &InboxSyncRequest {
+            recipient: member_for_device(&bob),
+            after_seq: 0,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(
+        page.entries[0].message.id,
+        id("welcome-duplicate-pending-bob")
+    );
+
+    let account_page = account_room_page(&app, "bob").await;
+    assert_eq!(account_page.rooms.len(), 1);
+    let devices = account_page.rooms[0]["devices"]
+        .as_array()
+        .expect("devices");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["device"]["device_id"], "bob-phone");
+    assert_eq!(devices[0]["active"], false);
+
+    let inventory = key_package_inventory_for_device(&app, &bob).await;
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.claimed, 1);
+}
+
+#[tokio::test]
 async fn sqlite_welcome_not_released_before_accepted_commit_over_http() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");

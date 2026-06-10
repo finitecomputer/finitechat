@@ -176,6 +176,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server enforces MAX_ACCOUNT_DEVICES_PER_ROOM during typed /commits, rejects overflow before durable append, and preserves claimed KeyPackage/no-Welcome/no-account-room side effects across SQLite restart",
         },
         PortFinding {
+            area: "http_duplicate_pending_device_add",
+            status: PortStatus::EasyFiniteOwnedLogic,
+            evidence: "finitechat-server rejects typed /commits that re-add a current or pending device before durable append, preserving the original Welcome, account-room projection, and claimed retry KeyPackage across SQLite restart",
+        },
+        PortFinding {
             area: "http_invalid_commit_repair_state",
             status: PortStatus::EasyFiniteOwnedLogic,
             evidence: "finitechat-server /rooms/report-invalid-commit authorizes reporters against persisted membership intervals, marks room-membership and account-room projections needs_repair in one SQLite transaction, reloads that state after restart, and blocks later typed /events and /commits",
