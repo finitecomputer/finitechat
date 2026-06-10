@@ -18,7 +18,7 @@ Current copied acceptance surface:
 - Copied Rust tests at repo creation: `287`
 - Current copied/application Rust tests after Darkmatter HTTP harness additions:
   `301`
-- Current Rust tests overall, including HTTP route/CLI adapter tests: `374`
+- Current Rust tests overall, including HTTP route/CLI adapter tests: `375`
 - Python tests overall: `8`
 - Python Hermes adapter tests: `7`
 - Python process binary smoke tests: `1`
@@ -46,7 +46,7 @@ Additional HTTP/CLI/Darkmatter Rust test distribution:
 | `crates/finitechat-cli/src/lib.rs` | 23 |
 | `crates/finitechat-darkmatter/src/lib.rs` | 2 |
 | `crates/finitechat-server/tests/http_engine_routes.rs` | 1 |
-| `crates/finitechat-server/tests/http_persistence.rs` | 41 |
+| `crates/finitechat-server/tests/http_persistence.rs` | 42 |
 | `crates/finitechat-server/tests/http_routes.rs` | 5 |
 
 Python test distribution:
@@ -61,8 +61,9 @@ Python test distribution:
 Audit state:
 
 - Port code state audited: `codex/darkmatter-port`, including HTTP
-  KeyPackage lease-expiry/reclaim, Welcome-release coupling, revoked-device
-  projection, and ephemeral activity route/cache coverage
+  KeyPackage publish retry/conflict, KeyPackage lease-expiry/reclaim,
+  Welcome-release coupling, revoked-device projection, and ephemeral activity
+  route/cache coverage
 - Baseline checkout: `/Users/futurepaul/dev/finite/finitechat`,
   `marmot-investigation` at `7e8048d`
 - Baseline untracked docs were ignored because they are outside `crates/` and
@@ -76,9 +77,9 @@ Parity result:
 - Baseline test-bearing files: `12`
 - Port test-bearing files: `18`
 - Baseline parsed tests: `294` (`287` Rust, `7` Python)
-- Port parsed tests: `382` (`374` Rust, `8` Python)
+- Port parsed tests: `383` (`375` Rust, `8` Python)
 - Missing baseline test names in the port: `0`
-- Port-only test names: `88`
+- Port-only test names: `89`
 - Intentionally reshaped baseline test names: `0` at the parsed test-key layer.
   The baseline relative paths and test names are preserved; port-only tests
   add Darkmatter HTTP/CLI/runtime/process coverage around them.
@@ -90,7 +91,7 @@ Port-only test buckets:
 | HTTP CLI request/live-server coverage | 23 | `crates/finitechat-cli/src/lib.rs` |
 | Runtime client over Darkmatter HTTP routes/live reqwest | 15 | `crates/finitechat-client/tests/client_state.rs` |
 | Darkmatter compatibility report/core smoke | 2 | `crates/finitechat-darkmatter/src/lib.rs` |
-| Server HTTP route, persistence, and real-engine route coverage | 47 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
+| Server HTTP route, persistence, and real-engine route coverage | 48 | `crates/finitechat-server/tests/http_routes.rs`, `crates/finitechat-server/tests/http_persistence.rs`, `crates/finitechat-server/tests/http_engine_routes.rs` |
 | Process-level server/CLI binary smoke | 1 | `tests/test_process_binary_smoke.py` |
 
 Conclusion: the port currently preserves the full baseline test-name surface and
@@ -130,7 +131,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `88` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `89` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -150,7 +151,7 @@ Port-only Darkmatter coverage added so far:
 | --- | ---: | --- |
 | CLI HTTP route coverage | 23 | Request building and live-server route calls through `finitechat_cli::run`. |
 | Runtime HTTP coverage | 15 | `HttpRuntimeDelivery`, in-process HTTP fault injection, and live `ReqwestHttpRuntimeTransport` tests. |
-| Server HTTP coverage | 47 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
+| Server HTTP coverage | 48 | Axum route, SQLite HTTP-operation replay, and real Marmot engine route tests. |
 | Darkmatter core smoke/report | 2 | HTTP delivery core ordering and compatibility bucket tests. |
 | Process binary smoke | 1 | Server binary plus CLI binary over SQLite-backed HTTP. |
 
@@ -183,7 +184,9 @@ restart, rejects consumed-package reuse, and maps HTTP claimed inventory back to
 leased counts in the runtime adapter. The HTTP wrapper now owns KeyPackage
 lease state above Marmot's opaque package bytes: it can expire a claimed lease
 back to available, persist that across restart, reclaim the same package, and
-reject attempts to expire consumed packages.
+reject attempts to expire consumed packages. Exact KeyPackage publication
+retries now replay safely after restart, while conflicting same-id packages are
+rejected without creating extra claimable inventory.
 
 Current Welcome-release progress: typed HTTP `/commits` now has a focused
 restart proof that bad commit metadata does not release a Welcome, the absence
@@ -353,8 +356,11 @@ Fork-only requirements beyond the current HTTP branch:
   restart.
 - The HTTP KeyPackage wrapper can also expose available/claimed inventory for
   an owner. This lets the runtime KeyPackage replenishment worker run over the
-  Darkmatter HTTP boundary without teaching the server application-specific device
-  structure.
+  Darkmatter HTTP boundary without teaching the server application-specific
+  device structure.
+- The HTTP KeyPackage publication path replays exact same-id package retries
+  after restart and rejects conflicting same-id bytes without creating another
+  claimable package.
 - The HTTP revoked-device wrapper can persist terminal device status,
   rebuild it after restart, block revoked devices from server-mediated
   KeyPackage, Welcome, event, and Commit paths, and skip revoked owners during
@@ -686,7 +692,7 @@ Additional HTTP route checkpoint:
 
 - `cargo test -p finitechat-server --test http_routes`: pass
 - `cargo test -p finitechat-server --test http_persistence`: pass
-- Route/store/engine tests added so far: `47`
+- Route/store/engine tests added so far: `48`
 - Route coverage proven:
   - `GET /health`
   - `POST /messages`
@@ -724,6 +730,8 @@ Additional HTTP route checkpoint:
   - consumed KeyPackage state rebuilds after restart
   - KeyPackage available/claimed inventory survives restart and idempotent
     publish replay does not resurrect claimed inventory
+  - exact KeyPackage publication retry survives restart and conflicting
+    same-id package bytes reject without creating extra claimable inventory
   - typed `/commits` rejects unclaimed KeyPackages and stale KeyPackage
     metadata before side effects
   - typed `/commits` consumes claimed KeyPackages atomically with accepted
@@ -926,6 +934,7 @@ Runtime delivery checkpoint:
 - `cargo test -p finitechat-server --test http_persistence submit_commit_route_rejects_missing_staged_welcome_before_side_effects`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_restart`: pass
+- `cargo test -p finitechat-server --test http_persistence sqlite_key_package_publish_retry_and_conflict_survive_restart`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_welcome_not_released_before_accepted_commit_over_http`: pass
 - `cargo test -p finitechat-server --test http_persistence sqlite_key_package_lease_expiry_and_reclaim_survives_restart_over_http`: pass
 - `cargo test -p finitechat-cli expire_key_package_lease_command_builds_expiry_request`: pass
@@ -956,6 +965,10 @@ Runtime delivery checkpoint:
   Darkmatter HTTP `/key-packages/inventory` and `/key-packages` routes.
 - Reopening the HTTP server from SQLite proves the worker sees the persisted
   inventory and uploads zero duplicate KeyPackages on replay.
+- HTTP KeyPackage publication retry is now proven directly at the route layer:
+  an exact same-id publish can be retried after restart, the original package
+  bytes remain claimable, and conflicting same-id bytes reject without adding a
+  second claimable package.
 - The runtime delivery adapter can claim a KeyPackage through
   `/key-packages/claim`, recover the original package metadata, compute
   the same deterministic lease token, and replay after server restart with no

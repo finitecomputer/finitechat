@@ -20,10 +20,10 @@ use finitechat_http::{
     HttpFanoutRoomPlan, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
     HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, PublishMessageRequest, ReleaseLinkClaimRequest,
-    ReleaseLinkClaimResponse, ReportInvalidCommitRequest, ReportInvalidCommitResponse,
-    RevokeDeviceRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
-    UploadLinkPayloadRequest,
+    MarkFanoutPreparedRequest, PublishKeyPackageResponse, PublishMessageRequest,
+    ReleaseLinkClaimRequest, ReleaseLinkClaimResponse, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, RevokeDeviceRequest, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     DeviceRef, FiniteEnvelope, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
@@ -340,6 +340,66 @@ async fn sqlite_key_package_inventory_tracks_available_and_claimed_after_restart
         StatusCode::OK
     );
     assert_inventory(app, owner, 1, 1).await;
+}
+
+#[tokio::test]
+async fn sqlite_key_package_publish_retry_and_conflict_survive_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let owner = member("publish-retry-owner");
+    let original = key_package_publication("kp-publish-retry", owner.clone(), b"original-package");
+    let conflicting =
+        key_package_publication("kp-publish-retry", owner.clone(), b"conflicting-package");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages", &original).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let published: PublishKeyPackageResponse = read_json(response).await;
+    assert!(published.published);
+    assert_inventory(app, owner.clone(), 1, 0).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages", &original).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: PublishKeyPackageResponse = read_json(response).await;
+    assert!(replayed.published);
+    assert_inventory(app.clone(), owner.clone(), 1, 0).await;
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed = claimed.expect("exact replay leaves one claimable KeyPackage");
+    assert_eq!(claimed.key_package_id, original.key_package_id);
+    assert_eq!(claimed.owner, owner.clone());
+    assert_eq!(claimed.key_package, original.key_package);
+    assert_inventory(app, owner.clone(), 0, 1).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/key-packages", &conflicting).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "conflicting_key_package");
+    assert_inventory(app.clone(), owner.clone(), 0, 1).await;
+
+    let response = post_json(
+        app,
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest { owner },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert!(
+        claimed.is_none(),
+        "conflicting retry must not create a second claimable KeyPackage"
+    );
 }
 
 #[tokio::test]

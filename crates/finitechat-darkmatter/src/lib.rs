@@ -91,6 +91,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can claim one KeyPackage per explicit device owner and replay the exact batch response by idempotency key after restart",
         },
         PortFinding {
+            area: "http_key_package_publish_retry",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server replays exact KeyPackage publication retries after restart and rejects conflicting same-id packages without creating extra claimable inventory",
+        },
+        PortFinding {
             area: "http_key_package_inventory_runtime_sync",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-client run_runtime_sync_tick replenishes KeyPackages through Darkmatter HTTP inventory/upload routes and replays zero duplicate uploads after server restart",
