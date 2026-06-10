@@ -132,7 +132,7 @@ Audit method:
 
 - Start from the `294` baseline test names proven present in the parity audit.
 - Classify preserved tests by file-level backend ownership, then separately
-  account for the `109` port-only Darkmatter/HTTP/CLI/process tests.
+  account for the `110` port-only Darkmatter/HTTP/CLI/process tests.
 - This audit intentionally treats preserved baseline tests as still requiring
   migration unless their file is already product-only or OpenMLS-helper-only.
 
@@ -346,10 +346,31 @@ expire survive SQLite restart, same-payload upload is idempotent, conflicting
 payloads, oversized payloads, and late uploads reject without replacing the
 stored payload, and CLI route DTO coverage exists for every link-session route.
 
+Preserved fake/sim reducer audit result:
+
+| Preserved family | Port status |
+| --- | --- |
+| `finitechat-engine` sync projection and commit race tests | Covered by `RoomSyncProjection` unit tests, the Darkmatter HTTP projection test, raw `/messages` commit-admission tests, typed `/commits`, removal, and invalid-commit HTTP tests. |
+| KeyPackage, Welcome, commit, idempotency, membership, direct-room, sync-page, delivery-effect, liveness, and ephemeral-activity scenarios in `finitechat-sim/tests/scenarios.rs` | Covered by focused HTTP route, SQLite restart, runtime-delivery, and live-server tests listed above. |
+| Link-session, account-room discovery, and link-fanout scenarios | Covered by HTTP link-session route tests, account-room projection tests, CLI DTO tests, and runtime link-fanout tests over `HttpRuntimeDelivery` and live Axum. |
+| Fake credential, fake Welcome activation, changed-leaf validation, and login challenge sketches | Product auth/OpenMLS/client policy placeholders. They do not have a concrete Darkmatter HTTP route in this repo and should not be turned into fake server endpoints without an auth spec. |
+| Daemon survival and finitecomputer boundary scenarios | Product runtime behavior above the encrypted payload boundary. The HTTP port proves durable opaque command/state delivery, command-inbox effects, liveness separation, and hint/pull semantics; full crash recovery belongs to a production daemon entrypoint when one exists. |
+
+Preserved SQLite reducer audit result:
+
+| Preserved family | Port status |
+| --- | --- |
+| Old SQLite room log, idempotency, commit epoch, KeyPackage, Welcome, account-room, direct-room, link-session, application-effect, liveness, and ephemeral-activity persistence tests | Covered by `finitechat-server/tests/http_persistence.rs` route tests over the Darkmatter HTTP operation log and adapter projections. |
+| Old commit crash matrix and rejected replay tests | Covered by typed HTTP `/commits` crash/retry and rejected-replay tests across delivery, idempotency, Welcome, account-room, room-membership, and KeyPackage projection write points. |
+| Old application-effect crash/idempotency tests | Covered by typed HTTP `/application-events` crash/retry, effect projection, policy matrix, and count durability tests. |
+| `sqlite_operation_fuzz_matches_in_memory_delivery_service` | Not ported as a literal differential fuzzer because the old in-memory reducer is no longer the target backend. Its operation classes are covered by focused HTTP tests; a future mixed HTTP operation fuzzer would be useful hardening, but it is not evidence of a Darkmatter protocol gap by itself. |
+| `sqlite_commit_epoch_unique_index_blocks_second_commit_row` | Superseded by Darkmatter commit admission and typed `/commits` epoch validation. The new backend should reject conflicting commits through route/projection invariants rather than preserve the old table-level unique-index proof. |
+
 Conclusion: the port now preserves all baseline names and adds Darkmatter HTTP
-coverage, but the migration is not complete. The remaining implementation work
-is concentrated in the old fake/in-memory reducer and SQLite store tests that
-do not yet run through Darkmatter HTTP.
+coverage. The remaining implementation work is no longer an obvious missing
+core protocol bucket; it is final verification, plus optional hardening such as
+a mixed HTTP operation fuzzer if we want a direct successor to the old store
+differential fuzz test.
 
 ## Darkmatter-Facing Delta Buckets
 
@@ -1345,10 +1366,12 @@ Watch list for the remaining gate:
   names in `docs/scenario-coverage.md` and either port them to Darkmatter
   HTTP/runtime tests or classify them as product-layer behavior above the
   encrypted payload.
-- [ ] Review preserved `finitechat-engine` and `finitechat-sim` fake-delivery
+- [x] Review preserved `finitechat-engine` and `finitechat-sim` fake-delivery
   tests for any reducer invariants not already covered by typed HTTP route,
   SQLite replay, or runtime-delivery tests.
-- [ ] Review preserved `finitechat-store` SQLite reducer tests for any crash or
+- [x] Review preserved `finitechat-store` SQLite reducer tests for any crash or
   reopen invariant not already covered by the Darkmatter HTTP operation log.
+- [ ] Decide whether to add a mixed HTTP operation fuzzer as a hardening
+  successor to `sqlite_operation_fuzz_matches_in_memory_delivery_service`.
 - [ ] Refresh the parity counts and run the final targeted/full test set after
   the remaining classifications are complete.
