@@ -1341,7 +1341,7 @@ Watch list for the remaining gate:
 - [x] Classify the remaining V1 transport scenarios in
   `docs/scenario-coverage.md` as covered by HTTP/projection tests or deferred
   until a concrete SSE/push/stream adapter exists.
-- [ ] Review the remaining Command/RPC and Runtime Status Snapshot scenario
+- [x] Review the remaining Command/RPC and Runtime Status Snapshot scenario
   names in `docs/scenario-coverage.md` and either port them to Darkmatter
   HTTP/runtime tests or classify them as product-layer behavior above the
   encrypted payload.

@@ -557,6 +557,16 @@ application payload behavior:
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
+Darkmatter HTTP port status:
+
+| Responsibility | Status |
+| --- | --- |
+| Opaque command request delivery | Covered by `/application-events` tests that persist command-inbox work, preserve opaque request ids, replay exact idempotent publishes, and reject duplicate durable message ids with new idempotency keys. |
+| Command result/cancel delivery policy | Covered at the HTTP effect layer: result/cancel events are durable, non-notifying application events and survive SQLite restart. |
+| Decrypted command validation, target policy, terminal races, resource serialization, and activity clears | Product-layer behavior above Darkmatter. Coverage remains in `finitechat-proto` and daemon-survival tests because the server must not parse encrypted command payloads. |
+| Runtime daemon execution and crash recovery | Product runtime behavior. The current repo has fake-daemon survival coverage; Darkmatter HTTP should only provide ordered durable input/output and idempotent publish routes until a production daemon entrypoint exists. |
+| Hosted runner and management queue boundaries | Product architecture behavior outside the chat transport. These scenarios should stay out of Darkmatter unless a future adapter exposes a concrete route boundary. |
+
 ## Transport Scenarios
 
 V1 transport should prove streams are hints and pull sync is authoritative:
@@ -605,6 +615,16 @@ Runtime status is encrypted application state, not request/response RPC:
 The typed projection read path rejects missing, stale, schema-mismatched, and
 malformed payloads without issuing command work. Page loads should read this
 projection or fail loudly; an explicit refresh remains a command.
+
+Darkmatter HTTP port status:
+
+| Responsibility | Status |
+| --- | --- |
+| Snapshot payload validation and dashboard read semantics | Product-layer coverage in `finitechat-proto`; Darkmatter treats snapshots as opaque encrypted application payloads. |
+| Durable snapshot transport without notification side effects | Covered by HTTP application-delivery policy tests; runtime state snapshots are durable but do not create push, unread, or command-inbox work. |
+| Rebuilding projected status from the ordered HTTP log | Covered by `sqlite_runtime_state_snapshot_projects_from_http_log_after_restart`, which syncs the snapshot after SQLite restart and rebuilds `RuntimeStateProjection`. |
+| Runtime liveness separation | Covered by `/devices/liveness` tests: heartbeats are volatile server-visible delivery state, do not advance room sync, and are cleared by restart. |
+| Slow refresh cadence and explicit refresh command behavior | Product runtime/client behavior; it should stay above Darkmatter unless a future runtime daemon entrypoint owns refresh scheduling. |
 
 ## Chat Payload Scenarios
 
