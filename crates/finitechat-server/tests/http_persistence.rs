@@ -838,7 +838,6 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-revoked-active"),
-            activated: true,
         },
     )
     .await;
@@ -865,7 +864,6 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-revoked-pending"),
-            activated: true,
         },
     )
     .await;
@@ -3188,7 +3186,6 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-filtered-bob"),
-            activated: true,
         },
     )
     .await;
@@ -3390,7 +3387,6 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-multi-alice-phone"),
-            activated: true,
         },
     )
     .await;
@@ -3491,7 +3487,6 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-multi-alice-browser"),
-            activated: true,
         },
     )
     .await;
@@ -3591,7 +3586,6 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-removed-sync-bob"),
-            activated: true,
         },
     )
     .await;
@@ -4839,7 +4833,6 @@ async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-ephemeral-bob"),
-            activated: true,
         },
     )
     .await;
@@ -5366,7 +5359,6 @@ async fn sqlite_welcome_activation_marks_account_room_device_active_after_restar
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-phone-activation"),
-            activated: true,
         },
     )
     .await;
@@ -5397,7 +5389,6 @@ async fn sqlite_welcome_activation_marks_account_room_device_active_after_restar
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-phone-activation"),
-            activated: true,
         },
     )
     .await;
@@ -5477,7 +5468,6 @@ async fn sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-delayed-sync-bob"),
-            activated: true,
         },
     )
     .await;
@@ -5570,7 +5560,6 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-restart"),
-            activated: true,
         },
     )
     .await;
@@ -5584,7 +5573,6 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id("welcome-restart"),
-            activated: true,
         },
     )
     .await;
@@ -5593,175 +5581,7 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
     assert!(acked.acked);
 }
 
-#[tokio::test]
-async fn sqlite_welcome_failed_ack_is_terminal_after_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let recipient = member("failed-welcome-recipient");
-    let welcome = PublishMessageRequest {
-        target: HttpPublishTarget::Inbox {
-            recipient: recipient.clone(),
-        },
-        message: welcome_message("welcome-failed", recipient.clone(), b"welcome-bytes"),
-        idempotency_key: None,
-    };
 
-    let app = persistent_app(&db_path);
-    assert_eq!(
-        post_json(app.clone(), "/messages", &welcome).await.status(),
-        StatusCode::OK
-    );
-    let response = post_json(
-        app.clone(),
-        "/welcomes/claim",
-        &ClaimWelcomesRequest {
-            recipient: recipient.clone(),
-            limit: 10,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
-    assert_eq!(claimed.len(), 1);
-
-    let response = post_json(
-        app,
-        "/welcomes/ack",
-        &AckWelcomeRequest {
-            message_id: id("welcome-failed"),
-            activated: false,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app.clone(),
-        "/welcomes/claim",
-        &ClaimWelcomesRequest {
-            recipient,
-            limit: 10,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
-    assert!(claimed.is_empty());
-
-    let response = post_json(
-        app,
-        "/welcomes/ack",
-        &AckWelcomeRequest {
-            message_id: id("welcome-failed"),
-            activated: true,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "welcome_ack_conflict");
-}
-
-#[tokio::test]
-async fn sqlite_welcome_failed_ack_keeps_membership_inactive_after_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let room_id = "room-failed-welcome-membership".to_owned();
-    let mls_group_id = "mls-failed-welcome-membership".to_owned();
-    let alice = DeviceRef::new("alice", "alice-laptop");
-    let bob = DeviceRef::new("bob", "bob-phone");
-    let app = persistent_app(&db_path);
-
-    let response = post_json(
-        app.clone(),
-        "/account-rooms/bootstrap",
-        &BootstrapAccountRoomRequest {
-            room_id: room_id.clone(),
-            mls_group_id: mls_group_id.clone(),
-            creator: alice.clone(),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let request = submit_add_device_request(
-        &room_id,
-        &mls_group_id,
-        &alice,
-        &bob,
-        "welcome-failed-membership-bob",
-        "commit-failed-membership-bob",
-    );
-    publish_and_claim_key_package_for_add(&app, &request).await;
-    let response = post_json(app.clone(), "/commits", &request).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let accepted: CommitAccepted = read_json(response).await;
-    assert_eq!(accepted.seq, 1);
-
-    let response = post_json(
-        app.clone(),
-        "/welcomes/claim",
-        &ClaimWelcomesRequest {
-            recipient: member_for_device(&bob),
-            limit: 10,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
-    assert_eq!(claimed.len(), 1);
-
-    let response = post_json(
-        app,
-        "/welcomes/ack",
-        &AckWelcomeRequest {
-            message_id: id("welcome-failed-membership-bob"),
-            activated: false,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let app = persistent_app(&db_path);
-    let page = account_room_page(&app, &bob.account_id).await;
-    assert_eq!(page.rooms.len(), 1);
-    assert_eq!(
-        page.rooms[0]["devices"][0]["device"]["device_id"],
-        "bob-phone"
-    );
-    assert_eq!(page.rooms[0]["devices"][0]["active"], false);
-
-    let response = post_json(
-        app.clone(),
-        "/events",
-        &typed_event_request(&append_application_request(
-            &room_id,
-            &mls_group_id,
-            &bob,
-            1,
-            b"failed-welcome-send",
-            "failed-welcome-send-idempotency",
-        )),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "sender_not_active");
-
-    let response = post_json(
-        app,
-        "/welcomes/ack",
-        &AckWelcomeRequest {
-            message_id: id("welcome-failed-membership-bob"),
-            activated: true,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "welcome_ack_conflict");
-}
 
 #[tokio::test]
 async fn sqlite_mixed_http_operation_fuzzer_survives_restarts() {
@@ -5837,7 +5657,6 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
         "/welcomes/ack",
         &AckWelcomeRequest {
             message_id: id(&welcome_id),
-            activated: true,
         },
     )
     .await;

@@ -350,7 +350,6 @@ pub struct HttpClaimedWelcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckWelcomeRequest {
     pub message_id: MessageId,
-    pub activated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

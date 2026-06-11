@@ -2692,7 +2692,7 @@ pub trait RuntimeDelivery {
 
     fn claim_welcomes(&mut self, device: &DeviceRef) -> Result<Vec<WelcomeRecord>, Self::Error>;
 
-    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error>;
+    fn ack_welcome(&mut self, welcome_id: &str) -> Result<(), Self::Error>;
 
     fn sync_events(
         &mut self,
@@ -3129,12 +3129,11 @@ impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
             .collect()
     }
 
-    fn ack_welcome(&mut self, welcome_id: &str, activated: bool) -> Result<(), Self::Error> {
+    fn ack_welcome(&mut self, welcome_id: &str) -> Result<(), Self::Error> {
         let _: AckWelcomeResponse = self.post_json(
             "/welcomes/ack",
             &AckWelcomeRequest {
                 message_id: HttpMessageId::new(welcome_id.as_bytes().to_vec()),
-                activated,
             },
         )?;
         Ok(())
@@ -3328,7 +3327,7 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
 
     for ack in device.pending_welcome_acks() {
         delivery
-            .ack_welcome(&ack.welcome_id, true)
+            .ack_welcome(&ack.welcome_id)
             .map_err(RuntimeWorkerError::Delivery)?;
         store.clear_pending_welcome_ack_and_save(device, &ack.welcome_id)?;
         report.record_welcome_ack()?;

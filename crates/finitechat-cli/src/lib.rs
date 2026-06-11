@@ -720,12 +720,10 @@ fn ack_welcome_request(
     mut args: Vec<String>,
 ) -> Result<PreparedHttpRequest, CliError> {
     let message_id = required_option(&mut args, "--message-id")?;
-    let activated = required_option(&mut args, "--activated")?;
     reject_extra_args(&args)?;
 
     let request = AckWelcomeRequest {
         message_id: MessageId::new(message_id.into_bytes()),
-        activated: parse_bool("--activated", &activated)?,
     };
     post_json_request(server, "/welcomes/ack", &request)
 }
@@ -853,13 +851,6 @@ fn parse_u64(name: &'static str, value: &str) -> Result<u64, CliError> {
         .map_err(|_| CliError::Usage(format!("{name} must be an unsigned integer")))
 }
 
-fn parse_bool(name: &'static str, value: &str) -> Result<bool, CliError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(CliError::Usage(format!("{name} must be true or false"))),
-    }
-}
 
 fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
@@ -880,7 +871,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID --activated true|false".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 #[cfg(test)]
@@ -1511,21 +1502,14 @@ mod tests {
 
     #[test]
     fn ack_welcome_command_builds_ack_request() {
-        let request = prepare_http_request([
-            "ack-welcome",
-            "--message-id",
-            "welcome-bob",
-            "--activated",
-            "true",
-        ])
-        .expect("request");
+        let request = prepare_http_request(["ack-welcome", "--message-id", "welcome-bob"])
+            .expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
         assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/ack");
         let body: AckWelcomeRequest =
             serde_json::from_value(request.json.expect("json")).expect("ack welcome request");
         assert_eq!(body.message_id.as_slice(), b"welcome-bob");
-        assert!(body.activated);
     }
 
     #[test]
@@ -1685,8 +1669,6 @@ mod tests {
             "ack-welcome",
             "--message-id",
             welcome_id,
-            "--activated",
-            "true",
         ]);
         assert_eq!(acked["acked"], true);
 
@@ -1697,32 +1679,8 @@ mod tests {
             "ack-welcome",
             "--message-id",
             welcome_id,
-            "--activated",
-            "true",
         ]);
         assert_eq!(acked_again["acked"], true);
-
-        let conflict = run(
-            [
-                "http",
-                "--server",
-                &server_url,
-                "ack-welcome",
-                "--message-id",
-                welcome_id,
-                "--activated",
-                "false",
-            ],
-            &mut Vec::new(),
-        )
-        .expect_err("conflicting ack fails");
-        assert!(matches!(
-            conflict,
-            CliError::Server {
-                status: reqwest::StatusCode::CONFLICT,
-                ..
-            }
-        ));
 
         let listed = run_cli_json([
             "http",

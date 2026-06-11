@@ -357,7 +357,7 @@ fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
     assert_eq!(replay.claimed_welcomes, 0);
     assert_eq!(replay.activated_welcome_acks_sent, 0);
     delivery
-        .ack_welcome("welcome_http_runtime_alice", true)
+        .ack_welcome("welcome_http_runtime_alice")
         .unwrap();
 }
 
@@ -1046,7 +1046,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
         )
         .unwrap();
     delivery
-        .ack_welcome("welcome_alice_http_membership_filter", true)
+        .ack_welcome("welcome_alice_http_membership_filter")
         .unwrap();
 
     let after_activation = alice
@@ -2239,7 +2239,7 @@ where
             &welcome.ratchet_tree_payload,
         )
         .unwrap();
-    delivery.ack_welcome(welcome_id, true).unwrap();
+    delivery.ack_welcome(welcome_id).unwrap();
     welcome
 }
 

@@ -2134,7 +2134,7 @@ impl HttpServerState {
         &self,
         request: AckWelcomeRequest,
     ) -> Result<AckWelcomeResponse, ServerHttpError> {
-        let mut activation_message = None;
+        let activation_message;
         let mut claims = self
             .welcome_claims
             .lock()
@@ -2144,38 +2144,22 @@ impl HttpServerState {
                 message_id: request.message_id,
             });
         };
-        if request.activated {
-            ensure_welcome_message_recipient_not_revoked(
-                &self.revoked_device_keys(),
-                &record.message,
-            )?;
-        }
-        let terminal_state = if request.activated {
-            WelcomeClaimState::Acked
-        } else {
-            WelcomeClaimState::Failed
-        };
-        match (record.state, terminal_state) {
-            (WelcomeClaimState::Claimed, _) => {
-                record.state = terminal_state;
+        ensure_welcome_message_recipient_not_revoked(
+            &self.revoked_device_keys(),
+            &record.message,
+        )?;
+        match record.state {
+            WelcomeClaimState::Claimed => {
+                record.state = WelcomeClaimState::Acked;
                 if let Some(store) = &self.store {
                     store.upsert_welcome_claim(record)?;
                 }
-                if request.activated {
-                    activation_message = Some(record.message.clone());
-                }
+                activation_message = Some(record.message.clone());
             }
-            (current, wanted) if current == wanted => {
-                if request.activated {
-                    activation_message = Some(record.message.clone());
-                }
-            }
-            (current, wanted) => {
-                return Err(ServerHttpError::WelcomeAckConflict {
-                    message_id: request.message_id,
-                    current,
-                    wanted,
-                });
+            // A failed activation never reaches the server: the device simply
+            // retries, so a repeated ack is an idempotent activation replay.
+            WelcomeClaimState::Acked => {
+                activation_message = Some(record.message.clone());
             }
         }
         drop(claims);
@@ -2771,7 +2755,6 @@ impl WelcomeClaimRecord {
 pub enum WelcomeClaimState {
     Claimed,
     Acked,
-    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -5034,11 +5017,6 @@ pub enum ServerHttpError {
         max: usize,
     },
     Store(DurableStoreError),
-    WelcomeAckConflict {
-        message_id: MessageId,
-        current: WelcomeClaimState,
-        wanted: WelcomeClaimState,
-    },
     WelcomeNotFound {
         message_id: MessageId,
     },
@@ -5294,15 +5272,6 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_welcome_claim_limit".to_owned(),
                 format!("welcome claim limit must be between 1 and {max}, got {actual}"),
-            ),
-            Self::WelcomeAckConflict {
-                message_id,
-                current,
-                wanted,
-            } => (
-                StatusCode::CONFLICT,
-                "welcome_ack_conflict".to_owned(),
-                format!("welcome {message_id} is already {current:?}; cannot ack as {wanted:?}"),
             ),
             Self::WelcomeNotFound { message_id } => (
                 StatusCode::NOT_FOUND,
