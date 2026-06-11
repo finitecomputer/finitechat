@@ -620,14 +620,6 @@ pub enum EngineError {
     ReporterNotInInterval(DeviceRef),
     #[error("conflicting idempotency key")]
     ConflictingIdempotencyKey,
-    #[error(
-        "idempotency capacity exceeded for room {room_id} and sender {sender:?}: max {max_records}"
-    )]
-    IdempotencyCapacityExceeded {
-        room_id: RoomId,
-        sender: DeviceRef,
-        max_records: u32,
-    },
     #[error("link session already exists: {0}")]
     LinkSessionAlreadyExists(LinkSessionId),
     #[error("link session not found: {0}")]
