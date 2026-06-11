@@ -14,7 +14,7 @@ use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, DeviceMembership,
     EphemeralActivityAccepted, EphemeralActivityRecord, EventAccepted, MembershipInterval,
-    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, direct_room_key, lease_token_for,
+    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, lease_token_for,
     staged_welcomes_by_id, validate_activity_expiry,
 };
 pub use finitechat_http::{
@@ -22,7 +22,7 @@ pub use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest,
+    CreateLinkSessionRequest,
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
     FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
@@ -34,12 +34,13 @@ pub use finitechat_http::{
     MarkFanoutPreparedRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
     RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
     UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_KEY_PACKAGES_PER_DEVICE,
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
     RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
@@ -1071,119 +1072,6 @@ impl HttpServerState {
         Ok(BootstrapAccountRoomResponse { bootstrapped })
     }
 
-    fn create_or_get_direct_room(
-        &self,
-        request: CreateDirectRoomRequest,
-    ) -> Result<CreateDirectRoomResponse, ServerHttpError> {
-        validate_account_room_id("room_id", &request.room_id)?;
-        validate_account_room_id("mls_group_id", &request.mls_group_id)?;
-        request.creator.validate_limits().map_err(|error| {
-            ServerHttpError::InvalidAccountRoomRequest {
-                reason: error.to_string(),
-            }
-        })?;
-        validate_account_room_id("other_account_id", &request.other_account_id)?;
-
-        let direct_accounts =
-            direct_room_key(&request.creator.account_id, &request.other_account_id);
-        {
-            let rooms = self
-                .room_memberships
-                .lock()
-                .expect("HTTP room-membership mutex");
-            if let Some(existing) = rooms
-                .values()
-                .find(|projection| projection.direct_accounts.as_ref() == Some(&direct_accounts))
-            {
-                return Ok(CreateDirectRoomResponse {
-                    room_id: existing.room_id.clone(),
-                    created: false,
-                });
-            }
-            if rooms.contains_key(&request.room_id) {
-                return Err(ServerHttpError::DirectRoomConflict {
-                    room_id: request.room_id,
-                    reason: "room id already exists with different direct-room accounts".to_owned(),
-                });
-            }
-        }
-
-        let account_id = request.creator.account_id.clone();
-        let record = AccountRoomRecord {
-            room_id: request.room_id.clone(),
-            mls_group_id: request.mls_group_id.clone(),
-            current_epoch: 0,
-            last_seq: 0,
-            status: RoomStatus::Open,
-            devices: vec![AccountRoomDevice {
-                device: request.creator.clone(),
-                active: true,
-            }],
-        };
-        record
-            .validate_limits()
-            .map_err(|error| ServerHttpError::InvalidAccountRoomRequest {
-                reason: error.to_string(),
-            })?;
-        let value = serde_json::to_value(&record)
-            .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?;
-        {
-            let directory = self
-                .account_rooms
-                .lock()
-                .expect("HTTP account-room directory mutex");
-            if directory
-                .get(&account_id)
-                .and_then(|rooms| rooms.get(&request.room_id))
-                .is_some()
-            {
-                return Err(ServerHttpError::DirectRoomConflict {
-                    room_id: request.room_id,
-                    reason: "account-room record already exists without matching direct room"
-                        .to_owned(),
-                });
-            }
-        }
-
-        let projection = initial_room_membership_projection(
-            &request.room_id,
-            &request.mls_group_id,
-            &request.creator,
-            0,
-            0,
-            true,
-            Some(direct_accounts),
-        );
-        if let Some(store) = &self.store {
-            store.upsert_account_room(&AccountRoomDirectoryRecord {
-                account_id: account_id.clone(),
-                room_id: request.room_id.clone(),
-                record: value.clone(),
-            })?;
-            store.upsert_room_membership(&projection)?;
-        }
-
-        let mut directory = self
-            .account_rooms
-            .lock()
-            .expect("HTTP account-room directory mutex");
-        directory
-            .entry(account_id)
-            .or_default()
-            .insert(request.room_id.clone(), value);
-        drop(directory);
-
-        let mut rooms = self
-            .room_memberships
-            .lock()
-            .expect("HTTP room-membership mutex");
-        rooms.insert(request.room_id.clone(), projection);
-
-        Ok(CreateDirectRoomResponse {
-            room_id: request.room_id,
-            created: true,
-        })
-    }
 
     fn list_account_rooms(
         &self,
@@ -1365,7 +1253,6 @@ impl HttpServerState {
             observed.current_epoch,
             observed.last_seq,
             true,
-            None,
         );
         rooms.insert(request.room_id.clone(), projection.clone());
         drop(rooms);
@@ -1717,6 +1604,23 @@ impl HttpServerState {
             return Err(ServerHttpError::SenderNotActive {
                 sender: request.sender.clone(),
             });
+        }
+        // Authority: changing another account's membership requires admin
+        // (ADR 0003 §2). Same-account linking and removal stay open to any
+        // active member, which keeps the device-link fanout admin-free.
+        if projection.membership_complete {
+            let touches_other_account = request
+                .membership_delta
+                .adds
+                .iter()
+                .map(|add| &add.device)
+                .chain(request.membership_delta.removes.iter().map(|remove| &remove.device))
+                .any(|device| device.account_id != request.sender.account_id);
+            if touches_other_account && !projection.admins.contains(&request.sender.account_id) {
+                return Err(ServerHttpError::CommitAuthorityRequired {
+                    sender: request.sender.clone(),
+                });
+            }
         }
         validate_membership_adds_for_projection(projection, &request.membership_delta.adds)?;
         Ok(())
@@ -2134,6 +2038,82 @@ impl HttpServerState {
         Ok(())
     }
 
+    fn update_room_admins(
+        &self,
+        request: UpdateRoomAdminsRequest,
+    ) -> Result<UpdateRoomAdminsResponse, ServerHttpError> {
+        let (grant, target) = match (&request.grant, &request.revoke) {
+            (Some(account), None) => (true, account.clone()),
+            (None, Some(account)) => (false, account.clone()),
+            _ => {
+                return Err(ServerHttpError::InvalidAdminChange {
+                    reason: "exactly one of grant or revoke is required".to_owned(),
+                });
+            }
+        };
+        self.ensure_device_not_revoked(&request.sender)?;
+
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get_mut(&request.room_id) else {
+            return Err(ServerHttpError::RoomMembershipConflict {
+                room_id: request.room_id.clone(),
+                reason: "admin change requires a room-membership projection".to_owned(),
+            });
+        };
+        if projection.status != RoomStatus::Open {
+            return Err(ServerHttpError::RoomNotOpen {
+                room_id: request.room_id.clone(),
+                status: projection.status,
+            });
+        }
+        if !projection.device_active_at_head(&request.sender) {
+            return Err(ServerHttpError::SenderNotActive {
+                sender: request.sender.clone(),
+            });
+        }
+        if !projection.admins.contains(&request.sender.account_id) {
+            return Err(ServerHttpError::CommitAuthorityRequired {
+                sender: request.sender.clone(),
+            });
+        }
+
+        if grant {
+            if projection
+                .current_or_pending_device_count_for_account(&target)
+                == 0
+            {
+                return Err(ServerHttpError::InvalidAdminChange {
+                    reason: format!("account {target} has no devices in the room"),
+                });
+            }
+            projection.admins.insert(target);
+        } else {
+            if !projection.admins.contains(&target) {
+                return Err(ServerHttpError::InvalidAdminChange {
+                    reason: format!("account {target} is not an admin"),
+                });
+            }
+            if projection.admins.len() == 1 {
+                return Err(ServerHttpError::InvalidAdminChange {
+                    reason: "cannot revoke the last admin".to_owned(),
+                });
+            }
+            projection.admins.remove(&target);
+        }
+        let updated = projection.clone();
+        drop(rooms);
+
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&updated)?;
+        }
+        Ok(UpdateRoomAdminsResponse {
+            admins: updated.admins.iter().cloned().collect(),
+        })
+    }
+
     pub fn sync_inbox(
         &self,
         recipient: &MemberId,
@@ -2255,10 +2235,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/link-sessions/ack", post(ack_link_payload))
         .route("/link-sessions/release", post(release_link_claim))
         .route("/link-sessions/expire", post(expire_link_session))
-        .route("/direct-rooms", post(create_direct_room))
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
+        .route("/rooms/admins", post(update_room_admins))
         .route("/rooms/report-invalid-commit", post(report_invalid_commit))
         .route("/welcomes/claim", post(claim_welcomes))
         .route("/welcomes/ack", post(ack_welcome))
@@ -2474,13 +2454,6 @@ async fn expire_link_session(
     Ok(Json(response))
 }
 
-async fn create_direct_room(
-    State(state): State<HttpServerState>,
-    Json(request): Json<CreateDirectRoomRequest>,
-) -> Result<Json<CreateDirectRoomResponse>, ServerHttpError> {
-    let response = state.create_or_get_direct_room(request)?;
-    Ok(Json(response))
-}
 
 async fn save_account_room(
     State(state): State<HttpServerState>,
@@ -2504,6 +2477,14 @@ async fn list_account_rooms(
 ) -> Result<Json<ListAccountRoomDirectoryResponse>, ServerHttpError> {
     let page = state.list_account_rooms(request)?;
     Ok(Json(page))
+}
+
+async fn update_room_admins(
+    State(state): State<HttpServerState>,
+    Json(request): Json<UpdateRoomAdminsRequest>,
+) -> Result<Json<UpdateRoomAdminsResponse>, ServerHttpError> {
+    let response = state.update_room_admins(request)?;
+    Ok(Json(response))
 }
 
 async fn report_invalid_commit(
@@ -2676,8 +2657,11 @@ struct HttpRoomMembershipProjection {
     status: RoomStatus,
     #[serde(default = "default_membership_complete")]
     membership_complete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    direct_accounts: Option<(String, String)>,
+    /// Accounts allowed to change membership for other accounts (ADR 0003 §2
+    /// as amended by ADR 0004 §4). Creator-initialized at typed bootstrap.
+    #[serde(default)]
+    admins: BTreeSet<String>,
+    #[serde(default)]
     membership: BTreeMap<String, DeviceMembership>,
 }
 
@@ -3760,18 +3744,6 @@ fn validate_membership_adds_for_projection(
 ) -> Result<(), ServerHttpError> {
     let mut added_devices_by_account = BTreeMap::<String, usize>::new();
     for add in adds {
-        if let Some((left, right)) = &projection.direct_accounts
-            && add.device.account_id.as_str() != left.as_str()
-            && add.device.account_id.as_str() != right.as_str()
-        {
-            return Err(ServerHttpError::InvalidCommitRequest {
-                reason: format!(
-                    "direct room cannot add third account {}",
-                    add.device.account_id
-                ),
-            });
-        }
-
         let current_devices =
             projection.current_or_pending_device_count_for_account(&add.device.account_id);
         let added_devices = added_devices_by_account
@@ -3783,15 +3755,6 @@ fn validate_membership_adds_for_projection(
             return Err(ServerHttpError::InvalidCommitRequest {
                 reason: format!(
                     "room.devices_per_account has {proposed} items, max {MAX_ACCOUNT_DEVICES_PER_ROOM}"
-                ),
-            });
-        }
-        if projection.direct_accounts.is_some()
-            && proposed > MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize
-        {
-            return Err(ServerHttpError::InvalidCommitRequest {
-                reason: format!(
-                    "direct_room.devices_per_account has {proposed} items, max {MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT}"
                 ),
             });
         }
@@ -3824,7 +3787,6 @@ fn apply_room_membership_delta(
             expected_epoch,
             0,
             expected_epoch == 0,
-            None,
         )
     });
     if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
@@ -4468,7 +4430,6 @@ fn initial_room_membership_projection(
     current_epoch: u64,
     last_seq: HttpSequence,
     membership_complete: bool,
-    direct_accounts: Option<(String, String)>,
 ) -> HttpRoomMembershipProjection {
     let mut membership = BTreeMap::new();
     membership.insert(
@@ -4489,7 +4450,7 @@ fn initial_room_membership_projection(
         last_seq,
         status: RoomStatus::Open,
         membership_complete,
-        direct_accounts,
+        admins: BTreeSet::from([creator.account_id.clone()]),
         membership,
     }
 }
@@ -4822,6 +4783,12 @@ pub enum ServerHttpError {
     SenderNotActive {
         sender: DeviceRef,
     },
+    CommitAuthorityRequired {
+        sender: DeviceRef,
+    },
+    InvalidAdminChange {
+        reason: String,
+    },
     InvalidRepairReport {
         reason: String,
     },
@@ -5028,6 +4995,18 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::FORBIDDEN,
                 "sender_not_active".to_owned(),
                 format!("sender {sender:?} is not active in the room"),
+            ),
+            Self::CommitAuthorityRequired { sender } => (
+                StatusCode::FORBIDDEN,
+                "commit_authority_required".to_owned(),
+                format!(
+                    "sender {sender:?} must be a room admin to change another account's membership"
+                ),
+            ),
+            Self::InvalidAdminChange { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_admin_change".to_owned(),
+                reason,
             ),
             Self::InvalidRepairReport { reason } => (
                 StatusCode::BAD_REQUEST,

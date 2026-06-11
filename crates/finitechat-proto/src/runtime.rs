@@ -78,13 +78,6 @@ pub struct CreateRoomRequest {
     pub creator: DeviceRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateDirectRoomRequest {
-    pub room_id: RoomId,
-    pub mls_group_id: MlsGroupId,
-    pub creator: DeviceRef,
-    pub other_account_id: AccountId,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadKeyPackageRequest {
@@ -389,19 +382,6 @@ impl CreateRoomRequest {
     }
 }
 
-impl CreateDirectRoomRequest {
-    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
-        validate_room_id(&self.room_id)?;
-        validate_mls_group_id(&self.mls_group_id)?;
-        self.creator.validate_limits()?;
-        validate_string_bytes(
-            "other_account_id",
-            &self.other_account_id,
-            crate::MAX_ACCOUNT_ID_BYTES,
-        )?;
-        Ok(())
-    }
-}
 
 impl ListAccountRoomsRequest {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
@@ -700,13 +680,6 @@ pub fn staged_welcomes_by_id<'a>(
     Ok(by_id)
 }
 
-pub fn direct_room_key(left: &str, right: &str) -> (AccountId, AccountId) {
-    if left <= right {
-        (left.to_string(), right.to_string())
-    } else {
-        (right.to_string(), left.to_string())
-    }
-}
 
 fn length_prefixed(value: &str) -> String {
     format!("{}:{value}", value.len())

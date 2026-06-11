@@ -15,7 +15,7 @@ use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateDirectRoomRequest, CreateDirectRoomResponse, CreateLinkSessionRequest,
+    CreateLinkSessionRequest, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
     GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetFanoutRequest, GetLinkSessionRequest,
@@ -32,7 +32,7 @@ use finitechat_http::{
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
     LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
-    MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT, MAX_ENVELOPE_PAYLOAD_BYTES,
+    MAX_ENVELOPE_PAYLOAD_BYTES,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
     MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, RuntimeStateProjection,
@@ -1618,197 +1618,7 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
 }
 
 
-#[tokio::test]
-async fn sqlite_direct_room_create_or_get_and_third_account_rejection_over_http() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let app = persistent_app(&db_path);
-    let alice = DeviceRef::new("alice", "alice-laptop");
-    let bob = DeviceRef::new("bob", "bob-phone");
-    let charlie = DeviceRef::new("charlie", "charlie-phone");
-    let room_id = "direct-http-ab";
-    let mls_group_id = "mls-direct-http-ab";
 
-    let response = post_json(
-        app.clone(),
-        "/direct-rooms",
-        &CreateDirectRoomRequest {
-            room_id: room_id.to_owned(),
-            mls_group_id: mls_group_id.to_owned(),
-            creator: alice.clone(),
-            other_account_id: bob.account_id.clone(),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let created: CreateDirectRoomResponse = read_json(response).await;
-    assert_eq!(created.room_id, room_id);
-    assert!(created.created);
-
-    let listed = account_room_page(&app, &alice.account_id).await;
-    assert_eq!(listed.rooms.len(), 1);
-    assert_eq!(listed.rooms[0]["room_id"], room_id);
-    assert_eq!(
-        listed.rooms[0]["devices"][0]["device"]["device_id"],
-        "alice-laptop"
-    );
-    assert_eq!(listed.rooms[0]["devices"][0]["active"], true);
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app.clone(),
-        "/direct-rooms",
-        &CreateDirectRoomRequest {
-            room_id: "direct-http-ba-should-not-create".to_owned(),
-            mls_group_id: "mls-direct-http-ba".to_owned(),
-            creator: bob.clone(),
-            other_account_id: alice.account_id.clone(),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let existing: CreateDirectRoomResponse = read_json(response).await;
-    assert_eq!(existing.room_id, room_id);
-    assert!(!existing.created);
-
-    let add_charlie = submit_add_device_request(
-        room_id,
-        mls_group_id,
-        &alice,
-        &charlie,
-        "welcome-direct-charlie",
-        "direct-add-charlie",
-    );
-    publish_and_claim_key_package_for_add(&app, &add_charlie).await;
-
-    let response = post_json(app.clone(), "/commits", &add_charlie).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "invalid_commit_request");
-    assert!(error.error.contains("direct room cannot add third account"));
-    assert_submit_commit_had_no_side_effects(&app, room_id, &charlie).await;
-
-    let app = persistent_app(&db_path);
-    let response = post_json(app.clone(), "/commits", &add_charlie).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "invalid_commit_request");
-    assert!(error.error.contains("direct room cannot add third account"));
-    assert_submit_commit_had_no_side_effects(&app, room_id, &charlie).await;
-
-    let listed = account_room_page(&app, &charlie.account_id).await;
-    assert!(listed.rooms.is_empty());
-}
-
-#[tokio::test]
-async fn sqlite_direct_room_rejects_per_account_device_cap_over_http() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let app = persistent_app(&db_path);
-    let alice = DeviceRef::new("alice", "alice-laptop");
-    let room_id = "direct-http-device-cap";
-    let mls_group_id = "mls-direct-http-device-cap";
-
-    let response = post_json(
-        app.clone(),
-        "/direct-rooms",
-        &CreateDirectRoomRequest {
-            room_id: room_id.to_owned(),
-            mls_group_id: mls_group_id.to_owned(),
-            creator: alice.clone(),
-            other_account_id: "bob".to_owned(),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    for index in 0..MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT {
-        let bob = DeviceRef::new("bob", format!("bob-direct-{index}"));
-        let request = submit_add_device_request_at_epoch_with_ids(
-            room_id,
-            mls_group_id,
-            &alice,
-            &bob,
-            u64::from(index),
-            &format!("welcome-direct-cap-{index}"),
-            &format!("commit-direct-cap-{index}"),
-        );
-        publish_and_claim_key_package_for_add(&app, &request).await;
-        let response = post_json(app.clone(), "/commits", &request).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let accepted: CommitAccepted = read_json(response).await;
-        assert_eq!(accepted.seq, u64::from(index) + 1);
-    }
-
-    let overflow = DeviceRef::new("bob", "bob-direct-overflow");
-    let overflow_request = submit_add_device_request_at_epoch_with_ids(
-        room_id,
-        mls_group_id,
-        &alice,
-        &overflow,
-        u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
-        "welcome-direct-cap-overflow",
-        "commit-direct-cap-overflow",
-    );
-    publish_and_claim_key_package_for_add(&app, &overflow_request).await;
-    let response = post_json(app.clone(), "/commits", &overflow_request).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "invalid_commit_request");
-    assert!(error.error.contains("direct_room.devices_per_account"));
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app.clone(),
-        "/sync/group",
-        &GroupSyncRequest {
-            group_id: group_id(room_id),
-            after_seq: u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT),
-            limit: 10,
-            requester: Some(member_for_device(&alice)),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let page: HttpSyncPage = read_json(response).await;
-    assert!(page.entries.is_empty());
-    assert_eq!(
-        page.next_after_seq,
-        u64::from(MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT)
-    );
-
-    let page = account_room_page(&app, "bob").await;
-    assert_eq!(page.rooms.len(), 1);
-    assert_eq!(
-        page.rooms[0]["devices"].as_array().expect("devices").len(),
-        MAX_DIRECT_ROOM_DEVICES_PER_ACCOUNT as usize
-    );
-    assert!(
-        !page.rooms[0]["devices"]
-            .as_array()
-            .expect("devices")
-            .iter()
-            .any(|device| device["device"]["device_id"] == "bob-direct-overflow")
-    );
-
-    let response = post_json(
-        app.clone(),
-        "/sync/inbox",
-        &InboxSyncRequest {
-            recipient: member_for_device(&overflow),
-            after_seq: 0,
-            limit: 10,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let page: HttpSyncPage = read_json(response).await;
-    assert!(page.entries.is_empty());
-
-    let inventory = key_package_inventory_for_device(&app, &overflow).await;
-    assert_eq!(inventory.available, 0);
-    assert_eq!(inventory.claimed, 1);
-}
 
 #[tokio::test]
 async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart() {
@@ -5796,6 +5606,169 @@ fn member(label: &str) -> MemberId {
 
 fn member_for_device(device: &DeviceRef) -> MemberId {
     MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+}
+
+#[tokio::test]
+async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-laptop");
+    let carol = DeviceRef::new("carol", "carol-laptop");
+    let room_id = "room-admin-authority".to_owned();
+    let mls_group_id = "mls-admin-authority".to_owned();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The creator is admin: a cross-account add is allowed.
+    let add_bob = submit_add_device_request_at_epoch(&room_id, &mls_group_id, &alice, &bob, 0);
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_accepted: CommitAccepted = read_json(response).await;
+
+    // Activate bob so he is an active (non-admin) member.
+    let bob_recipient = member_for_device(&bob);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: bob_recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claims.len(), 1);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: claims[0].message.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A non-admin cannot change another account's membership.
+    let bob_adds_carol = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &bob,
+        &carol,
+        1,
+        "welcome-admin-carol-denied",
+        "commit-admin-carol-denied",
+    );
+    publish_and_claim_key_package_for_add(&app, &bob_adds_carol).await;
+    let response = post_json(app.clone(), "/commits", &bob_adds_carol).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "commit_authority_required");
+
+    // A non-admin can still link their own account's device (fanout path).
+    let bob_phone = DeviceRef::new("bob", "bob-phone");
+    let bob_adds_own = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &bob,
+        &bob_phone,
+        1,
+        "welcome-admin-bob-phone",
+        "commit-admin-bob-phone",
+    );
+    publish_and_claim_key_package_for_add(&app, &bob_adds_own).await;
+    let response = post_json(app.clone(), "/commits", &bob_adds_own).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let own_accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(own_accepted.seq, bob_accepted.seq + 1);
+
+    // A non-admin cannot grant admin.
+    let response = post_json(
+        app.clone(),
+        "/rooms/admins",
+        &UpdateRoomAdminsRequest {
+            room_id: room_id.clone(),
+            sender: bob.clone(),
+            grant: Some("bob".to_owned()),
+            revoke: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // The admin grants bob.
+    let response = post_json(
+        app.clone(),
+        "/rooms/admins",
+        &UpdateRoomAdminsRequest {
+            room_id: room_id.clone(),
+            sender: alice.clone(),
+            grant: Some("bob".to_owned()),
+            revoke: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let granted: UpdateRoomAdminsResponse = read_json(response).await;
+    assert_eq!(granted.admins, vec!["alice".to_owned(), "bob".to_owned()]);
+
+    // The grant survives restart: bob can now add carol.
+    let app = persistent_app(&db_path);
+    let bob_adds_carol_retry = submit_add_device_request_at_epoch_with_ids(
+        &room_id,
+        &mls_group_id,
+        &bob,
+        &carol,
+        2,
+        "welcome-admin-carol-granted",
+        "commit-admin-carol-granted",
+    );
+    publish_and_claim_key_package_for_add(&app, &bob_adds_carol_retry).await;
+    let response = post_json(app.clone(), "/commits", &bob_adds_carol_retry).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Admins may revoke other admins, but never the last one.
+    let response = post_json(
+        app.clone(),
+        "/rooms/admins",
+        &UpdateRoomAdminsRequest {
+            room_id: room_id.clone(),
+            sender: bob.clone(),
+            grant: None,
+            revoke: Some("alice".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let revoked: UpdateRoomAdminsResponse = read_json(response).await;
+    assert_eq!(revoked.admins, vec!["bob".to_owned()]);
+    let response = post_json(
+        app.clone(),
+        "/rooms/admins",
+        &UpdateRoomAdminsRequest {
+            room_id: room_id.clone(),
+            sender: bob.clone(),
+            grant: None,
+            revoke: Some("bob".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_admin_change");
 }
 
 fn submit_add_device_request(

@@ -6,7 +6,7 @@ use cgka_traits::{
 use finitechat_proto::{
     AccountRoomRecord, AppendApplicationEventRequest, AppendEventRequest,
     ApplicationDeliveryPolicy, ClaimKeyPackageResult, CommitAccepted,
-    CreateDirectRoomRequest, CreateRoomRequest, EngineError, EventAccepted,
+    CreateRoomRequest, EngineError, EventAccepted,
     KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
     SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
@@ -644,19 +644,6 @@ impl FiniteChatDevice {
         &self.device_ref
     }
 
-    pub fn create_direct_room_request(
-        &self,
-        room_id: impl Into<String>,
-        mls_group_id: impl Into<String>,
-        other_account_id: impl Into<String>,
-    ) -> CreateDirectRoomRequest {
-        CreateDirectRoomRequest {
-            room_id: room_id.into(),
-            mls_group_id: mls_group_id.into(),
-            creator: self.device_ref.clone(),
-            other_account_id: other_account_id.into(),
-        }
-    }
 
     pub fn create_group_state(
         &mut self,

@@ -181,11 +181,6 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "finitechat-server can bootstrap the creator's initial active account-room record from typed room metadata and reload it after restart",
         },
         PortFinding {
-            area: "http_direct_room_constraints",
-            status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server persists direct-room account pairs in the room-membership projection, create-or-get returns the same room for reversed account order after restart, and typed /commits reject third-account adds and direct-room per-account device overflow before delivery side effects",
-        },
-        PortFinding {
             area: "http_account_room_commit_projection",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-server can project typed /commits and raw /messages projection wrappers into persisted account-room records, then reload the updated discovery state after restart",
@@ -274,6 +269,11 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_later_device_fanout_same_epoch_reprepare",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-client run_link_fanout_tick can recover from typed bootstrap discovery after an HTTP fanout submit fails before accept, a competing same-epoch commit wins, sync clears the local pending commit, and the worker reprepares at the next epoch",
+        },
+        PortFinding {
+            area: "http_room_admin_authority",
+            status: PortStatus::EasyAdapterOwnedLogic,
+            evidence: "finitechat-server gates cross-account membership changes on room admins (creator-initialized, grant/revoke via /rooms/admins with a last-admin rule); same-account device linking stays admin-free; direct rooms were dissolved into ordinary rooms per ADR 0004",
         },
         PortFinding {
             area: "multi_device_later_device_fanout",

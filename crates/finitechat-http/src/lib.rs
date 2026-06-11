@@ -305,19 +305,6 @@ pub struct BootstrapAccountRoomResponse {
     pub bootstrapped: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateDirectRoomRequest {
-    pub room_id: String,
-    pub mls_group_id: String,
-    pub creator: DeviceRef,
-    pub other_account_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreateDirectRoomResponse {
-    pub room_id: String,
-    pub created: bool,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListAccountRoomDirectoryRequest {
@@ -355,6 +342,21 @@ pub struct AckWelcomeRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckWelcomeResponse {
     pub acked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRoomAdminsRequest {
+    pub room_id: String,
+    pub sender: DeviceRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateRoomAdminsResponse {
+    pub admins: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

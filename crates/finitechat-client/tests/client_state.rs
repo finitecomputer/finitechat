@@ -1459,9 +1459,11 @@ fn runtime_submit_commit_removes_account_room_over_darkmatter_http_routes() {
             .any(|device| device.device == charlie_ref && device.active)
     );
 
+    // Only an admin may remove another account's devices (ADR 0003 §2);
+    // alice created the room, so she authors the removal.
     let prepared = world
-        .bob
-        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "bob_http_remove_charlie")
+        .alice
+        .prepare_remove_member_commit(ROOM_ID, &charlie_ref, "alice_http_remove_charlie")
         .unwrap();
     let accepted = delivery.submit_commit(prepared.request).unwrap();
     assert_eq!(accepted.seq, world.last_seq + 1);
@@ -2310,7 +2312,7 @@ where
 }
 
 struct ActiveThreeMemberRoom {
-    _alice: FiniteChatDevice,
+    alice: FiniteChatDevice,
     bob: FiniteChatDevice,
     charlie: FiniteChatDevice,
     last_seq: u64,
@@ -2374,7 +2376,7 @@ fn active_alice_bob_charlie_room(delivery: &mut TestHttpRuntimeDelivery) -> Acti
     assert_eq!(charlie.group_epoch(ROOM_ID).unwrap(), 2);
 
     ActiveThreeMemberRoom {
-        _alice: alice,
+        alice,
         bob,
         charlie,
         last_seq: accepted.seq,
