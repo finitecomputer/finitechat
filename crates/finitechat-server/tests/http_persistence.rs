@@ -5879,6 +5879,115 @@ async fn sqlite_bootstrap_rejects_unsupported_protocol_version_and_defaults_to_v
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn sqlite_state_snapshot_boots_without_full_history_replay() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let room_id = "room-snapshot".to_owned();
+    let mls_group_id = "mls-snapshot".to_owned();
+
+    let state = persistent_state(&db_path);
+    let app = http_router(state.clone());
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut last_seq = 0;
+    for index in 0..5 {
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            format!("snapshot message {index}").as_bytes(),
+            &format!("snapshot-msg-{index}"),
+        );
+        let response = post_json(app.clone(), "/events", &typed_event_request(&request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EventAccepted = read_json(response).await;
+        last_seq = accepted.seq;
+    }
+
+    state.snapshot_now().expect("snapshot");
+
+    // Two more events form the tail the snapshot does not cover.
+    for index in 5..7 {
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            format!("snapshot message {index}").as_bytes(),
+            &format!("snapshot-msg-{index}"),
+        );
+        let response = post_json(app.clone(), "/events", &typed_event_request(&request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: EventAccepted = read_json(response).await;
+        last_seq = accepted.seq;
+    }
+    drop(app);
+    drop(state);
+
+    // Prove the snapshot is authoritative for its prefix: delete every
+    // operation the snapshot covers (a preview of horizon compaction) and
+    // the reopened server must still serve the complete ordered log.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw");
+        let snapshot_seq: i64 = conn
+            .query_row(
+                "SELECT last_op_seq FROM http_state_snapshots WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("snapshot row");
+        assert!(snapshot_seq > 0);
+        conn.execute(
+            "DELETE FROM http_delivery_ops WHERE seq <= ?1",
+            rusqlite::params![snapshot_seq],
+        )
+        .expect("compact prefix");
+    }
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 50,
+            requester: None,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), last_seq as usize);
+    assert_eq!(page.next_after_seq, last_seq);
+
+    // Idempotent replay of a pre-snapshot event still works.
+    let replay = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        b"snapshot message 0",
+        "snapshot-msg-0",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&replay)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 fn submit_add_device_request(
     room_id: &str,
     mls_group_id: &str,

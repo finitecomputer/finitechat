@@ -43,7 +43,7 @@ use finitechat_proto::{
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
     RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -62,6 +62,11 @@ const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
 /// product phase (hundreds of active users, dozens of long chats each); they
 /// must be applied before op-log replay so reopening a large server never
 /// trips a smaller cap than the one it was written under.
+/// How many accepted operations may accumulate before the durable state
+/// snapshot refreshes. Startup replays at most this many ops on top of the
+/// snapshot.
+const SNAPSHOT_INTERVAL_OPS: u64 = 4_096;
+
 pub fn finite_delivery_limits() -> HttpDeliveryLimits {
     HttpDeliveryLimits {
         max_groups: 65_536,
@@ -85,6 +90,7 @@ pub struct HttpServerState {
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
     device_liveness: Arc<Mutex<BTreeMap<String, DeviceLivenessRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
+    ops_since_snapshot: Arc<Mutex<u64>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
 
@@ -103,25 +109,48 @@ impl HttpServerState {
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
+            ops_since_snapshot: Arc::new(Mutex::new(0)),
             store: None,
         }
     }
 
     pub fn from_sqlite_path(path: impl AsRef<Path>) -> Result<Self, DurableStoreError> {
         let store = Arc::new(SqliteHttpDeliveryStore::open(path)?);
-        let mut service = HttpDeliveryService::with_limits(finite_delivery_limits());
-        let operations = store.load_operations()?;
+        // Boot from the latest snapshot plus the operation-log tail; full
+        // replay only happens for stores that have never snapshotted.
+        let (mut service, mut key_package_inventory, mut revoked_devices, snapshot_seq) =
+            match store.load_state_snapshot()? {
+                Some((seq, snapshot)) => (
+                    snapshot.service,
+                    snapshot
+                        .key_package_inventory
+                        .into_iter()
+                        .map(|record| (record.key_package_id.clone(), record))
+                        .collect(),
+                    snapshot.revoked_devices,
+                    seq,
+                ),
+                None => (
+                    HttpDeliveryService::with_limits(finite_delivery_limits()),
+                    HashMap::new(),
+                    BTreeSet::new(),
+                    0,
+                ),
+            };
+        let operations = store.load_operations_after(snapshot_seq)?;
         for operation in operations.iter().cloned() {
             replay_operation(&mut service, operation)?;
         }
+        apply_operations_to_key_package_inventory(&mut key_package_inventory, &operations);
+        apply_operations_to_revoked_devices(&mut revoked_devices, &operations);
         let publish_idempotency = store.load_publish_idempotency()?;
         let key_package_claim_idempotency = store.load_key_package_claim_idempotency()?;
-        let key_package_inventory = rebuild_key_package_inventory(&operations);
-        let revoked_devices = rebuild_revoked_devices(&operations);
-        if !key_package_inventory_cache_matches(
-            &store.load_key_package_inventory()?,
-            &key_package_inventory,
-        ) {
+        if snapshot_seq == 0
+            && !key_package_inventory_cache_matches(
+                &store.load_key_package_inventory()?,
+                &key_package_inventory,
+            )
+        {
             for record in key_package_inventory.values() {
                 store.upsert_key_package_inventory(record)?;
             }
@@ -144,6 +173,7 @@ impl HttpServerState {
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
+            ops_since_snapshot: Arc::new(Mutex::new(0)),
             store: Some(store),
         })
     }
@@ -2065,6 +2095,58 @@ impl HttpServerState {
         })
     }
 
+    /// Write a fresh durable-state snapshot so the next startup replays only
+    /// the operation-log tail. Called automatically every
+    /// [`SNAPSHOT_INTERVAL_OPS`] accepted operations and available for
+    /// graceful shutdowns.
+    pub fn snapshot_now(&self) -> Result<(), ServerHttpError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        // Lock order matches submit_commit (service before inventory); the
+        // revoked set is copied last. Holding these blocks op appends, so the
+        // MAX(seq) read is consistent with the captured state.
+        let service = self.service.lock().expect("HTTP delivery service mutex");
+        let inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let revoked = self
+            .revoked_devices
+            .lock()
+            .expect("HTTP revoked device mutex");
+        let snapshot = DurableStateSnapshot {
+            service: service.clone(),
+            key_package_inventory: inventory.values().cloned().collect(),
+            revoked_devices: revoked.clone(),
+        };
+        let last_op_seq = store.max_operation_seq()?;
+        store.save_state_snapshot(last_op_seq, &snapshot)?;
+        *self
+            .ops_since_snapshot
+            .lock()
+            .expect("snapshot counter mutex") = 0;
+        Ok(())
+    }
+
+    fn note_op_for_snapshot(&self) {
+        let due = {
+            let mut counter = self
+                .ops_since_snapshot
+                .lock()
+                .expect("snapshot counter mutex");
+            *counter += 1;
+            *counter >= SNAPSHOT_INTERVAL_OPS
+        };
+        if due {
+            // Snapshotting is an optimization; a failure here must not fail
+            // the request that triggered it.
+            if self.snapshot_now().is_err() {
+                // The next interval will retry.
+            }
+        }
+    }
+
     pub fn sync_inbox(
         &self,
         recipient: &MemberId,
@@ -2205,7 +2287,9 @@ async fn append_application_event(
     State(state): State<HttpServerState>,
     Json(request): Json<AppendApplicationEventRequest>,
 ) -> Result<Json<EventAccepted>, ServerHttpError> {
-    Ok(Json(state.append_application_event(request)?))
+    let response = state.append_application_event(request)?;
+    state.note_op_for_snapshot();
+    Ok(Json(response))
 }
 
 async fn get_application_effect(
@@ -2232,7 +2316,9 @@ async fn submit_commit(
     State(state): State<HttpServerState>,
     Json(request): Json<SubmitCommitRequest>,
 ) -> Result<Json<CommitAccepted>, ServerHttpError> {
-    Ok(Json(state.submit_commit(request)?))
+    let response = state.submit_commit(request)?;
+    state.note_op_for_snapshot();
+    Ok(Json(response))
 }
 
 async fn sync_group(
@@ -2279,6 +2365,7 @@ async fn publish_key_package(
     Json(publication): Json<HttpKeyPackagePublication>,
 ) -> Result<Json<PublishKeyPackageResponse>, ServerHttpError> {
     let response = state.publish_key_package(publication)?;
+    state.note_op_for_snapshot();
     Ok(Json(response))
 }
 
@@ -2563,6 +2650,19 @@ struct AccountRoomDirectoryRecord {
     record: Value,
 }
 
+/// Everything `from_sqlite_path` otherwise derives by replaying the full
+/// operation log. Snapshotting it makes startup snapshot + tail replay, per
+/// the standing constraint that full-history replay is a rare recovery
+/// action (ADR 0003).
+#[derive(Serialize, Deserialize)]
+struct DurableStateSnapshot {
+    service: HttpDeliveryService,
+    // Stored as a list: JSON maps need string keys, and the record carries
+    // its own id.
+    key_package_inventory: Vec<KeyPackageInventoryRecord>,
+    revoked_devices: BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct AccountRoomDirectoryMutation {
     deletes: Vec<(String, String)>,
@@ -2697,6 +2797,11 @@ impl SqliteHttpDeliveryStore {
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
                 body_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_state_snapshots (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_op_seq INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_publish_idempotency (
                 idempotency_key TEXT PRIMARY KEY,
@@ -2947,16 +3052,64 @@ impl SqliteHttpDeliveryStore {
         Ok(())
     }
 
-    fn load_operations(&self) -> Result<Vec<PersistedOperation>, DurableStoreError> {
+    fn load_operations_after(
+        &self,
+        after_seq: i64,
+    ) -> Result<Vec<PersistedOperation>, DurableStoreError> {
         let conn = self.connection();
-        let mut statement =
-            conn.prepare("SELECT body_json FROM http_delivery_ops ORDER BY seq ASC")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut statement = conn
+            .prepare("SELECT body_json FROM http_delivery_ops WHERE seq > ?1 ORDER BY seq ASC")?;
+        let rows = statement.query_map(params![after_seq], |row| row.get::<_, String>(0))?;
         let mut operations = Vec::new();
         for row in rows {
             operations.push(serde_json::from_str(&row?)?);
         }
         Ok(operations)
+    }
+
+    fn max_operation_seq(&self) -> Result<i64, DurableStoreError> {
+        let conn = self.connection();
+        let max: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM http_delivery_ops",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(max)
+    }
+
+    fn load_state_snapshot(
+        &self,
+    ) -> Result<Option<(i64, DurableStateSnapshot)>, DurableStoreError> {
+        let conn = self.connection();
+        let row = conn
+            .query_row(
+                "SELECT last_op_seq, snapshot_json FROM http_state_snapshots WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((seq, json)) => Ok(Some((seq, serde_json::from_str(&json)?))),
+            None => Ok(None),
+        }
+    }
+
+    fn save_state_snapshot(
+        &self,
+        last_op_seq: i64,
+        snapshot: &DurableStateSnapshot,
+    ) -> Result<(), DurableStoreError> {
+        let json = serde_json::to_string(snapshot)?;
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO http_state_snapshots (id, last_op_seq, snapshot_json)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                 last_op_seq = excluded.last_op_seq,
+                 snapshot_json = excluded.snapshot_json",
+            params![last_op_seq, json],
+        )?;
+        Ok(())
     }
 
     fn load_publish_idempotency(
@@ -3772,20 +3925,21 @@ fn replay_operation(
     Ok(())
 }
 
-fn rebuild_revoked_devices(operations: &[PersistedOperation]) -> BTreeSet<String> {
-    operations
-        .iter()
-        .filter_map(|operation| match operation {
-            PersistedOperation::RevokeDevice { device } => Some(DeviceMembership::key(device)),
-            _ => None,
-        })
-        .collect()
+fn apply_operations_to_revoked_devices(
+    revoked: &mut BTreeSet<String>,
+    operations: &[PersistedOperation],
+) {
+    for operation in operations {
+        if let PersistedOperation::RevokeDevice { device } = operation {
+            revoked.insert(DeviceMembership::key(device));
+        }
+    }
 }
 
-fn rebuild_key_package_inventory(
+fn apply_operations_to_key_package_inventory(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     operations: &[PersistedOperation],
-) -> HashMap<HttpKeyPackageId, KeyPackageInventoryRecord> {
-    let mut inventory = HashMap::new();
+) {
     for operation in operations {
         match operation {
             PersistedOperation::PublishKeyPackage { publication } => {
@@ -3806,11 +3960,11 @@ fn rebuild_key_package_inventory(
                 }
             }
             PersistedOperation::ClaimKeyPackage { owner } => {
-                mark_next_key_package_claimed(&mut inventory, owner);
+                mark_next_key_package_claimed(inventory, owner);
             }
             PersistedOperation::ClaimKeyPackages { owners } => {
                 for owner in owners {
-                    mark_next_key_package_claimed(&mut inventory, owner);
+                    mark_next_key_package_claimed(inventory, owner);
                 }
             }
             PersistedOperation::ExpireKeyPackageLease { key_package_id } => {
@@ -3821,12 +3975,11 @@ fn rebuild_key_package_inventory(
                 }
             }
             PersistedOperation::PublishMessage { message, .. } => {
-                consume_key_packages_from_persisted_message(&mut inventory, message);
+                consume_key_packages_from_persisted_message(inventory, message);
             }
             PersistedOperation::RevokeDevice { .. } => {}
         }
     }
-    inventory
 }
 
 fn key_package_inventory_cache_matches(

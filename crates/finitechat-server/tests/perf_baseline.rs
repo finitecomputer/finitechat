@@ -139,12 +139,18 @@ fn server_publish_sync_and_startup_timings() {
     }
     report("sync page (100 entries from seq 0)", samples);
 
+    // Startup replay cost for the accumulated op log (no snapshot yet).
     drop(state);
-
-    // Startup replay cost for the accumulated op log.
     let started = Instant::now();
     let reopened = HttpServerState::from_sqlite_path(&db).expect("reopen state");
-    println!("startup replay: {:?}", started.elapsed());
+    println!("startup full replay: {:?}", started.elapsed());
+
+    // Startup with a fresh snapshot: only the (empty) tail replays.
+    reopened.snapshot_now().expect("snapshot");
+    drop(reopened);
+    let started = Instant::now();
+    let reopened = HttpServerState::from_sqlite_path(&db).expect("reopen from snapshot");
+    println!("startup from snapshot: {:?}", started.elapsed());
     let page = reopened
         .sync_group(GroupSyncRequest {
             group_id: GroupId::new(b"perf-room-0".to_vec()),
