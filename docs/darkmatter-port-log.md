@@ -1508,3 +1508,19 @@ tests deleted, 6 new admin/leave/versioning tests added), clippy
 `-D warnings` clean, Python suite pass (typed-route process smoke). Perf
 harness re-run: publish p50 49.8 µs, client apply 61.9 µs/entry — no latency
 added by any step.
+
+## Remaining Queue Closed
+
+- Durable state snapshot + tail-replay startup (perf-plan Phase E, first
+  half): `http_state_snapshots` table, automatic refresh every 4,096 ops,
+  `snapshot_now()` for shutdown hooks, and a persistence test that compacts
+  the covered op prefix to prove the snapshot is authoritative. Upstream
+  gained snapshot-serializability (`map_as_pairs`) in commit `0b9a61b`.
+- `/push-tokens` register/replace/remove (ADR 0003 §5): durable wrapper
+  state; revocation drops tokens and blocks re-registration.
+- Stream lane reserved (ADR 0003 §6): `StreamStart`/`StreamFinish` durable
+  kinds with frozen policies and `StreamStartV1`/`StreamFinishV1` payloads.
+
+Remaining from the plan after this checkpoint: retention/horizon compaction
+(cursor semantics already decided and previewed by the snapshot test),
+idempotency expiry against the same horizon, and the pusher daemon.

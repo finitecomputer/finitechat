@@ -162,3 +162,17 @@ Re-ran both harnesses after the eight ADR 0003/0004 implementation steps
 p50 49.8 µs, sync page unchanged, client apply 61.9 µs/entry, save 109 µs.
 No regression from the added validation (admin/authority checks are map
 lookups on the already-locked projection).
+
+### 2026-06-11 — Snapshot startup + remaining ADR items
+
+- Server now snapshots all op-derived state every 4,096 ops (and via
+  `snapshot_now()`); startup = snapshot + tail replay. Measured at 12k ops:
+  146 ms full replay → 114 ms from snapshot. The modest delta is honest: at
+  this phase live state ≈ history size, so parsing one big blob ≈ parsing
+  many small ones. The structural win is what the test proves — the snapshot
+  is authoritative for its prefix (ops deleted under it, server still serves
+  the full log), which is exactly the contract horizon compaction needs.
+- New observation: snapshot/op-log JSON parsing dominates startup either
+  way; a binary format (postcard) for the snapshot blob is the cheap next
+  step if startup ever matters more.
+- Push tokens and stream-lane kinds added with no hot-path impact.
