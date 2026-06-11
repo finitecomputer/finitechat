@@ -3,6 +3,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+/// Protocol version this build of finite chat speaks (ADR 0003 §1).
+pub const PROTOCOL_VERSION_V1: u32 = 1;
+/// Oldest room protocol version this build still accepts.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_REQUIRED_CAPABILITIES: u32 = 16;
+pub const MAX_REQUIRED_CAPABILITY_BYTES: u32 = 64;
+
 pub type AccountId = String;
 pub type DeviceId = String;
 pub type RoomId = String;
@@ -130,6 +137,44 @@ const _: () = {
     assert!(FINITECHAT_ACTIVITY_WORKING_EXPIRY_MILLIS <= MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS);
     assert!(MAX_IDEMPOTENCY_KEY_BYTES > 0);
 };
+
+/// Per-room protocol slots (ADR 0003 §1): rolled out before any external
+/// client exists so version negotiation has somewhere to live. Version 1
+/// rooms carry no required capabilities; the fields exist so adding either
+/// never changes the wire shape again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoomProtocol {
+    pub protocol_version: u32,
+    pub required_capabilities: Vec<String>,
+}
+
+impl Default for RoomProtocol {
+    fn default() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION_V1,
+            required_capabilities: Vec::new(),
+        }
+    }
+}
+
+impl RoomProtocol {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_item_count(
+            "room_protocol.required_capabilities",
+            self.required_capabilities.len(),
+            MAX_REQUIRED_CAPABILITIES,
+        )?;
+        for capability in &self.required_capabilities {
+            validate_string_bytes(
+                "room_protocol.required_capabilities[]",
+                capability,
+                MAX_REQUIRED_CAPABILITY_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DeviceRef {

@@ -76,6 +76,8 @@ pub struct CreateRoomRequest {
     pub room_id: RoomId,
     pub mls_group_id: MlsGroupId,
     pub creator: DeviceRef,
+    #[serde(default)]
+    pub protocol: crate::RoomProtocol,
 }
 
 

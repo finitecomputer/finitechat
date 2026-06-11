@@ -6,6 +6,7 @@ use cgka_traits::engine::KeyPackage;
 use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
 use finitechat_proto::{
+    RoomProtocol,
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
     EventAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
@@ -353,6 +354,7 @@ async fn sqlite_key_package_inventory_cap_counts_claimed_and_consumed_over_http(
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -700,7 +702,8 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: alice.clone(),
-            },
+            protocol: RoomProtocol::default(),
+        },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -827,6 +830,7 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
             room_id: target_room_id.clone(),
             mls_group_id: target_mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -1563,7 +1567,8 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
             account_id: "alice".to_owned(),
             device_id: "alice-laptop".to_owned(),
         },
-    };
+            protocol: RoomProtocol::default(),
+        };
 
     let app = persistent_app(&db_path);
     let response = post_json(app, "/account-rooms/bootstrap", &bootstrap).await;
@@ -1651,6 +1656,7 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -1766,6 +1772,7 @@ async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_r
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -1881,6 +1888,7 @@ async fn sqlite_submit_commit_rejects_account_device_cap_before_side_effects() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -1991,6 +1999,7 @@ async fn sqlite_submit_commit_rejects_duplicate_pending_device_before_side_effec
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -2103,6 +2112,7 @@ async fn sqlite_welcome_not_released_before_accepted_commit_over_http() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -2175,6 +2185,7 @@ async fn sqlite_submit_commit_replay_repairs_projection_after_partial_durable_pu
             room_id: room_id.clone(),
             mls_group_id,
             creator,
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -2284,6 +2295,7 @@ async fn sqlite_rejected_submit_commit_replays_rejection_after_restart() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: creator.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -2405,7 +2417,8 @@ async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: creator.clone(),
-            },
+            protocol: RoomProtocol::default(),
+        },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2616,6 +2629,7 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -2830,6 +2844,7 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: bob.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3123,6 +3138,7 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3295,6 +3311,7 @@ async fn sqlite_typed_event_rejects_oversized_payload_without_persisting_log() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3368,6 +3385,7 @@ async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_confli
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3447,6 +3465,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3595,6 +3614,7 @@ async fn sqlite_application_delivery_policy_matrix_survives_restart_over_http() 
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3688,6 +3708,7 @@ async fn sqlite_runtime_state_snapshot_projects_from_http_log_after_restart() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: runtime.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -3821,6 +3842,7 @@ async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_ov
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4002,7 +4024,8 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: alice.clone(),
-            },
+            protocol: RoomProtocol::default(),
+        },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4077,6 +4100,7 @@ async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4165,6 +4189,7 @@ async fn sqlite_ephemeral_activity_over_http_does_not_persist_or_advance_sequenc
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4242,6 +4267,7 @@ async fn sqlite_ephemeral_activity_route_scope_and_opaque_payload_over_http() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4352,6 +4378,7 @@ async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4466,6 +4493,7 @@ async fn sqlite_device_liveness_is_volatile_and_does_not_advance_room_state() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4611,6 +4639,7 @@ async fn sqlite_device_liveness_rejects_bad_observations_without_room_side_effec
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4746,6 +4775,7 @@ async fn sqlite_invalid_commit_report_blocks_typed_mutations_after_restart() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -4984,6 +5014,7 @@ async fn sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http() {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -5174,6 +5205,7 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -5627,6 +5659,7 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -5789,6 +5822,7 @@ async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it(
             room_id: room_id.clone(),
             mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
+            protocol: RoomProtocol::default(),
         },
     )
     .await;
@@ -5944,6 +5978,64 @@ async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it(
     )
     .await;
     // Bob is fully removed now, so alice (sole member) may leave.
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sqlite_bootstrap_rejects_unsupported_protocol_version_and_defaults_to_v1() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+
+    let app = persistent_app(&db_path);
+    // A future protocol version is refused with 426 before any side effects.
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: "room-protocol-future".to_owned(),
+            mls_group_id: "mls-protocol-future".to_owned(),
+            creator: alice.clone(),
+            protocol: RoomProtocol {
+                protocol_version: 999,
+                required_capabilities: Vec::new(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "unsupported_protocol_version");
+
+    // Omitted protocol fields default to v1 on the wire (serde default), and
+    // explicit v1 with capabilities is stored.
+    let body = serde_json::json!({
+        "room_id": "room-protocol-default",
+        "mls_group_id": "mls-protocol-default",
+        "creator": {"account_id": "alice", "device_id": "alice-laptop"},
+    });
+    let response = post_json(app.clone(), "/account-rooms/bootstrap", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: "room-protocol-caps".to_owned(),
+            mls_group_id: "mls-protocol-caps".to_owned(),
+            creator: alice.clone(),
+            protocol: RoomProtocol {
+                protocol_version: 1,
+                required_capabilities: vec!["streams.v1".to_owned()],
+            },
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Both rooms replay idempotently after restart.
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/account-rooms/bootstrap", &body).await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 

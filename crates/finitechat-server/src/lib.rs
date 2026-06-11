@@ -41,7 +41,8 @@ pub use finitechat_http::{
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
     MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_KEY_PACKAGES_PER_DEVICE,
+    MAX_KEY_PACKAGES_PER_DEVICE, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
+    RoomProtocol,
     MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
     RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_string_bytes,
 };
@@ -1000,6 +1001,20 @@ impl HttpServerState {
             }
         })?;
 
+        request.protocol.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidAccountRoomRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        if request.protocol.protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION
+            || request.protocol.protocol_version > PROTOCOL_VERSION_V1
+        {
+            return Err(ServerHttpError::UnsupportedProtocolVersion {
+                requested: request.protocol.protocol_version,
+                min: MIN_SUPPORTED_PROTOCOL_VERSION,
+                max: PROTOCOL_VERSION_V1,
+            });
+        }
         let account_id = request.creator.account_id.clone();
         validate_account_room_id("account_id", &account_id)?;
         let mut bootstrapped = false;
@@ -1253,6 +1268,7 @@ impl HttpServerState {
             observed.current_epoch,
             observed.last_seq,
             true,
+            request.protocol.clone(),
         );
         rooms.insert(request.room_id.clone(), projection.clone());
         drop(rooms);
@@ -2784,6 +2800,9 @@ struct HttpRoomMembershipProjection {
     /// member workers discover the pending cryptographic cleanup.
     #[serde(default)]
     departed: BTreeSet<String>,
+    /// Per-room protocol slots (ADR 0003 §1).
+    #[serde(default)]
+    protocol: RoomProtocol,
     #[serde(default)]
     membership: BTreeMap<String, DeviceMembership>,
 }
@@ -3910,6 +3929,7 @@ fn apply_room_membership_delta(
             expected_epoch,
             0,
             expected_epoch == 0,
+            RoomProtocol::default(),
         )
     });
     if projection.room_id != room_id || projection.mls_group_id != mls_group_id {
@@ -4555,6 +4575,7 @@ fn initial_room_membership_projection(
     current_epoch: u64,
     last_seq: HttpSequence,
     membership_complete: bool,
+    protocol: RoomProtocol,
 ) -> HttpRoomMembershipProjection {
     let mut membership = BTreeMap::new();
     membership.insert(
@@ -4577,6 +4598,7 @@ fn initial_room_membership_projection(
         membership_complete,
         admins: BTreeSet::from([creator.account_id.clone()]),
         departed: BTreeSet::new(),
+        protocol,
         membership,
     }
 }
@@ -4915,6 +4937,11 @@ pub enum ServerHttpError {
     InvalidAdminChange {
         reason: String,
     },
+    UnsupportedProtocolVersion {
+        requested: u32,
+        min: u32,
+        max: u32,
+    },
     InvalidRepairReport {
         reason: String,
     },
@@ -5133,6 +5160,17 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_admin_change".to_owned(),
                 reason,
+            ),
+            Self::UnsupportedProtocolVersion {
+                requested,
+                min,
+                max,
+            } => (
+                StatusCode::UPGRADE_REQUIRED,
+                "unsupported_protocol_version".to_owned(),
+                format!(
+                    "room protocol version {requested} is outside the supported range {min}..={max}"
+                ),
             ),
             Self::InvalidRepairReport { reason } => (
                 StatusCode::BAD_REQUEST,

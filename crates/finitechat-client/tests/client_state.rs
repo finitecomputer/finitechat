@@ -9,6 +9,7 @@ use finitechat_client::{
     SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_proto::{
+    RoomProtocol,
     DurableAppEventKind,
     AppendEventRequest, CreateRoomRequest,
     EventAccepted, ListAccountRoomsRequest,
@@ -317,6 +318,7 @@ fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
             room_id: ROOM_ID.to_owned(),
             mls_group_id: MLS_GROUP_ID.to_owned(),
             creator: bob.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     delivery
@@ -532,6 +534,7 @@ fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: alice.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
 
@@ -624,6 +627,7 @@ fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: alice.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     delivery
@@ -704,6 +708,7 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: bob.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     let prior_plaintext =
@@ -813,6 +818,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: bob.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     charlie_store.save_device_state(&charlie).unwrap();
@@ -965,6 +971,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: bob.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
 
@@ -2275,6 +2282,7 @@ where
             room_id: setup.room_id.to_string(),
             mls_group_id: setup.mls_group_id.to_string(),
             creator: alice.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     delivery

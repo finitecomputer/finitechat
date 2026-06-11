@@ -2815,6 +2815,7 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
             room_id: request.room_id.clone(),
             mls_group_id: request.mls_group_id.clone(),
             creator: request.creator.clone(),
+            protocol: request.protocol.clone(),
         };
         let _: BootstrapAccountRoomResponse =
             self.post_json("/account-rooms/bootstrap", &request)?;

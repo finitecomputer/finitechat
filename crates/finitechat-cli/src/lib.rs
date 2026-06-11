@@ -14,7 +14,7 @@ use finitechat_http::{
     LeaveRoomRequest, ReportInvalidCommitRequest, RevokeDeviceRequest, UpdateRoomAdminsRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
     UploadLinkPayloadRequest,
 };
-use finitechat_proto::DeviceRef;
+use finitechat_proto::{DeviceRef, RoomProtocol};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -571,7 +571,8 @@ fn account_room_bootstrap_request(
             account_id,
             device_id,
         },
-    };
+            protocol: RoomProtocol::default(),
+        };
     post_json_request(server, "/account-rooms/bootstrap", &request)
 }
 

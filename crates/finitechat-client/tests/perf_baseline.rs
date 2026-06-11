@@ -14,7 +14,7 @@ use finitechat_client::{
     run_runtime_sync_tick,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{CreateRoomRequest, DurableAppEventKind};
+use finitechat_proto::{CreateRoomRequest, DurableAppEventKind, RoomProtocol};
 use finitechat_server::{HttpServerState, http_router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -140,6 +140,7 @@ fn client_sync_tick_and_save_timings() {
             room_id: room_id.to_owned(),
             mls_group_id: mls_group_id.to_owned(),
             creator: bob.device_ref().clone(),
+            protocol: RoomProtocol::default(),
         })
         .unwrap();
     server

@@ -1,6 +1,7 @@
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::{GroupId, MemberId, MessageId};
-use finitechat_proto::{ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry};
+use finitechat_proto::{
+    RoomProtocol,ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use transport_http_server::{
@@ -298,6 +299,8 @@ pub struct BootstrapAccountRoomRequest {
     pub room_id: String,
     pub mls_group_id: String,
     pub creator: DeviceRef,
+    #[serde(default)]
+    pub protocol: RoomProtocol,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
