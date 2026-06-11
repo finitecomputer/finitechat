@@ -7,7 +7,12 @@ cryptographic delivery boundaries from user-facing conversation structure.
 
 **Room**:
 An MLS group plus one server-ordered delivery log.
-_Avoid_: Chat, topic, conversation
+_Avoid_: Chat, topic, conversation, direct room
+
+**DM**:
+A Room whose members happen to be two accounts. Not a distinct protocol
+concept; several named Rooms with the same person are legal and useful.
+_Avoid_: Direct room (retired server concept)
 
 **Conversation**:
 An application-level session inside a room.
@@ -36,6 +41,8 @@ _Avoid_: Hermes, agent, inference provider
 ## Relationships
 
 - A **Room** contains zero or more **Conversations**.
+- A **DM** is a **Room**, not a separate kind; per-topic lanes with one
+  person are **Topics** inside a Room, or separate named Rooms — both legal.
 - A **Topic** is a **Conversation** presented as a named lane.
 - A **Conversation** contains one or more **Segments** when an app supports context resets.
 - A **Segment** belongs to exactly one **Conversation**.

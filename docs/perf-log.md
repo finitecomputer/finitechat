@@ -138,3 +138,19 @@ Budgets vs. plan: publish p99 ~0.1 ms against a 25 ms budget; sync p99
 4. `PublishMessageFingerprint` duplicating the full request is both the perf
    item (6) above and a wire-simplification: idempotency equality only needs
    a content digest.
+
+### 2026-06-11 — Grill session outcomes (protocol simplification)
+
+The six simplification observations were stress-tested with the user and all
+six accepted (decisions + execution order in
+`docs/adr/0004-protocol-surface-simplifications.md`). Two turned out to be
+latent always-works defects, found during the grilling:
+
+- the scoped idempotency capacity rule permanently blocked a sender after
+  4,096 lifetime messages per room (records never expire) — exactly the
+  long-chat scenario this phase targets;
+- the production client sends through the no-effects `/events` route, so
+  push/unread delivery effects are never recorded for real traffic.
+
+Standing posture recorded in ADR 0004: Marmot interop is kept only when free
+— never bend the product surface to preserve it.
