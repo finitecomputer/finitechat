@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -49,15 +49,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryService,
-    HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
-    HttpSequence, HttpServerError, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryLimits,
+    HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishCheck,
+    HttpPublishReceipt, HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
+    MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
 const MAX_HTTP_FANOUT_ROOMS: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
 const MAX_HTTP_FANOUT_ID_BYTES: usize = 128;
 const MAX_HTTP_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
+
+/// Capacity limits for the durable finite chat server.
+///
+/// The upstream defaults are sized for tests. These are sized for the current
+/// product phase (hundreds of active users, dozens of long chats each); they
+/// must be applied before op-log replay so reopening a large server never
+/// trips a smaller cap than the one it was written under.
+pub fn finite_delivery_limits() -> HttpDeliveryLimits {
+    HttpDeliveryLimits {
+        max_groups: 65_536,
+        max_recipient_inboxes: 65_536,
+        max_queue_entries_per_route: 262_144,
+        max_key_packages_per_account: 4_096,
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpServerState {
@@ -99,7 +115,7 @@ impl HttpServerState {
 
     pub fn from_sqlite_path(path: impl AsRef<Path>) -> Result<Self, DurableStoreError> {
         let store = Arc::new(SqliteHttpDeliveryStore::open(path)?);
-        let mut service = HttpDeliveryService::default();
+        let mut service = HttpDeliveryService::with_limits(finite_delivery_limits());
         let operations = store.load_operations()?;
         for operation in operations.iter().cloned() {
             replay_operation(&mut service, operation)?;
@@ -140,26 +156,6 @@ impl HttpServerState {
         })
     }
 
-    fn apply_mutation<R>(
-        &self,
-        mutation: impl FnOnce(
-            &mut HttpDeliveryService,
-        ) -> Result<(R, Option<PersistedOperation>), HttpServerError>,
-    ) -> Result<R, ServerHttpError> {
-        let mut service = self.service.lock().expect("HTTP delivery service mutex");
-        let Some(store) = &self.store else {
-            let (result, _) = mutation(&mut service)?;
-            return Ok(result);
-        };
-
-        let mut candidate = service.clone();
-        let (result, operation) = mutation(&mut candidate)?;
-        if let Some(operation) = operation {
-            store.append_operation(&operation)?;
-        }
-        *service = candidate;
-        Ok(result)
-    }
 
     /// Raw delivery-contract publish, also used by the upstream
     /// `transport-http-server` conformance suite against this durable server.
@@ -169,16 +165,24 @@ impl HttpServerState {
     ) -> Result<HttpPublishReceipt, ServerHttpError> {
         self.validate_raw_commit_import(&request)?;
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.apply_mutation(|service| {
-                let receipt = service.publish(request.target.clone(), request.message.clone())?;
-                let operation =
-                    (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
-                        target: request.target,
-                        message: request.message,
-                        idempotency_key: None,
-                    });
-                Ok((receipt, operation))
-            });
+            let mut service = self.service.lock().expect("HTTP delivery service mutex");
+            let receipt = match service.check_publish(&request.target, &request.message)? {
+                HttpPublishCheck::DuplicateReplay(receipt) => return Ok(receipt),
+                HttpPublishCheck::Fresh(receipt) => receipt,
+            };
+            if let Some(store) = &self.store {
+                store.append_operation(&PersistedOperation::PublishMessage {
+                    target: request.target.clone(),
+                    message: request.message.clone(),
+                    idempotency_key: None,
+                })?;
+            }
+            // The dry run admitted this publish under the held lock, so the
+            // apply cannot fail; `?` keeps the impossible path a 500 instead
+            // of a panic.
+            let published = service.publish(request.target, request.message)?;
+            debug_assert_eq!(published, receipt);
+            return Ok(published);
         };
 
         if idempotency_key.is_empty() {
@@ -198,12 +202,14 @@ impl HttpServerState {
             return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
         }
 
-        let mut candidate = service.clone();
         ensure_publish_idempotency_capacity(&idempotency, &request)?;
-        let receipt = candidate.publish(request.target.clone(), request.message.clone())?;
+        let receipt = match service.check_publish(&request.target, &request.message)? {
+            HttpPublishCheck::DuplicateReplay(receipt) => receipt,
+            HttpPublishCheck::Fresh(receipt) => receipt,
+        };
         let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
-            target: request.target,
-            message: request.message,
+            target: request.target.clone(),
+            message: request.message.clone(),
             idempotency_key: Some(idempotency_key.clone()),
         });
         let record = PublishIdempotencyRecord {
@@ -213,7 +219,10 @@ impl HttpServerState {
         if let Some(store) = &self.store {
             store.append_publish_mutation(operation.as_ref(), Some((&idempotency_key, &record)))?;
         }
-        *service = candidate;
+        if !receipt.duplicate {
+            let published = service.publish(request.target, request.message)?;
+            debug_assert_eq!(published, receipt);
+        }
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
     }
@@ -244,26 +253,21 @@ impl HttpServerState {
         }
 
         let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
-        let mut candidate = service.clone();
         ensure_publish_idempotency_capacity(&idempotency, &request)?;
-        let receipt = match candidate.publish(request.target.clone(), request.message.clone()) {
-            Ok(receipt) => receipt,
-            Err(HttpServerError::ConflictingMessageId { .. }) => {
+        let receipt = match service.check_publish(&request.target, &request.message) {
+            Ok(HttpPublishCheck::Fresh(receipt)) => receipt,
+            Ok(HttpPublishCheck::DuplicateReplay(_))
+            | Err(HttpServerError::ConflictingMessageId { .. }) => {
                 return Err(ServerHttpError::DuplicateMessageId {
                     message_id: typed_message_id,
                 });
             }
             Err(error) => return Err(error.into()),
         };
-        if receipt.duplicate {
-            return Err(ServerHttpError::DuplicateMessageId {
-                message_id: typed_message_id,
-            });
-        }
 
         let operation = PersistedOperation::PublishMessage {
-            target: request.target,
-            message: request.message,
+            target: request.target.clone(),
+            message: request.message.clone(),
             idempotency_key: Some(idempotency_key.clone()),
         };
         let record = PublishIdempotencyRecord {
@@ -273,7 +277,8 @@ impl HttpServerState {
         if let Some(store) = &self.store {
             store.append_publish_mutation(Some(&operation), Some((&idempotency_key, &record)))?;
         }
-        *service = candidate;
+        let published = service.publish(request.target, request.message)?;
+        debug_assert_eq!(published, receipt);
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
     }
@@ -1734,17 +1739,17 @@ impl HttpServerState {
             .lock()
             .expect("HTTP KeyPackage inventory mutex");
 
-        let mut candidate_service = service.clone();
-        let mut candidate_publish_idempotency = publish_idempotency.clone();
+        // Commit and Welcome publishes are dry-run checked against live
+        // state (the delivery service is never cloned); only the small
+        // projection maps keep the candidate pattern.
         let mut candidate_account_rooms = account_rooms.clone();
         let mut candidate_room_memberships = room_memberships.clone();
         let mut candidate_key_package_inventory = key_package_inventory.clone();
 
-        let (receipt, commit_mutation) = publish_request_to_candidate(
-            &mut candidate_service,
-            &mut candidate_publish_idempotency,
-            commit_publish,
-        )?;
+        let commit_check =
+            check_publish_request(&service, &publish_idempotency, &commit_publish)?;
+        let receipt = commit_check.receipt.clone();
+        let mut checked_publishes = vec![(commit_publish, commit_check)];
         let account_room_mutation = apply_account_room_membership_delta(
             &mut candidate_account_rooms,
             &request.room_id,
@@ -1768,15 +1773,15 @@ impl HttpServerState {
         )?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
-        let mut publish_mutations = commit_mutation.into_iter().collect::<Vec<_>>();
         for welcome in &welcomes {
-            let (_, mutation) = publish_request_to_candidate(
-                &mut candidate_service,
-                &mut candidate_publish_idempotency,
-                welcome_publish_request(welcome)?,
-            )?;
-            publish_mutations.extend(mutation);
+            let publish = welcome_publish_request(welcome)?;
+            let check = check_publish_request(&service, &publish_idempotency, &publish)?;
+            checked_publishes.push((publish, check));
         }
+        let publish_mutations = checked_publishes
+            .iter()
+            .filter_map(|(_, check)| check.mutation.clone())
+            .collect::<Vec<_>>();
 
         if let Some(store) = &self.store {
             store.append_submit_commit_mutation(
@@ -1787,8 +1792,15 @@ impl HttpServerState {
             )?;
         }
 
-        *service = candidate_service;
-        *publish_idempotency = candidate_publish_idempotency;
+        for (publish, check) in checked_publishes {
+            if check.fresh {
+                let published = service.publish(publish.target, publish.message)?;
+                debug_assert_eq!(published, check.receipt);
+            }
+            if let Some(mutation) = check.mutation {
+                publish_idempotency.insert(mutation.idempotency_key, mutation.record);
+            }
+        }
         *account_rooms = candidate_account_rooms;
         *room_memberships = candidate_room_memberships;
         *key_package_inventory = candidate_key_package_inventory;
@@ -1918,34 +1930,30 @@ impl HttpServerState {
             .lock()
             .expect("HTTP application-effects mutex");
 
-        let mut candidate_service = service.clone();
-        let mut candidate_idempotency = idempotency.clone();
-        let mut candidate_room_memberships = room_memberships.clone();
-        let mut candidate_application_effects = application_effects.clone();
-        let (receipt, publish_mutation) = publish_typed_event_request_to_candidate(
-            &mut candidate_service,
-            &mut candidate_idempotency,
-            event_publish,
-            &message_id,
-        )?;
-        let room_membership_projection = apply_room_event_acceptance(
-            &mut candidate_room_memberships,
+        // Check phase: every admission rule runs read-only against live
+        // state, producing exactly the rows to persist.
+        let (receipt, publish_mutation) =
+            check_typed_event_publish(&service, &idempotency, &event_publish, &message_id)?;
+        let room_membership_projection = check_room_event_acceptance(
+            &room_memberships,
             &request.event.room_id,
             receipt.seq,
         );
         let effect = HttpApplicationDeliveryEffect {
-            room_id: request.event.room_id,
+            room_id: request.event.room_id.clone(),
             seq: receipt.seq,
             message_id: message_id.clone(),
             sender: request.event.sender,
             delivery_policy: request.delivery_policy,
         };
-        let effect_mutation = apply_application_delivery_effect(
-            &mut candidate_application_effects,
+        let effect_mutation = check_application_delivery_effect(
+            &application_effects,
             effect,
             &request.event.idempotency_key,
         )?;
 
+        // Persist phase: one SQLite transaction, before any in-memory state
+        // changes, so an injected failure rolls back with nothing to undo.
         if let Some(store) = &self.store {
             store.append_application_event_mutation(
                 publish_mutation.as_ref(),
@@ -1954,10 +1962,22 @@ impl HttpServerState {
             )?;
         }
 
-        *service = candidate_service;
-        *idempotency = candidate_idempotency;
-        *room_memberships = candidate_room_memberships;
-        *application_effects = candidate_application_effects;
+        // Apply phase: infallible given the checks above ran under the held
+        // locks.
+        if let Some(mutation) = publish_mutation {
+            let published = service.publish(
+                event_publish.target.clone(),
+                event_publish.message.clone(),
+            )?;
+            debug_assert_eq!(published, receipt);
+            idempotency.insert(mutation.idempotency_key, mutation.record);
+        }
+        if let Some(projection) = room_membership_projection {
+            room_memberships.insert(request.event.room_id.clone(), projection);
+        }
+        if let Some(effect) = effect_mutation {
+            application_effects.insert(effect.message_id.clone(), effect);
+        }
         Ok(EventAccepted {
             seq: receipt.seq,
             message_id,
@@ -3002,19 +3022,22 @@ impl HttpRoomMembershipProjection {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SqliteHttpDeliveryStore {
-    path: Arc<PathBuf>,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteHttpDeliveryStore {
     fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
         let store = Self {
-            path: Arc::new(path.as_ref().to_owned()),
+            conn: Mutex::new(Connection::open(path.as_ref())?),
         };
-        let conn = store.connection()?;
+        let conn = store.connection();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS http_delivery_ops (
+            "PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = FULL;
+            PRAGMA busy_timeout = 5000;
+            CREATE TABLE IF NOT EXISTS http_delivery_ops (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
                 body_json TEXT NOT NULL
@@ -3067,12 +3090,13 @@ impl SqliteHttpDeliveryStore {
                 state_json TEXT NOT NULL
             );",
         )?;
+        drop(conn);
         Ok(store)
     }
 
     fn append_operation(&self, operation: &PersistedOperation) -> Result<(), DurableStoreError> {
         let body_json = serde_json::to_string(operation)?;
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
             params![operation.kind(), body_json],
@@ -3085,7 +3109,7 @@ impl SqliteHttpDeliveryStore {
         operation: Option<&PersistedOperation>,
         idempotency: Option<(&str, &PublishIdempotencyRecord)>,
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         if let Some(operation) = operation {
             transaction.execute(
@@ -3118,7 +3142,7 @@ impl SqliteHttpDeliveryStore {
         room_membership_projection: &HttpRoomMembershipProjection,
         key_package_inventory_mutation: &[KeyPackageInventoryRecord],
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         for mutation in publish_mutations {
             if let Some(operation) = &mutation.operation {
@@ -3182,7 +3206,7 @@ impl SqliteHttpDeliveryStore {
         room_membership_projection: Option<&HttpRoomMembershipProjection>,
         effect: Option<&HttpApplicationDeliveryEffect>,
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         if let Some(mutation) = publish_mutation {
             if let Some(operation) = &mutation.operation {
@@ -3226,7 +3250,7 @@ impl SqliteHttpDeliveryStore {
         idempotency: Option<(&str, &KeyPackageClaimIdempotencyRecord)>,
         inventory_records: &[KeyPackageInventoryRecord],
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         if let Some(operation) = operation {
             transaction.execute(
@@ -3260,7 +3284,7 @@ impl SqliteHttpDeliveryStore {
         operation: &PersistedOperation,
         inventory_record: &KeyPackageInventoryRecord,
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         transaction.execute(
             "INSERT INTO http_delivery_ops (kind, body_json) VALUES (?1, ?2)",
@@ -3272,7 +3296,7 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn load_operations(&self) -> Result<Vec<PersistedOperation>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement =
             conn.prepare("SELECT body_json FROM http_delivery_ops ORDER BY seq ASC")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -3286,7 +3310,7 @@ impl SqliteHttpDeliveryStore {
     fn load_publish_idempotency(
         &self,
     ) -> Result<HashMap<String, PublishIdempotencyRecord>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT idempotency_key, fingerprint_json, receipt_json FROM http_publish_idempotency",
         )?;
@@ -3314,7 +3338,7 @@ impl SqliteHttpDeliveryStore {
     fn load_key_package_claim_idempotency(
         &self,
     ) -> Result<HashMap<String, KeyPackageClaimIdempotencyRecord>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT idempotency_key, fingerprint_json, response_json
              FROM http_key_package_claim_idempotency",
@@ -3344,7 +3368,7 @@ impl SqliteHttpDeliveryStore {
         &self,
         record: &KeyPackageInventoryRecord,
     ) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_key_package_inventory (
                 key_package_id_json,
@@ -3366,7 +3390,7 @@ impl SqliteHttpDeliveryStore {
     fn load_key_package_inventory(
         &self,
     ) -> Result<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT key_package_id_json, owner_json, state_json FROM http_key_package_inventory",
         )?;
@@ -3396,7 +3420,7 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn upsert_fanout_plan(&self, plan: &HttpFanoutPlan) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_fanout_plans (fanout_id, plan_json)
              VALUES (?1, ?2)
@@ -3408,7 +3432,7 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn load_fanout_plans(&self) -> Result<HashMap<String, HttpFanoutPlan>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare("SELECT fanout_id, plan_json FROM http_fanout_plans")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -3422,7 +3446,7 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn upsert_link_session(&self, record: &HttpLinkSessionRecord) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_link_sessions (link_session_id, record_json)
              VALUES (?1, ?2)
@@ -3436,7 +3460,7 @@ impl SqliteHttpDeliveryStore {
     fn load_link_sessions(
         &self,
     ) -> Result<BTreeMap<String, HttpLinkSessionRecord>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT link_session_id, record_json
              FROM http_link_sessions
@@ -3457,7 +3481,7 @@ impl SqliteHttpDeliveryStore {
         &self,
         record: &AccountRoomDirectoryRecord,
     ) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_account_rooms (account_id, room_id, record_json)
              VALUES (?1, ?2, ?3)
@@ -3475,7 +3499,7 @@ impl SqliteHttpDeliveryStore {
     fn load_account_room_directory(
         &self,
     ) -> Result<BTreeMap<String, BTreeMap<String, Value>>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT account_id, room_id, record_json
              FROM http_account_rooms
@@ -3504,7 +3528,7 @@ impl SqliteHttpDeliveryStore {
         account_id: &str,
         room_id: &str,
     ) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "DELETE FROM http_account_rooms WHERE account_id = ?1 AND room_id = ?2",
             params![account_id, room_id],
@@ -3516,7 +3540,7 @@ impl SqliteHttpDeliveryStore {
         &self,
         projection: &HttpRoomMembershipProjection,
     ) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_room_memberships (room_id, projection_json)
              VALUES (?1, ?2)
@@ -3532,7 +3556,7 @@ impl SqliteHttpDeliveryStore {
         projection: &HttpRoomMembershipProjection,
         account_records: &[AccountRoomDirectoryRecord],
     ) -> Result<(), DurableStoreError> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection();
         let transaction = conn.transaction()?;
         transaction.execute(
             "INSERT INTO http_room_memberships (room_id, projection_json)
@@ -3561,7 +3585,7 @@ impl SqliteHttpDeliveryStore {
     fn load_room_memberships(
         &self,
     ) -> Result<BTreeMap<String, HttpRoomMembershipProjection>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT room_id, projection_json
              FROM http_room_memberships
@@ -3581,7 +3605,7 @@ impl SqliteHttpDeliveryStore {
     fn load_application_effects(
         &self,
     ) -> Result<BTreeMap<String, HttpApplicationDeliveryEffect>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT message_id, room_id, seq, sender_json, delivery_policy_json
              FROM http_application_delivery_effects
@@ -3614,7 +3638,7 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn upsert_welcome_claim(&self, record: &WelcomeClaimRecord) -> Result<(), DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         conn.execute(
             "INSERT INTO http_welcome_claims (
                 message_id_json,
@@ -3642,7 +3666,7 @@ impl SqliteHttpDeliveryStore {
     fn load_welcome_claims(
         &self,
     ) -> Result<HashMap<MessageId, WelcomeClaimRecord>, DurableStoreError> {
-        let conn = self.connection()?;
+        let conn = self.connection();
         let mut statement = conn.prepare(
             "SELECT message_id_json, recipient_json, seq, message_json, state_json
              FROM http_welcome_claims",
@@ -3673,8 +3697,8 @@ impl SqliteHttpDeliveryStore {
         Ok(claims)
     }
 
-    fn connection(&self) -> Result<Connection, rusqlite::Error> {
-        Connection::open(&*self.path)
+    fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("HTTP delivery store connection mutex")
     }
 }
 
@@ -3724,54 +3748,86 @@ fn upsert_application_effect_in_transaction(
     Ok(())
 }
 
-fn publish_request_to_candidate(
-    service: &mut HttpDeliveryService,
-    idempotency: &mut HashMap<String, PublishIdempotencyRecord>,
-    request: PublishMessageRequest,
-) -> Result<(HttpPublishReceipt, Option<PublishMutation>), ServerHttpError> {
+/// Result of a read-only publish admission check inside a typed commit.
+struct CheckedPublish {
+    receipt: HttpPublishReceipt,
+    /// True when the publish must be applied to the live service after the
+    /// durable rows are persisted; false for exact replays.
+    fresh: bool,
+    mutation: Option<PublishMutation>,
+}
+
+/// Read-only form of the old candidate publish: validates one publish inside
+/// a typed commit against live state and returns the receipt it would
+/// produce, whether it still needs applying, and the durable rows to
+/// persist. Distinct queues and idempotency keys per publish are guaranteed
+/// by typed-commit validation (duplicate adds are rejected), so a batch of
+/// these checks against the same live state predicts seqs correctly.
+fn check_publish_request(
+    service: &HttpDeliveryService,
+    idempotency: &HashMap<String, PublishIdempotencyRecord>,
+    request: &PublishMessageRequest,
+) -> Result<CheckedPublish, ServerHttpError> {
     let Some(idempotency_key) = request.idempotency_key.clone() else {
-        let receipt = service.publish(request.target, request.message)?;
-        return Ok((receipt, None));
+        let (receipt, fresh) = match service.check_publish(&request.target, &request.message)? {
+            HttpPublishCheck::DuplicateReplay(receipt) => (receipt, false),
+            HttpPublishCheck::Fresh(receipt) => (receipt, true),
+        };
+        return Ok(CheckedPublish {
+            receipt,
+            fresh,
+            mutation: None,
+        });
     };
     if idempotency_key.is_empty() {
         return Err(ServerHttpError::InvalidIdempotencyKey);
     }
 
-    let fingerprint = PublishMessageFingerprint::from_request(&request);
+    let fingerprint = PublishMessageFingerprint::from_request(request);
     if let Some(record) = idempotency.get(&idempotency_key) {
         if record.fingerprint == fingerprint {
-            return Ok((record.receipt.clone(), None));
+            return Ok(CheckedPublish {
+                receipt: record.receipt.clone(),
+                fresh: false,
+                mutation: None,
+            });
         }
         return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
     }
-    ensure_publish_idempotency_capacity(idempotency, &request)?;
+    ensure_publish_idempotency_capacity(idempotency, request)?;
 
-    let receipt = service.publish(request.target.clone(), request.message.clone())?;
-    let operation = (!receipt.duplicate).then_some(PersistedOperation::PublishMessage {
-        target: request.target,
-        message: request.message,
+    let (receipt, fresh) = match service.check_publish(&request.target, &request.message)? {
+        HttpPublishCheck::DuplicateReplay(receipt) => (receipt, false),
+        HttpPublishCheck::Fresh(receipt) => (receipt, true),
+    };
+    let operation = fresh.then(|| PersistedOperation::PublishMessage {
+        target: request.target.clone(),
+        message: request.message.clone(),
         idempotency_key: Some(idempotency_key.clone()),
     });
     let record = PublishIdempotencyRecord {
         fingerprint,
         receipt: receipt.clone(),
     };
-    idempotency.insert(idempotency_key.clone(), record.clone());
 
-    Ok((
+    Ok(CheckedPublish {
         receipt,
-        Some(PublishMutation {
+        fresh,
+        mutation: Some(PublishMutation {
             operation,
             idempotency_key,
             record,
         }),
-    ))
+    })
 }
 
-fn publish_typed_event_request_to_candidate(
-    service: &mut HttpDeliveryService,
-    idempotency: &mut HashMap<String, PublishIdempotencyRecord>,
-    request: PublishMessageRequest,
+/// Read-only admission check for a typed event publish. Returns the receipt
+/// the publish would produce plus the durable mutation to persist before
+/// applying. Returns `(receipt, None)` for an exact idempotent replay.
+fn check_typed_event_publish(
+    service: &HttpDeliveryService,
+    idempotency: &HashMap<String, PublishIdempotencyRecord>,
+    request: &PublishMessageRequest,
     message_id: &str,
 ) -> Result<(HttpPublishReceipt, Option<PublishMutation>), ServerHttpError> {
     let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -3781,41 +3837,36 @@ fn publish_typed_event_request_to_candidate(
         return Err(ServerHttpError::InvalidIdempotencyKey);
     }
 
-    let fingerprint = PublishMessageFingerprint::from_request(&request);
+    let fingerprint = PublishMessageFingerprint::from_request(request);
     if let Some(record) = idempotency.get(&idempotency_key) {
         if record.fingerprint == fingerprint {
             return Ok((record.receipt.clone(), None));
         }
         return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
     }
-    ensure_publish_idempotency_capacity(idempotency, &request)?;
+    ensure_publish_idempotency_capacity(idempotency, request)?;
 
     let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
-    let receipt = match service.publish(request.target.clone(), request.message.clone()) {
-        Ok(receipt) => receipt,
-        Err(HttpServerError::ConflictingMessageId { .. }) => {
+    let receipt = match service.check_publish(&request.target, &request.message) {
+        Ok(HttpPublishCheck::Fresh(receipt)) => receipt,
+        Ok(HttpPublishCheck::DuplicateReplay(_))
+        | Err(HttpServerError::ConflictingMessageId { .. }) => {
             return Err(ServerHttpError::DuplicateMessageId {
                 message_id: typed_message_id,
             });
         }
         Err(error) => return Err(error.into()),
     };
-    if receipt.duplicate {
-        return Err(ServerHttpError::DuplicateMessageId {
-            message_id: typed_message_id,
-        });
-    }
 
     let operation = PersistedOperation::PublishMessage {
-        target: request.target,
-        message: request.message,
+        target: request.target.clone(),
+        message: request.message.clone(),
         idempotency_key: Some(idempotency_key.clone()),
     };
     let record = PublishIdempotencyRecord {
         fingerprint,
         receipt: receipt.clone(),
     };
-    idempotency.insert(idempotency_key.clone(), record.clone());
 
     Ok((
         receipt,
@@ -3825,6 +3876,41 @@ fn publish_typed_event_request_to_candidate(
             record,
         }),
     ))
+}
+
+/// Read-only form of [`apply_room_event_acceptance`]: returns the updated
+/// projection to persist and later insert, without touching the map.
+fn check_room_event_acceptance(
+    rooms: &BTreeMap<String, HttpRoomMembershipProjection>,
+    room_id: &str,
+    accepted_seq: HttpSequence,
+) -> Option<HttpRoomMembershipProjection> {
+    let projection = rooms.get(room_id)?;
+    if projection.last_seq >= accepted_seq {
+        return None;
+    }
+    let mut updated = projection.clone();
+    updated.last_seq = accepted_seq;
+    Some(updated)
+}
+
+/// Validate a delivery effect against the stored projection and return the
+/// row to persist and later insert, without touching the map. Exact replays
+/// return `None`; conflicting policies for the same message id are rejected.
+fn check_application_delivery_effect(
+    effects: &BTreeMap<String, HttpApplicationDeliveryEffect>,
+    effect: HttpApplicationDeliveryEffect,
+    idempotency_key: &str,
+) -> Result<Option<HttpApplicationDeliveryEffect>, ServerHttpError> {
+    if let Some(existing) = effects.get(&effect.message_id) {
+        if existing == &effect {
+            return Ok(None);
+        }
+        return Err(ServerHttpError::IdempotencyConflict {
+            idempotency_key: idempotency_key.to_owned(),
+        });
+    }
+    Ok(Some(effect))
 }
 
 fn apply_room_event_acceptance(
@@ -3838,23 +3924,6 @@ fn apply_room_event_acceptance(
     }
     projection.last_seq = accepted_seq;
     Some(projection.clone())
-}
-
-fn apply_application_delivery_effect(
-    effects: &mut BTreeMap<String, HttpApplicationDeliveryEffect>,
-    effect: HttpApplicationDeliveryEffect,
-    idempotency_key: &str,
-) -> Result<Option<HttpApplicationDeliveryEffect>, ServerHttpError> {
-    if let Some(existing) = effects.get(&effect.message_id) {
-        if existing == &effect {
-            return Ok(None);
-        }
-        return Err(ServerHttpError::IdempotencyConflict {
-            idempotency_key: idempotency_key.to_owned(),
-        });
-    }
-    effects.insert(effect.message_id.clone(), effect.clone());
-    Ok(Some(effect))
 }
 
 fn apply_account_room_membership_delta(

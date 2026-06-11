@@ -601,7 +601,7 @@ impl FiniteChatDevice {
             .collect::<Vec<_>>();
         openmls_storage_records.sort_by(|left, right| left.key.cmp(&right.key));
 
-        let mut rooms = self
+        let rooms = self
             .groups
             .iter()
             .map(|(room_id, group)| {
@@ -612,7 +612,7 @@ impl FiniteChatDevice {
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
-        rooms.sort_by(|left, right| left.room_id.cmp(&right.room_id));
+        // self.groups is a BTreeMap, so rooms are already sorted by room_id.
         let pending_welcomes = self.pending_welcomes.values().cloned().collect::<Vec<_>>();
         let pending_welcome_acks = self
             .pending_welcome_acks
@@ -2404,9 +2404,10 @@ impl LegacyClientStoreTable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SqliteClientStore {
     db_path: PathBuf,
+    conn: Connection,
     options: SqliteClientStoreOptions,
 }
 
@@ -2423,10 +2424,13 @@ impl SqliteClientStore {
             })?;
         }
 
-        let store = Self { db_path, options };
-        let conn = store.connect()?;
+        let conn = open_client_store_connection(&db_path)?;
         migrate_client_store(&conn)?;
-        Ok(store)
+        Ok(Self {
+            db_path,
+            conn,
+            options,
+        })
     }
 
     pub fn db_path(&self) -> &Path {
@@ -2445,9 +2449,8 @@ impl SqliteClientStore {
     ) -> Result<FiniteChatDevice, ClientStoreError> {
         let account_id = hex_lower(config.account_secret_key.public_key().as_bytes());
         let device_id = config.device_id.clone();
-        let conn = self.connect()?;
         let state =
-            load_device_state(&conn, &self.options.encryption_key, &account_id, &device_id)?
+            load_device_state(&self.conn, &self.options.encryption_key, &account_id, &device_id)?
                 .ok_or(ClientStoreError::DeviceStateNotFound {
                     account_id,
                     device_id,
@@ -2591,21 +2594,11 @@ impl SqliteClientStore {
         room_id: &str,
         entry: &RoomLogEntry,
     ) -> Result<Option<AppliedLogEntry>, ClientStoreError> {
-        validate_room_id(room_id).map_err(ClientError::from)?;
-        if entry.room_id != room_id {
-            return Err(ClientError::LogEntryRoomMismatch {
-                expected: room_id.to_string(),
-                actual: entry.room_id.clone(),
-            }
-            .into());
+        let applied = apply_log_entry_in_memory(device, room_id, entry)?;
+        if applied.is_some() {
+            self.save_device_state(device)?;
         }
-        if entry.seq <= device.last_applied_seq(room_id)? {
-            return Ok(None);
-        }
-        let applied = device.apply_log_entry(room_id, entry)?;
-        device.set_last_applied_seq(room_id, entry.seq)?;
-        self.save_device_state(device)?;
-        Ok(Some(applied))
+        Ok(applied)
     }
 
     pub fn advance_room_cursor_and_save(
@@ -2618,29 +2611,57 @@ impl SqliteClientStore {
         self.save_device_state(device)
     }
 
-    fn connect(&self) -> Result<Connection, ClientStoreError> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
-            "#,
-        )?;
-        Ok(conn)
-    }
-
     fn with_transaction<T>(
         &mut self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, ClientStoreError>,
     ) -> Result<T, ClientStoreError> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
     }
+}
+
+/// Apply one ordered log entry to the in-memory device without persisting.
+///
+/// The sync workers apply a whole page in memory and save once per page;
+/// crash recovery replays at most one page, and the `seq <=
+/// last_applied_seq` guard makes that replay idempotent against whatever
+/// state was last saved.
+fn apply_log_entry_in_memory(
+    device: &mut FiniteChatDevice,
+    room_id: &str,
+    entry: &RoomLogEntry,
+) -> Result<Option<AppliedLogEntry>, ClientStoreError> {
+    validate_room_id(room_id).map_err(ClientError::from)?;
+    if entry.room_id != room_id {
+        return Err(ClientError::LogEntryRoomMismatch {
+            expected: room_id.to_string(),
+            actual: entry.room_id.clone(),
+        }
+        .into());
+    }
+    if entry.seq <= device.last_applied_seq(room_id)? {
+        return Ok(None);
+    }
+    let applied = device.apply_log_entry(room_id, entry)?;
+    device.set_last_applied_seq(room_id, entry.seq)?;
+    Ok(Some(applied))
+}
+
+fn open_client_store_connection(db_path: &Path) -> Result<Connection, ClientStoreError> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = FULL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+        "#,
+    )?;
+    Ok(conn)
 }
 
 pub trait RuntimeDelivery {
@@ -3495,9 +3516,12 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
             .into());
         }
 
+        let mut dirty = false;
         for entry in page.entries {
             let seq = entry.seq;
             if entry.message_id == prepared.message_id {
+                // The completion path persists the whole device state,
+                // including any entries applied in memory above.
                 if let Some(applied) = store.complete_link_fanout_room_from_log_and_save(
                     device, fanout_id, room_id, &entry,
                 )? {
@@ -3510,7 +3534,8 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
                 }
                 return Ok(());
             }
-            if let Some(applied) = store.apply_log_entry_and_save(device, room_id, &entry)? {
+            if let Some(applied) = apply_log_entry_in_memory(device, room_id, &entry)? {
+                dirty = true;
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.to_string(),
                     seq,
@@ -3520,7 +3545,13 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
         }
 
         if page.next_after_seq > device.last_applied_seq(room_id)? {
-            store.advance_room_cursor_and_save(device, room_id, page.next_after_seq)?;
+            device
+                .set_last_applied_seq(room_id, page.next_after_seq)
+                .map_err(ClientStoreError::from)?;
+            dirty = true;
+        }
+        if dirty {
+            store.save_device_state(device)?;
         }
         if !page.has_more {
             break;
@@ -3565,9 +3596,11 @@ fn sync_room_pages<D: RuntimeDelivery>(
             .into());
         }
 
+        let mut dirty = false;
         for entry in page.entries {
             let seq = entry.seq;
-            if let Some(applied) = store.apply_log_entry_and_save(device, &room_id, &entry)? {
+            if let Some(applied) = apply_log_entry_in_memory(device, &room_id, &entry)? {
+                dirty = true;
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.clone(),
                     seq,
@@ -3577,7 +3610,13 @@ fn sync_room_pages<D: RuntimeDelivery>(
         }
 
         if page.next_after_seq > device.last_applied_seq(&room_id)? {
-            store.advance_room_cursor_and_save(device, &room_id, page.next_after_seq)?;
+            device
+                .set_last_applied_seq(&room_id, page.next_after_seq)
+                .map_err(ClientStoreError::from)?;
+            dirty = true;
+        }
+        if dirty {
+            store.save_device_state(device)?;
         }
 
         if !page.has_more {
