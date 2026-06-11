@@ -889,14 +889,14 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &active_room_id,
             &active_mls_group_id,
             &bob,
             1,
             b"revoked-send",
             "revoked-send-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -3044,14 +3044,14 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             0,
             b"hidden",
             "app-before-bob-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3092,14 +3092,14 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &bob,
             1,
             b"pending-send",
             "bob-pending-send-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -3131,14 +3131,14 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let response = post_json(
         app,
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             1,
             b"visible",
             "app-after-bob-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3198,14 +3198,14 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &bob,
             1,
             b"activated-send",
             "bob-activated-send-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3411,14 +3411,14 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice_devices[1],
             1,
             b"phone active",
             "multi-device-phone-active",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3431,15 +3431,15 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
         let response = post_json(
             app.clone(),
             "/events",
-            &append_application_request(
+            &typed_event_request(&append_application_request(
                 &room_id,
                 &mls_group_id,
                 device,
                 1,
                 b"still pending",
                 idempotency_key,
-            ),
-        )
+            )),
+    )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let error: ErrorResponse = read_json(response).await;
@@ -3449,14 +3449,14 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &bob,
             1,
             b"bob after invite",
             "multi-device-bob-after-invite",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3499,14 +3499,14 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice_devices[0],
             1,
             b"browser active",
             "multi-device-browser-active",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3523,14 +3523,14 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
     let response = post_json(
         app,
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice_devices[2],
             1,
             b"tablet still pending",
             "multi-device-tablet-still-pending",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -3632,14 +3632,14 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             2,
             b"after removal",
             "alice-after-remove-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3649,14 +3649,14 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &bob,
             2,
             b"stale send",
             "bob-stale-send-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -3705,14 +3705,14 @@ async fn sqlite_removed_device_syncs_through_removal_and_cannot_send_over_http()
     let response = post_json(
         app,
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             2,
             b"blocked after repair",
             "alice-after-removal-repair-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -3745,14 +3745,14 @@ async fn sqlite_typed_event_rejects_oversized_payload_without_persisting_log() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             0,
             &oversized,
             "oversized-event-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -3828,29 +3828,29 @@ async fn sqlite_typed_event_duplicate_message_id_with_new_idempotency_key_confli
     };
     let message_id = first.envelope.message_id().expect("event message id");
 
-    let response = post_json(app.clone(), "/events", &first).await;
+    let response = post_json(app.clone(), "/events", &typed_event_request(&first)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let accepted: EventAccepted = read_json(response).await;
     assert_eq!(accepted.seq, 1);
     assert_eq!(accepted.message_id, message_id);
 
-    let response = post_json(app.clone(), "/events", &first).await;
+    let response = post_json(app.clone(), "/events", &typed_event_request(&first)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let replayed: EventAccepted = read_json(response).await;
     assert_eq!(replayed, accepted);
 
-    let response = post_json(app.clone(), "/events", &duplicate).await;
+    let response = post_json(app.clone(), "/events", &typed_event_request(&duplicate)).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "duplicate_message_id");
 
     let app = persistent_app(&db_path);
-    let response = post_json(app.clone(), "/events", &first).await;
+    let response = post_json(app.clone(), "/events", &typed_event_request(&first)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let replayed_after_restart: EventAccepted = read_json(response).await;
     assert_eq!(replayed_after_restart, accepted);
 
-    let response = post_json(app.clone(), "/events", &duplicate).await;
+    let response = post_json(app.clone(), "/events", &typed_event_request(&duplicate)).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "duplicate_message_id");
@@ -3923,7 +3923,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: chat.clone(),
             delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
@@ -3937,7 +3937,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: chat.clone(),
             delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
@@ -3950,7 +3950,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: command.clone(),
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
@@ -3964,7 +3964,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: receipt.clone(),
             delivery_policy: DurableAppEventKind::ChatReceipt.delivery_policy(),
@@ -4007,7 +4007,7 @@ async fn sqlite_application_delivery_effects_survive_restart_over_http() {
 
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: chat,
             delivery_policy: DurableAppEventKind::ChatReceipt.delivery_policy(),
@@ -4062,7 +4062,7 @@ async fn sqlite_application_delivery_policy_matrix_survives_restart_over_http() 
         );
         let response = post_json(
             app.clone(),
-            "/application-events",
+            "/events",
             &AppendApplicationEventRequest {
                 event: request,
                 delivery_policy: kind.delivery_policy(),
@@ -4153,7 +4153,7 @@ async fn sqlite_runtime_state_snapshot_projects_from_http_log_after_restart() {
     );
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: request,
             delivery_policy: DurableAppEventKind::RuntimeStateSnapshot.delivery_policy(),
@@ -4282,7 +4282,7 @@ async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_ov
     );
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: status_refresh,
             delivery_policy: status_refresh_policy,
@@ -4307,7 +4307,7 @@ async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_ov
         .expect("duplicate message id");
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: first_command.clone(),
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
@@ -4328,7 +4328,7 @@ async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_ov
     );
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: second_command,
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
@@ -4359,7 +4359,7 @@ async fn sqlite_runtime_command_policy_and_opaque_request_ids_survive_restart_ov
     let app = persistent_app(&db_path);
     let response = post_json(
         app.clone(),
-        "/application-events",
+        "/events",
         &AppendApplicationEventRequest {
             event: duplicate_command,
             delivery_policy: DurableAppEventKind::RuntimeCommandRequest.delivery_policy(),
@@ -4452,7 +4452,7 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
         let app = persistent_app(&db_path);
         let response = post_json(
             app,
-            "/application-events",
+            "/events",
             &AppendApplicationEventRequest {
                 event: request.clone(),
                 delivery_policy: policy,
@@ -4471,7 +4471,7 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
 
         let response = post_json(
             app.clone(),
-            "/application-events",
+            "/events",
             &AppendApplicationEventRequest {
                 event: request.clone(),
                 delivery_policy: policy,
@@ -4486,7 +4486,7 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
         let app = persistent_app(&db_path);
         let response = post_json(
             app.clone(),
-            "/application-events",
+            "/events",
             &AppendApplicationEventRequest {
                 event: request,
                 delivery_policy: policy,
@@ -4527,15 +4527,15 @@ async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
         let response = post_json(
             app.clone(),
             "/events",
-            &append_application_request(
+            &typed_event_request(&append_application_request(
                 &room_id,
                 &mls_group_id,
                 &alice,
                 0,
                 format!("small-{index}").as_bytes(),
                 &format!("bounded-event-{index}"),
-            ),
-        )
+            )),
+    )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let accepted: EventAccepted = read_json(response).await;
@@ -5245,14 +5245,14 @@ async fn sqlite_invalid_commit_report_blocks_typed_mutations_after_restart() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             1,
             b"blocked",
             "invalid-report-blocked-event",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -5443,14 +5443,14 @@ async fn sqlite_delayed_welcome_syncs_forward_from_commit_seq_over_http() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &alice,
             1,
             b"later-before-welcome-ack",
             "delayed-welcome-later-event",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -5735,14 +5735,14 @@ async fn sqlite_welcome_failed_ack_keeps_membership_inactive_after_restart() {
     let response = post_json(
         app.clone(),
         "/events",
-        &append_application_request(
+        &typed_event_request(&append_application_request(
             &room_id,
             &mls_group_id,
             &bob,
             1,
             b"failed-welcome-send",
             "failed-welcome-send-idempotency",
-        ),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -5856,11 +5856,13 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
                     format!(r#"{{"type":"chat.message","seed":{seed},"step":{step}}}"#).as_bytes(),
                     &format!("mixed-http-fuzz-raw-{seed}-{step}"),
                 );
-                let response = post_json(app, "/events", &request).await;
+                let response = post_json(app, "/events", &typed_event_request(&request)).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 let accepted: EventAccepted = read_json(response).await;
                 assert_eq!(accepted.seq, last_seq + 1);
                 last_seq = accepted.seq;
+                // Every fresh typed event now records delivery effects.
+                effectful_events += 1;
                 if first_raw_event.is_none() {
                     first_raw_event = Some((request, accepted));
                 }
@@ -5878,7 +5880,7 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
                 );
                 let response = post_json(
                     app.clone(),
-                    "/application-events",
+                    "/events",
                     &AppendApplicationEventRequest {
                         event: request,
                         delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
@@ -5981,7 +5983,8 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
             }
             _ => {
                 if let Some((request, accepted)) = &first_raw_event {
-                    let response = post_json(app, "/events", request).await;
+                    let response =
+                        post_json(app, "/events", &typed_event_request(request)).await;
                     assert_eq!(response.status(), StatusCode::OK);
                     let replayed: EventAccepted = read_json(response).await;
                     assert_eq!(&replayed, accepted);
@@ -6055,6 +6058,14 @@ impl HttpFuzzRng {
 
     fn next_bool(&mut self) -> bool {
         self.next_u64(2) == 0
+    }
+}
+
+
+fn typed_event_request(event: &AppendEventRequest) -> AppendApplicationEventRequest {
+    AppendApplicationEventRequest {
+        event: event.clone(),
+        delivery_policy: DurableAppEventKind::ChatMessage.delivery_policy(),
     }
 }
 

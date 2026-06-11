@@ -14,7 +14,7 @@ use finitechat_client::{
     run_runtime_sync_tick,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::CreateRoomRequest;
+use finitechat_proto::{CreateRoomRequest, DurableAppEventKind};
 use finitechat_server::{HttpServerState, http_router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -176,7 +176,7 @@ fn client_sync_tick_and_save_timings() {
         let request = bob
             .create_application_request(room_id, plaintext.as_bytes(), format!("perf_msg_{index}"))
             .unwrap();
-        server.append_event(&request).unwrap();
+        server.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     }
     println!(
         "populate: {MESSAGES} MLS messages in {:?} ({:?}/message avg)",

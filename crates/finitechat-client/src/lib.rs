@@ -5,7 +5,8 @@ use cgka_traits::{
     MessageId as HttpMessageId,
 };
 use finitechat_proto::{
-    AccountRoomRecord, AppendEventRequest, ClaimKeyPackageResult, CommitAccepted,
+    AccountRoomRecord, AppendApplicationEventRequest, AppendEventRequest,
+    ApplicationDeliveryPolicy, ClaimKeyPackageResult, CommitAccepted,
     CreateDirectRoomRequest, CreateRoomRequest, EngineError, EventAccepted,
     KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
     SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
@@ -2936,8 +2937,15 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
     pub fn append_event(
         &mut self,
         request: &AppendEventRequest,
+        delivery_policy: ApplicationDeliveryPolicy,
     ) -> Result<EventAccepted, HttpRuntimeDeliveryError<T::Error>> {
-        self.post_json("/events", request)
+        self.post_json(
+            "/events",
+            &AppendApplicationEventRequest {
+                event: request.clone(),
+                delivery_policy,
+            },
+        )
     }
 
     fn post_json<B, R>(

@@ -226,60 +226,6 @@ impl HttpServerState {
         Ok(receipt)
     }
 
-    fn publish_typed_event_message(
-        &self,
-        request: PublishMessageRequest,
-        message_id: &str,
-    ) -> Result<HttpPublishReceipt, ServerHttpError> {
-        let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return Err(ServerHttpError::InvalidIdempotencyKey);
-        };
-        if idempotency_key.is_empty() {
-            return Err(ServerHttpError::InvalidIdempotencyKey);
-        }
-
-        let fingerprint = PublishMessageFingerprint::from_request(&request);
-        let mut service = self.service.lock().expect("HTTP delivery service mutex");
-        let mut idempotency = self
-            .publish_idempotency
-            .lock()
-            .expect("HTTP publish idempotency mutex");
-        if let Some(record) = idempotency.get(&idempotency_key) {
-            if record.fingerprint == fingerprint {
-                return Ok(record.receipt.clone());
-            }
-            return Err(ServerHttpError::IdempotencyConflict { idempotency_key });
-        }
-
-        let typed_message_id = MessageId::new(message_id.as_bytes().to_vec());
-        let receipt = match service.check_publish(&request.target, &request.message) {
-            Ok(HttpPublishCheck::Fresh(receipt)) => receipt,
-            Ok(HttpPublishCheck::DuplicateReplay(_))
-            | Err(HttpServerError::ConflictingMessageId { .. }) => {
-                return Err(ServerHttpError::DuplicateMessageId {
-                    message_id: typed_message_id,
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let operation = PersistedOperation::PublishMessage {
-            target: request.target.clone(),
-            message: request.message.clone(),
-            idempotency_key: Some(idempotency_key.clone()),
-        };
-        let record = PublishIdempotencyRecord {
-            fingerprint,
-            receipt: receipt.clone(),
-        };
-        if let Some(store) = &self.store {
-            store.append_publish_mutation(Some(&operation), Some((&idempotency_key, &record)))?;
-        }
-        let published = service.publish(request.target, request.message)?;
-        debug_assert_eq!(published, receipt);
-        idempotency.insert(idempotency_key, record);
-        Ok(receipt)
-    }
 
     fn validate_raw_commit_import(
         &self,
@@ -1876,25 +1822,6 @@ impl HttpServerState {
         Ok(())
     }
 
-    fn append_event(&self, request: AppendEventRequest) -> Result<EventAccepted, ServerHttpError> {
-        validate_append_event_request(&request)?;
-        self.ensure_device_not_revoked(&request.sender)?;
-        let message_id = request.envelope.message_id().map_err(|error| {
-            ServerHttpError::InvalidEventRequest {
-                reason: error.to_string(),
-            }
-        })?;
-        self.validate_event_room_membership(&request)?;
-
-        let event_publish = event_publish_request(&request, &message_id)?;
-        let receipt = self.publish_typed_event_message(event_publish, &message_id)?;
-        self.record_room_event_acceptance(&request.room_id, receipt.seq)?;
-        Ok(EventAccepted {
-            seq: receipt.seq,
-            message_id,
-        })
-    }
-
     fn append_application_event(
         &self,
         request: AppendApplicationEventRequest,
@@ -1902,7 +1829,7 @@ impl HttpServerState {
         validate_append_event_request(&request.event)?;
         if request.event.envelope.kind != LogEntryKind::Application {
             return Err(ServerHttpError::InvalidEventRequest {
-                reason: "application-event route only accepts application envelopes".to_owned(),
+                reason: "/events accepts only application envelopes".to_owned(),
             });
         }
         self.ensure_device_not_revoked(&request.event.sender)?;
@@ -2150,26 +2077,6 @@ impl HttpServerState {
         })
     }
 
-    fn record_room_event_acceptance(
-        &self,
-        room_id: &str,
-        accepted_seq: HttpSequence,
-    ) -> Result<(), ServerHttpError> {
-        let mut rooms = self
-            .room_memberships
-            .lock()
-            .expect("HTTP room-membership mutex");
-        let Some(projection) = apply_room_event_acceptance(&mut rooms, room_id, accepted_seq)
-        else {
-            return Ok(());
-        };
-        drop(rooms);
-
-        if let Some(store) = &self.store {
-            store.upsert_room_membership(&projection)?;
-        }
-        Ok(())
-    }
 
     fn claim_welcomes(
         &self,
@@ -2433,8 +2340,7 @@ pub fn http_router(state: HttpServerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/messages", post(publish_message))
-        .route("/events", post(append_event))
-        .route("/application-events", post(append_application_event))
+        .route("/events", post(append_application_event))
         .route("/application-effects/get", post(get_application_effect))
         .route(
             "/application-effects/counts",
@@ -2492,12 +2398,6 @@ async fn publish_message(
     Ok(Json(receipt))
 }
 
-async fn append_event(
-    State(state): State<HttpServerState>,
-    Json(request): Json<AppendEventRequest>,
-) -> Result<Json<EventAccepted>, ServerHttpError> {
-    Ok(Json(state.append_event(request)?))
-}
 
 async fn append_application_event(
     State(state): State<HttpServerState>,
@@ -3839,8 +3739,9 @@ fn check_typed_event_publish(
     ))
 }
 
-/// Read-only form of [`apply_room_event_acceptance`]: returns the updated
-/// projection to persist and later insert, without touching the map.
+/// Compute the room-membership `last_seq` advance for an accepted typed
+/// event: returns the updated projection to persist and later insert,
+/// without touching the map.
 fn check_room_event_acceptance(
     rooms: &BTreeMap<String, HttpRoomMembershipProjection>,
     room_id: &str,
@@ -3874,18 +3775,6 @@ fn check_application_delivery_effect(
     Ok(Some(effect))
 }
 
-fn apply_room_event_acceptance(
-    rooms: &mut BTreeMap<String, HttpRoomMembershipProjection>,
-    room_id: &str,
-    accepted_seq: HttpSequence,
-) -> Option<HttpRoomMembershipProjection> {
-    let projection = rooms.get_mut(room_id)?;
-    if projection.last_seq >= accepted_seq {
-        return None;
-    }
-    projection.last_seq = accepted_seq;
-    Some(projection.clone())
-}
 
 fn apply_account_room_membership_delta(
     directory: &mut BTreeMap<String, BTreeMap<String, Value>>,

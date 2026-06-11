@@ -9,6 +9,7 @@ use finitechat_client::{
     SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick, run_runtime_sync_tick,
 };
 use finitechat_proto::{
+    DurableAppEventKind,
     AppendEventRequest, CreateRoomRequest,
     EventAccepted, ListAccountRoomsRequest,
     RoomSyncProjection,
@@ -274,7 +275,7 @@ fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
     let message = bob
         .create_application_request(ROOM_ID, plaintext, "app_http_live_room_sync")
         .unwrap();
-    let message_accepted = delivery.append_event(&message).unwrap();
+    let message_accepted = delivery.append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(message_accepted.seq, add_accepted_seq + 1);
 
     let report =
@@ -394,7 +395,7 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
     let message = bob
         .create_application_request(ROOM_ID, plaintext, "app_http_room_sync")
         .unwrap();
-    let message_accepted = delivery.append_event(&message).unwrap();
+    let message_accepted = delivery.append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(message_accepted.seq, add_accepted_seq + 1);
 
     let report =
@@ -549,7 +550,7 @@ fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
                     format!(r#"{{"body":"message {index}"}}"#).into_bytes(),
                 ),
                 idempotency_key,
-            })
+            }, DurableAppEventKind::ChatMessage.delivery_policy())
             .unwrap();
     }
 
@@ -681,7 +682,7 @@ fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
             "alice_after_http_pending_observation",
         )
         .unwrap();
-    let accepted_event = delivery.append_event(&request).unwrap();
+    let accepted_event = delivery.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(accepted_event.seq, 2);
 }
 
@@ -710,7 +711,7 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
     let prior = bob
         .create_application_request(room_id, prior_plaintext, "history_http_before_invite")
         .unwrap();
-    let prior = delivery.append_event(&prior).unwrap();
+    let prior = delivery.append_event(&prior, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(prior.seq, 1);
 
     phone_store.save_device_state(&alice_phone).unwrap();
@@ -747,7 +748,7 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
     let post = bob
         .create_application_request(room_id, post_plaintext, "history_http_after_invite")
         .unwrap();
-    let post = delivery.append_event(&post).unwrap();
+    let post = delivery.append_event(&post, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(post.seq, 3);
 
     let report = run_runtime_sync_tick(
@@ -881,7 +882,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     let stale_old_epoch_send = stale_charlie
         .create_application_request(room_id, b"stale", "charlie_removed_old_epoch_http")
         .unwrap();
-    let err = delivery.append_event(&stale_old_epoch_send).unwrap_err();
+    let err = delivery.append_event(&stale_old_epoch_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -916,7 +917,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
         ),
         idempotency_key: "charlie_removed_new_epoch_http".to_owned(),
     };
-    let err = delivery.append_event(&forged_new_epoch_send).unwrap_err();
+    let err = delivery.append_event(&forged_new_epoch_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -931,7 +932,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     let post_removal = bob
         .create_application_request(room_id, plaintext, "bob_after_http_remove")
         .unwrap();
-    let post_removal = delivery.append_event(&post_removal).unwrap();
+    let post_removal = delivery.append_event(&post_removal, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(post_removal.seq, 3);
     let bob_post_page = delivery
         .sync_events(room_id, bob.device_ref(), remove_acceptance.seq)
@@ -970,7 +971,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let before_invite = bob
         .create_application_request(room_id, b"before invite", "bob_before_http_filter")
         .unwrap();
-    let before_invite = delivery.append_event(&before_invite).unwrap();
+    let before_invite = delivery.append_event(&before_invite, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(before_invite.seq, 1);
 
     let alice_hidden = delivery
@@ -1019,7 +1020,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
         ),
         idempotency_key: "alice_pending_http_filter".to_owned(),
     };
-    let err = delivery.append_event(&pending_send).unwrap_err();
+    let err = delivery.append_event(&pending_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -1055,7 +1056,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
             "alice_after_http_filter_activation",
         )
         .unwrap();
-    let after_activation = delivery.append_event(&after_activation).unwrap();
+    let after_activation = delivery.append_event(&after_activation, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
     assert_eq!(after_activation.seq, 3);
 
     let bob_after = delivery
@@ -2423,7 +2424,7 @@ fn send_bob_messages<T: HttpRuntimeTransport>(
                 format!("bob_msg_{scenario_index}_{}", *next_message_index),
             )
             .unwrap();
-        let accepted = delivery.append_event(&request).unwrap();
+        let accepted = delivery.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
         assert_application_acceptance(&accepted, sent_plaintexts);
         sent_plaintexts.push(SentPlaintext {
             seq: accepted.seq,
