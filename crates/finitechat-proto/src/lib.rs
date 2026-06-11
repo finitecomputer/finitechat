@@ -305,6 +305,12 @@ pub enum DurableAppEventKind {
     RuntimeCommandRequest,
     RuntimeCommandResult,
     RuntimeCommandCancel,
+    /// Durable anchor for a live agent token stream (ADR 0003 §6,
+    /// reservation only). Transient deltas never enter the ordered log.
+    StreamStart,
+    /// Durable close of a stream; the payload carries the transcript hash
+    /// the streamed deltas must verify against.
+    StreamFinish,
     Namespaced {
         name: String,
         policy: ApplicationDeliveryPolicy,
@@ -322,7 +328,11 @@ impl DurableAppEventKind {
             | Self::ChatReaction
             | Self::ChatReceipt
             | Self::RuntimeStateSnapshot
-            | Self::RuntimeCommandCancel => ApplicationDeliveryPolicy::NON_NOTIFYING,
+            | Self::RuntimeCommandCancel
+            | Self::StreamStart => ApplicationDeliveryPolicy::NON_NOTIFYING,
+            // The finish is the user-visible artifact of a stream: it is the
+            // message that gets pushed, not the transient deltas.
+            Self::StreamFinish => ApplicationDeliveryPolicy::USER_VISIBLE_MESSAGE,
             Self::ConversationCreate | Self::ConversationUpdate | Self::ConversationArchive => {
                 ApplicationDeliveryPolicy::NON_NOTIFYING
             }
@@ -341,6 +351,34 @@ impl DurableAppEventKind {
         Ok(())
     }
 }
+
+/// Reserved stream-lane anchors (ADR 0003 §6). A stream is pinned to the
+/// room epoch at `StreamStartV1`; a membership change mid-stream aborts the
+/// stream. The transient delta transport (SSE keyed by room + conversation,
+/// replay TTL <= 300 s) is future work — only these durable kinds and the
+/// deltas-never-in-the-ordered-log rule are frozen now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamStartV1 {
+    pub stream_id: String,
+    pub conversation_id: ConversationId,
+    /// Room epoch the stream is pinned to.
+    pub epoch: Epoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFinishV1 {
+    pub stream_id: String,
+    pub conversation_id: ConversationId,
+    /// Hash binding the durable final payload to the transient deltas that
+    /// streamed; algorithm is deliberately opaque bytes at this layer.
+    #[serde(with = "bytes_as_vec")]
+    pub transcript_hash: Vec<u8>,
+    /// The complete final text/content, so a client that missed the stream
+    /// renders the same message as one that watched it.
+    #[serde(with = "bytes_as_vec")]
+    pub final_payload: Vec<u8>,
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecryptedApplicationEventV1 {
@@ -1337,6 +1375,8 @@ impl ConversationProjection {
             | DurableAppEventKind::RuntimeCommandRequest
             | DurableAppEventKind::RuntimeCommandResult
             | DurableAppEventKind::RuntimeCommandCancel
+            | DurableAppEventKind::StreamStart
+            | DurableAppEventKind::StreamFinish
             | DurableAppEventKind::Namespaced { .. } => Ok(ConversationProjectionDecision::Ignored),
         }
     }
@@ -5438,6 +5478,28 @@ mod tests {
             payload: payload.to_vec(),
         }
     }
+
+    #[test]
+    fn stream_kinds_have_reserved_policies_and_round_trip() {
+        assert_eq!(
+            DurableAppEventKind::StreamStart.delivery_policy(),
+            ApplicationDeliveryPolicy::NON_NOTIFYING
+        );
+        assert_eq!(
+            DurableAppEventKind::StreamFinish.delivery_policy(),
+            ApplicationDeliveryPolicy::USER_VISIBLE_MESSAGE
+        );
+        let finish = StreamFinishV1 {
+            stream_id: "stream-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            transcript_hash: vec![0xAA; 32],
+            final_payload: b"final text".to_vec(),
+        };
+        let decoded: StreamFinishV1 =
+            serde_json::from_slice(&serde_json::to_vec(&finish).unwrap()).unwrap();
+        assert_eq!(decoded, finish);
+    }
+
 }
 mod runtime;
 pub use runtime::*;
