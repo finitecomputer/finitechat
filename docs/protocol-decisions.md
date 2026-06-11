@@ -1,6 +1,8 @@
 # Protocol Decision Queue
 
-Date: 2026-06-11. Status: **all seven proposed — awaiting review.**
+Date: 2026-06-11. Status: **all seven ACCEPTED 2026-06-11** — recorded in
+`docs/adr/0003-protocol-v1-hardening-decisions.md`. Chosen options inline
+below.
 
 Source analysis: `docs/feature-audit-marmot-pika.md` §1 (what Marmot and Pika
 thought of that we hadn't) and §5 (ordering rationale). This document turns
@@ -44,10 +46,10 @@ hard way (`min_version` / `update_required` after a breaking format change).
 control both ends until external clients exist, and the slots above are what
 make later negotiation possible.
 
-**Open question for review.** Should `required_capabilities` be per-room (a
-room created with feature X excludes clients without X) or server-global? The
-proposal includes both slots; the per-room one is the more Marmot-shaped and
-the one I'd keep if you want only one.
+**DECIDED: per-room.** Vertically integrated service, but clients take
+different forms (CLI, Electron, native iOS) and may support different
+features; rollout coordination is the real driver. Don't overengineer; copy
+Marmot's shapes where they serve us.
 
 ## 2. Admin authority for group rooms
 
@@ -75,10 +77,8 @@ leaves); Pika shipped a binary per-member admin flag.
 account/device model — authority is an account property; devices come and go
 via linking.
 
-**Open questions for review.** (a) Can an admin revoke another admin? Proposal
-says yes, except the last one. (b) Should group rooms have an "anyone may
-invite" toggle? Proposal says no for v1 — fewer states to test; revisit on
-demand.
+**DECIDED: admins yes; no anyone-may-invite toggle for v1.** Admins may
+revoke other admins, never the last one.
 
 ## 3. Leaving a group
 
@@ -105,9 +105,8 @@ first): leaves the departing user hostage to other members' availability, and
 "I left but I'm still in the group" is a product failure even if it's
 cryptographically honest.
 
-**Open question for review.** Per-device leave vs whole-account leave. The
-proposal is whole-account (leaving a room is an account-level act; removing
-one device is the *unlink* flow, which is separate work). Confirm.
+**DECIDED: whole-account leave.** Per-device removal is the unlink flow,
+separate work.
 
 ## 4. Retention field + below-horizon sync semantics
 
@@ -129,11 +128,10 @@ durable ordered log currently keeps everything forever, every client assumes
   only affects pre-existing devices syncing very old cursors.
 - Client-side deletion of expired plaintext is client policy, not protocol.
 
-**Open question for review.** Whether expired-by-retention entries are
-*server-deleted* (privacy-strong, history gone) or merely *client-hidden*
-(server keeps ciphertext until compaction). Proposal: server-deleted at
-compaction time — it is the only version that means anything against a
-subpoena, and our server-authoritative design can actually deliver it.
+**DECIDED: server-deleted.** Also a standing design directive recorded
+here: full-history replay must be a rare recovery action, not a day-to-day
+mechanism — this raises the priority of the Phase E snapshot/horizon work
+(today the server replays the whole op log on every startup).
 
 ## 5. Push notification wake contract
 
@@ -155,11 +153,10 @@ Extension decrypts on-device and renders rich previews.
 - The pusher daemon consumes the delivery-effect projection (it already
   records per-message push counts) — no new protocol surface.
 
-**Open question for review.** Badge counts: server-computed (the unread
-projection already exists) and included in the APNs payload, or NSE-computed?
-Proposal: server-computed badge integer in the platform envelope (not in our
-wake payload), since the projection is already there and NSE-computed badges
-are notoriously flaky.
+**DECIDED: client/NSE-computed badges; no server badge tracking.** Erring
+on the side of protocol simplicity: the wake payload stays exactly
+`{room_id, seq}` and the server takes on no additional per-device read-state
+beyond the existing delivery-effect counts.
 
 ## 6. Agent stream lane reservation
 
@@ -182,10 +179,8 @@ to one MLS epoch; broker replay window for reconnects.
   replay TTL ≤ 300 s — our server-ordered architecture makes the broker
   trivial compared to their QUIC mesh; QUIC remains an option later.
 
-**Open question for review.** None blocking — this is a reservation. Flagging
-only that `transcript_hash` algorithm choice (plain SHA-256 over
-length-prefixed deltas vs Marmot's AAD-bound scheme) can be deferred to
-implementation since the field is opaque bytes.
+**DECIDED: reserve, don't build.** Transcript-hash algorithm deferred to
+implementation (opaque bytes on the wire).
 
 ## 7. Recovery and credential rotation (documentation blessing)
 
@@ -202,20 +197,18 @@ have the machinery; it has just never been named as the recovery path.
   pending-removal, recoverable by relink.
 - Write as a short ADR once accepted.
 
-**Open question for review.** Should credential lifetimes stay short (current
-test fixtures use minutes; production needs a real number)? Proposal: 90-day
-credentials with renewal nudges from 30 days out.
+**DECIDED: 90-day credentials, renewal nudges from 30 days out.**
 
 ---
 
 ## Review checklist
 
-| # | Decision | Blocking for | Needs from you |
+| # | Decision | Blocking for | Outcome |
 | - | --- | --- | --- |
-| 1 | Versioning slots | any external client | per-room vs global caps |
-| 2 | Admin authority | any external client | demote rule, invite toggle |
-| 3 | Leave-group | first real users | whole-account vs per-device |
-| 4 | Retention/horizon | Phase E compaction | server-delete vs hide |
-| 5 | Push wake contract | mobile clients | badge computation side |
-| 6 | Stream lane | agent streaming | none (reservation) |
-| 7 | Recovery blessing | docs only | credential lifetime |
+| 1 | Versioning slots | any external client | accepted; per-room capabilities |
+| 2 | Admin authority | any external client | accepted; no invite toggle |
+| 3 | Leave-group | first real users | accepted; whole-account |
+| 4 | Retention/horizon | Phase E compaction | accepted; server-deleted |
+| 5 | Push wake contract | mobile clients | accepted; client-computed badges |
+| 6 | Stream lane | agent streaming | accepted; reservation only |
+| 7 | Recovery blessing | docs only | accepted; 90-day credentials |
