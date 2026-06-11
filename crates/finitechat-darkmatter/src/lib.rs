@@ -41,9 +41,9 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             evidence: "Darkmatter http_delivery_compatibility test carries real Marmot invite and app messages through the service core",
         },
         PortFinding {
-            area: "marmot_engine_over_http_routes",
+            area: "typed_only_product_surface",
             status: PortStatus::WorksOutOfBox,
-            evidence: "finitechat-server route tests carry real Marmot Welcome, invite Commit, and app messages through Axum HTTP handlers",
+            evidence: "the raw /messages route and Marmot-engine interop test were removed per ADR 0004; typed rooms speak only typed routes, and the upstream contract is proven at the state level by the conformance suite",
         },
         PortFinding {
             area: "application_policy_projection",
@@ -68,7 +68,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_publish_idempotency_replay",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server replays stored /messages receipts for matching idempotency keys and rejects conflicting retries",
+            evidence: "finitechat-server replays stored publish receipts for matching idempotency keys and rejects conflicting retries (state-level; the raw route is removed)",
         },
         PortFinding {
             area: "http_welcome_claim_ack_recovery",

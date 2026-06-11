@@ -32,6 +32,30 @@ def _free_local_addr() -> str:
     return f"{host}:{port}"
 
 
+def _typed_event(payload: str) -> dict:
+    sender = {"account_id": "alice", "device_id": "alice-laptop"}
+    return {
+        "event": {
+            "room_id": "process-room",
+            "sender": sender,
+            "envelope": {
+                "room_id": "process-room",
+                "mls_group_id": "process-mls",
+                "epoch": 0,
+                "sender": sender,
+                "kind": "application",
+                "payload": list(payload.encode("utf-8")),
+            },
+            "idempotency_key": "process-idempotency",
+        },
+        "delivery_policy": {
+            "push": "default",
+            "unread": "default",
+            "command_inbox": "never",
+        },
+    }
+
+
 class ProcessBinarySmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -47,7 +71,7 @@ class ProcessBinarySmokeTests(unittest.TestCase):
         cls.server_bin = _binary_path("finitechat-darkmatter-server")
         cls.cli_bin = _binary_path("finitechat-darkmatter")
 
-    def test_server_and_cli_binaries_publish_replay_restart_and_sync(self):
+    def test_server_and_cli_binaries_typed_event_replay_restart_and_sync(self):
         with tempfile.TemporaryDirectory() as temp:
             db_path = Path(temp) / "process-smoke.sqlite3"
             addr = _free_local_addr()
@@ -58,25 +82,28 @@ class ProcessBinarySmokeTests(unittest.TestCase):
                 health = self._cli_json(server_url, "health")
                 self.assertEqual(health["status"], "ok")
 
-                published = self._cli_json(
+                bootstrap = self._cli_json(
                     server_url,
-                    "publish-group",
-                    "--group-id",
+                    "account-room-bootstrap",
+                    "--room-id",
                     "process-room",
-                    "--transport-group-id",
-                    "process-transport",
-                    "--message-id",
-                    "process-message-1",
-                    "--payload",
-                    "commit-bytes",
-                    "--commit-epoch",
-                    "1",
-                    "--idempotency-key",
-                    "process-idempotency",
+                    "--mls-group-id",
+                    "process-mls",
+                    "--account-id",
+                    "alice",
+                    "--device-id",
+                    "alice-laptop",
                 )
-                self.assertEqual(published["plane"], "Group")
-                self.assertEqual(published["seq"], 1)
-                self.assertFalse(published["duplicate"])
+                self.assertTrue(bootstrap["bootstrapped"])
+
+                event_request = json.dumps(_typed_event("smoke-payload"))
+                accepted = self._cli_json(
+                    server_url,
+                    "append-event",
+                    "--request-json",
+                    event_request,
+                )
+                self.assertEqual(accepted["seq"], 1)
 
                 server = self._restart_server(server, addr, db_path)
                 self._wait_for_health(server, server_url)
@@ -92,41 +119,21 @@ class ProcessBinarySmokeTests(unittest.TestCase):
                 self.assertEqual(page["next_after_seq"], 1)
                 self.assertEqual(len(page["entries"]), 1)
                 self.assertEqual(page["entries"][0]["seq"], 1)
-                self.assertEqual(page["entries"][0]["message"]["payload"], list(b"commit-bytes"))
 
                 replayed = self._cli_json(
                     server_url,
-                    "publish-group",
-                    "--group-id",
-                    "process-room",
-                    "--transport-group-id",
-                    "process-transport",
-                    "--message-id",
-                    "process-message-1",
-                    "--payload",
-                    "commit-bytes",
-                    "--commit-epoch",
-                    "1",
-                    "--idempotency-key",
-                    "process-idempotency",
+                    "append-event",
+                    "--request-json",
+                    event_request,
                 )
-                self.assertEqual(replayed, published)
+                self.assertEqual(replayed, accepted)
 
+                conflict_request = json.dumps(_typed_event("different-payload"))
                 conflict = self._cli(
                     server_url,
-                    "publish-group",
-                    "--group-id",
-                    "process-room",
-                    "--transport-group-id",
-                    "process-transport",
-                    "--message-id",
-                    "process-message-conflict",
-                    "--payload",
-                    "different-commit",
-                    "--commit-epoch",
-                    "2",
-                    "--idempotency-key",
-                    "process-idempotency",
+                    "append-event",
+                    "--request-json",
+                    conflict_request,
                     check=False,
                 )
                 self.assertEqual(conflict.returncode, 1)

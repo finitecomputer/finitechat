@@ -1,8 +1,7 @@
 use std::io::Write;
 
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use cgka_traits::{GroupId, MemberId, MessageId};
 use finitechat_http::{
     AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
     BootstrapAccountRoomRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
@@ -11,7 +10,7 @@ use finitechat_http::{
     GetDeviceLivenessRequest, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
     HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
     ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    ObserveDeviceLivenessRequest, PublishMessageRequest, ReleaseLinkClaimRequest,
+    ObserveDeviceLivenessRequest, ReleaseLinkClaimRequest,
     ReportInvalidCommitRequest, RevokeDeviceRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
     UploadLinkPayloadRequest,
 };
@@ -20,8 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpCommitAdmission, HttpKeyPackageId, HttpKeyPackagePublication,
-    HttpPublishTarget,
+    HttpKeyPackageId, HttpKeyPackagePublication,
 };
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
@@ -123,8 +121,6 @@ where
                 json: None,
             })
         }
-        "publish-group" => publish_group_request(&server, args),
-        "publish-inbox" => publish_inbox_request(&server, args),
         "submit-commit" => submit_commit_request(&server, args),
         "append-event" => append_event_request(&server, args),
         "application-effect-get" => application_effect_get_request(&server, args),
@@ -162,69 +158,7 @@ where
     }
 }
 
-fn publish_group_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let group_id = required_option(&mut args, "--group-id")?;
-    let transport_group_id = required_option(&mut args, "--transport-group-id")?;
-    let message_id = required_option(&mut args, "--message-id")?;
-    let payload = required_option(&mut args, "--payload")?;
-    let idempotency_key = take_option(&mut args, "--idempotency-key")?;
-    let commit_epoch = take_option(&mut args, "--commit-epoch")?
-        .map(|epoch| parse_u64("--commit-epoch", &epoch))
-        .transpose()?;
-    reject_extra_args(&args)?;
 
-    let transport_group_id = transport_group_id.into_bytes();
-    let request = PublishMessageRequest {
-        target: HttpPublishTarget::Group {
-            group_id: GroupId::new(group_id.into_bytes()),
-            transport_group_id: transport_group_id.clone(),
-            commit_admission: commit_epoch.map(|source_epoch| HttpCommitAdmission {
-                source_epoch: EpochId(source_epoch),
-            }),
-        },
-        message: TransportMessage {
-            id: MessageId::new(message_id.into_bytes()),
-            payload: payload.into_bytes(),
-            timestamp: Timestamp(0),
-            causal_deps: Vec::new(),
-            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-            envelope: TransportEnvelope::GroupMessage { transport_group_id },
-        },
-        idempotency_key,
-    };
-    post_json_request(server, "/messages", &request)
-}
-
-fn publish_inbox_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let recipient = required_option(&mut args, "--recipient")?;
-    let message_id = required_option(&mut args, "--message-id")?;
-    let payload = required_option(&mut args, "--payload")?;
-    let idempotency_key = take_option(&mut args, "--idempotency-key")?;
-    reject_extra_args(&args)?;
-
-    let recipient = MemberId::new(recipient.into_bytes());
-    let request = PublishMessageRequest {
-        target: HttpPublishTarget::Inbox {
-            recipient: recipient.clone(),
-        },
-        message: TransportMessage {
-            id: MessageId::new(message_id.into_bytes()),
-            payload: payload.into_bytes(),
-            timestamp: Timestamp(0),
-            causal_deps: Vec::new(),
-            source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-            envelope: TransportEnvelope::Welcome { recipient },
-        },
-        idempotency_key,
-    };
-    post_json_request(server, "/messages", &request)
-}
 
 fn submit_commit_request(server: &str, args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
     request_json_passthrough(server, "/commits", args)
@@ -871,7 +805,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] publish-group --group-id ID --transport-group-id ID --message-id ID --payload BYTES [--commit-epoch N] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] publish-inbox --recipient ID --message-id ID --payload BYTES [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] direct-room-create-or-get --room-id ID --mls-group-id ID --account-id ID --device-id ID --other-account-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 #[cfg(test)]
@@ -888,7 +822,7 @@ mod tests {
         GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
         HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-        ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest,
+        ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
         ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
         SaveAccountRoomRequest, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
     };
@@ -896,53 +830,8 @@ mod tests {
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
         WelcomeState,
     };
-    use transport_http_server::{HttpDeliveryPlane, HttpPublishReceipt, HttpSyncPage};
+    use transport_http_server::HttpSyncPage;
 
-    #[test]
-    fn publish_group_command_builds_route_dto() {
-        let request = prepare_http_request([
-            "--server",
-            "http://localhost:9000/",
-            "publish-group",
-            "--group-id",
-            "room-a",
-            "--transport-group-id",
-            "transport-a",
-            "--message-id",
-            "commit-a",
-            "--payload",
-            "commit-bytes",
-            "--commit-epoch",
-            "4",
-            "--idempotency-key",
-            "idem-commit-a",
-        ])
-        .expect("prepared request");
-
-        assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://localhost:9000/messages");
-        let body: PublishMessageRequest =
-            serde_json::from_value(request.json.expect("json")).expect("message request");
-        match body.target {
-            HttpPublishTarget::Group {
-                group_id,
-                transport_group_id,
-                commit_admission,
-            } => {
-                assert_eq!(group_id.as_slice(), b"room-a");
-                assert_eq!(transport_group_id, b"transport-a");
-                assert_eq!(
-                    commit_admission.map(|admission| admission.source_epoch),
-                    Some(EpochId(4))
-                );
-            }
-            HttpPublishTarget::Inbox { .. } => panic!("expected group target"),
-        }
-        assert_eq!(body.message.id.as_slice(), b"commit-a");
-        assert_eq!(body.message.payload, b"commit-bytes");
-        assert_eq!(body.message.source.0, HTTP_SERVER_SOURCE);
-        assert_eq!(body.idempotency_key.as_deref(), Some("idem-commit-a"));
-    }
 
     #[test]
     fn sync_group_command_defaults_cursor_and_limit() {
@@ -985,29 +874,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn publish_inbox_command_builds_welcome_envelope() {
-        let request = prepare_http_request([
-            "publish-inbox",
-            "--recipient",
-            "bob-device",
-            "--message-id",
-            "welcome-bob",
-            "--payload",
-            "welcome-bytes",
-        ])
-        .expect("prepared request");
-
-        let body: PublishMessageRequest =
-            serde_json::from_value(request.json.expect("json")).expect("message request");
-        assert!(matches!(body.target, HttpPublishTarget::Inbox { .. }));
-        match body.message.envelope {
-            TransportEnvelope::Welcome { recipient } => {
-                assert_eq!(recipient.as_slice(), b"bob-device");
-            }
-            TransportEnvelope::GroupMessage { .. } => panic!("expected Welcome envelope"),
-        }
-    }
 
     #[test]
     fn submit_commit_command_posts_request_json() {
@@ -1695,109 +1561,6 @@ mod tests {
         assert_eq!(listed["rooms"][0]["devices"][1]["active"], true);
     }
 
-    #[test]
-    fn live_cli_publish_sync_and_idempotency_conflict_over_http_server() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let server_db = dir.path().join("cli-live-publish.sqlite3");
-        let server_url = spawn_live_cli_server(&server_db);
-        let group_id = "cli-live-room";
-        let transport_group_id = "cli-live-transport";
-        let message_id = "cli-live-commit-1";
-        let idempotency_key = "cli-live-idempotency";
-
-        let health = run_cli_json(["http", "--server", &server_url, "health"]);
-        assert_eq!(health["status"], "ok");
-
-        let published: HttpPublishReceipt = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "publish-group",
-            "--group-id",
-            group_id,
-            "--transport-group-id",
-            transport_group_id,
-            "--message-id",
-            message_id,
-            "--payload",
-            "commit-bytes",
-            "--commit-epoch",
-            "1",
-            "--idempotency-key",
-            idempotency_key,
-        ]))
-        .expect("publish receipt");
-        assert_eq!(published.message_id.as_slice(), message_id.as_bytes());
-        assert_eq!(published.plane, HttpDeliveryPlane::Group);
-        assert_eq!(published.seq, 1);
-        assert!(!published.duplicate);
-
-        let replayed: HttpPublishReceipt = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "publish-group",
-            "--group-id",
-            group_id,
-            "--transport-group-id",
-            transport_group_id,
-            "--message-id",
-            message_id,
-            "--payload",
-            "commit-bytes",
-            "--commit-epoch",
-            "1",
-            "--idempotency-key",
-            idempotency_key,
-        ]))
-        .expect("replayed publish receipt");
-        assert_eq!(replayed, published);
-
-        let page: HttpSyncPage = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "sync-group",
-            "--group-id",
-            group_id,
-            "--limit",
-            "10",
-        ]))
-        .expect("group page");
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].seq, published.seq);
-        assert_eq!(page.entries[0].message.payload, b"commit-bytes");
-
-        let conflict = run(
-            [
-                "http",
-                "--server",
-                &server_url,
-                "publish-group",
-                "--group-id",
-                group_id,
-                "--transport-group-id",
-                transport_group_id,
-                "--message-id",
-                "cli-live-commit-conflict",
-                "--payload",
-                "different-commit",
-                "--commit-epoch",
-                "2",
-                "--idempotency-key",
-                idempotency_key,
-            ],
-            &mut Vec::new(),
-        )
-        .expect_err("conflicting idempotency key fails");
-        assert!(matches!(
-            conflict,
-            CliError::Server {
-                status: reqwest::StatusCode::CONFLICT,
-                ..
-            }
-        ));
-    }
 
     #[test]
     fn live_cli_batch_key_package_claim_replays_over_http_server() {

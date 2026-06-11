@@ -24,6 +24,5 @@ tokio.workspace = true
 transport-http-server.workspace = true
 
 [dev-dependencies]
-cgka-conformance-simulator.workspace = true
 tempfile.workspace = true
 tower.workspace = true

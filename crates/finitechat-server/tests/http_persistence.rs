@@ -39,7 +39,7 @@ use finitechat_proto::{
     RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
     StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
-use finitechat_server::{HttpServerState, http_router};
+use finitechat_server::{HttpServerState, ServerHttpError, http_router};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,64 +51,6 @@ use transport_http_server::{
     HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
-#[tokio::test]
-async fn sqlite_log_rebuilds_group_queue_and_duplicate_index_after_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let group_id = group_id("durable-group");
-    let transport_group_id = b"durable-transport".to_vec();
-    let first = PublishMessageRequest {
-        target: group_target(
-            group_id.clone(),
-            transport_group_id.clone(),
-            Some(HttpCommitAdmission {
-                source_epoch: EpochId(1),
-            }),
-        ),
-        message: group_message("commit-1", transport_group_id.clone(), b"commit"),
-        idempotency_key: None,
-    };
-    let second = PublishMessageRequest {
-        target: group_target(group_id.clone(), transport_group_id.clone(), None),
-        message: group_message("app-1", transport_group_id, b"app"),
-        idempotency_key: None,
-    };
-
-    let app = persistent_app(&db_path);
-    assert_eq!(
-        post_json(app.clone(), "/messages", &first).await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post_json(app.clone(), "/messages", &second).await.status(),
-        StatusCode::OK
-    );
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app.clone(),
-        "/sync/group",
-        &GroupSyncRequest {
-            group_id: group_id.clone(),
-            after_seq: 0,
-            limit: 10,
-            requester: None,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let page: HttpSyncPage = read_json(response).await;
-    assert_eq!(page.entries.len(), 2);
-    assert_eq!(page.entries[0].message.id, id("commit-1"));
-    assert_eq!(page.entries[1].message.id, id("app-1"));
-    assert_eq!(page.next_after_seq, 2);
-
-    let response = post_json(app, "/messages", &first).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let receipt: HttpPublishReceipt = read_json(response).await;
-    assert_eq!(receipt.seq, 1);
-    assert!(receipt.duplicate);
-}
 
 #[tokio::test]
 async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
@@ -122,19 +64,21 @@ async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
         idempotency_key: Some("idem-message-1".to_owned()),
     };
 
-    let app = persistent_app(&db_path);
-    let response = post_json(app, "/messages", &request).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let accepted: HttpPublishReceipt = read_json(response).await;
+    let state = persistent_state(&db_path);
+    let accepted = state
+        .publish_message(request.clone())
+        .expect("first publish");
     assert_eq!(accepted.seq, 1);
     assert!(!accepted.duplicate);
+    drop(state);
 
-    let app = persistent_app(&db_path);
-    let response = post_json(app.clone(), "/messages", &request).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let replayed: HttpPublishReceipt = read_json(response).await;
+    let state = persistent_state(&db_path);
+    let replayed = state
+        .publish_message(request.clone())
+        .expect("idempotent replay");
     assert_eq!(replayed, accepted);
     assert!(!replayed.duplicate);
+    let app = http_router(state);
 
     let response = post_json(
         app.clone(),
@@ -174,18 +118,20 @@ async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
         idempotency_key: Some("idem-conflict".to_owned()),
     };
 
-    let app = persistent_app(&db_path);
-    assert_eq!(
-        post_json(app, "/messages", &first).await.status(),
-        StatusCode::OK
-    );
+    let state = persistent_state(&db_path);
+    state.publish_message(first.clone()).expect("first publish");
+    drop(state);
 
-    let app = persistent_app(&db_path);
-    let response = post_json(app.clone(), "/messages", &conflicting).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "idempotency_conflict");
-    assert!(error.error.contains("idem-conflict"));
+    let state = persistent_state(&db_path);
+    let error = state
+        .publish_message(conflicting.clone())
+        .expect_err("conflicting idempotency key rejected");
+    assert!(matches!(
+        error,
+        ServerHttpError::IdempotencyConflict { ref idempotency_key }
+            if idempotency_key == "idem-conflict"
+    ));
+    let app = http_router(state);
 
     let response = post_json(
         app.clone(),
@@ -204,47 +150,6 @@ async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
     assert_eq!(page.entries[0].message.id, id("idempotency-conflict-a"));
 }
 
-#[tokio::test]
-async fn sqlite_log_rebuilds_commit_admission_after_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let group_id = group_id("epoch-durable-group");
-    let transport_group_id = b"epoch-durable-transport".to_vec();
-    let first = PublishMessageRequest {
-        target: group_target(
-            group_id.clone(),
-            transport_group_id.clone(),
-            Some(HttpCommitAdmission {
-                source_epoch: EpochId(9),
-            }),
-        ),
-        message: group_message("commit-epoch-9-a", transport_group_id.clone(), b"commit-a"),
-        idempotency_key: None,
-    };
-    let second = PublishMessageRequest {
-        target: group_target(
-            group_id,
-            transport_group_id.clone(),
-            Some(HttpCommitAdmission {
-                source_epoch: EpochId(9),
-            }),
-        ),
-        message: group_message("commit-epoch-9-b", transport_group_id, b"commit-b"),
-        idempotency_key: None,
-    };
-
-    let app = persistent_app(&db_path);
-    assert_eq!(
-        post_json(app, "/messages", &first).await.status(),
-        StatusCode::OK
-    );
-
-    let app = persistent_app(&db_path);
-    let response = post_json(app, "/messages", &second).await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "stale_epoch");
-}
 
 #[tokio::test]
 async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
@@ -1712,50 +1617,6 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
     assert_eq!(error.kind, "account_room_bootstrap_conflict");
 }
 
-#[tokio::test]
-async fn sqlite_account_room_bootstrap_rejects_raw_commit_history_without_membership_delta() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let room_id = "room-bootstrap-raw-commit-rejected".to_owned();
-    let mls_group_id = "mls-bootstrap-raw-commit-rejected".to_owned();
-    let alice = DeviceRef::new("alice", "alice-laptop");
-    let app = persistent_app(&db_path);
-
-    let response = post_json(
-        app.clone(),
-        "/messages",
-        &raw_commit_publish_request(
-            &room_id,
-            &mls_group_id,
-            &alice,
-            0,
-            "raw-bootstrap-commit-without-delta",
-            "raw-bootstrap-commit-without-delta-idempotency",
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app,
-        "/account-rooms/bootstrap",
-        &BootstrapAccountRoomRequest {
-            room_id,
-            mls_group_id,
-            creator: alice,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "room_membership_conflict");
-    assert!(
-        error
-            .error
-            .contains("existing raw commit history to carry membership_delta")
-    );
-}
 
 #[tokio::test]
 async fn sqlite_direct_room_create_or_get_and_third_account_rejection_over_http() {
@@ -2777,96 +2638,6 @@ async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
     }
 }
 
-#[tokio::test]
-async fn sqlite_raw_message_commit_projection_compatibility_survives_restart() {
-    let temp = TempDir::new().expect("tempdir");
-    let db_path = temp.path().join("delivery.sqlite3");
-    let creator = DeviceRef::new("alice", "alice-laptop");
-    let phone = DeviceRef::new("alice", "alice-phone");
-    let room_id = "room-raw-projection-compat".to_owned();
-    let mls_group_id = "mls-raw-projection-compat".to_owned();
-    let request = submit_add_device_request(
-        &room_id,
-        &mls_group_id,
-        &creator,
-        &phone,
-        "welcome-raw-projection-compat",
-        "raw-projection-idempotency",
-    );
-    let message_id = request
-        .envelope
-        .message_id()
-        .expect("commit envelope message id");
-    let entry = finitechat_proto::RoomLogEntry {
-        room_id: room_id.clone(),
-        seq: 0,
-        message_id: message_id.clone(),
-        sender: creator.clone(),
-        kind: LogEntryKind::Commit,
-        epoch: request.expected_epoch,
-        envelope: request.envelope.clone(),
-        idempotency_key: request.idempotency_key.clone(),
-    };
-    let payload = serde_json::to_vec(&FiniteAccountRoomCommitProjection {
-        entry,
-        membership_delta: request.membership_delta.clone(),
-    })
-    .expect("projection payload");
-    let transport_group_id = room_id.as_bytes().to_vec();
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app.clone(),
-        "/account-rooms/bootstrap",
-        &BootstrapAccountRoomRequest {
-            room_id: room_id.clone(),
-            mls_group_id,
-            creator,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let response = post_json(
-        app,
-        "/messages",
-        &PublishMessageRequest {
-            target: group_target(
-                group_id(&room_id),
-                transport_group_id.clone(),
-                Some(HttpCommitAdmission {
-                    source_epoch: EpochId(0),
-                }),
-            ),
-            message: group_message(&message_id, transport_group_id, &payload),
-            idempotency_key: Some("raw-projection-message-idempotency".to_owned()),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let app = persistent_app(&db_path);
-    let response = post_json(
-        app,
-        "/account-rooms/list",
-        &ListAccountRoomDirectoryRequest {
-            account_id: "alice".to_owned(),
-            after_room_id: None,
-            limit: 10,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
-    assert_eq!(page.rooms.len(), 1);
-    assert_eq!(page.rooms[0]["room_id"], room_id);
-    assert_eq!(page.rooms[0]["current_epoch"], 1);
-    assert_eq!(
-        page.rooms[0]["devices"][1]["device"]["device_id"],
-        "alice-phone"
-    );
-    assert_eq!(page.rooms[0]["devices"][1]["active"], false);
-}
 
 #[tokio::test]
 async fn submit_commit_route_rejects_missing_staged_welcome_before_side_effects() {
@@ -3208,23 +2979,6 @@ async fn sqlite_group_sync_filters_by_persisted_room_membership_projection() {
     assert_eq!(response.status(), StatusCode::OK);
     let bob_acceptance: EventAccepted = read_json(response).await;
     assert_eq!(bob_acceptance.seq, 4);
-
-    let response = post_json(
-        app.clone(),
-        "/messages",
-        &raw_commit_publish_request(
-            &room_id,
-            &mls_group_id,
-            &alice,
-            1,
-            "raw-commit-without-membership-delta",
-            "raw-commit-without-membership-delta-idempotency",
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "invalid_raw_commit_import");
 
     let app = persistent_app(&db_path);
     let response = post_json(
@@ -5323,10 +5077,9 @@ async fn sqlite_welcome_activation_marks_account_room_device_active_after_restar
         ratchet_tree_payload: b"ratchet-tree".to_vec(),
     };
     let welcome_payload = serde_json::to_vec(&welcome_record).expect("welcome record json");
-    let response = post_json(
-        app.clone(),
-        "/messages",
-        &PublishMessageRequest {
+    let seed_state = persistent_state(&db_path);
+    seed_state
+        .publish_message(PublishMessageRequest {
             target: HttpPublishTarget::Inbox {
                 recipient: recipient.clone(),
             },
@@ -5336,10 +5089,10 @@ async fn sqlite_welcome_activation_marks_account_room_device_active_after_restar
                 &welcome_payload,
             ),
             idempotency_key: None,
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
+        })
+        .expect("seed welcome inbox");
+    drop(seed_state);
+    let app = persistent_app(&db_path);
 
     let response = post_json(
         app.clone(),
@@ -5507,11 +5260,9 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
         idempotency_key: Some("idem-welcome-restart".to_owned()),
     };
 
-    let app = persistent_app(&db_path);
-    assert_eq!(
-        post_json(app.clone(), "/messages", &welcome).await.status(),
-        StatusCode::OK
-    );
+    let state = persistent_state(&db_path);
+    state.publish_message(welcome.clone()).expect("seed welcome");
+    let app = http_router(state);
 
     let response = post_json(
         app.clone(),
@@ -5889,7 +5640,11 @@ fn typed_event_request(event: &AppendEventRequest) -> AppendApplicationEventRequ
 }
 
 fn persistent_app(path: &std::path::Path) -> Router {
-    http_router(HttpServerState::from_sqlite_path(path).expect("persistent server state"))
+    http_router(persistent_state(path))
+}
+
+fn persistent_state(path: &std::path::Path) -> HttpServerState {
+    HttpServerState::from_sqlite_path(path).expect("persistent server state")
 }
 
 async fn post_json<T: Serialize>(app: Router, uri: &str, body: &T) -> Response<Body> {
@@ -6747,45 +6502,6 @@ fn ephemeral_activity_request(
     }
 }
 
-fn raw_commit_publish_request(
-    room_id: &str,
-    mls_group_id: &str,
-    sender: &DeviceRef,
-    epoch: u64,
-    message_id: &str,
-    idempotency_key: &str,
-) -> PublishMessageRequest {
-    let entry = finitechat_proto::RoomLogEntry {
-        room_id: room_id.to_owned(),
-        seq: 0,
-        message_id: message_id.to_owned(),
-        sender: sender.clone(),
-        kind: LogEntryKind::Commit,
-        epoch,
-        envelope: FiniteEnvelope {
-            room_id: room_id.to_owned(),
-            mls_group_id: mls_group_id.to_owned(),
-            epoch,
-            sender: sender.clone(),
-            kind: LogEntryKind::Commit,
-            payload: b"raw-commit-without-membership-delta".to_vec(),
-        },
-        idempotency_key: idempotency_key.to_owned(),
-    };
-    let transport_group_id = room_id.as_bytes().to_vec();
-    let payload = serde_json::to_vec(&entry).expect("room log entry json");
-    PublishMessageRequest {
-        target: group_target(
-            group_id(room_id),
-            transport_group_id.clone(),
-            Some(HttpCommitAdmission {
-                source_epoch: EpochId(epoch),
-            }),
-        ),
-        message: group_message(message_id, transport_group_id, &payload),
-        idempotency_key: Some(idempotency_key.to_owned()),
-    }
-}
 
 fn key_package_publication(
     key_package_id: &str,

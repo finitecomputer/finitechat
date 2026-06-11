@@ -1420,107 +1420,7 @@ impl HttpServerState {
         })
     }
 
-    fn record_finite_commit_projection(
-        &self,
-        request: &PublishMessageRequest,
-        accepted_seq: HttpSequence,
-    ) -> Result<(), ServerHttpError> {
-        let Ok(payload) =
-            serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&request.message.payload)
-        else {
-            return Ok(());
-        };
-        if !matches!(&request.target, HttpPublishTarget::Group { .. })
-            || request.message.id.as_slice() != payload.entry.message_id.as_bytes()
-            || payload.entry.kind != LogEntryKind::Commit
-            || payload.entry.envelope.kind != LogEntryKind::Commit
-            || payload.entry.envelope.room_id != payload.entry.room_id
-            || payload
-                .membership_delta
-                .validate_structure(payload.entry.epoch, &payload.entry.message_id)
-                .is_err()
-        {
-            return Ok(());
-        }
 
-        let room_id = payload.entry.room_id.clone();
-        let mls_group_id = payload.entry.envelope.mls_group_id.clone();
-        let current_epoch = payload.membership_delta.post_commit_epoch;
-        self.record_account_room_membership_delta(
-            &room_id,
-            &mls_group_id,
-            current_epoch,
-            &payload.membership_delta,
-            accepted_seq,
-        )?;
-        self.record_room_membership_delta(
-            &room_id,
-            &mls_group_id,
-            &payload.entry.sender,
-            payload.entry.epoch,
-            &payload.membership_delta,
-            accepted_seq,
-        )
-    }
-
-    fn record_room_log_entry_observation(
-        &self,
-        request: &PublishMessageRequest,
-        accepted_seq: HttpSequence,
-    ) -> Result<(), ServerHttpError> {
-        if !matches!(&request.target, HttpPublishTarget::Group { .. }) {
-            return Ok(());
-        }
-        let has_membership_delta =
-            serde_json::from_slice::<FiniteAccountRoomCommitProjection>(&request.message.payload)
-                .is_ok();
-        let Some(entry) = room_log_entry_from_payload(&request.message.payload) else {
-            return Ok(());
-        };
-        if request.message.id.as_slice() != entry.message_id.as_bytes()
-            || entry.envelope.room_id != entry.room_id
-        {
-            return Ok(());
-        }
-
-        let mut rooms = self
-            .room_memberships
-            .lock()
-            .expect("HTTP room-membership mutex");
-        let Some(projection) = rooms.get_mut(&entry.room_id) else {
-            return Ok(());
-        };
-        if projection.mls_group_id != entry.envelope.mls_group_id {
-            return Ok(());
-        }
-
-        let mut changed = false;
-        if entry.kind == LogEntryKind::Commit {
-            let observed_epoch = entry.epoch.saturating_add(1);
-            if projection.current_epoch < observed_epoch {
-                projection.current_epoch = observed_epoch;
-                changed = true;
-            }
-            if !has_membership_delta && projection.membership_complete {
-                projection.membership_complete = false;
-                changed = true;
-            }
-        }
-        if projection.last_seq < accepted_seq {
-            projection.last_seq = accepted_seq;
-            changed = true;
-        }
-        if !changed {
-            return Ok(());
-        }
-        let projection = projection.clone();
-        drop(rooms);
-
-        if let Some(store) = &self.store {
-            store.upsert_room_membership(&projection)?;
-        }
-        Ok(())
-    }
 
     fn record_submit_commit_projection(
         &self,
@@ -2323,7 +2223,6 @@ impl HttpServerState {
 pub fn http_router(state: HttpServerState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/messages", post(publish_message))
         .route("/events", post(append_application_event))
         .route("/application-effects/get", post(get_application_effect))
         .route(
@@ -2372,15 +2271,6 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn publish_message(
-    State(state): State<HttpServerState>,
-    Json(request): Json<PublishMessageRequest>,
-) -> Result<Json<HttpPublishReceipt>, ServerHttpError> {
-    let receipt = state.publish_message(request.clone())?;
-    state.record_finite_commit_projection(&request, receipt.seq)?;
-    state.record_room_log_entry_observation(&request, receipt.seq)?;
-    Ok(Json(receipt))
-}
 
 
 async fn append_application_event(

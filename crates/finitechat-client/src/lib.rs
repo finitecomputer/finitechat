@@ -1,7 +1,6 @@
 use cgka_traits::engine::KeyPackage as HttpKeyPackage;
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
 use cgka_traits::{
-    EpochId as HttpEpochId, GroupId as HttpGroupId, MemberId as HttpMemberId,
+    GroupId as HttpGroupId, MemberId as HttpMemberId,
     MessageId as HttpMessageId,
 };
 use finitechat_proto::{
@@ -16,7 +15,7 @@ use finitechat_http::{
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
     FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
     HttpKeyPackageInventory, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse, PublishMessageRequest,
+    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse,
     SaveAccountRoomRequest, SaveAccountRoomResponse,
 };
 use finitechat_mls::{
@@ -53,8 +52,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpCommitAdmission, HttpKeyPackageId, HttpKeyPackagePublication,
-    HttpPublishReceipt, HttpPublishTarget, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
+    HttpKeyPackageId, HttpKeyPackagePublication, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
@@ -2804,106 +2802,8 @@ impl<T> HttpRuntimeDelivery<T> {
 }
 
 impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
-    pub fn publish_welcome_record(
-        &mut self,
-        welcome: &WelcomeRecord,
-    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
-        let recipient = http_member_id_for_device(&welcome.recipient)?;
-        let request = PublishMessageRequest {
-            target: HttpPublishTarget::Inbox {
-                recipient: recipient.clone(),
-            },
-            message: TransportMessage {
-                id: HttpMessageId::new(welcome.welcome_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(welcome)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::Welcome { recipient },
-            },
-            idempotency_key: Some(format!("welcome:{}", welcome.welcome_id)),
-        };
-        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
-        Ok(())
-    }
 
-    pub fn publish_room_log_entry(
-        &mut self,
-        entry: &RoomLogEntry,
-    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
-        let transport_group_id = http_transport_group_id_for_room(&entry.room_id);
-        let request = PublishMessageRequest {
-            target: HttpPublishTarget::Group {
-                group_id: http_group_id_for_room(&entry.room_id),
-                transport_group_id: transport_group_id.clone(),
-                commit_admission: (entry.kind == LogEntryKind::Commit).then_some(
-                    HttpCommitAdmission {
-                        source_epoch: HttpEpochId(entry.epoch),
-                    },
-                ),
-            },
-            message: TransportMessage {
-                id: HttpMessageId::new(entry.message_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(entry)
-                    .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::GroupMessage { transport_group_id },
-            },
-            idempotency_key: Some(format!("room:{}:{}", entry.room_id, entry.message_id)),
-        };
-        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
-        Ok(())
-    }
 
-    pub fn publish_commit_projection(
-        &mut self,
-        submit: &SubmitCommitRequest,
-        entry: &RoomLogEntry,
-    ) -> Result<(), HttpRuntimeDeliveryError<T::Error>> {
-        let message_id = submit
-            .envelope
-            .message_id()
-            .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-        if entry.kind != LogEntryKind::Commit
-            || entry.epoch != submit.expected_epoch
-            || entry.room_id != submit.room_id
-            || entry.message_id != message_id
-            || submit.membership_delta.commit_message_id != message_id
-        {
-            return Err(HttpRuntimeDeliveryError::CommitValidation(
-                "commit projection entry does not match submit request".to_owned(),
-            ));
-        }
-
-        let transport_group_id = http_transport_group_id_for_room(&entry.room_id);
-        let request = PublishMessageRequest {
-            target: HttpPublishTarget::Group {
-                group_id: http_group_id_for_room(&entry.room_id),
-                transport_group_id: transport_group_id.clone(),
-                commit_admission: Some(HttpCommitAdmission {
-                    source_epoch: HttpEpochId(entry.epoch),
-                }),
-            },
-            message: TransportMessage {
-                id: HttpMessageId::new(entry.message_id.as_bytes().to_vec()),
-                payload: serde_json::to_vec(&FiniteAccountRoomCommitProjection {
-                    entry: entry.clone(),
-                    membership_delta: submit.membership_delta.clone(),
-                })
-                .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?,
-                timestamp: Timestamp(0),
-                causal_deps: Vec::new(),
-                source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
-                envelope: TransportEnvelope::GroupMessage { transport_group_id },
-            },
-            idempotency_key: Some(format!("room:{}:{}", entry.room_id, entry.message_id)),
-        };
-        let _: HttpPublishReceipt = self.post_json("/messages", &request)?;
-        Ok(())
-    }
 
     pub fn publish_account_room_record(
         &mut self,
@@ -3282,9 +3182,6 @@ fn http_group_id_for_room(room_id: &str) -> HttpGroupId {
     HttpGroupId::new(room_id.as_bytes().to_vec())
 }
 
-fn http_transport_group_id_for_room(room_id: &str) -> Vec<u8> {
-    room_id.as_bytes().to_vec()
-}
 
 
 pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
