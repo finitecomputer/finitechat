@@ -345,6 +345,18 @@ pub struct AckWelcomeResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveRoomRequest {
+    pub room_id: String,
+    pub sender: DeviceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaveRoomResponse {
+    pub left: bool,
+    pub departed_at_seq: HttpSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateRoomAdminsRequest {
     pub room_id: String,
     pub sender: DeviceRef,

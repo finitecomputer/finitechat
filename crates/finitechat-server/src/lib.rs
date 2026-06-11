@@ -34,7 +34,7 @@ pub use finitechat_http::{
     MarkFanoutPreparedRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
-    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
+    LeaveRoomRequest, LeaveRoomResponse, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
     RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
     UploadLinkPayloadRequest,
 };
@@ -2038,6 +2038,115 @@ impl HttpServerState {
         Ok(())
     }
 
+    fn leave_room(&self, request: LeaveRoomRequest) -> Result<LeaveRoomResponse, ServerHttpError> {
+        self.ensure_device_not_revoked(&request.sender)?;
+        let mut rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let Some(projection) = rooms.get_mut(&request.room_id) else {
+            return Err(ServerHttpError::RoomMembershipConflict {
+                room_id: request.room_id.clone(),
+                reason: "leave requires a room-membership projection".to_owned(),
+            });
+        };
+        if projection.status != RoomStatus::Open {
+            return Err(ServerHttpError::RoomNotOpen {
+                room_id: request.room_id.clone(),
+                status: projection.status,
+            });
+        }
+        let account_id = request.sender.account_id.clone();
+        let departed_at_seq = projection.last_seq;
+        if projection.departed.contains(&account_id)
+            || projection
+                .current_or_pending_device_count_for_account(&account_id)
+                == 0
+        {
+            // Idempotent replay: the account already left (or was removed).
+            return Ok(LeaveRoomResponse {
+                left: false,
+                departed_at_seq,
+            });
+        }
+        if !projection.device_active_at_head(&request.sender) {
+            return Err(ServerHttpError::SenderNotActive {
+                sender: request.sender.clone(),
+            });
+        }
+
+        // Whole-account leave (ADR 0003 §3): close every open interval the
+        // account holds; delivery filtering takes over immediately. The MLS
+        // removal commit follows asynchronously from an admin device.
+        for membership in projection.membership.values_mut() {
+            if membership.device.account_id != account_id {
+                continue;
+            }
+            for interval in membership.intervals.iter_mut() {
+                if interval.end_seq.is_none() {
+                    interval.end_seq = Some(departed_at_seq);
+                }
+            }
+        }
+        projection.departed.insert(account_id.clone());
+        // The last admin cannot leave a room that still has other members —
+        // that would strand the room with no one able to manage membership.
+        // They must grant another admin first (or remove everyone).
+        if projection.admins.contains(&account_id) && projection.admins.len() == 1 {
+            let remaining_accounts = projection
+                .membership
+                .values()
+                .filter(|membership| membership.device.account_id != account_id)
+                .filter(|membership| {
+                    membership
+                        .intervals
+                        .iter()
+                        .any(|interval| interval.end_seq.is_none())
+                })
+                .count();
+            if remaining_accounts > 0 {
+                // Re-open the intervals we just closed and refuse: the last
+                // admin must hand off (or remove everyone) before leaving.
+                for membership in projection.membership.values_mut() {
+                    if membership.device.account_id != account_id {
+                        continue;
+                    }
+                    for interval in membership.intervals.iter_mut() {
+                        if interval.end_seq == Some(departed_at_seq) {
+                            interval.end_seq = None;
+                        }
+                    }
+                }
+                projection.departed.remove(&account_id);
+                return Err(ServerHttpError::InvalidAdminChange {
+                    reason: "the last admin must grant another admin before leaving".to_owned(),
+                });
+            }
+        }
+        projection.admins.remove(&account_id);
+        let updated = projection.clone();
+        drop(rooms);
+
+        // Drop the room from the departing account's directory.
+        {
+            let mut directory = self
+                .account_rooms
+                .lock()
+                .expect("HTTP account-room directory mutex");
+            if let Some(rooms_for_account) = directory.get_mut(&account_id) {
+                rooms_for_account.remove(&request.room_id);
+            }
+        }
+        if let Some(store) = &self.store {
+            store.upsert_room_membership(&updated)?;
+            store.delete_account_room(&account_id, &request.room_id)?;
+        }
+        Ok(LeaveRoomResponse {
+            left: true,
+            departed_at_seq,
+        })
+    }
+
     fn update_room_admins(
         &self,
         request: UpdateRoomAdminsRequest,
@@ -2238,6 +2347,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
+        .route("/rooms/leave", post(leave_room))
         .route("/rooms/admins", post(update_room_admins))
         .route("/rooms/report-invalid-commit", post(report_invalid_commit))
         .route("/welcomes/claim", post(claim_welcomes))
@@ -2479,6 +2589,14 @@ async fn list_account_rooms(
     Ok(Json(page))
 }
 
+async fn leave_room(
+    State(state): State<HttpServerState>,
+    Json(request): Json<LeaveRoomRequest>,
+) -> Result<Json<LeaveRoomResponse>, ServerHttpError> {
+    let response = state.leave_room(request)?;
+    Ok(Json(response))
+}
+
 async fn update_room_admins(
     State(state): State<HttpServerState>,
     Json(request): Json<UpdateRoomAdminsRequest>,
@@ -2661,6 +2779,11 @@ struct HttpRoomMembershipProjection {
     /// as amended by ADR 0004 §4). Creator-initialized at typed bootstrap.
     #[serde(default)]
     admins: BTreeSet<String>,
+    /// Accounts that left (ADR 0003 §3) and still await the MLS removal
+    /// commit. The server already filters their delivery; this marker lets
+    /// member workers discover the pending cryptographic cleanup.
+    #[serde(default)]
+    departed: BTreeSet<String>,
     #[serde(default)]
     membership: BTreeMap<String, DeviceMembership>,
 }
@@ -3819,6 +3942,8 @@ fn apply_room_membership_delta(
         {
             interval.end_seq = Some(accepted_seq);
         }
+        // The MLS removal commit for a departed account completes the leave.
+        projection.departed.remove(&remove.device.account_id);
     }
     for add in &membership_delta.adds {
         projection
@@ -4451,6 +4576,7 @@ fn initial_room_membership_projection(
         status: RoomStatus::Open,
         membership_complete,
         admins: BTreeSet::from([creator.account_id.clone()]),
+        departed: BTreeSet::new(),
         membership,
     }
 }

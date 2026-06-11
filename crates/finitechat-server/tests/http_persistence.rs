@@ -15,7 +15,8 @@ use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateLinkSessionRequest, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
+    CreateLinkSessionRequest, LeaveRoomRequest, LeaveRoomResponse, UpdateRoomAdminsRequest,
+    UpdateRoomAdminsResponse,
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
     GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetFanoutRequest, GetLinkSessionRequest,
@@ -5769,6 +5770,181 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "invalid_admin_change");
+}
+
+#[tokio::test]
+async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-laptop");
+    let bob = DeviceRef::new("bob", "bob-laptop");
+    let room_id = "room-leave".to_owned();
+    let mls_group_id = "mls-leave".to_owned();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let add_bob = submit_add_device_request_at_epoch(&room_id, &mls_group_id, &alice, &bob, 0);
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _add_accepted: CommitAccepted = read_json(response).await;
+
+    // Activate bob.
+    let bob_recipient = member_for_device(&bob);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: bob_recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: claims[0].message.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Alice sends one more message bob can see before leaving.
+    let pre_leave = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        1,
+        b"before bob leaves",
+        "leave-pre-message",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&pre_leave)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let pre_accepted: EventAccepted = read_json(response).await;
+
+    // Bob leaves (whole-account, server-recognized immediately).
+    let response = post_json(
+        app.clone(),
+        "/rooms/leave",
+        &LeaveRoomRequest {
+            room_id: room_id.clone(),
+            sender: bob.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let left: LeaveRoomResponse = read_json(response).await;
+    assert!(left.left);
+    assert_eq!(left.departed_at_seq, pre_accepted.seq);
+
+    // The leave is idempotent and survives restart.
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/rooms/leave",
+        &LeaveRoomRequest {
+            room_id: room_id.clone(),
+            sender: bob.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay: LeaveRoomResponse = read_json(response).await;
+    assert!(!replay.left);
+
+    // Departed senders cannot send.
+    let post_leave_send = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &bob,
+        1,
+        b"after leaving",
+        "leave-post-message",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&post_leave_send)).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Later traffic is hidden from the departed account, but history through
+    // the leave seq stays syncable.
+    let alice_post = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        1,
+        b"after bob left",
+        "leave-alice-post",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&alice_post)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(&room_id),
+            after_seq: 0,
+            limit: 10,
+            requester: Some(member_for_device(&bob)),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_page: HttpSyncPage = read_json(response).await;
+    assert!(bob_page.entries.iter().all(|entry| entry.seq <= left.departed_at_seq));
+
+    // Bob's directory no longer lists the room.
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/list",
+        &ListAccountRoomDirectoryRequest {
+            account_id: "bob".to_owned(),
+            after_room_id: None,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: ListAccountRoomDirectoryResponse = read_json(response).await;
+    assert!(page.rooms.is_empty());
+
+    // The admin's later MLS removal commit for the departed device is
+    // accepted and completes the leave.
+    let remove_bob = submit_remove_device_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        1,
+        "leave-remove-bob",
+    );
+    let response = post_json(app.clone(), "/commits", &remove_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The last admin cannot leave while members remain.
+    let response = post_json(
+        app.clone(),
+        "/rooms/leave",
+        &LeaveRoomRequest {
+            room_id: room_id.clone(),
+            sender: alice.clone(),
+        },
+    )
+    .await;
+    // Bob is fully removed now, so alice (sole member) may leave.
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 fn submit_add_device_request(
