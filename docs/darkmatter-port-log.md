@@ -1468,3 +1468,43 @@ The retired reducer no longer exists anywhere in the repo:
 
 Verification: `cargo test --workspace` pass (215 tests), `cargo clippy
 --workspace --all-targets -- -D warnings` pass, Python suite pass (8 tests).
+
+## ADR 0003/0004 Execution Checkpoint
+
+All accepted protocol decisions with pre-external-client impact are now
+implemented, in eight verified steps (one commit each):
+
+1. Scoped idempotency capacity rule deleted (ADR 0004 §5) — it permanently
+   blocked a sender after 4,096 lifetime messages per room.
+2. Event routes merged (ADR 0004 §3): one `/events` route taking
+   `{event, delivery_policy}`; delivery effects are recorded for every send,
+   fixing the silent no-effects production path.
+3. Welcome lifecycle reduced to claim + idempotent activate (ADR 0004 §6);
+   the terminal failed-ack state is gone.
+4. Raw `/messages` left the product surface (ADR 0004 §2): route, CLI raw
+   publish commands, client raw adapters, projection-wrapper import
+   compatibility, the Marmot-engine interop test, and the simulator
+   dev-dependency are deleted. The upstream contract remains proven at state
+   level by the conformance suite; the process smoke now drives typed
+   bootstrap + append-event end to end.
+5. Admin authority (ADR 0003 §2 as amended): creator-initialized admin set on
+   the membership projection; cross-account membership changes require admin;
+   `/rooms/admins` grant/revoke with a last-admin rule. Direct rooms
+   dissolved (ADR 0004 §4): `/direct-rooms`, stored account pairs,
+   third-account rejection, and the extra device cap are deleted.
+6. Whole-account leave (ADR 0003 §3): `/rooms/leave` closes the account's
+   intervals immediately; a departed marker lets the later MLS removal
+   commit complete the leave; the last admin must hand off before leaving a
+   populated room.
+7. Per-room protocol slots (ADR 0003 §1): `RoomProtocol` on bootstrap and the
+   projection, serde-defaulted to v1; out-of-range versions are refused with
+   426 Upgrade Required.
+8. Server-side fanout checkpoint surface deleted (ADR 0004 §1): seven
+   routes, the table, CLI commands, and tests; the client's durable fanout
+   state was always the real resume mechanism.
+
+Verification: `cargo test --workspace` pass (197 tests; ~24 obsolete-surface
+tests deleted, 6 new admin/leave/versioning tests added), clippy
+`-D warnings` clean, Python suite pass (typed-route process smoke). Perf
+harness re-run: publish p50 49.8 µs, client apply 61.9 µs/entry — no latency
+added by any step.

@@ -58,7 +58,7 @@ pub fn current_port_findings() -> Vec<PortFinding> {
         PortFinding {
             area: "http_cli_route_client",
             status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, application delivery effects, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke/liveness, KeyPackage claim/lease expiry, fanout checkpoint, link-session pairing, direct-room create-or-get, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, fanout checkpoint, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
+            evidence: "finitechat-cli can construct and send Darkmatter HTTP route DTOs for publish, typed submit-commit, typed events, application delivery effects, ephemeral activity, requester-aware sync, invalid-commit reporting, device revoke/liveness, KeyPackage claim/lease expiry, link-session pairing, account-room directory, and Welcome operations; CLI tests drive publish/sync, idempotency conflict, typed submit-commit, batch KeyPackage claim, and Welcome claim/ack flows against a live Axum server; process smoke starts the server binary with SQLite and drives the CLI binary through persisted publish/sync/replay/conflict",
         },
         PortFinding {
             area: "http_sqlite_operation_log",
@@ -154,11 +154,6 @@ pub fn current_port_findings() -> Vec<PortFinding> {
             area: "http_route_dto_boundary",
             status: PortStatus::EasyAdapterOwnedLogic,
             evidence: "finitechat-http owns shared route DTOs; production finitechat-client and finitechat-cli no longer depend on finitechat-server for wire types",
-        },
-        PortFinding {
-            area: "http_fanout_plan_checkpoint",
-            status: PortStatus::EasyAdapterOwnedLogic,
-            evidence: "finitechat-server persists opaque later-device fanout room plans, prepared message ids, reprepare checkpoints, and accepted seqs across restart",
         },
         PortFinding {
             area: "http_link_session_pairing",

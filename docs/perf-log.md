@@ -154,3 +154,11 @@ latent always-works defects, found during the grilling:
 
 Standing posture recorded in ADR 0004: Marmot interop is kept only when free
 — never bend the product surface to preserve it.
+
+### 2026-06-11 — ADR execution perf check
+
+Re-ran both harnesses after the eight ADR 0003/0004 implementation steps
+(admin authority, leave, versioning, and five surface deletions): publish
+p50 49.8 µs, sync page unchanged, client apply 61.9 µs/entry, save 109 µs.
+No regression from the added validation (admin/authority checks are map
+lookups on the already-locked projection).

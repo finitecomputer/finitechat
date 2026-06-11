@@ -7,11 +7,10 @@ use finitechat_http::{
     BootstrapAccountRoomRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimWelcomesRequest,
     CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest,
-    GetDeviceLivenessRequest, GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest,
-    HttpFanoutRoomPlan, InboxSyncRequest, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-    ObserveDeviceLivenessRequest, ReleaseLinkClaimRequest,
-    LeaveRoomRequest, ReportInvalidCommitRequest, RevokeDeviceRequest, UpdateRoomAdminsRequest, SaveAccountRoomRequest, SaveFanoutRoomRequest,
+    GetDeviceLivenessRequest, GetLinkSessionRequest, GroupSyncRequest,
+    InboxSyncRequest, KeyPackageInventoryRequest,
+    ListAccountRoomDirectoryRequest,     ObserveDeviceLivenessRequest, ReleaseLinkClaimRequest,
+    LeaveRoomRequest, ReportInvalidCommitRequest, RevokeDeviceRequest, UpdateRoomAdminsRequest, SaveAccountRoomRequest,
     UploadLinkPayloadRequest,
 };
 use finitechat_proto::{DeviceRef, RoomProtocol};
@@ -136,10 +135,6 @@ where
         "claim-key-package" => claim_key_package_request(&server, args),
         "claim-key-packages" => claim_key_packages_request(&server, args),
         "expire-key-package-lease" => expire_key_package_lease_request(&server, args),
-        "fanout-get" => fanout_get_request(&server, args),
-        "fanout-save-room" => fanout_save_room_request(&server, args),
-        "fanout-mark-prepared" => fanout_mark_prepared_request(&server, args),
-        "fanout-mark-done" => fanout_mark_done_request(&server, args),
         "link-session-create" => link_session_create_request(&server, args),
         "link-session-get" => link_session_get_request(&server, args),
         "link-session-upload" => link_session_upload_request(&server, args),
@@ -372,80 +367,9 @@ fn expire_key_package_lease_request(
     post_json_request(server, "/key-packages/leases/expire", &request)
 }
 
-fn fanout_get_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let fanout_id = required_option(&mut args, "--fanout-id")?;
-    reject_extra_args(&args)?;
 
-    let request = GetFanoutRequest { fanout_id };
-    post_json_request(server, "/fanouts/get", &request)
-}
 
-fn fanout_save_room_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let fanout_id = required_option(&mut args, "--fanout-id")?;
-    let target_owner = required_option(&mut args, "--target-owner")?;
-    let room_id = required_option(&mut args, "--room-id")?;
-    let key_package_id = required_option(&mut args, "--key-package-id")?;
-    let welcome_id = required_option(&mut args, "--welcome-id")?;
-    let commit_idempotency_key = required_option(&mut args, "--commit-idempotency-key")?;
-    let claimed_key_package_id = take_option(&mut args, "--claimed-key-package-id")?;
-    reject_extra_args(&args)?;
 
-    let request = SaveFanoutRoomRequest {
-        fanout_id,
-        target_owner: MemberId::new(target_owner.into_bytes()),
-        room: HttpFanoutRoomPlan {
-            room_id: GroupId::new(room_id.into_bytes()),
-            key_package_id: HttpKeyPackageId::new(key_package_id.into_bytes()),
-            welcome_id: MessageId::new(welcome_id.into_bytes()),
-            commit_idempotency_key,
-            claimed_key_package_id: claimed_key_package_id
-                .map(|key_package_id| HttpKeyPackageId::new(key_package_id.into_bytes())),
-        },
-    };
-    post_json_request(server, "/fanouts/rooms", &request)
-}
-
-fn fanout_mark_prepared_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let fanout_id = required_option(&mut args, "--fanout-id")?;
-    let room_id = required_option(&mut args, "--room-id")?;
-    let message_id = required_option(&mut args, "--message-id")?;
-    reject_extra_args(&args)?;
-
-    let request = MarkFanoutPreparedRequest {
-        fanout_id,
-        room_id: GroupId::new(room_id.into_bytes()),
-        prepared_message_id: MessageId::new(message_id.into_bytes()),
-    };
-    post_json_request(server, "/fanouts/rooms/prepared", &request)
-}
-
-fn fanout_mark_done_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let fanout_id = required_option(&mut args, "--fanout-id")?;
-    let room_id = required_option(&mut args, "--room-id")?;
-    let message_id = required_option(&mut args, "--message-id")?;
-    let accepted_seq = required_option(&mut args, "--accepted-seq")?;
-    reject_extra_args(&args)?;
-
-    let request = MarkFanoutDoneRequest {
-        fanout_id,
-        room_id: GroupId::new(room_id.into_bytes()),
-        prepared_message_id: MessageId::new(message_id.into_bytes()),
-        accepted_seq: parse_u64("--accepted-seq", &accepted_seq)?,
-    };
-    post_json_request(server, "/fanouts/rooms/done", &request)
-}
 
 fn link_session_create_request(
     server: &str,
@@ -821,7 +745,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] fanout-get --fanout-id ID\n  finitechat-darkmatter http [--server URL] fanout-save-room --fanout-id ID --target-owner ID --room-id ID --key-package-id ID --welcome-id ID --commit-idempotency-key KEY [--claimed-key-package-id ID]\n  finitechat-darkmatter http [--server URL] fanout-mark-prepared --fanout-id ID --room-id ID --message-id ID\n  finitechat-darkmatter http [--server URL] fanout-mark-done --fanout-id ID --room-id ID --message-id ID --accepted-seq N\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
+    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 #[cfg(test)]
@@ -835,12 +759,11 @@ mod tests {
         BootstrapAccountRoomRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
         ClaimWelcomesRequest, CreateLinkSessionRequest,
         ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest, GetDeviceLivenessRequest,
-        GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpFanoutPlan,
-        HttpFanoutRoomStatus, HttpKeyPackageClaim, KeyPackageInventoryRequest,
-        ListAccountRoomDirectoryRequest, MarkFanoutDoneRequest, MarkFanoutPreparedRequest,
-        ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+        GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim,
+        KeyPackageInventoryRequest,
+        ListAccountRoomDirectoryRequest,         ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
         ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
-        SaveAccountRoomRequest, SaveFanoutRoomRequest, UploadLinkPayloadRequest,
+        SaveAccountRoomRequest, UploadLinkPayloadRequest,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
@@ -1088,87 +1011,7 @@ mod tests {
         assert_eq!(body.key_package_id.as_slice(), b"kp-lease-expired");
     }
 
-    #[test]
-    fn fanout_save_room_command_builds_route_dto() {
-        let request = prepare_http_request([
-            "fanout-save-room",
-            "--fanout-id",
-            "fanout-a",
-            "--target-owner",
-            "alice-phone",
-            "--room-id",
-            "room-a",
-            "--key-package-id",
-            "kp-a",
-            "--welcome-id",
-            "welcome-a",
-            "--commit-idempotency-key",
-            "link-a",
-            "--claimed-key-package-id",
-            "kp-a",
-        ])
-        .expect("request");
 
-        assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/fanouts/rooms");
-        let body: SaveFanoutRoomRequest =
-            serde_json::from_value(request.json.expect("json")).expect("fanout room request");
-        assert_eq!(body.fanout_id, "fanout-a");
-        assert_eq!(body.target_owner.as_slice(), b"alice-phone");
-        assert_eq!(body.room.room_id.as_slice(), b"room-a");
-        assert_eq!(body.room.key_package_id.as_slice(), b"kp-a");
-        assert_eq!(body.room.welcome_id.as_slice(), b"welcome-a");
-        assert_eq!(body.room.commit_idempotency_key, "link-a");
-        assert_eq!(
-            body.room
-                .claimed_key_package_id
-                .expect("claimed package")
-                .as_slice(),
-            b"kp-a"
-        );
-    }
-
-    #[test]
-    fn fanout_status_commands_build_route_dtos() {
-        let prepared = prepare_http_request([
-            "fanout-mark-prepared",
-            "--fanout-id",
-            "fanout-a",
-            "--room-id",
-            "room-a",
-            "--message-id",
-            "commit-a",
-        ])
-        .expect("prepared request");
-
-        assert_eq!(prepared.url, "http://127.0.0.1:8787/fanouts/rooms/prepared");
-        let body: MarkFanoutPreparedRequest =
-            serde_json::from_value(prepared.json.expect("json")).expect("prepared body");
-        assert_eq!(body.fanout_id, "fanout-a");
-        assert_eq!(body.room_id.as_slice(), b"room-a");
-        assert_eq!(body.prepared_message_id.as_slice(), b"commit-a");
-
-        let done = prepare_http_request([
-            "fanout-mark-done",
-            "--fanout-id",
-            "fanout-a",
-            "--room-id",
-            "room-a",
-            "--message-id",
-            "commit-b",
-            "--accepted-seq",
-            "9",
-        ])
-        .expect("done request");
-
-        assert_eq!(done.url, "http://127.0.0.1:8787/fanouts/rooms/done");
-        let body: MarkFanoutDoneRequest =
-            serde_json::from_value(done.json.expect("json")).expect("done body");
-        assert_eq!(body.fanout_id, "fanout-a");
-        assert_eq!(body.room_id.as_slice(), b"room-a");
-        assert_eq!(body.prepared_message_id.as_slice(), b"commit-b");
-        assert_eq!(body.accepted_seq, 9);
-    }
 
     #[test]
     fn link_session_commands_build_route_dtos() {
@@ -1627,114 +1470,6 @@ mod tests {
         assert_eq!(remaining.owner.as_slice(), b"live-phone");
     }
 
-    #[test]
-    fn live_cli_fanout_checkpoint_flow_over_http_server() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let server_db = dir.path().join("cli-live-fanout.sqlite3");
-        let server_url = spawn_live_cli_server(&server_db);
-
-        let saved: HttpFanoutPlan = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "fanout-save-room",
-            "--fanout-id",
-            "live-fanout",
-            "--target-owner",
-            "live-phone",
-            "--room-id",
-            "live-room",
-            "--key-package-id",
-            "live-kp-1",
-            "--welcome-id",
-            "live-welcome-1",
-            "--commit-idempotency-key",
-            "live-commit-key",
-            "--claimed-key-package-id",
-            "live-kp-1",
-        ]))
-        .expect("saved fanout");
-        assert_eq!(saved.fanout_id, "live-fanout");
-        assert_eq!(saved.rooms.len(), 1);
-        assert!(matches!(
-            saved.rooms[0].status,
-            HttpFanoutRoomStatus::Pending
-        ));
-
-        let prepared: HttpFanoutPlan = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "fanout-mark-prepared",
-            "--fanout-id",
-            "live-fanout",
-            "--room-id",
-            "live-room",
-            "--message-id",
-            "live-commit-loser",
-        ]))
-        .expect("prepared fanout");
-        assert!(matches!(
-            prepared.rooms[0].status,
-            HttpFanoutRoomStatus::Prepared {
-                ref prepared_message_id
-            } if prepared_message_id.as_slice() == b"live-commit-loser"
-        ));
-
-        let reprepared: HttpFanoutPlan = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "fanout-mark-prepared",
-            "--fanout-id",
-            "live-fanout",
-            "--room-id",
-            "live-room",
-            "--message-id",
-            "live-commit-retry",
-        ]))
-        .expect("reprepared fanout");
-        assert!(matches!(
-            reprepared.rooms[0].status,
-            HttpFanoutRoomStatus::Prepared {
-                ref prepared_message_id
-            } if prepared_message_id.as_slice() == b"live-commit-retry"
-        ));
-
-        let done: HttpFanoutPlan = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "fanout-mark-done",
-            "--fanout-id",
-            "live-fanout",
-            "--room-id",
-            "live-room",
-            "--message-id",
-            "live-commit-retry",
-            "--accepted-seq",
-            "12",
-        ]))
-        .expect("done fanout");
-        assert!(matches!(
-            done.rooms[0].status,
-            HttpFanoutRoomStatus::Done {
-                ref prepared_message_id,
-                accepted_seq: 12,
-            } if prepared_message_id.as_slice() == b"live-commit-retry"
-        ));
-
-        let loaded: HttpFanoutPlan = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "fanout-get",
-            "--fanout-id",
-            "live-fanout",
-        ]))
-        .expect("loaded fanout");
-        assert_eq!(loaded, done);
-    }
 
     #[test]
     fn unknown_option_is_usage_error() {

@@ -141,67 +141,13 @@ pub struct HttpKeyPackageClaim {
     pub claimed: Option<HttpClaimedKeyPackage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SaveFanoutRoomRequest {
-    pub fanout_id: String,
-    pub target_owner: MemberId,
-    pub room: HttpFanoutRoomPlan,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetFanoutRequest {
-    pub fanout_id: String,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MarkFanoutPreparedRequest {
-    pub fanout_id: String,
-    pub room_id: GroupId,
-    pub prepared_message_id: MessageId,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MarkFanoutDoneRequest {
-    pub fanout_id: String,
-    pub room_id: GroupId,
-    pub prepared_message_id: MessageId,
-    pub accepted_seq: HttpSequence,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HttpFanoutPlan {
-    pub fanout_id: String,
-    pub target_owner: MemberId,
-    pub rooms: Vec<HttpFanoutRoomState>,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HttpFanoutRoomState {
-    pub plan: HttpFanoutRoomPlan,
-    pub status: HttpFanoutRoomStatus,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HttpFanoutRoomPlan {
-    pub room_id: GroupId,
-    pub key_package_id: HttpKeyPackageId,
-    pub welcome_id: MessageId,
-    pub commit_idempotency_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claimed_key_package_id: Option<HttpKeyPackageId>,
-}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HttpFanoutRoomStatus {
-    Pending,
-    Prepared {
-        prepared_message_id: MessageId,
-    },
-    Done {
-        prepared_message_id: MessageId,
-        accepted_seq: HttpSequence,
-    },
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateLinkSessionRequest {

@@ -26,17 +26,14 @@ pub use finitechat_http::{
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
     FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetFanoutRequest, GetLinkSessionRequest, GroupSyncRequest, HealthResponse,
-    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpFanoutPlan, HttpFanoutRoomPlan,
-    HttpFanoutRoomState, HttpFanoutRoomStatus, HttpKeyPackageClaim, HttpKeyPackageInventory,
+    GetLinkSessionRequest, GroupSyncRequest, HealthResponse,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpKeyPackageClaim, HttpKeyPackageInventory,
     HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, MarkFanoutDoneRequest,
-    MarkFanoutPreparedRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
     LeaveRoomRequest, LeaveRoomResponse, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
-    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SaveFanoutRoomRequest,
-    UploadLinkPayloadRequest,
+    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
@@ -57,9 +54,6 @@ use transport_http_server::{
     MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 
-const MAX_HTTP_FANOUT_ROOMS: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
-const MAX_HTTP_FANOUT_ID_BYTES: usize = 128;
-const MAX_HTTP_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
 
 /// Capacity limits for the durable finite chat server.
@@ -84,7 +78,6 @@ pub struct HttpServerState {
     key_package_claim_idempotency: Arc<Mutex<HashMap<String, KeyPackageClaimIdempotencyRecord>>>,
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     revoked_devices: Arc<Mutex<BTreeSet<String>>>,
-    fanout_plans: Arc<Mutex<HashMap<String, HttpFanoutPlan>>>,
     link_sessions: Arc<Mutex<BTreeMap<String, HttpLinkSessionRecord>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
@@ -103,7 +96,6 @@ impl HttpServerState {
             key_package_claim_idempotency: Arc::new(Mutex::new(HashMap::new())),
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             revoked_devices: Arc::new(Mutex::new(BTreeSet::new())),
-            fanout_plans: Arc::new(Mutex::new(HashMap::new())),
             link_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
@@ -134,7 +126,6 @@ impl HttpServerState {
                 store.upsert_key_package_inventory(record)?;
             }
         }
-        let fanout_plans = store.load_fanout_plans()?;
         let link_sessions = store.load_link_sessions()?;
         let account_rooms = store.load_account_room_directory()?;
         let room_memberships = store.load_room_memberships()?;
@@ -146,7 +137,6 @@ impl HttpServerState {
             key_package_claim_idempotency: Arc::new(Mutex::new(key_package_claim_idempotency)),
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             revoked_devices: Arc::new(Mutex::new(revoked_devices)),
-            fanout_plans: Arc::new(Mutex::new(fanout_plans)),
             link_sessions: Arc::new(Mutex::new(link_sessions)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
@@ -580,173 +570,9 @@ impl HttpServerState {
         })
     }
 
-    fn save_fanout_room(
-        &self,
-        request: SaveFanoutRoomRequest,
-    ) -> Result<HttpFanoutPlan, ServerHttpError> {
-        validate_fanout_id(&request.fanout_id)?;
-        validate_fanout_room_plan(&request.room)?;
-        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
-        let plan = fanouts
-            .entry(request.fanout_id.clone())
-            .or_insert_with(|| HttpFanoutPlan {
-                fanout_id: request.fanout_id.clone(),
-                target_owner: request.target_owner.clone(),
-                rooms: Vec::new(),
-            });
-        if plan.target_owner != request.target_owner {
-            return Err(ServerHttpError::FanoutConflict {
-                fanout_id: request.fanout_id,
-                reason: "target owner differs from existing fanout".to_owned(),
-            });
-        }
-        match plan
-            .rooms
-            .iter()
-            .position(|room| room.plan.room_id == request.room.room_id)
-        {
-            Some(index) if plan.rooms[index].plan == request.room => {}
-            Some(_) => {
-                return Err(ServerHttpError::FanoutConflict {
-                    fanout_id: request.fanout_id,
-                    reason: "room plan differs from existing fanout room".to_owned(),
-                });
-            }
-            None => {
-                if plan.rooms.len() >= MAX_HTTP_FANOUT_ROOMS {
-                    return Err(ServerHttpError::FanoutLimitExceeded {
-                        fanout_id: request.fanout_id,
-                        actual: plan.rooms.len() + 1,
-                        max: MAX_HTTP_FANOUT_ROOMS,
-                    });
-                }
-                plan.rooms.push(HttpFanoutRoomState {
-                    plan: request.room,
-                    status: HttpFanoutRoomStatus::Pending,
-                });
-                plan.rooms.sort_by(|left, right| {
-                    left.plan
-                        .room_id
-                        .as_slice()
-                        .cmp(right.plan.room_id.as_slice())
-                });
-            }
-        }
-        let plan = plan.clone();
-        if let Some(store) = &self.store {
-            store.upsert_fanout_plan(&plan)?;
-        }
-        Ok(plan)
-    }
 
-    fn get_fanout(
-        &self,
-        request: GetFanoutRequest,
-    ) -> Result<Option<HttpFanoutPlan>, ServerHttpError> {
-        validate_fanout_id(&request.fanout_id)?;
-        let fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
-        Ok(fanouts.get(&request.fanout_id).cloned())
-    }
 
-    fn mark_fanout_prepared(
-        &self,
-        request: MarkFanoutPreparedRequest,
-    ) -> Result<HttpFanoutPlan, ServerHttpError> {
-        validate_fanout_id(&request.fanout_id)?;
-        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
-        let plan =
-            fanouts
-                .get_mut(&request.fanout_id)
-                .ok_or_else(|| ServerHttpError::FanoutNotFound {
-                    fanout_id: request.fanout_id.clone(),
-                })?;
-        let room = plan
-            .rooms
-            .iter_mut()
-            .find(|room| room.plan.room_id == request.room_id)
-            .ok_or_else(|| ServerHttpError::FanoutRoomNotFound {
-                fanout_id: request.fanout_id.clone(),
-                room_id: request.room_id.clone(),
-            })?;
-        match &room.status {
-            HttpFanoutRoomStatus::Done { .. } => {
-                return Err(ServerHttpError::FanoutConflict {
-                    fanout_id: request.fanout_id,
-                    reason: "cannot mark a completed fanout room prepared".to_owned(),
-                });
-            }
-            HttpFanoutRoomStatus::Pending | HttpFanoutRoomStatus::Prepared { .. } => {
-                room.status = HttpFanoutRoomStatus::Prepared {
-                    prepared_message_id: request.prepared_message_id,
-                };
-            }
-        }
-        let plan = plan.clone();
-        if let Some(store) = &self.store {
-            store.upsert_fanout_plan(&plan)?;
-        }
-        Ok(plan)
-    }
 
-    fn mark_fanout_done(
-        &self,
-        request: MarkFanoutDoneRequest,
-    ) -> Result<HttpFanoutPlan, ServerHttpError> {
-        validate_fanout_id(&request.fanout_id)?;
-        let mut fanouts = self.fanout_plans.lock().expect("HTTP fanout mutex");
-        let plan =
-            fanouts
-                .get_mut(&request.fanout_id)
-                .ok_or_else(|| ServerHttpError::FanoutNotFound {
-                    fanout_id: request.fanout_id.clone(),
-                })?;
-        let room = plan
-            .rooms
-            .iter_mut()
-            .find(|room| room.plan.room_id == request.room_id)
-            .ok_or_else(|| ServerHttpError::FanoutRoomNotFound {
-                fanout_id: request.fanout_id.clone(),
-                room_id: request.room_id.clone(),
-            })?;
-        match &room.status {
-            HttpFanoutRoomStatus::Pending => {
-                return Err(ServerHttpError::FanoutConflict {
-                    fanout_id: request.fanout_id,
-                    reason: "cannot complete a fanout room before it is prepared".to_owned(),
-                });
-            }
-            HttpFanoutRoomStatus::Prepared {
-                prepared_message_id,
-            } if *prepared_message_id == request.prepared_message_id => {
-                room.status = HttpFanoutRoomStatus::Done {
-                    prepared_message_id: request.prepared_message_id,
-                    accepted_seq: request.accepted_seq,
-                };
-            }
-            HttpFanoutRoomStatus::Prepared { .. } => {
-                return Err(ServerHttpError::FanoutConflict {
-                    fanout_id: request.fanout_id,
-                    reason: "prepared message id does not match fanout room state".to_owned(),
-                });
-            }
-            HttpFanoutRoomStatus::Done {
-                prepared_message_id,
-                accepted_seq,
-            } if *prepared_message_id == request.prepared_message_id
-                && *accepted_seq == request.accepted_seq => {}
-            HttpFanoutRoomStatus::Done { .. } => {
-                return Err(ServerHttpError::FanoutConflict {
-                    fanout_id: request.fanout_id,
-                    reason: "completed fanout room differs from request".to_owned(),
-                });
-            }
-        }
-        let plan = plan.clone();
-        if let Some(store) = &self.store {
-            store.upsert_fanout_plan(&plan)?;
-        }
-        Ok(plan)
-    }
 
     fn create_link_session(
         &self,
@@ -2349,10 +2175,6 @@ pub fn http_router(state: HttpServerState) -> Router {
             "/key-packages/leases/expire",
             post(expire_key_package_lease),
         )
-        .route("/fanouts/get", post(get_fanout))
-        .route("/fanouts/rooms", post(save_fanout_room))
-        .route("/fanouts/rooms/prepared", post(mark_fanout_prepared))
-        .route("/fanouts/rooms/done", post(mark_fanout_done))
         .route("/link-sessions", post(create_link_session))
         .route("/link-sessions/get", post(get_link_session))
         .route("/link-sessions/payload", post(upload_link_payload))
@@ -2492,37 +2314,9 @@ async fn expire_key_package_lease(
     Ok(Json(response))
 }
 
-async fn save_fanout_room(
-    State(state): State<HttpServerState>,
-    Json(request): Json<SaveFanoutRoomRequest>,
-) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
-    let fanout = state.save_fanout_room(request)?;
-    Ok(Json(fanout))
-}
 
-async fn get_fanout(
-    State(state): State<HttpServerState>,
-    Json(request): Json<GetFanoutRequest>,
-) -> Result<Json<Option<HttpFanoutPlan>>, ServerHttpError> {
-    let fanout = state.get_fanout(request)?;
-    Ok(Json(fanout))
-}
 
-async fn mark_fanout_prepared(
-    State(state): State<HttpServerState>,
-    Json(request): Json<MarkFanoutPreparedRequest>,
-) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
-    let fanout = state.mark_fanout_prepared(request)?;
-    Ok(Json(fanout))
-}
 
-async fn mark_fanout_done(
-    State(state): State<HttpServerState>,
-    Json(request): Json<MarkFanoutDoneRequest>,
-) -> Result<Json<HttpFanoutPlan>, ServerHttpError> {
-    let fanout = state.mark_fanout_done(request)?;
-    Ok(Json(fanout))
-}
 
 async fn create_link_session(
     State(state): State<HttpServerState>,
@@ -2919,10 +2713,6 @@ impl SqliteHttpDeliveryStore {
                 owner_json TEXT NOT NULL,
                 state_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS http_fanout_plans (
-                fanout_id TEXT PRIMARY KEY,
-                plan_json TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS http_link_sessions (
                 link_session_id TEXT PRIMARY KEY,
                 record_json TEXT NOT NULL
@@ -3281,31 +3071,7 @@ impl SqliteHttpDeliveryStore {
         Ok(inventory)
     }
 
-    fn upsert_fanout_plan(&self, plan: &HttpFanoutPlan) -> Result<(), DurableStoreError> {
-        let conn = self.connection();
-        conn.execute(
-            "INSERT INTO http_fanout_plans (fanout_id, plan_json)
-             VALUES (?1, ?2)
-             ON CONFLICT(fanout_id) DO UPDATE SET
-                plan_json = excluded.plan_json",
-            params![plan.fanout_id, serde_json::to_string(plan)?],
-        )?;
-        Ok(())
-    }
 
-    fn load_fanout_plans(&self) -> Result<HashMap<String, HttpFanoutPlan>, DurableStoreError> {
-        let conn = self.connection();
-        let mut statement = conn.prepare("SELECT fanout_id, plan_json FROM http_fanout_plans")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut fanouts = HashMap::new();
-        for row in rows {
-            let (fanout_id, plan_json) = row?;
-            fanouts.insert(fanout_id, serde_json::from_str(&plan_json)?);
-        }
-        Ok(fanouts)
-    }
 
     fn upsert_link_session(&self, record: &HttpLinkSessionRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection();
@@ -4607,22 +4373,7 @@ fn default_membership_complete() -> bool {
     true
 }
 
-fn validate_fanout_id(fanout_id: &str) -> Result<(), ServerHttpError> {
-    validate_string_id("fanout_id", fanout_id, MAX_HTTP_FANOUT_ID_BYTES)
-}
 
-fn validate_fanout_room_plan(plan: &HttpFanoutRoomPlan) -> Result<(), ServerHttpError> {
-    if plan.commit_idempotency_key.is_empty() {
-        return Err(ServerHttpError::InvalidFanoutRequest {
-            reason: "commit idempotency key must not be empty".to_owned(),
-        });
-    }
-    validate_string_id(
-        "commit_idempotency_key",
-        &plan.commit_idempotency_key,
-        MAX_HTTP_IDEMPOTENCY_KEY_BYTES,
-    )
-}
 
 fn validate_link_session_id(link_session_id: &str) -> Result<(), ServerHttpError> {
     validate_string_bytes("link_session_id", link_session_id, MAX_OBJECT_ID_BYTES).map_err(
@@ -4725,14 +4476,6 @@ fn account_scoped_account_room_record(
     Ok(Some(record))
 }
 
-fn validate_string_id(field: &'static str, value: &str, max: usize) -> Result<(), ServerHttpError> {
-    if value.is_empty() || value.len() > max {
-        return Err(ServerHttpError::InvalidFanoutRequest {
-            reason: format!("{field} must contain between 1 and {max} bytes"),
-        });
-    }
-    Ok(())
-}
 
 fn claim_key_packages_from_inventory(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
