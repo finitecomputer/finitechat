@@ -32,7 +32,9 @@ pub use finitechat_http::{
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
-    LeaveRoomRequest, LeaveRoomResponse, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
+    LeaveRoomRequest, LeaveRoomResponse, PushTokenRecord, RegisterPushTokenRequest,
+    RegisterPushTokenResponse, RemovePushTokenRequest, RemovePushTokenResponse,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
     RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
@@ -90,6 +92,7 @@ pub struct HttpServerState {
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
     device_liveness: Arc<Mutex<BTreeMap<String, DeviceLivenessRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
+    push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -109,6 +112,7 @@ impl HttpServerState {
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
+            push_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             store: None,
         }
@@ -160,6 +164,7 @@ impl HttpServerState {
         let room_memberships = store.load_room_memberships()?;
         let application_effects = store.load_application_effects()?;
         let welcome_claims = store.load_welcome_claims()?;
+        let push_tokens = store.load_push_tokens()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
@@ -173,6 +178,7 @@ impl HttpServerState {
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
+            push_tokens: Arc::new(Mutex::new(push_tokens)),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             store: Some(store),
         })
@@ -485,7 +491,15 @@ impl HttpServerState {
             if let Some(store) = &self.store {
                 store.append_operation(&operation)?;
             }
-            revoked_devices.insert(device_key);
+            revoked_devices.insert(device_key.clone());
+            drop(revoked_devices);
+            // A revoked device must never be woken again.
+            let mut tokens = self.push_tokens.lock().expect("HTTP push-token mutex");
+            if tokens.remove(&device_key).is_some()
+                && let Some(store) = &self.store
+            {
+                store.delete_push_token(&device_key)?;
+            }
         }
         Ok(RevokeDeviceResponse { revoked: true })
     }
@@ -2095,6 +2109,47 @@ impl HttpServerState {
         })
     }
 
+    fn register_push_token(
+        &self,
+        request: RegisterPushTokenRequest,
+    ) -> Result<RegisterPushTokenResponse, ServerHttpError> {
+        request.device.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidDeviceRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        if request.token.is_empty() || request.token.len() > 4_096 {
+            return Err(ServerHttpError::InvalidDeviceRequest {
+                reason: "push token must be 1..=4096 bytes".to_owned(),
+            });
+        }
+        self.ensure_device_not_revoked(&request.device)?;
+        let record = PushTokenRecord {
+            device: request.device.clone(),
+            platform: request.platform,
+            token: request.token,
+        };
+        let mut tokens = self.push_tokens.lock().expect("HTTP push-token mutex");
+        if let Some(store) = &self.store {
+            store.upsert_push_token(&record)?;
+        }
+        tokens.insert(DeviceMembership::key(&request.device), record);
+        Ok(RegisterPushTokenResponse { registered: true })
+    }
+
+    fn remove_push_token(
+        &self,
+        request: RemovePushTokenRequest,
+    ) -> Result<RemovePushTokenResponse, ServerHttpError> {
+        let key = DeviceMembership::key(&request.device);
+        let mut tokens = self.push_tokens.lock().expect("HTTP push-token mutex");
+        let removed = tokens.remove(&key).is_some();
+        if removed && let Some(store) = &self.store {
+            store.delete_push_token(&key)?;
+        }
+        Ok(RemovePushTokenResponse { removed })
+    }
+
     /// Write a fresh durable-state snapshot so the next startup replays only
     /// the operation-log tail. Called automatically every
     /// [`SNAPSHOT_INTERVAL_OPS`] accepted operations and available for
@@ -2267,6 +2322,8 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
+        .route("/push-tokens", post(register_push_token))
+        .route("/push-tokens/remove", post(remove_push_token))
         .route("/rooms/leave", post(leave_room))
         .route("/rooms/admins", post(update_room_admins))
         .route("/rooms/report-invalid-commit", post(report_invalid_commit))
@@ -2484,6 +2541,22 @@ async fn list_account_rooms(
 ) -> Result<Json<ListAccountRoomDirectoryResponse>, ServerHttpError> {
     let page = state.list_account_rooms(request)?;
     Ok(Json(page))
+}
+
+async fn register_push_token(
+    State(state): State<HttpServerState>,
+    Json(request): Json<RegisterPushTokenRequest>,
+) -> Result<Json<RegisterPushTokenResponse>, ServerHttpError> {
+    let response = state.register_push_token(request)?;
+    Ok(Json(response))
+}
+
+async fn remove_push_token(
+    State(state): State<HttpServerState>,
+    Json(request): Json<RemovePushTokenRequest>,
+) -> Result<Json<RemovePushTokenResponse>, ServerHttpError> {
+    let response = state.remove_push_token(request)?;
+    Ok(Json(response))
 }
 
 async fn leave_room(
@@ -2798,6 +2871,10 @@ impl SqliteHttpDeliveryStore {
                 kind TEXT NOT NULL,
                 body_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS http_push_tokens (
+                device_key TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS http_state_snapshots (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 last_op_seq INTEGER NOT NULL,
@@ -3075,6 +3152,44 @@ impl SqliteHttpDeliveryStore {
             |row| row.get(0),
         )?;
         Ok(max)
+    }
+
+    fn load_push_tokens(
+        &self,
+    ) -> Result<BTreeMap<String, PushTokenRecord>, DurableStoreError> {
+        let conn = self.connection();
+        let mut statement =
+            conn.prepare("SELECT device_key, record_json FROM http_push_tokens")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut tokens = BTreeMap::new();
+        for row in rows {
+            let (key, json) = row?;
+            tokens.insert(key, serde_json::from_str(&json)?);
+        }
+        Ok(tokens)
+    }
+
+    fn upsert_push_token(&self, record: &PushTokenRecord) -> Result<(), DurableStoreError> {
+        let json = serde_json::to_string(record)?;
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO http_push_tokens (device_key, record_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(device_key) DO UPDATE SET record_json = excluded.record_json",
+            params![DeviceMembership::key(&record.device), json],
+        )?;
+        Ok(())
+    }
+
+    fn delete_push_token(&self, device_key: &str) -> Result<(), DurableStoreError> {
+        let conn = self.connection();
+        conn.execute(
+            "DELETE FROM http_push_tokens WHERE device_key = ?1",
+            params![device_key],
+        )?;
+        Ok(())
     }
 
     fn load_state_snapshot(

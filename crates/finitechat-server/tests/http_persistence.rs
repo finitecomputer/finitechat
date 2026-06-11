@@ -12,6 +12,7 @@ use finitechat_proto::{
     EventAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_http::{
+    PushPlatform, RegisterPushTokenRequest, RemovePushTokenRequest, RemovePushTokenResponse,
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
@@ -5986,6 +5987,106 @@ async fn sqlite_state_snapshot_boots_without_full_history_replay() {
     );
     let response = post_json(app.clone(), "/events", &typed_event_request(&replay)).await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-phone");
+    let bob = DeviceRef::new("bob", "bob-phone");
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-tokens",
+        &RegisterPushTokenRequest {
+            device: alice.clone(),
+            platform: PushPlatform::Apns,
+            token: "apns-token-alice".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/push-tokens",
+        &RegisterPushTokenRequest {
+            device: bob.clone(),
+            platform: PushPlatform::Fcm,
+            token: "fcm-token-bob".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Replacement is an upsert; removal is idempotent; both survive restart.
+    let response = post_json(
+        app.clone(),
+        "/push-tokens",
+        &RegisterPushTokenRequest {
+            device: alice.clone(),
+            platform: PushPlatform::Apns,
+            token: "apns-token-alice-2".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-tokens/remove",
+        &RemovePushTokenRequest {
+            device: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let removed: RemovePushTokenResponse = read_json(response).await;
+    assert!(removed.removed);
+    let response = post_json(
+        app.clone(),
+        "/push-tokens/remove",
+        &RemovePushTokenRequest {
+            device: alice.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let removed: RemovePushTokenResponse = read_json(response).await;
+    assert!(!removed.removed);
+
+    // Revoking a device drops its token, and a revoked device cannot
+    // re-register.
+    let response = post_json(
+        app.clone(),
+        "/devices/revoke",
+        &RevokeDeviceRequest { device: bob.clone() },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-tokens/remove",
+        &RemovePushTokenRequest { device: bob.clone() },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let removed: RemovePushTokenResponse = read_json(response).await;
+    assert!(!removed.removed, "revocation already dropped bob's token");
+    let response = post_json(
+        app.clone(),
+        "/push-tokens",
+        &RegisterPushTokenRequest {
+            device: bob,
+            platform: PushPlatform::Fcm,
+            token: "fcm-token-bob-again".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 fn submit_add_device_request(

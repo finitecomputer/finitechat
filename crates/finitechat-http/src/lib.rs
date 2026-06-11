@@ -293,6 +293,42 @@ pub struct AckWelcomeResponse {
     pub acked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushPlatform {
+    Apns,
+    Fcm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterPushTokenRequest {
+    pub device: DeviceRef,
+    pub platform: PushPlatform,
+    pub token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterPushTokenResponse {
+    pub registered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovePushTokenRequest {
+    pub device: DeviceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovePushTokenResponse {
+    pub removed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushTokenRecord {
+    pub device: DeviceRef,
+    pub platform: PushPlatform,
+    pub token: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaveRoomRequest {
     pub room_id: String,
