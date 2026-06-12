@@ -68,7 +68,7 @@ story.
 ## Status
 
 - [x] Phase 1 — docs
-- [ ] Phase 2 — proto + server invite sessions
+- [x] Phase 2 — proto + server invite sessions
 - [ ] Phase 3 — client addressing + invite codes + join/accept
 - [ ] Phase 4 — CLI hermes subcommands
 - [ ] Phase 5 — hermes plugin refresh

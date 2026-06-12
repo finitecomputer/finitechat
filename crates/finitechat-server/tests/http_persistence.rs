@@ -17,7 +17,12 @@ use finitechat_http::{
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateLinkSessionRequest, LeaveRoomRequest, LeaveRoomResponse, UpdateRoomAdminsRequest,
+    CreateInviteSessionRequest, CreateLinkSessionRequest, ExpireInviteSessionRequest,
+    ExpireInviteSessionResponse, HttpInviteJoinRequestRecord, HttpInviteJoinState,
+    HttpInviteSessionRecord, HttpInviteSessionState, InviteJoinStatusRequest,
+    InviteJoinStatusResponse, LeaveRoomRequest, LeaveRoomResponse,
+    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, RespondInviteJoinRequest,
+    SubmitInviteJoinRequest, UpdateRoomAdminsRequest,
     UpdateRoomAdminsResponse,
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
@@ -6864,4 +6869,363 @@ fn welcome_message(message_id: &str, recipient: MemberId, payload: &[u8]) -> Tra
         source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
         envelope: TransportEnvelope::Welcome { recipient },
     }
+}
+
+fn invite_pin_proof_stub(label: &str) -> String {
+    // Server-side tests only need a structurally valid proof (64 hex chars);
+    // proof verification is inviter-side by design (ADR 0006).
+    let mut proof = String::with_capacity(64);
+    for byte in label.bytes().cycle().take(32) {
+        proof.push_str(&format!("{byte:02x}"));
+    }
+    proof
+}
+
+#[tokio::test]
+async fn sqlite_invite_session_lifecycle_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-agent");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-invite-lifecycle".to_owned();
+    let mls_group_id = "mls-invite-lifecycle".to_owned();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let create = CreateInviteSessionRequest {
+        invite_id: "invite-lifecycle".to_owned(),
+        room_id: room_id.clone(),
+        inviter: alice.clone(),
+        max_joins: 1,
+        expires_at_ms: 2_000_000,
+    };
+    let response = post_json(app.clone(), "/invites", &create).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session: HttpInviteSessionRecord = read_json(response).await;
+    assert_eq!(session.state, HttpInviteSessionState::Open);
+    assert_eq!(session.accepted_joins, 0);
+
+    let response = post_json(app.clone(), "/invites", &create).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invite_session_already_exists");
+
+    let join = SubmitInviteJoinRequest {
+        invite_id: "invite-lifecycle".to_owned(),
+        request_id: "join-bob".to_owned(),
+        joiner: bob.clone(),
+        key_package: b"opaque-mls-key-package-bytes".to_vec(),
+        pin_proof: invite_pin_proof_stub("bob"),
+        display_name: Some("Bob".to_owned()),
+        submitted_at_ms: 1_000_000,
+    };
+    let response = post_json(app.clone(), "/invites/join", &join).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let record: HttpInviteJoinRequestRecord = read_json(response).await;
+    assert_eq!(record.state, HttpInviteJoinState::Pending);
+
+    // Exact resubmission replays the original record.
+    let response = post_json(app.clone(), "/invites/join", &join).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay: HttpInviteJoinRequestRecord = read_json(response).await;
+    assert_eq!(replay, record);
+
+    // Same request id with different content conflicts.
+    let mut tampered = join.clone();
+    tampered.key_package = b"different-bytes".to_vec();
+    let response = post_json(app.clone(), "/invites/join", &tampered).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invite_session_conflict");
+
+    // Restart: the pending join request and session survive.
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/invites/requests",
+        &ListInviteJoinRequestsRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: ListInviteJoinRequestsResponse = read_json(response).await;
+    assert_eq!(listed.session.state, HttpInviteSessionState::Open);
+    assert_eq!(listed.requests.len(), 1);
+    assert_eq!(listed.requests[0], record);
+
+    // Accepting the only allowed join closes the session (max_joins = 1).
+    let response = post_json(
+        app.clone(),
+        "/invites/respond",
+        &RespondInviteJoinRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+            request_id: "join-bob".to_owned(),
+            accept: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: HttpInviteJoinRequestRecord = read_json(response).await;
+    assert_eq!(accepted.state, HttpInviteJoinState::Accepted);
+
+    // Idempotent accept replays the resolved record.
+    let response = post_json(
+        app.clone(),
+        "/invites/respond",
+        &RespondInviteJoinRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+            request_id: "join-bob".to_owned(),
+            accept: true,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Flipping the verdict after resolution conflicts.
+    let response = post_json(
+        app.clone(),
+        "/invites/respond",
+        &RespondInviteJoinRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+            request_id: "join-bob".to_owned(),
+            accept: false,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = post_json(
+        app.clone(),
+        "/invites/status",
+        &InviteJoinStatusRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+            request_id: "join-bob".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: InviteJoinStatusResponse = read_json(response).await;
+    assert_eq!(status.state, HttpInviteJoinState::Accepted);
+    assert_eq!(status.room_id, room_id);
+
+    // The closed session rejects further joins.
+    let mut late = join.clone();
+    late.request_id = "join-late".to_owned();
+    let response = post_json(app.clone(), "/invites/join", &late).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invite_session_closed");
+
+    // Restart again: closed state and accepted verdict survive.
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/invites/status",
+        &InviteJoinStatusRequest {
+            invite_id: "invite-lifecycle".to_owned(),
+            request_id: "join-bob".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: InviteJoinStatusResponse = read_json(response).await;
+    assert_eq!(status.state, HttpInviteJoinState::Accepted);
+}
+
+#[tokio::test]
+async fn sqlite_invite_create_requires_existing_room_and_admin_inviter() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-agent");
+    let mallory = DeviceRef::new("mallory", "mallory-laptop");
+    let room_id = "room-invite-authority".to_owned();
+
+    let app = persistent_app(&db_path);
+
+    // No such room.
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-no-room".to_owned(),
+            room_id: room_id.clone(),
+            inviter: alice.clone(),
+            max_joins: 1,
+            expires_at_ms: 1_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_invite_request");
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: "mls-invite-authority".to_owned(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A non-admin account cannot open an invite session for the room.
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-not-admin".to_owned(),
+            room_id: room_id.clone(),
+            inviter: mallory.clone(),
+            max_joins: 1,
+            expires_at_ms: 1_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_invite_request");
+
+    // max_joins is bounded.
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-too-many".to_owned(),
+            room_id: room_id.clone(),
+            inviter: alice.clone(),
+            max_joins: 0,
+            expires_at_ms: 1_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn sqlite_invite_join_validation_and_expiry_reject_before_persisting() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-agent");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-invite-validation".to_owned();
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: "mls-invite-validation".to_owned(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-validation".to_owned(),
+            room_id: room_id.clone(),
+            inviter: alice.clone(),
+            max_joins: 4,
+            expires_at_ms: 1_000_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let valid_join = SubmitInviteJoinRequest {
+        invite_id: "invite-validation".to_owned(),
+        request_id: "join-validation".to_owned(),
+        joiner: bob.clone(),
+        key_package: b"kp".to_vec(),
+        pin_proof: invite_pin_proof_stub("bob"),
+        display_name: None,
+        submitted_at_ms: 500,
+    };
+
+    // pin_proof must be 64 hex chars.
+    let mut bad_proof = valid_join.clone();
+    bad_proof.pin_proof = "not-hex".to_owned();
+    let response = post_json(app.clone(), "/invites/join", &bad_proof).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // The key package must be non-empty.
+    let mut empty_kp = valid_join.clone();
+    empty_kp.key_package = Vec::new();
+    let response = post_json(app.clone(), "/invites/join", &empty_kp).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Joins claiming a time after expiry are rejected.
+    let mut stale = valid_join.clone();
+    stale.submitted_at_ms = 2_000_000;
+    let response = post_json(app.clone(), "/invites/join", &stale).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invite_session_closed");
+
+    // Nothing above persisted a join request.
+    let response = post_json(
+        app.clone(),
+        "/invites/requests",
+        &ListInviteJoinRequestsRequest {
+            invite_id: "invite-validation".to_owned(),
+        },
+    )
+    .await;
+    let listed: ListInviteJoinRequestsResponse = read_json(response).await;
+    assert!(listed.requests.is_empty());
+
+    // Explicit expiry closes the session idempotently and blocks joins.
+    let response = post_json(
+        app.clone(),
+        "/invites/expire",
+        &ExpireInviteSessionRequest {
+            invite_id: "invite-validation".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired: ExpireInviteSessionResponse = read_json(response).await;
+    assert!(expired.expired);
+
+    let response = post_json(
+        app.clone(),
+        "/invites/expire",
+        &ExpireInviteSessionRequest {
+            invite_id: "invite-validation".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(app.clone(), "/invites/join", &valid_join).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Expiry survives restart.
+    let app = persistent_app(&db_path);
+    let response = post_json(app.clone(), "/invites/join", &valid_join).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invite_session_closed");
 }

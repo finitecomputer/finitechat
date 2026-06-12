@@ -4,6 +4,7 @@ use finitechat_proto::{
     RoomProtocol,ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use transport_http_server::{
     HttpClaimedKeyPackage, HttpKeyPackageId, HttpPublishTarget, HttpSequence,
 };
@@ -226,6 +227,131 @@ pub enum HttpLinkSessionState {
     Claimed,
     Delivered,
     Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateInviteSessionRequest {
+    pub invite_id: String,
+    pub room_id: String,
+    pub inviter: DeviceRef,
+    pub max_joins: u32,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitInviteJoinRequest {
+    pub invite_id: String,
+    pub request_id: String,
+    pub joiner: DeviceRef,
+    pub key_package: Vec<u8>,
+    pub pin_proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub submitted_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListInviteJoinRequestsRequest {
+    pub invite_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListInviteJoinRequestsResponse {
+    pub session: HttpInviteSessionSummary,
+    pub requests: Vec<HttpInviteJoinRequestRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RespondInviteJoinRequest {
+    pub invite_id: String,
+    pub request_id: String,
+    pub accept: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteJoinStatusRequest {
+    pub invite_id: String,
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteJoinStatusResponse {
+    pub room_id: String,
+    pub state: HttpInviteJoinState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireInviteSessionRequest {
+    pub invite_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireInviteSessionResponse {
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpInviteSessionSummary {
+    pub invite_id: String,
+    pub room_id: String,
+    pub inviter: DeviceRef,
+    pub max_joins: u32,
+    pub accepted_joins: u32,
+    pub expires_at_ms: u64,
+    pub state: HttpInviteSessionState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpInviteSessionRecord {
+    pub invite_id: String,
+    pub room_id: String,
+    pub inviter: DeviceRef,
+    pub max_joins: u32,
+    pub accepted_joins: u32,
+    pub expires_at_ms: u64,
+    pub state: HttpInviteSessionState,
+    #[serde(default)]
+    pub join_requests: BTreeMap<String, HttpInviteJoinRequestRecord>,
+}
+
+impl HttpInviteSessionRecord {
+    pub fn summary(&self) -> HttpInviteSessionSummary {
+        HttpInviteSessionSummary {
+            invite_id: self.invite_id.clone(),
+            room_id: self.room_id.clone(),
+            inviter: self.inviter.clone(),
+            max_joins: self.max_joins,
+            accepted_joins: self.accepted_joins,
+            expires_at_ms: self.expires_at_ms,
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpInviteSessionState {
+    Open,
+    Closed,
+    Expired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpInviteJoinRequestRecord {
+    pub request_id: String,
+    pub joiner: DeviceRef,
+    pub key_package: Vec<u8>,
+    pub pin_proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub submitted_at_ms: u64,
+    pub state: HttpInviteJoinState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpInviteJoinState {
+    Pending,
+    Accepted,
+    Rejected,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
