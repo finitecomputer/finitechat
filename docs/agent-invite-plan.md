@@ -71,6 +71,6 @@ story.
 - [x] Phase 2 — proto + server invite sessions
 - [x] Phase 3 — client addressing + invite codes + join/accept
 - [x] Phase 4 — CLI hermes subcommands
-- [ ] Phase 5 — hermes plugin refresh
+- [x] Phase 5 — hermes plugin refresh
 - [ ] Phase 6 — container harness + e2e
 - [ ] Phase 7 — perf pass

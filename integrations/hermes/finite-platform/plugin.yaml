@@ -1,9 +1,21 @@
 name: finite-platform
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
-  Finite Chat platform adapter for Hermes. Connects Hermes to a Finite Chat
-  room through the finitechat hermes JSON bridge.
+  Finite Chat platform adapter for Hermes. Connects Hermes to E2EE Finite
+  Chat rooms through the finitechat hermes JSON bridge: the agent prints an
+  invite QR + rotating PIN at startup, verified joiners are admitted before
+  they ever enter the MLS group, and all message senders are
+  MLS-authenticated.
 author: finitecomputer
 requires_env:
-  - FINITECHAT_ROOM_ID
+  - name: FINITECHAT_HOME
+    description: >
+      Agent home directory created by `finitechat-darkmatter hermes init
+      --server URL` (holds the agent's Nostr identity, encrypted client
+      store, and stored invites).
+optional_env:
+  - name: FINITECHAT_BIN
+    description: Path to the finitechat binary (default: found on PATH).
+  - name: FINITECHAT_ROOM_ID
+    description: Optional room filter; by default all invited rooms are served.

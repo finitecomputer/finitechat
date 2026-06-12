@@ -252,11 +252,18 @@ fn cmd_pin<W: Write>(
     };
     let now = now_secs();
     let pin = invite_current_pin(&code.invite_token, now);
+    let url = code
+        .encode()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
     crate::write_pretty_json(
         output,
         &json!({
             "invite_id": code.invite_id,
+            "room_id": code.room_id,
+            "url": url,
+            "qr": render_qr(&url)?,
             "pin": pin,
+            "pin_window_seconds": INVITE_PIN_WINDOW_SECONDS,
             "seconds_remaining": INVITE_PIN_WINDOW_SECONDS - (now % INVITE_PIN_WINDOW_SECONDS),
         }),
     )

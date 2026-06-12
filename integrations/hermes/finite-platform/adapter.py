@@ -33,7 +33,7 @@ def check_requirements() -> bool:
 
 def validate_config(config: PlatformConfig) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("room_id") or os.getenv("FINITECHAT_ROOM_ID"))
+    return bool(extra.get("home") or os.getenv("FINITECHAT_HOME"))
 
 
 def is_connected(config: PlatformConfig) -> bool:
@@ -49,6 +49,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(FINITE_PLATFORM_NAME))
         extra = getattr(config, "extra", {}) or {}
+        self.home = str(extra.get("home") or os.getenv("FINITECHAT_HOME") or "").strip()
+        # Optional room filter; by default the adapter serves every room the
+        # agent's invites admit people into.
         self.room_id = str(extra.get("room_id") or os.getenv("FINITECHAT_ROOM_ID") or "").strip()
         self.poll_timeout_secs = _bounded_int(
             extra.get("poll_timeout_secs") or os.getenv("FINITECHAT_HERMES_POLL_TIMEOUT_SECS"),
@@ -76,17 +79,45 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self._activity_conversation_by_room: Dict[str, Optional[str]] = {}
 
     async def connect(self) -> bool:
-        if not self.room_id:
-            logger.error("[finite] FINITECHAT_ROOM_ID is required")
+        if not self.home:
+            logger.error("[finite] FINITECHAT_HOME is required (agent home directory)")
             return False
         if not self._finitechat_cmd:
             logger.error("[finite] finitechat CLI is not configured")
             return False
 
+        await self._surface_invite()
         self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info("[finite] connected to room %s", self.room_id)
+        logger.info(
+            "[finite] connected (home=%s%s)",
+            self.home,
+            f", room filter={self.room_id}" if self.room_id else "",
+        )
         return True
+
+    async def _surface_invite(self) -> None:
+        """Print the join QR/URL/PIN at startup (the agentnoise pattern for
+        headless boxes). Reuses the stored invite; creates one on first run."""
+        result = await self._finitechat_json("pin", {}, timeout=30)
+        if not result.ok:
+            result = await self._finitechat_json("invite", {}, timeout=60)
+        if not result.ok:
+            logger.warning("[finite] could not prepare an invite: %s", result.error)
+            return
+        qr = result.data.get("qr") or ""
+        url = result.data.get("url") or ""
+        pin = result.data.get("pin") or ""
+        if qr:
+            print(qr, flush=True)
+        if url:
+            print(f"Scan or open in Finite Chat:\n  {url}", flush=True)
+        if pin:
+            print(
+                f"Challenge PIN (rotates every "
+                f"{result.data.get('pin_window_seconds') or 30}s): {pin}",
+                flush=True,
+            )
 
     async def disconnect(self) -> None:
         if self._poll_task:
@@ -269,13 +300,15 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def _poll_loop(self) -> None:
         while self.is_connected:
+            payload: Dict[str, Any] = {
+                "limit": self.poll_limit,
+                "timeout_millis": self.poll_timeout_secs * 1000,
+            }
+            if self.room_id:
+                payload["room_id"] = self.room_id
             result = await self._finitechat_json(
                 "poll",
-                {
-                    "room_id": self.room_id,
-                    "limit": self.poll_limit,
-                    "timeout_millis": self.poll_timeout_secs * 1000,
-                },
+                payload,
                 timeout=self.poll_timeout_secs + 15,
             )
             if not result.ok:
@@ -283,6 +316,8 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 await asyncio.sleep(2.0)
                 continue
 
+            for account in result.data.get("joined") or []:
+                logger.info("[finite] verified joiner admitted: %s", account)
             events = result.data.get("events") or []
             for raw_event in events:
                 try:
@@ -294,8 +329,8 @@ class FiniteChatAdapter(BasePlatformAdapter):
         if not isinstance(raw_event, dict):
             return
         room_id = str(raw_event.get("room_id") or self.room_id)
-        if room_id != self.room_id:
-            logger.warning("[finite] ignored event for unexpected room %s", room_id)
+        if self.room_id and room_id != self.room_id:
+            logger.warning("[finite] ignored event for filtered room %s", room_id)
             return
         seq = raw_event.get("seq")
         message_id = str(raw_event.get("message_id") or "")
@@ -335,12 +370,6 @@ class FiniteChatAdapter(BasePlatformAdapter):
             internal=bool(raw_event.get("internal") or False),
         )
         await self.handle_message(event)
-        if isinstance(seq, int):
-            await self._finitechat_json(
-                "ack",
-                {"room_id": room_id, "seq": seq, "message_id": message_id},
-                timeout=15,
-            )
 
     async def _send_media(
         self,
@@ -425,7 +454,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
     ) -> "_FiniteChatResult":
         if not self._finitechat_cmd:
             return _FiniteChatResult(False, {}, "finitechat CLI is not configured", False)
-        command = [*self._finitechat_cmd, "hermes", action, "--json"]
+        command = [*self._finitechat_cmd, "hermes"]
+        if self.home:
+            command += ["--home", self.home]
+        command += [action, "--json"]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
@@ -477,9 +509,10 @@ def _resolve_finitechat_command(configured: str) -> List[str]:
     ).strip()
     if raw:
         return shlex.split(raw)
-    path = shutil.which("finitechat")
-    if path:
-        return [path]
+    for name in ("finitechat", "finitechat-darkmatter"):
+        path = shutil.which(name)
+        if path:
+            return [path]
     return []
 
 
@@ -582,8 +615,11 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["FINITECHAT_ROOM_ID"],
-        install_hint="Install finitechat and set FINITECHAT_ROOM_ID.",
+        required_env=["FINITECHAT_HOME"],
+        install_hint=(
+            "Install the finitechat binary, run `finitechat-darkmatter hermes "
+            "init --server URL`, and set FINITECHAT_HOME to the agent home."
+        ),
         allowed_users_env="FINITECHAT_ALLOWED_USERS",
         allow_all_env="FINITECHAT_ALLOW_ALL_USERS",
         max_message_length=FiniteChatAdapter.MAX_MESSAGE_LENGTH,

@@ -133,9 +133,11 @@ class FinitePlatformAdapterTests(unittest.TestCase):
     def setUp(self):
         self.module = load_adapter_module()
 
-    def adapter(self):
-        config = PlatformConfig(extra={"room_id": "room-agent-1", "finitechat_bin": "/bin/echo"})
-        return self.module.FiniteChatAdapter(config)
+    def adapter(self, room_id="room-agent-1"):
+        extra = {"home": "/tmp/finite-agent-home", "finitechat_bin": "/bin/echo"}
+        if room_id:
+            extra["room_id"] = room_id
+        return self.module.FiniteChatAdapter(PlatformConfig(extra=extra))
 
     def test_register_exposes_finite_platform_contract(self):
         ctx = MockPluginContext()
@@ -145,7 +147,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         entry = ctx.registered[0]
         self.assertEqual(entry["name"], "finite")
         self.assertEqual(entry["label"], "Finite Chat")
-        self.assertEqual(entry["required_env"], ["FINITECHAT_ROOM_ID"])
+        self.assertEqual(entry["required_env"], ["FINITECHAT_HOME"])
         self.assertEqual(entry["allowed_users_env"], "FINITECHAT_ALLOWED_USERS")
         self.assertEqual(entry["max_message_length"], self.module.FiniteChatAdapter.MAX_MESSAGE_LENGTH)
         self.assertTrue(callable(entry["adapter_factory"]))
@@ -215,7 +217,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(payload["attachments"][0]["kind"], "file")
         self.assertEqual(payload["attachments"][0]["mime_type"], "application/pdf")
 
-    def test_poll_event_maps_room_to_chat_and_conversation_to_thread_then_acks(self):
+    def test_poll_event_maps_room_to_chat_and_conversation_to_thread(self):
         adapter = self.adapter()
         calls = []
 
@@ -265,26 +267,75 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.source.chat_topic, "Builds")
         self.assertEqual(event.media_urls, ["/tmp/screenshot.png"])
         self.assertEqual(event.reply_to_message_id, "msg-11")
-        self.assertEqual(calls[-1][0], "ack")
-        self.assertEqual(calls[-1][1], {"room_id": "room-agent-1", "seq": 12, "message_id": "msg-12"})
+        # The CLI owns the durable cursor; the adapter never acks.
+        self.assertEqual(calls, [])
 
-    def test_wrong_room_event_is_not_dispatched_or_acked(self):
-        adapter = self.adapter()
+    def test_room_filter_drops_other_rooms_but_unfiltered_serves_all(self):
+        filtered = self.adapter(room_id="room-agent-1")
+        filtered._finitechat_json = self._record_json([])
+        asyncio.run(
+            filtered._handle_finitechat_event(
+                {"room_id": "other-room", "seq": 1, "message_id": "msg-1", "text": "nope"}
+            )
+        )
+        self.assertEqual(filtered.handled_messages, [])
+
+        unfiltered = self.adapter(room_id=None)
+        unfiltered._finitechat_json = self._record_json([])
+        asyncio.run(
+            unfiltered._handle_finitechat_event(
+                {"room_id": "any-room", "seq": 2, "message_id": "msg-2", "text": "hello"}
+            )
+        )
+        self.assertEqual(len(unfiltered.handled_messages), 1)
+        self.assertEqual(unfiltered.handled_messages[0].source.chat_id, "any-room")
+
+    def test_home_is_required_and_room_is_optional(self):
+        self.assertTrue(
+            self.module.validate_config(
+                PlatformConfig(extra={"home": "/tmp/finite-agent-home"})
+            )
+        )
+        old_home = os.environ.pop("FINITECHAT_HOME", None)
+        try:
+            self.assertFalse(self.module.validate_config(PlatformConfig(extra={})))
+        finally:
+            if old_home is not None:
+                os.environ["FINITECHAT_HOME"] = old_home
+
+    def test_connect_surfaces_invite_qr_url_and_pin(self):
+        adapter = self.adapter(room_id=None)
         calls = []
 
+        async def fake_json(action, payload, *, timeout):
+            calls.append(action)
+            if action == "pin":
+                return self.module._FiniteChatResult(False, {}, "no stored invites", False)
+            if action == "invite":
+                return self.module._FiniteChatResult(
+                    True,
+                    {
+                        "qr": "█▀▀▀█ qr █▀▀▀█",
+                        "url": "finite://join?v=1&s=http%3A%2F%2Fx&r=r&i=i&t=00&a=npub1q",
+                        "pin": "123456",
+                        "pin_window_seconds": 30,
+                    },
+                    None,
+                    False,
+                )
+            return self.module._FiniteChatResult(True, {}, None, False)
+
+        adapter._finitechat_json = fake_json
+        asyncio.run(adapter._surface_invite())
+        # Falls back from the stored-invite lookup to creating one.
+        self.assertEqual(calls, ["pin", "invite"])
+
+    def _record_json(self, calls):
         async def fake_json(action, payload, *, timeout):
             calls.append((action, payload, timeout))
             return self.module._FiniteChatResult(True, {}, None, False)
 
-        adapter._finitechat_json = fake_json
-        asyncio.run(
-            adapter._handle_finitechat_event(
-                {"room_id": "other-room", "seq": 1, "message_id": "msg-1", "text": "nope"}
-            )
-        )
-
-        self.assertEqual(adapter.handled_messages, [])
-        self.assertEqual(calls, [])
+        return fake_json
 
     def test_typing_activity_uses_ephemeral_bridge_not_status_messages(self):
         adapter = self.adapter()
