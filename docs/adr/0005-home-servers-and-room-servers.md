@@ -95,9 +95,11 @@ discovering where it lives.
    the only interop mechanism; no app-specific behavior enters the protocol.
 5. **The cross-room state list is closed.** Account-resident server state is
    exactly: KeyPackage inventory, push tokens, revocation fast-block, link
-   sessions, device liveness, account-room directory. New server state must
-   be room-scoped, or be explicitly added here as home-scoped *with a
-   migration story*. This is a review-time rule starting now.
+   sessions, device liveness, account-room directory, and invite sessions
+   (added by ADR 0006; ephemeral with a TTL — the migration story is "print
+   a new invite"). New server state must be room-scoped, or be explicitly
+   added here as home-scoped *with a migration story*. This is a review-time
+   rule starting now.
 6. **Revocation degrades gracefully, by design.** Server-side revocation is
    a fast-block convenience at the home server; real enforcement is MLS
    removal commits, which are per-room and work on any room server. Nothing
