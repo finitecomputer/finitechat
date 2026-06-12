@@ -1524,3 +1524,26 @@ added by any step.
 Remaining from the plan after this checkpoint: retention/horizon compaction
 (cursor semantics already decided and previewed by the snapshot test),
 idempotency expiry against the same horizon, and the pusher daemon.
+
+## Checkpoint: Sharded Topology Recorded (ADR 0005)
+
+2026-06-12. A code audit validated the product vision — each room can live on
+its own server — against the implementation. Verdict: strong match. The
+per-room ordering (no global sequence anywhere), self-certifying key-derived
+identity, and the ADR 0001 trust split mean a per-room server is just a
+server with one room, and a hostile self-hosted server's blast radius is
+exactly that room. The audit also enumerated the exact coupling: six pieces
+of account-resident server state (KeyPackage inventory, push tokens,
+revocation fast-block, link sessions, device liveness, account-room
+directory) and a client that holds a single `base_url` with no server
+identity on room records.
+
+ADR 0005 records the target topology (home server for account state and
+push, room servers for rooms, wake relay between them), the migration
+principles (home servers replaceable, identity never server-issued, wake
+payload frozen at `{room_id, seq}`, cross-room state list closed), the
+home/room route taxonomy, and the readiness backlog — headlined by "stop
+deepening the single-URL assumption in the client" as the only item where
+waiting makes the work larger. Glossary gained Room server / Home server /
+Wake relay; architecture report §10/§11 updated. Nothing built; today's
+deployment is reframed as the degenerate one-server-both-roles topology.

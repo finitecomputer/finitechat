@@ -260,6 +260,8 @@ Decisions are ADRs; vocabulary is the glossary; running work is logged.
 - `docs/adr/0004` — surface simplifications: typed-only rooms, one event
   route, claim+activate welcomes, direct rooms dissolved, interop only if
   free
+- `docs/adr/0005` — home servers and room servers: the sharded target
+  topology, the migration principles, and the route taxonomy
 - `CONTEXT.md` / `docs/protocol-glossary.md` — domain language and the
   user-promise behind each mechanism
 - `docs/perf-plan.md` / `docs/perf-log.md` — performance program and ledger
@@ -272,5 +274,8 @@ Retention/horizon compaction (cursor semantics decided, snapshot proven as
 its substrate), idempotency-record expiry against the same horizon, the
 pusher daemon (token routes and wake contract exist), the agent stream
 delta transport (durable anchors reserved), media transport beyond the
-blob-reference design, calls, and any multi-server story — this is a
-single-ordering-authority system by design at this phase.
+blob-reference design, calls, and the home-server/room-server split
+(ADR 0005 — target topology and guardrails recorded; today's deployment is
+the degenerate case of one server playing both roles). Each room keeps a
+single ordering authority by design at every phase; what eventually shards
+is *which* server holds that authority, per room.

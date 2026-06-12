@@ -156,6 +156,34 @@ The full device snapshot (including OpenMLS storage records) serialized and
 encrypted at rest with AES-256-GCM under a key derived from the account secret.
 _User promise_: a stolen disk or backup leaks neither messages nor group keys.
 
+## Topology vocabulary (ADR 0005 — target, not yet built)
+
+**Room server**:
+The single ordering authority for one or more rooms: hosts their logs,
+membership projections, and welcome lifecycles. Self-hostable by anyone; holds
+no push credentials and no account registry. Today every room shares one
+server; the protocol does not require it.
+_User promise_: your group can run on a server your group controls, and a bad
+or dead server costs you exactly that one room — never your identity or your
+other chats.
+
+**Home server**:
+The account-resident server: KeyPackage inventory, push tokens, device
+linking, liveness, fast-block revocation, and the account-room directory.
+Typically run by the app vendor, because push delivery requires vendor-held
+APNs/FCM credentials. Replaceable by design — identity is key-derived and
+every home-server record is client-regenerable.
+_User promise_: if your home server goes out of business, you migrate; you do
+not lose your identity, your rooms, or your history.
+
+**Wake relay**:
+In the sharded topology, room servers forward the wake hint `{room_id, seq}`
+to the device's home server, which holds the push credentials. The payload is
+frozen content-free and state-free (pull-based sync), so relaying through an
+untrusted room server is safe.
+_User promise_: pushes work even for self-hosted rooms, without handing your
+device token or your messages to a stranger's server.
+
 ## One-line altitude check
 
 Everything in "Server-side mechanisms" exists to make the server a trustworthy
