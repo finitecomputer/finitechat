@@ -158,6 +158,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,6 +598,7 @@ dependencies = [
  "finitechat-server",
  "openmls",
  "openmls_basic_credential",
+ "openmls_memory_storage",
  "openmls_rust_crypto",
  "reqwest",
  "rusqlite",
@@ -643,6 +650,7 @@ dependencies = [
  "hkdf",
  "openmls",
  "openmls_basic_credential",
+ "openmls_memory_storage",
  "openmls_rust_crypto",
  "secp256k1",
  "sha2",
@@ -653,6 +661,8 @@ dependencies = [
 name = "finitechat-proto"
 version = "0.1.0"
 dependencies = [
+ "bech32",
+ "hmac",
  "serde",
  "serde_json",
  "sha2",

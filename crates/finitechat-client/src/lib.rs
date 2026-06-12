@@ -13,16 +13,22 @@ use finitechat_proto::{
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    FiniteAccountRoomCommitProjection, GroupSyncRequest, HttpClaimedWelcome,
-    HttpKeyPackageInventory, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, PublishKeyPackageResponse,
-    SaveAccountRoomRequest, SaveAccountRoomResponse,
+    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GroupSyncRequest,
+    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState,
+    HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
+    InviteJoinStatusResponse, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
+    ListInviteJoinRequestsResponse, PublishKeyPackageResponse, RespondInviteJoinRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
     NostrPublicKey, NostrSecretKey,
 };
 use finitechat_proto::message_id_for_bytes;
+use finitechat_proto::{
+    InviteCodeV1, MAX_INVITE_TTL_MILLIS, invite_join_proof, verify_invite_join_proof,
+};
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
     MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS, MAX_DEVICE_ID_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
@@ -60,11 +66,12 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
-const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 7;
+const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 8;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
 const MAX_PERSISTED_ROOMS: u32 = 1024;
+const MAX_ROOM_SERVER_URL_BYTES: u32 = 2048;
 const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
 const MAX_PENDING_KEY_PACKAGE_UPLOADS: u32 = MAX_KEY_PACKAGES_PER_DEVICE;
 const MAX_LINK_FANOUTS: u32 = 16;
@@ -142,6 +149,10 @@ pub struct PersistedRoomState {
     pub room_id: RoomId,
     pub mls_group_id: MlsGroupId,
     pub last_applied_seq: u64,
+    /// Which server hosts this room's ordered log. `None` means the
+    /// device's home server (ADR 0005); invited rooms record the address
+    /// from their invite code so the sync ticks can group rooms by server.
+    pub server_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +267,8 @@ pub struct RuntimeLinkFanoutReport {
 pub struct RoomSyncCursor {
     pub room_id: RoomId,
     pub after_seq: u64,
+    /// `None` = the device's home server (ADR 0005).
+    pub server_url: Option<String>,
 }
 
 impl RuntimeSyncOptions {
@@ -413,6 +426,7 @@ pub struct FiniteChatDevice {
     signer: SignatureKeyPair,
     groups: BTreeMap<RoomId, MlsGroup>,
     room_cursors: BTreeMap<RoomId, u64>,
+    room_server_urls: BTreeMap<RoomId, String>,
     pending_welcomes: BTreeMap<WelcomeId, PendingWelcomeState>,
     pending_welcome_acks: BTreeMap<WelcomeId, PendingWelcomeAckState>,
     pending_key_package_uploads: BTreeMap<KeyPackageId, UploadKeyPackageRequest>,
@@ -459,6 +473,7 @@ impl FiniteChatDevice {
             signer,
             groups: BTreeMap::new(),
             room_cursors: BTreeMap::new(),
+            room_server_urls: BTreeMap::new(),
             pending_welcomes: BTreeMap::new(),
             pending_welcome_acks: BTreeMap::new(),
             pending_key_package_uploads: BTreeMap::new(),
@@ -537,6 +552,15 @@ impl FiniteChatDevice {
                 return Err(ClientError::DuplicatePersistedRoom(room.room_id.clone()));
             }
         }
+        let room_server_urls = state
+            .rooms
+            .iter()
+            .filter_map(|room| {
+                room.server_url
+                    .clone()
+                    .map(|server_url| (room.room_id.clone(), server_url))
+            })
+            .collect::<BTreeMap<_, _>>();
         let room_cursors = state
             .rooms
             .iter()
@@ -572,6 +596,7 @@ impl FiniteChatDevice {
             signer,
             groups,
             room_cursors,
+            room_server_urls,
             pending_welcomes,
             pending_welcome_acks,
             pending_key_package_uploads,
@@ -608,6 +633,7 @@ impl FiniteChatDevice {
                     room_id: room_id.clone(),
                     mls_group_id: mls_group_id_string(group.group_id())?,
                     last_applied_seq: *self.room_cursors.get(room_id).unwrap_or(&0),
+                    server_url: self.room_server_urls.get(room_id).cloned(),
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -1288,8 +1314,37 @@ impl FiniteChatDevice {
             .map(|room_id| RoomSyncCursor {
                 room_id: room_id.clone(),
                 after_seq: *self.room_cursors.get(room_id).unwrap_or(&0),
+                server_url: self.room_server_urls.get(room_id).cloned(),
             })
             .collect()
+    }
+
+    /// Record which server hosts a room's ordered log. `None` means the
+    /// home server. Joined-via-invite rooms record the address from their
+    /// invite code.
+    pub fn set_room_server_url(
+        &mut self,
+        room_id: &str,
+        server_url: Option<String>,
+    ) -> Result<(), ClientError> {
+        validate_room_id(room_id)?;
+        self.group(room_id)?;
+        if let Some(server_url) = &server_url {
+            validate_string_bytes("room.server_url", server_url, MAX_ROOM_SERVER_URL_BYTES)?;
+        }
+        match server_url {
+            Some(server_url) => {
+                self.room_server_urls.insert(room_id.to_owned(), server_url);
+            }
+            None => {
+                self.room_server_urls.remove(room_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn room_server_url(&self, room_id: &str) -> Option<&str> {
+        self.room_server_urls.get(room_id).map(String::as_str)
     }
 
     pub fn pending_welcome_count(&self) -> usize {
@@ -1942,6 +1997,58 @@ impl FiniteChatDevice {
         Ok(count)
     }
 
+    fn random_bytes<const N: usize>(&self) -> Result<[u8; N], ClientError> {
+        self.provider
+            .rand()
+            .random_array()
+            .map_err(|_| ClientError::Randomness)
+    }
+
+    /// Fresh high-entropy invite token (ADR 0006): lives only in the
+    /// invite URL/QR, never alone on the server.
+    pub fn generate_invite_token(&self) -> Result<Vec<u8>, ClientError> {
+        Ok(self.random_bytes::<16>()?.to_vec())
+    }
+
+    pub fn generate_object_id(&self, prefix: &str) -> Result<String, ClientError> {
+        let bytes = self.random_bytes::<8>()?;
+        Ok(format!("{prefix}-{}", hex_lower(&bytes)))
+    }
+
+    /// Verify that some member of the room carries a valid credential for
+    /// the given account. Joiners run this against the inviter account from
+    /// the invite code after activating the Welcome: a hostile rendezvous
+    /// server that admits the device to a different group fails here.
+    pub fn verify_room_member_account(
+        &self,
+        room_id: &str,
+        account_id: &str,
+    ) -> Result<(), ClientError> {
+        let group = self.group(room_id)?;
+        let expected = NostrPublicKey::from_bytes(decode_lower_hex_32(account_id)?)
+            .map_err(ClientError::from)?;
+        for member in group.members() {
+            let Ok(credential) = FiniteDeviceCredentialV1::from_credential(member.credential)
+            else {
+                continue;
+            };
+            if credential.account_public_key() != expected {
+                continue;
+            }
+            credential.verify_expected(ExpectedDeviceCredential {
+                account_public_key: expected,
+                device_id: credential.device_id(),
+                mls_leaf_signing_public_key: &member.signature_key,
+                now_unix_seconds: self.now_unix_seconds,
+            })?;
+            return Ok(());
+        }
+        Err(ClientError::AccountNotInRoom {
+            room_id: room_id.to_owned(),
+            account_id: account_id.to_owned(),
+        })
+    }
+
     pub fn group_epoch(&self, room_id: &str) -> Result<u64, ClientError> {
         Ok(self.group(room_id)?.epoch().as_u64())
     }
@@ -2128,6 +2235,9 @@ impl PersistedRoomState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         validate_room_id(&self.room_id)?;
         validate_mls_group_id(&self.mls_group_id)?;
+        if let Some(server_url) = &self.server_url {
+            validate_string_bytes("room.server_url", server_url, MAX_ROOM_SERVER_URL_BYTES)?;
+        }
         Ok(())
     }
 }
@@ -2685,6 +2795,32 @@ pub trait RuntimeDelivery {
         requester: &DeviceRef,
         after_seq: u64,
     ) -> Result<SyncEventsPage, Self::Error>;
+
+    fn create_invite_session(
+        &mut self,
+        request: CreateInviteSessionRequest,
+    ) -> Result<HttpInviteSessionRecord, Self::Error>;
+
+    fn submit_invite_join(
+        &mut self,
+        request: SubmitInviteJoinRequest,
+    ) -> Result<HttpInviteJoinRequestRecord, Self::Error>;
+
+    fn list_invite_join_requests(
+        &mut self,
+        invite_id: &str,
+    ) -> Result<ListInviteJoinRequestsResponse, Self::Error>;
+
+    fn respond_invite_join(
+        &mut self,
+        request: RespondInviteJoinRequest,
+    ) -> Result<HttpInviteJoinRequestRecord, Self::Error>;
+
+    fn invite_join_status(
+        &mut self,
+        invite_id: &str,
+        request_id: &str,
+    ) -> Result<InviteJoinStatusResponse, Self::Error>;
 }
 
 pub trait HttpRuntimeTransport {
@@ -3027,6 +3163,53 @@ impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
         Ok(())
     }
 
+    fn create_invite_session(
+        &mut self,
+        request: CreateInviteSessionRequest,
+    ) -> Result<HttpInviteSessionRecord, Self::Error> {
+        self.post_json("/invites", &request)
+    }
+
+    fn submit_invite_join(
+        &mut self,
+        request: SubmitInviteJoinRequest,
+    ) -> Result<HttpInviteJoinRequestRecord, Self::Error> {
+        self.post_json("/invites/join", &request)
+    }
+
+    fn list_invite_join_requests(
+        &mut self,
+        invite_id: &str,
+    ) -> Result<ListInviteJoinRequestsResponse, Self::Error> {
+        self.post_json(
+            "/invites/requests",
+            &ListInviteJoinRequestsRequest {
+                invite_id: invite_id.to_owned(),
+            },
+        )
+    }
+
+    fn respond_invite_join(
+        &mut self,
+        request: RespondInviteJoinRequest,
+    ) -> Result<HttpInviteJoinRequestRecord, Self::Error> {
+        self.post_json("/invites/respond", &request)
+    }
+
+    fn invite_join_status(
+        &mut self,
+        invite_id: &str,
+        request_id: &str,
+    ) -> Result<InviteJoinStatusResponse, Self::Error> {
+        self.post_json(
+            "/invites/status",
+            &InviteJoinStatusRequest {
+                invite_id: invite_id.to_owned(),
+                request_id: request_id.to_owned(),
+            },
+        )
+    }
+
     fn sync_events(
         &mut self,
         room_id: &str,
@@ -3218,7 +3401,13 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
         report.record_welcome_ack()?;
     }
 
+    // Group rooms by server (ADR 0005): this tick talks to the home
+    // server, so rooms pinned to another room server are synced by
+    // `run_room_server_sync_tick` with that server's transport.
     for cursor in device.room_sync_cursors() {
+        if cursor.server_url.is_some() {
+            continue;
+        }
         sync_room_pages(
             store,
             device,
@@ -3231,6 +3420,295 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
     }
 
     Ok(report)
+}
+
+/// Sync the rooms hosted on one specific room server (ADR 0005). The
+/// caller provides a delivery bound to that server's address; welcomes are
+/// claimed there too, because an invited room's Welcome lives on the room's
+/// server (ADR 0006).
+pub fn run_room_server_sync_tick<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    options: &RuntimeSyncOptions,
+    server_url: &str,
+) -> Result<RuntimeSyncReport, RuntimeWorkerError<D::Error>> {
+    options.validate_limits()?;
+    let mut report = RuntimeSyncReport::default();
+
+    let claimed_welcomes = delivery
+        .claim_welcomes(device.device_ref())
+        .map_err(RuntimeWorkerError::Delivery)?;
+    report.record_claimed_welcomes(claimed_welcomes.len())?;
+    for welcome in claimed_welcomes {
+        store.store_pending_welcome_and_save(device, &welcome)?;
+    }
+
+    for welcome_id in device.pending_welcome_ids() {
+        store.activate_pending_welcome_and_save(device, &welcome_id)?;
+    }
+
+    for ack in device.pending_welcome_acks() {
+        delivery
+            .ack_welcome(&ack.welcome_id)
+            .map_err(RuntimeWorkerError::Delivery)?;
+        store.clear_pending_welcome_ack_and_save(device, &ack.welcome_id)?;
+        report.record_welcome_ack()?;
+    }
+
+    for cursor in device.room_sync_cursors() {
+        if cursor.server_url.as_deref() != Some(server_url) {
+            continue;
+        }
+        sync_room_pages(
+            store,
+            device,
+            delivery,
+            options,
+            cursor.room_id,
+            cursor.after_seq,
+            &mut report,
+        )?;
+    }
+
+    Ok(report)
+}
+
+/// Parameters for creating a room invite (ADR 0006). `server_url` is the
+/// public address of the server hosting the room — it goes into the invite
+/// code verbatim, because joining a room is discovering where it lives.
+#[derive(Debug, Clone)]
+pub struct CreateRoomInviteParams<'a> {
+    pub room_id: &'a str,
+    pub server_url: &'a str,
+    pub display_name: Option<String>,
+    pub max_joins: u32,
+    pub ttl_ms: u64,
+    pub now_ms: u64,
+}
+
+/// Create an invite session for a room this device administers and return
+/// the invite code. The code carries the only copy of the invite token;
+/// print it as a URL/QR and show `invite_current_pin` beside it.
+pub fn create_room_invite<D: RuntimeDelivery>(
+    device: &FiniteChatDevice,
+    delivery: &mut D,
+    params: CreateRoomInviteParams<'_>,
+) -> Result<InviteCodeV1, RuntimeWorkerError<D::Error>> {
+    let code = InviteCodeV1 {
+        server_url: params.server_url.to_owned(),
+        room_id: params.room_id.to_owned(),
+        invite_id: device.generate_object_id("invite")?,
+        invite_token: device.generate_invite_token()?,
+        inviter_account_id: device.device_ref().account_id.clone(),
+        display_name: params.display_name,
+    };
+    code.encode()
+        .map_err(|error| ClientError::InviteCode(error.to_string()))?;
+    delivery
+        .create_invite_session(CreateInviteSessionRequest {
+            invite_id: code.invite_id.clone(),
+            room_id: code.room_id.clone(),
+            inviter: device.device_ref().clone(),
+            max_joins: params.max_joins,
+            expires_at_ms: params
+                .now_ms
+                .saturating_add(params.ttl_ms.min(MAX_INVITE_TTL_MILLIS)),
+        })
+        .map_err(RuntimeWorkerError::Delivery)?;
+    Ok(code)
+}
+
+#[derive(Debug, Default)]
+pub struct InviteAcceptReport {
+    pub accepted: Vec<DeviceRef>,
+    pub rejected: Vec<DeviceRef>,
+    /// True when pending joins exist but the room already has an unmerged
+    /// pending commit; run a sync tick (which merges own commits from the
+    /// log) and call again.
+    pub deferred_pending_commit: bool,
+}
+
+/// Inviter-side processing of pending join requests (ADR 0006): verify each
+/// proof for the current PIN window ±1, reject failures, and admit all
+/// verified joiners in a single Add commit with their Welcomes. Nothing
+/// enters the MLS group before its proof verifies.
+pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    code: &InviteCodeV1,
+    now_ms: u64,
+) -> Result<InviteAcceptReport, RuntimeWorkerError<D::Error>> {
+    let mut report = InviteAcceptReport::default();
+    let listing = delivery
+        .list_invite_join_requests(&code.invite_id)
+        .map_err(RuntimeWorkerError::Delivery)?;
+    if listing.session.room_id != code.room_id {
+        return Err(ClientError::InviteRoomMismatch {
+            expected: code.room_id.clone(),
+            actual: listing.session.room_id,
+        }
+        .into());
+    }
+    let pending = listing
+        .requests
+        .into_iter()
+        .filter(|request| request.state == HttpInviteJoinState::Pending)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return Ok(report);
+    }
+    if device.has_pending_commit(&code.room_id)? {
+        report.deferred_pending_commit = true;
+        return Ok(report);
+    }
+
+    let mut verified = Vec::new();
+    for join in pending {
+        let proof_ok = verify_invite_join_proof(
+            &code.invite_token,
+            now_ms / 1000,
+            &join.joiner.account_id,
+            &join.joiner.device_id,
+            &join.key_package,
+            &join.pin_proof,
+        );
+        let upload = proof_ok
+            .then(|| serde_json::from_slice::<UploadKeyPackageRequest>(&join.key_package).ok())
+            .flatten()
+            .filter(|upload| upload.owner == join.joiner);
+        match upload {
+            Some(upload) => verified.push((join, upload)),
+            None => {
+                delivery
+                    .respond_invite_join(RespondInviteJoinRequest {
+                        invite_id: code.invite_id.clone(),
+                        request_id: join.request_id.clone(),
+                        accept: false,
+                    })
+                    .map_err(RuntimeWorkerError::Delivery)?;
+                report.rejected.push(join.joiner);
+            }
+        }
+    }
+    if verified.is_empty() {
+        return Ok(report);
+    }
+
+    // The joiner's KeyPackage rides inline in the join request; publish and
+    // claim it on this server so the existing commit validation (claimed
+    // KeyPackages only) applies unchanged.
+    let mut claimed_key_packages = Vec::with_capacity(verified.len());
+    let mut welcome_ids = Vec::with_capacity(verified.len());
+    for (join, upload) in &verified {
+        delivery
+            .upload_key_package(upload.clone())
+            .map_err(RuntimeWorkerError::Delivery)?;
+        let claimed = delivery
+            .claim_key_package_for_device(&join.joiner)
+            .map_err(RuntimeWorkerError::Delivery)?
+            .ok_or_else(|| {
+                ClientError::InviteKeyPackageUnavailable(join.joiner.device_id.clone())
+            })?;
+        claimed_key_packages.push(claimed);
+        welcome_ids.push(format!(
+            "invite-welcome-{}-{}",
+            code.invite_id, join.request_id
+        ));
+    }
+    let mut request_ids = verified
+        .iter()
+        .map(|(join, _)| join.request_id.as_str())
+        .collect::<Vec<_>>();
+    request_ids.sort_unstable();
+    let idempotency_key = format!("invite-add-{}-{}", code.invite_id, request_ids.join("+"));
+    let prepared = device.prepare_add_members_commit(
+        &code.room_id,
+        &claimed_key_packages,
+        &welcome_ids,
+        idempotency_key,
+    )?;
+    store.save_device_state(device)?;
+    delivery
+        .submit_commit(prepared.request)
+        .map_err(RuntimeWorkerError::Delivery)?;
+    for (join, _) in &verified {
+        delivery
+            .respond_invite_join(RespondInviteJoinRequest {
+                invite_id: code.invite_id.clone(),
+                request_id: join.request_id.clone(),
+                accept: true,
+            })
+            .map_err(RuntimeWorkerError::Delivery)?;
+        report.accepted.push(join.joiner.clone());
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteJoinHandle {
+    pub request_id: String,
+    pub key_package_id: String,
+}
+
+/// Joiner-side join request (ADR 0006): build a fresh single-use KeyPackage,
+/// persist its private material, and submit it with a proof binding the
+/// typed PIN and the invite token to this exact identity and key material.
+/// The raw PIN never leaves the device.
+pub fn submit_invite_join_request<D: RuntimeDelivery>(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    delivery: &mut D,
+    code: &InviteCodeV1,
+    pin: &str,
+    display_name: Option<String>,
+    now_ms: u64,
+) -> Result<InviteJoinHandle, RuntimeWorkerError<D::Error>> {
+    let upload = device.upload_key_package_auto_id_request()?;
+    let key_package_bytes =
+        serde_json::to_vec(&upload).map_err(|_| ClientError::SerializeKeyPackage)?;
+    // Persist the KeyPackage private material before the bytes leave the
+    // device: the agent may commit the Add immediately.
+    store.save_device_state(device)?;
+    let request_id = device.generate_object_id("join")?;
+    let pin_proof = invite_join_proof(
+        &code.invite_token,
+        pin,
+        &device.device_ref().account_id,
+        &device.device_ref().device_id,
+        &key_package_bytes,
+    );
+    delivery
+        .submit_invite_join(SubmitInviteJoinRequest {
+            invite_id: code.invite_id.clone(),
+            request_id: request_id.clone(),
+            joiner: device.device_ref().clone(),
+            key_package: key_package_bytes,
+            pin_proof,
+            display_name,
+            submitted_at_ms: now_ms,
+        })
+        .map_err(RuntimeWorkerError::Delivery)?;
+    Ok(InviteJoinHandle {
+        request_id,
+        key_package_id: upload.key_package_id,
+    })
+}
+
+/// After the invited room's Welcome has been activated (by the room-server
+/// sync tick), verify the inviter is really in the room and pin the room to
+/// the server the invite named. Mandatory (ADR 0006): this is the joiner's
+/// defense against a hostile rendezvous server admitting it to a different
+/// group.
+pub fn finalize_invited_room(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+    code: &InviteCodeV1,
+) -> Result<(), ClientStoreError> {
+    device.verify_room_member_account(&code.room_id, &code.inviter_account_id)?;
+    device.set_room_server_url(&code.room_id, Some(code.server_url.clone()))?;
+    store.save_device_state(device)
 }
 
 pub fn run_link_fanout_tick<D: RuntimeDelivery>(
@@ -3627,6 +4105,16 @@ pub enum ClientError {
     CreateGroup,
     #[error("failed to build OpenMLS KeyPackage")]
     BuildKeyPackage,
+    #[error("failed to draw randomness from the crypto provider")]
+    Randomness,
+    #[error("invite code is invalid: {0}")]
+    InviteCode(String),
+    #[error("invite session room {actual} does not match invite code room {expected}")]
+    InviteRoomMismatch { expected: String, actual: String },
+    #[error("no KeyPackage available for invited device {0}")]
+    InviteKeyPackageUnavailable(String),
+    #[error("room {room_id} has no verified member for account {account_id}")]
+    AccountNotInRoom { room_id: String, account_id: String },
     #[error("failed to serialize OpenMLS KeyPackage")]
     SerializeKeyPackage,
     #[error("failed to parse OpenMLS KeyPackage")]
@@ -4462,6 +4950,7 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
             finitechat_proto::MAX_MLS_GROUP_ID_BYTES,
         )?;
         out.extend_from_slice(&room.last_applied_seq.to_be_bytes());
+        append_raw_len_prefixed(&mut out, room.server_url.as_deref().unwrap_or("").as_bytes())?;
     }
     append_count(
         &mut out,
@@ -4593,11 +5082,24 @@ fn decode_device_state(bytes: &[u8]) -> Result<FiniteChatDeviceState, ClientStor
     let room_count = cursor.take_count("client_state.rooms", MAX_PERSISTED_ROOMS)?;
     let mut rooms = Vec::with_capacity(room_count);
     for _ in 0..room_count {
+        let room_id = cursor.take_string("room_id", finitechat_proto::MAX_ROOM_ID_BYTES)?;
+        let mls_group_id =
+            cursor.take_string("mls_group_id", finitechat_proto::MAX_MLS_GROUP_ID_BYTES)?;
+        let last_applied_seq = cursor.take_u64()?;
+        let server_url_bytes = cursor.take_vec("room.server_url", MAX_ROOM_SERVER_URL_BYTES)?;
+        let server_url = if server_url_bytes.is_empty() {
+            None
+        } else {
+            Some(
+                String::from_utf8(server_url_bytes)
+                    .map_err(|_| ClientStoreError::StateSnapshotUtf8)?,
+            )
+        };
         rooms.push(PersistedRoomState {
-            room_id: cursor.take_string("room_id", finitechat_proto::MAX_ROOM_ID_BYTES)?,
-            mls_group_id: cursor
-                .take_string("mls_group_id", finitechat_proto::MAX_MLS_GROUP_ID_BYTES)?,
-            last_applied_seq: cursor.take_u64()?,
+            room_id,
+            mls_group_id,
+            last_applied_seq,
+            server_url,
         });
     }
 
@@ -4692,6 +5194,10 @@ fn encoded_device_state_len(state: &FiniteChatDeviceState) -> Result<usize, Clie
         len = checked_len_add(len, U32_BYTES + room.room_id.len())?;
         len = checked_len_add(len, U32_BYTES + room.mls_group_id.len())?;
         len = checked_len_add(len, U64_BYTES)?;
+        len = checked_len_add(
+            len,
+            U32_BYTES + room.server_url.as_deref().unwrap_or("").len(),
+        )?;
     }
     len = checked_len_add(len, U32_BYTES)?;
     for welcome in &state.pending_welcomes {

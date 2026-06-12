@@ -6,9 +6,13 @@ use finitechat_client::{
     HttpRuntimeDelivery, HttpRuntimeDeliveryError, HttpRuntimeTransport,
     LinkFanoutRoomStatus, ReqwestHttpRuntimeTransport, ReqwestHttpRuntimeTransportError,
     RuntimeDelivery, RuntimeLinkFanoutOptions, RuntimeSyncOptions, RuntimeWorkerError,
-    SqliteClientStore, SqliteClientStoreOptions, run_link_fanout_tick, run_runtime_sync_tick,
+    CreateRoomInviteParams, SqliteClientStore, SqliteClientStoreOptions,
+    accept_pending_invite_joins, create_room_invite, finalize_invited_room, run_link_fanout_tick,
+    run_room_server_sync_tick, run_runtime_sync_tick, submit_invite_join_request,
 };
+use finitechat_http::HttpInviteJoinState;
 use finitechat_proto::{
+    InviteCodeV1, invite_current_pin,
     RoomProtocol,
     DurableAppEventKind,
     AppendEventRequest, CreateRoomRequest,
@@ -2601,3 +2605,258 @@ fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[Se
     assert_eq!(accepted.seq, expected_seq);
 }
 
+
+#[test]
+fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let now_ms = NOW * 1000;
+    let room_server_url = "http://rooms.finite.test:8787";
+
+    let agent_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "agent_hermes");
+    let mut agent_store = sqlite_client_store(dir.path().join("agent.sqlite3"), &agent_config);
+    let mut agent = FiniteChatDevice::new(agent_config.clone()).unwrap();
+    let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_phone");
+    let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
+    let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
+    let mut mallory = test_device(CHARLIE_ACCOUNT_SECRET_BYTES, "mallory_laptop");
+    let mut mallory_store =
+        sqlite_client_store(dir.path().join("mallory.sqlite3"), &test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "mallory_laptop"));
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+    agent_store.save_device_state(&agent).unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+
+    // The agent creates its room and an invite, printed as a URL + QR + PIN.
+    agent.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    agent_store.save_device_state(&agent).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: ROOM_ID.to_owned(),
+            mls_group_id: MLS_GROUP_ID.to_owned(),
+            creator: agent.device_ref().clone(),
+            protocol: RoomProtocol::default(),
+        })
+        .unwrap();
+    let code = create_room_invite(
+        &agent,
+        &mut delivery,
+        CreateRoomInviteParams {
+            room_id: ROOM_ID,
+            server_url: room_server_url,
+            display_name: Some("Hermes Agent".to_owned()),
+            max_joins: 4,
+            ttl_ms: 24 * 60 * 60 * 1000,
+            now_ms,
+        },
+    )
+    .unwrap();
+
+    // What travels is only the URL string; the app re-parses it.
+    let url = code.encode().unwrap();
+    let scanned = InviteCodeV1::parse(&url).unwrap();
+    assert_eq!(scanned, code);
+    assert_eq!(scanned.inviter_account_id, agent.device_ref().account_id);
+
+    // Bob types the PIN currently shown on the agent's terminal.
+    let pin = invite_current_pin(&scanned.invite_token, now_ms / 1000);
+    let bob_join = submit_invite_join_request(
+        &mut bob_store,
+        &mut bob,
+        &mut delivery,
+        &scanned,
+        &pin,
+        Some("Bob".to_owned()),
+        now_ms,
+    )
+    .unwrap();
+
+    // Mallory guesses a PIN (pick one that is definitely wrong).
+    let wrong_pin = if pin == "123456" { "654321" } else { "123456" };
+    let mallory_join = submit_invite_join_request(
+        &mut mallory_store,
+        &mut mallory,
+        &mut delivery,
+        &scanned,
+        wrong_pin,
+        Some("Definitely Bob".to_owned()),
+        now_ms,
+    )
+    .unwrap();
+
+    // The agent verifies proofs before anyone enters the MLS group.
+    let report =
+        accept_pending_invite_joins(&mut agent_store, &mut agent, &mut delivery, &code, now_ms)
+            .unwrap();
+    assert_eq!(report.accepted, vec![bob.device_ref().clone()]);
+    assert_eq!(report.rejected, vec![mallory.device_ref().clone()]);
+    assert!(!report.deferred_pending_commit);
+
+    // Joiner-visible verdicts.
+    let bob_status = delivery
+        .invite_join_status(&code.invite_id, &bob_join.request_id)
+        .unwrap();
+    assert_eq!(bob_status.state, HttpInviteJoinState::Accepted);
+    assert_eq!(bob_status.room_id, ROOM_ID);
+    let mallory_status = delivery
+        .invite_join_status(&code.invite_id, &mallory_join.request_id)
+        .unwrap();
+    assert_eq!(mallory_status.state, HttpInviteJoinState::Rejected);
+
+    // The agent merges its own add commit from the log (pending-commit rule).
+    run_runtime_sync_tick(&mut agent_store, &mut agent, &mut delivery, &options).unwrap();
+    assert_eq!(agent.group_epoch(ROOM_ID).unwrap(), 1);
+
+    // Bob claims and activates the Welcome from the room's server, then
+    // verifies the agent is really in the room and pins the server address.
+    let bob_report =
+        run_runtime_sync_tick(&mut bob_store, &mut bob, &mut delivery, &options).unwrap();
+    assert_eq!(bob_report.claimed_welcomes, 1);
+    assert_eq!(bob.group_epoch(ROOM_ID).unwrap(), 1);
+    finalize_invited_room(&mut bob_store, &mut bob, &scanned).unwrap();
+    assert_eq!(bob.room_server_url(ROOM_ID), Some(room_server_url));
+
+    // Verification rejects an account that is not in the room.
+    let mut fake = scanned.clone();
+    fake.inviter_account_id = mallory.device_ref().account_id.clone();
+    assert!(matches!(
+        bob.verify_room_member_account(ROOM_ID, &fake.inviter_account_id),
+        Err(ClientError::AccountNotInRoom { .. })
+    ));
+
+    // The room is now pinned to its room server: the home tick skips it and
+    // the room-server tick owns it.
+    let message = agent
+        .create_application_request(ROOM_ID, b"hello from your agent", "app_invite_hello")
+        .unwrap();
+    agent_store.save_device_state(&agent).unwrap();
+    delivery
+        .append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
+    let home_report =
+        run_runtime_sync_tick(&mut bob_store, &mut bob, &mut delivery, &options).unwrap();
+    assert!(home_report.applied_entries.is_empty());
+    let room_report = run_room_server_sync_tick(
+        &mut bob_store,
+        &mut bob,
+        &mut delivery,
+        &options,
+        room_server_url,
+    )
+    .unwrap();
+    assert_eq!(room_report.applied_entries.len(), 1);
+    assert_eq!(
+        room_report.applied_entries[0].entry,
+        AppliedLogEntry::Application(b"hello from your agent".to_vec())
+    );
+
+    // The server pin survives the encrypted store round trip.
+    let bob = bob_store.load_device(bob_config).unwrap();
+    assert_eq!(bob.room_server_url(ROOM_ID), Some(room_server_url));
+    // Mallory never entered the group.
+    assert_eq!(
+        agent
+            .verified_member_count(ROOM_ID, mallory.device_ref())
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn invite_accept_defers_while_a_pending_commit_is_unmerged() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let now_ms = NOW * 1000;
+
+    let agent_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "agent_hermes_defer");
+    let mut agent_store = sqlite_client_store(dir.path().join("agent.sqlite3"), &agent_config);
+    let mut agent = FiniteChatDevice::new(agent_config).unwrap();
+    let bob_config = test_config(BOB_ACCOUNT_SECRET_BYTES, "bob_phone_defer");
+    let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
+    let mut bob = FiniteChatDevice::new(bob_config).unwrap();
+    let mut dana = test_device(DANA_ACCOUNT_SECRET_BYTES, "dana_tablet");
+    let mut dana_store = sqlite_client_store(
+        dir.path().join("dana.sqlite3"),
+        &test_config(DANA_ACCOUNT_SECRET_BYTES, "dana_tablet"),
+    );
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+    agent_store.save_device_state(&agent).unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    agent.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
+    agent_store.save_device_state(&agent).unwrap();
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: ROOM_ID.to_owned(),
+            mls_group_id: MLS_GROUP_ID.to_owned(),
+            creator: agent.device_ref().clone(),
+            protocol: RoomProtocol::default(),
+        })
+        .unwrap();
+    let code = create_room_invite(
+        &agent,
+        &mut delivery,
+        CreateRoomInviteParams {
+            room_id: ROOM_ID,
+            server_url: "http://rooms.finite.test:8787",
+            display_name: None,
+            max_joins: 4,
+            ttl_ms: 60 * 60 * 1000,
+            now_ms,
+        },
+    )
+    .unwrap();
+    let pin = invite_current_pin(&code.invite_token, now_ms / 1000);
+
+    // First joiner is accepted; the add commit is pending until the agent
+    // observes it in the log.
+    submit_invite_join_request(
+        &mut bob_store,
+        &mut bob,
+        &mut delivery,
+        &code,
+        &pin,
+        None,
+        now_ms,
+    )
+    .unwrap();
+    let first =
+        accept_pending_invite_joins(&mut agent_store, &mut agent, &mut delivery, &code, now_ms)
+            .unwrap();
+    assert_eq!(first.accepted.len(), 1);
+
+    // A second joiner arriving before the merge is deferred, not lost.
+    submit_invite_join_request(
+        &mut dana_store,
+        &mut dana,
+        &mut delivery,
+        &code,
+        &pin,
+        None,
+        now_ms,
+    )
+    .unwrap();
+    let deferred =
+        accept_pending_invite_joins(&mut agent_store, &mut agent, &mut delivery, &code, now_ms)
+            .unwrap();
+    assert!(deferred.deferred_pending_commit);
+    assert!(deferred.accepted.is_empty());
+
+    // After a sync tick merges the pending commit, the deferred join lands.
+    run_runtime_sync_tick(&mut agent_store, &mut agent, &mut delivery, &options).unwrap();
+    let second =
+        accept_pending_invite_joins(&mut agent_store, &mut agent, &mut delivery, &code, now_ms)
+            .unwrap();
+    assert_eq!(second.accepted, vec![dana.device_ref().clone()]);
+    assert_eq!(agent.group_epoch(ROOM_ID).unwrap(), 1);
+    run_runtime_sync_tick(&mut agent_store, &mut agent, &mut delivery, &options).unwrap();
+    assert_eq!(agent.group_epoch(ROOM_ID).unwrap(), 2);
+}
