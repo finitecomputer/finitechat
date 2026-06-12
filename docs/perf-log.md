@@ -206,3 +206,52 @@ The invite/agent phase (ADR 0006) ended with the latency pass:
 - Observation (redundant validation): none added — invite-session
   verification is inviter-side only by design; the server stores opaque
   rendezvous material and never re-checks proofs.
+
+### 2026-06-12 — Bridge-path benchmark: hot spots vs the theoretical floor
+
+New ignored harness `crates/finitechat-cli/tests/perf_bridge.rs` measures
+every leg a hermes message crosses, in release mode against a live server
+(local pipeline; the container leg adds one vmnet RTT, ~0.2–0.5 ms, once
+the runtime is installed). Question asked: are we doing anything
+pathological, and is polling the blessed abstraction?
+
+Measured legs (p50):
+
+| Leg | Cost |
+| --- | --- |
+| MLS encrypt 1 KiB | 33 µs |
+| Client store save (full snapshot) | 141 µs |
+| HTTP POST /events (serialize + loopback + WAL) | 269 µs |
+| Receiver sync+decrypt+persist | ~98 µs/entry |
+| Publish → /sync/wait wake | ~0.6 ms |
+| `hermes send` via subprocess bridge | 4.4 ms |
+| Subprocess floor (`hermes pin`: spawn + store open) | 3.5 ms |
+| End-to-end bridge send → peer decrypted | 5.8 ms |
+| Pairing handshake (join submitted → verified member) | ~18 ms |
+
+**Pathological thing found and fixed:** opaque payload bytes serialized as
+JSON number arrays — 4.5× wire size for 1 KiB ciphertexts, 3.6× (118 KB!)
+for 32 KiB. Now base64 strings (reads stay tolerant of the legacy array
+form for stored logs): 1 KiB wire 4,606 → 2,009 bytes, 32 KiB 118 KB →
+44 KB, large-payload publish 3.6 → 1.45 ms, bulk receive 9.9 → 6.3 ms per
+64 entries.
+
+**Is polling the blessed abstraction? Yes, in its current two-part form.**
+Pull-based sync pages are the consistency model (hints never advance
+state) and are not up for debate. The wake *transport* on top is the
+server-held long-poll, and the numbers validate it: publish→wake is
+~0.6 ms, within ~2× of any push channel on the same socket, and the
+classic failure mode — an adapter polling too slowly — is structurally
+gone because the server paces the wait, not the client (a slow adapter
+adds only its own dispatch time, never a polling interval). SSE/WebSocket
+would save per-wait request overhead, not meaningful latency; not worth
+the connection-lifecycle machinery yet.
+
+**The real remaining hot spot is spawn-per-bridge-call, not polling:**
+~3.5 ms of the 4.4 ms send cost is process spawn + encrypted-store open;
+the in-process floor for the same work is ~0.4 ms. At agent timescales
+(LLM tokens arrive in seconds) this is invisible, so it stays — the
+designed next step, when it matters, is a resident bridge process
+(`hermes serve`, JSON-lines over stdio, same contract as today's
+subcommands) which would also let one long-poll loop run continuously
+instead of re-arming per poll call.

@@ -665,6 +665,7 @@ dependencies = [
 name = "finitechat-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bech32",
  "hmac",
  "serde",

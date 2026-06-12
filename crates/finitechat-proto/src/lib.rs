@@ -2720,20 +2720,36 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 mod bytes_as_vec {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
+    /// Opaque payload bytes travel as base64 strings (1.33× the raw size).
+    /// The previous JSON number-array form cost 3.6–4.5× on the wire and a
+    /// per-element parse; reads stay tolerant of it for stored logs.
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_bytes(bytes)
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BytesRepr {
+        Base64(String),
+        Legacy(Vec<u8>),
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Vec::<u8>::deserialize(deserializer)
+        match BytesRepr::deserialize(deserializer)? {
+            BytesRepr::Base64(value) => base64::engine::general_purpose::STANDARD
+                .decode(value.as_bytes())
+                .map_err(D::Error::custom),
+            BytesRepr::Legacy(bytes) => Ok(bytes),
+        }
     }
 }
 
