@@ -16,8 +16,10 @@ use finitechat_client::{
     AppliedLogEntry, CreateRoomInviteParams, FiniteChatDevice, FiniteChatDeviceConfig,
     HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeSyncOptions,
     SqliteClientStore, SqliteClientStoreOptions, accept_pending_invite_joins, create_room_invite,
-    generate_account_secret, run_runtime_sync_tick,
+    RuntimeDelivery, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
+    run_runtime_sync_tick, submit_invite_join_request,
 };
+use finitechat_http::HttpInviteJoinState;
 use finitechat_hermes::{
     HermesActivityRequestV1, HermesEditRequestV1, HermesMessagePayloadV1, HermesPollEventV1,
     HermesSendRequestV1, MAX_HERMES_POLL_TIMEOUT_MILLIS,
@@ -71,6 +73,7 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "init" => cmd_init(&home_dir, rest, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "pin" => cmd_pin(&home_dir, rest, output),
+        "join" => cmd_join(&home_dir, rest, output),
         "poll" => cmd_poll(&home_dir, read_request(request_json)?, output),
         "send" => cmd_send(&home_dir, read_request(request_json)?, output),
         "edit" => cmd_edit(&home_dir, read_request(request_json)?, output),
@@ -269,6 +272,97 @@ fn cmd_pin<W: Write>(
     )
 }
 
+/// User-side join: scan/paste the invite URL, type the PIN, land in the
+/// chat (ADR 0006). Submits the proof-bound join request, waits for the
+/// inviter's verdict, activates the Welcome from the room's server,
+/// verifies the inviter credential, and pins the room to its server.
+fn cmd_join<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let url = crate::required_option(&mut args, "--url")?;
+    let pin = crate::required_option(&mut args, "--pin")?;
+    let display_name = crate::take_option(&mut args, "--name")?;
+    let timeout_ms = crate::take_option(&mut args, "--timeout-ms")?
+        .map(|value| crate::parse_u64("--timeout-ms", &value))
+        .transpose()?
+        .unwrap_or(60_000);
+    crate::reject_extra_args(&args)?;
+
+    let code = InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?;
+    let home = load_home(home_dir)?;
+    let (mut store, mut device, _home_delivery) = open_agent(&home)?;
+    // The invite names the room's server; every leg of the join talks to it.
+    let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(
+        code.server_url.clone(),
+    ));
+    let handle = submit_invite_join_request(
+        &mut store,
+        &mut device,
+        &mut delivery,
+        &code,
+        &pin,
+        display_name,
+        now_ms(),
+    )
+    .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let verdict = loop {
+        let status = delivery
+            .invite_join_status(&code.invite_id, &handle.request_id)
+            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+        match status.state {
+            HttpInviteJoinState::Accepted => break "accepted",
+            HttpInviteJoinState::Rejected => break "rejected",
+            HttpInviteJoinState::Pending => {
+                if Instant::now() >= deadline {
+                    break "pending";
+                }
+                std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+            }
+        }
+    };
+    if verdict != "accepted" {
+        crate::write_pretty_json(
+            output,
+            &json!({ "state": verdict, "room_id": code.room_id }),
+        )?;
+        return if verdict == "rejected" {
+            Err(CliError::Hermes(
+                "join was rejected (wrong or expired PIN?)".to_owned(),
+            ))
+        } else {
+            Err(CliError::Hermes("join timed out awaiting the agent".to_owned()))
+        };
+    }
+
+    // Claim and activate the Welcome from the room's server.
+    let options = sync_options();
+    while Instant::now() < deadline {
+        run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
+            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+        if device.room_server_url(&code.room_id).is_some()
+            || device.group_epoch(&code.room_id).is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+    }
+    finalize_invited_room(&mut store, &mut device, &code)
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    crate::write_pretty_json(
+        output,
+        &json!({
+            "state": "joined",
+            "room_id": code.room_id,
+            "server_url": code.server_url,
+            "inviter_account_id": code.inviter_account_id,
+        }),
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct PollRequest {
     #[serde(default)]
@@ -298,8 +392,31 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     let mut joined: Vec<String> = Vec::new();
 
     loop {
-        let report = run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
+        let mut report = run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
             .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+
+        // Rooms pinned to other servers (joined via invite) sync against
+        // their own server (ADR 0005 grouping).
+        let mut room_servers: Vec<String> = device
+            .room_sync_cursors()
+            .into_iter()
+            .filter_map(|cursor| cursor.server_url)
+            .collect();
+        room_servers.sort_unstable();
+        room_servers.dedup();
+        for server_url in room_servers {
+            let mut room_delivery =
+                HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+            let room_report = run_room_server_sync_tick(
+                &mut store,
+                &mut device,
+                &mut room_delivery,
+                &options,
+                &server_url,
+            )
+            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+            report.applied_entries.extend(room_report.applied_entries);
+        }
 
         // Process pending invite joins after the sync tick so any
         // previously submitted add commit has merged (pending-commit rule).
@@ -635,5 +752,5 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat-darkmatter hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat-darkmatter hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat-darkmatter hermes [--home DIR] pin [--invite-id ID]\n  finitechat-darkmatter hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat-darkmatter hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat-darkmatter hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat-darkmatter hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat-darkmatter hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat-darkmatter hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat-darkmatter hermes [--home DIR] pin [--invite-id ID]\n  finitechat-darkmatter hermes [--home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat-darkmatter hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat-darkmatter hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat-darkmatter hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat-darkmatter hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
 }

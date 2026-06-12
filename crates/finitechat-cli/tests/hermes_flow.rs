@@ -311,3 +311,125 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     ]);
     assert_eq!(activity["accepted"], true);
 }
+
+#[test]
+fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("server.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let agent_home = dir.path().join("agent").display().to_string();
+    let user_home = dir.path().join("user").display().to_string();
+
+    hermes(&["hermes", "--home", &agent_home, "init", "--server", &server_url]);
+    let user_init = hermes(&["hermes", "--home", &user_home, "init", "--server", &server_url]);
+    let invite = hermes(&["hermes", "--home", &agent_home, "invite", "--json"]);
+    let url = invite["url"].as_str().unwrap().to_owned();
+    let code = InviteCodeV1::parse(&url).unwrap();
+    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
+
+    // The joiner's request sits pending until the agent polls; run the
+    // join in a thread while the agent admits it.
+    let join_url = url.clone();
+    let join_home = user_home.clone();
+    let join_thread = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        finitechat_cli::run(
+            [
+                "hermes",
+                "--home",
+                &join_home,
+                "join",
+                "--url",
+                &join_url,
+                "--pin",
+                &pin,
+                "--name",
+                "CLI User",
+                "--timeout-ms",
+                "30000",
+            ]
+            .iter()
+            .map(|arg| arg.to_string()),
+            &mut output,
+        )
+        .expect("join succeeds");
+        serde_json::from_slice::<Value>(&output).unwrap()
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &agent_home,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":15000}"#,
+    ]);
+    assert_eq!(poll["joined"].as_array().unwrap().len(), 1);
+
+    let joined = join_thread.join().unwrap();
+    assert_eq!(joined["state"], "joined");
+    assert_eq!(joined["room_id"], invite["room_id"]);
+
+    // Round trip purely over the CLI surface, both directions.
+    let room_id = invite["room_id"].as_str().unwrap();
+    hermes(&[
+        "hermes",
+        "--home",
+        &user_home,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "hello from the cli user",
+            "kind": "message",
+            "status": "complete",
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
+    let agent_poll = hermes(&[
+        "hermes",
+        "--home",
+        &agent_home,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":10000}"#,
+    ]);
+    let events = agent_poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["text"], "hello from the cli user");
+    assert_eq!(
+        events[0]["source"]["user_id"],
+        user_init["account_id"]
+    );
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &agent_home,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "hello back",
+            "kind": "message",
+            "status": "complete",
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
+    let user_poll = hermes(&[
+        "hermes",
+        "--home",
+        &user_home,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":10000}"#,
+    ]);
+    let events = user_poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["text"], "hello back");
+}

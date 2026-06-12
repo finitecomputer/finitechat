@@ -2011,7 +2011,11 @@ impl FiniteChatDevice {
         let mut count = 0u32;
         for member in group.members() {
             let credential = FiniteDeviceCredentialV1::from_credential(member.credential)?;
-            if credential.device_id() == device.device_id {
+            // Device ids are only unique per account (DeviceRef is the
+            // tuple); two accounts may share a device-id string.
+            if credential.account_public_key() == expected_account_public_key
+                && credential.device_id() == device.device_id
+            {
                 credential.verify_expected(ExpectedDeviceCredential {
                     account_public_key: expected_account_public_key,
                     device_id: &device.device_id,
@@ -2163,7 +2167,11 @@ impl FiniteChatDevice {
         let mut count = 0u32;
         for member in group.members() {
             let credential = FiniteDeviceCredentialV1::from_credential(member.credential)?;
-            if credential.device_id() == device.device_id {
+            // Device ids are only unique per account (DeviceRef is the
+            // tuple); two accounts may share a device-id string.
+            if credential.account_public_key() == expected_account_public_key
+                && credential.device_id() == device.device_id
+            {
                 credential.verify_expected(ExpectedDeviceCredential {
                     account_public_key: expected_account_public_key,
                     device_id: &device.device_id,
