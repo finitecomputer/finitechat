@@ -70,6 +70,12 @@ impl NostrSecretKey {
         public_key
     }
 
+    /// Raw secret bytes for durable storage by trusted callers (e.g. the
+    /// agent CLI's 0600 nsec file). Handle with care.
+    pub fn as_bytes(&self) -> &[u8; NOSTR_SECRET_KEY_BYTES] {
+        &self.0
+    }
+
     pub fn derive_secret_32(
         &self,
         domain: &[u8],

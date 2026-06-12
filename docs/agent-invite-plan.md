@@ -70,7 +70,7 @@ story.
 - [x] Phase 1 — docs
 - [x] Phase 2 — proto + server invite sessions
 - [x] Phase 3 — client addressing + invite codes + join/accept
-- [ ] Phase 4 — CLI hermes subcommands
+- [x] Phase 4 — CLI hermes subcommands
 - [ ] Phase 5 — hermes plugin refresh
 - [ ] Phase 6 — container harness + e2e
 - [ ] Phase 7 — perf pass

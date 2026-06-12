@@ -1,5 +1,7 @@
 use std::io::Write;
 
+mod hermes;
+
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MemberId, MessageId};
 use finitechat_http::{
@@ -57,6 +59,8 @@ pub enum CliError {
     },
     #[error("failed to write output: {0}")]
     Output(std::io::Error),
+    #[error("hermes: {0}")]
+    Hermes(String),
 }
 
 impl CliError {
@@ -67,7 +71,8 @@ impl CliError {
             | Self::Json(_)
             | Self::Http(_)
             | Self::Server { .. }
-            | Self::Output(_) => 1,
+            | Self::Output(_)
+            | Self::Hermes(_) => 1,
         }
     }
 }
@@ -94,6 +99,7 @@ where
             )
             .map_err(CliError::Output)
         }
+        Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
             let request = prepare_http_request(args.into_iter().skip(1))?;
             execute_http_request(&request, output)
@@ -772,7 +778,7 @@ fn execute_http_request<W: Write>(
     writeln!(output, "{body}").map_err(CliError::Output)
 }
 
-fn write_pretty_json<T: Serialize, W: Write>(output: &mut W, value: &T) -> Result<(), CliError> {
+pub(crate) fn write_pretty_json<T: Serialize, W: Write>(output: &mut W, value: &T) -> Result<(), CliError> {
     serde_json::to_writer_pretty(&mut *output, value).map_err(CliError::Serialize)?;
     writeln!(output).map_err(CliError::Output)
 }
@@ -793,11 +799,11 @@ fn take_positional(args: &mut Vec<String>) -> Option<String> {
     }
 }
 
-fn required_option(args: &mut Vec<String>, name: &'static str) -> Result<String, CliError> {
+pub(crate) fn required_option(args: &mut Vec<String>, name: &'static str) -> Result<String, CliError> {
     take_option(args, name)?.ok_or_else(|| CliError::Usage(format!("missing required {name}")))
 }
 
-fn take_option(args: &mut Vec<String>, name: &'static str) -> Result<Option<String>, CliError> {
+pub(crate) fn take_option(args: &mut Vec<String>, name: &'static str) -> Result<Option<String>, CliError> {
     let Some(index) = args.iter().position(|arg| arg == name) else {
         return Ok(None);
     };
@@ -845,13 +851,13 @@ fn optional_usize(
         .unwrap_or(Ok(default))
 }
 
-fn parse_u64(name: &'static str, value: &str) -> Result<u64, CliError> {
+pub(crate) fn parse_u64(name: &'static str, value: &str) -> Result<u64, CliError> {
     value
         .parse::<u64>()
         .map_err(|_| CliError::Usage(format!("{name} must be an unsigned integer")))
 }
 
-fn parse_hex(name: &'static str, value: &str) -> Result<Vec<u8>, CliError> {
+pub(crate) fn parse_hex(name: &'static str, value: &str) -> Result<Vec<u8>, CliError> {
     if !value.len().is_multiple_of(2) {
         return Err(CliError::Usage(format!(
             "{name} must be an even-length hex string"
@@ -867,7 +873,7 @@ fn parse_hex(name: &'static str, value: &str) -> Result<Vec<u8>, CliError> {
 }
 
 
-fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
+pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         Ok(())
     } else {

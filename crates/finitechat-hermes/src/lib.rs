@@ -689,6 +689,149 @@ fn take_attachments(
     Ok(attachments)
 }
 
+/// The decrypted application payload the Hermes bridge writes into a room
+/// (ADR 0002: Rust owns the schema; Python stays a translator). Non-hermes
+/// payloads in the same room are skipped by `decode`, so agents coexist
+/// with other application traffic.
+pub const HERMES_MESSAGE_PAYLOAD_TYPE_V1: &str = "finitechat.hermes.message.v1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HermesMessagePayloadV1 {
+    #[serde(rename = "type")]
+    pub payload_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ConversationId>,
+    pub text: String,
+    pub kind: HermesSendKindV1,
+    pub status: HermesMessageStatusV1,
+    /// For edits: the message id of the entry being superseded. Edits are
+    /// new log entries (the log is append-only); renderers show the latest
+    /// payload for an `edit_of` chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_of: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<HermesAttachmentV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, Value>,
+}
+
+impl HermesMessagePayloadV1 {
+    pub fn from_send(request: &HermesSendRequestV1) -> Self {
+        Self {
+            payload_type: HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: request.conversation_id.clone(),
+            text: request.text.clone(),
+            kind: request.kind,
+            status: request.status,
+            edit_of: None,
+            attachments: request.attachments.clone(),
+            reply_to_message_id: request.reply_to_message_id.clone(),
+            sender_name: None,
+            metadata: request.metadata.clone(),
+        }
+    }
+
+    pub fn from_edit(request: &HermesEditRequestV1) -> Self {
+        Self {
+            payload_type: HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: request.conversation_id.clone(),
+            text: request.text.clone(),
+            kind: HermesSendKindV1::Message,
+            status: request.status,
+            edit_of: Some(request.message_id.clone()),
+            attachments: Vec::new(),
+            reply_to_message_id: None,
+            sender_name: None,
+            metadata: request.metadata.clone(),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, HermesBridgeError> {
+        self.validate_limits()?;
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// `Ok(None)` when the plaintext is not a hermes message payload —
+    /// other application traffic in the room is simply not bridge-visible.
+    pub fn decode(plaintext: &[u8]) -> Result<Option<Self>, HermesBridgeError> {
+        let Ok(value) = serde_json::from_slice::<Value>(plaintext) else {
+            return Ok(None);
+        };
+        if value.get("type").and_then(Value::as_str) != Some(HERMES_MESSAGE_PAYLOAD_TYPE_V1) {
+            return Ok(None);
+        }
+        let payload: Self = serde_json::from_value(value)?;
+        payload.validate_limits()?;
+        Ok(Some(payload))
+    }
+
+    pub fn validate_limits(&self) -> Result<(), HermesBridgeError> {
+        validate_string_bytes("hermes.payload.text", &self.text, MAX_HERMES_TEXT_BYTES)
+            .map_err(HermesBridgeError::from)?;
+        validate_item_count(
+            "hermes.payload.attachments",
+            self.attachments.len(),
+            MAX_HERMES_ATTACHMENTS,
+        )
+        .map_err(HermesBridgeError::from)?;
+        for attachment in &self.attachments {
+            attachment.validate_limits()?;
+        }
+        Ok(())
+    }
+
+    /// Build the poll event Hermes consumes. `sender_account_id` and
+    /// `sender_device_id` come from the MLS-authenticated decryption
+    /// result, never from the payload.
+    pub fn into_poll_event(
+        self,
+        room_id: impl Into<RoomId>,
+        seq: Seq,
+        message_id: impl Into<MessageId>,
+        sender_account_id: impl Into<String>,
+        sender_device_id: impl Into<String>,
+    ) -> HermesPollEventV1 {
+        let room_id = room_id.into();
+        let sender_account_id = sender_account_id.into();
+        let message_type = self
+            .attachments
+            .first()
+            .map(HermesAttachmentV1::message_type)
+            .unwrap_or(HermesMessageTypeV1::Text);
+        HermesPollEventV1 {
+            room_id: room_id.clone(),
+            seq,
+            message_id: message_id.into(),
+            conversation_id: self.conversation_id.clone(),
+            text: self.text,
+            message_type,
+            source: HermesSourceV1 {
+                platform: FINITECHAT_HERMES_PLATFORM_NAME.to_owned(),
+                chat_id: room_id,
+                chat_name: None,
+                chat_type: HermesChatTypeV1::Group,
+                user_id: Some(sender_account_id),
+                user_name: self.sender_name,
+                thread_id: self.conversation_id,
+                chat_topic: None,
+                user_id_alt: Some(sender_device_id.into()),
+                chat_id_alt: None,
+                is_bot: false,
+            },
+            attachments: self.attachments,
+            reply_to_message_id: self.reply_to_message_id,
+            reply_to_text: None,
+            auto_skill: None,
+            channel_prompt: None,
+            internal: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

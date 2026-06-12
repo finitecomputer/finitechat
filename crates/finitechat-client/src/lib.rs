@@ -23,11 +23,12 @@ use finitechat_http::{
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
-    NostrPublicKey, NostrSecretKey,
+    NOSTR_SECRET_KEY_BYTES, NostrPublicKey, NostrSecretKey,
 };
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
-    InviteCodeV1, MAX_INVITE_TTL_MILLIS, invite_join_proof, verify_invite_join_proof,
+    AppendEphemeralActivityRequest, EphemeralActivityAccepted, InviteCodeV1,
+    MAX_INVITE_TTL_MILLIS, invite_join_proof, verify_invite_join_proof,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
@@ -72,6 +73,8 @@ const CLIENT_STORE_NONCE_BYTES: usize = 12;
 const CLIENT_STORE_AEAD_TAG_BYTES: u32 = 16;
 const MAX_PERSISTED_ROOMS: u32 = 1024;
 const MAX_ROOM_SERVER_URL_BYTES: u32 = 2048;
+const ACTIVITY_EXPORTER_LABEL: &str = "finite-activity-v1";
+const ACTIVITY_NONCE_BYTES: usize = 12;
 const MAX_PENDING_CLIENT_WELCOMES: u32 = MAX_WELCOME_CLAIMS_PER_REQUEST;
 const MAX_PENDING_KEY_PACKAGE_UPLOADS: u32 = MAX_KEY_PACKAGES_PER_DEVICE;
 const MAX_LINK_FANOUTS: u32 = 16;
@@ -123,6 +126,13 @@ pub struct FiniteChatDeviceConfig {
     pub now_unix_seconds: u64,
     pub credential_not_before_unix_seconds: u64,
     pub credential_not_after_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedApplicationEntry {
+    pub plaintext: Vec<u8>,
+    /// MLS-authenticated sender derived from the verified message credential.
+    pub sender: DeviceRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +220,12 @@ pub struct OpenMlsStorageRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppliedLogEntry {
-    Application(Vec<u8>),
+    Application {
+        plaintext: Vec<u8>,
+        /// The MLS-authenticated sender (from the decrypted message's
+        /// verified credential), not the server-claimed envelope sender.
+        sender: DeviceRef,
+    },
     Commit { sender: DeviceRef, epoch: u64 },
 }
 
@@ -247,6 +262,7 @@ pub struct RuntimeSyncReport {
 pub struct RuntimeAppliedEntry {
     pub room_id: RoomId,
     pub seq: u64,
+    pub message_id: String,
     pub entry: AppliedLogEntry,
 }
 
@@ -1187,8 +1203,11 @@ impl FiniteChatDevice {
     ) -> Result<AppliedLogEntry, ClientError> {
         match entry.kind {
             LogEntryKind::Application => {
-                let plaintext = self.decrypt_application_entry(room_id, entry)?;
-                Ok(AppliedLogEntry::Application(plaintext))
+                let decrypted = self.decrypt_application_entry(room_id, entry)?;
+                Ok(AppliedLogEntry::Application {
+                    plaintext: decrypted.plaintext,
+                    sender: decrypted.sender,
+                })
             }
             LogEntryKind::Commit => {
                 self.apply_commit_entry(room_id, entry)?;
@@ -1955,7 +1974,7 @@ impl FiniteChatDevice {
         &mut self,
         room_id: &str,
         entry: &RoomLogEntry,
-    ) -> Result<Vec<u8>, ClientError> {
+    ) -> Result<DecryptedApplicationEntry, ClientError> {
         validate_log_entry_shape(room_id, entry, LogEntryKind::Application)?;
         let provider = &self.provider;
         let group = self
@@ -1968,10 +1987,18 @@ impl FiniteChatDevice {
                 protocol_message_from_bytes(&entry.envelope.payload)?,
             )
             .map_err(|_| ClientError::ProcessMessage)?;
+        let credential = FiniteDeviceCredentialV1::from_credential(processed.credential().clone())?;
+        let sender = DeviceRef {
+            account_id: hex_lower(credential.account_public_key().as_bytes()),
+            device_id: credential.device_id().to_owned(),
+        };
         let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
             return Err(ClientError::UnexpectedMessage);
         };
-        Ok(message.into_bytes())
+        Ok(DecryptedApplicationEntry {
+            plaintext: message.into_bytes(),
+            sender,
+        })
     }
 
     pub fn verified_member_count(
@@ -2047,6 +2074,76 @@ impl FiniteChatDevice {
             room_id: room_id.to_owned(),
             account_id: account_id.to_owned(),
         })
+    }
+
+    /// Encrypt an ephemeral activity payload (typing/working indicators)
+    /// under a key derived from the room's MLS exporter secret at the
+    /// current epoch. Activities are disposable: a payload from another
+    /// epoch simply fails to decrypt and is skipped (forward secrecy means
+    /// old epoch secrets are gone by design).
+    pub fn encrypt_activity_payload(
+        &self,
+        room_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let group = self.group(room_id)?;
+        let epoch = group.epoch().as_u64();
+        let key = group
+            .export_secret(self.provider.crypto(), ACTIVITY_EXPORTER_LABEL, &[], 32)
+            .map_err(|_| ClientError::ActivityCiphertext)?;
+        let nonce: [u8; ACTIVITY_NONCE_BYTES] = self.random_bytes()?;
+        let ciphertext = self
+            .provider
+            .crypto()
+            .aead_encrypt(
+                AeadType::Aes256Gcm,
+                &key,
+                plaintext,
+                &nonce,
+                room_id.as_bytes(),
+            )
+            .map_err(|_| ClientError::ActivityCiphertext)?;
+        let mut out = Vec::with_capacity(8 + ACTIVITY_NONCE_BYTES + ciphertext.len());
+        out.extend_from_slice(&epoch.to_be_bytes());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt_activity_payload(
+        &self,
+        room_id: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
+        let group = self.group(room_id)?;
+        if payload.len() < 8 + ACTIVITY_NONCE_BYTES {
+            return Err(ClientError::ActivityCiphertext);
+        }
+        let epoch = u64::from_be_bytes(payload[..8].try_into().expect("8 bytes"));
+        if epoch != group.epoch().as_u64() {
+            return Err(ClientError::ActivityEpochMismatch {
+                payload_epoch: epoch,
+                group_epoch: group.epoch().as_u64(),
+            });
+        }
+        let key = group
+            .export_secret(self.provider.crypto(), ACTIVITY_EXPORTER_LABEL, &[], 32)
+            .map_err(|_| ClientError::ActivityCiphertext)?;
+        let nonce = &payload[8..8 + ACTIVITY_NONCE_BYTES];
+        self.provider
+            .crypto()
+            .aead_decrypt(
+                AeadType::Aes256Gcm,
+                &key,
+                &payload[8 + ACTIVITY_NONCE_BYTES..],
+                nonce,
+                room_id.as_bytes(),
+            )
+            .map_err(|_| ClientError::ActivityCiphertext)
+    }
+
+    pub fn room_mls_group_id(&self, room_id: &str) -> Result<String, ClientError> {
+        mls_group_id_string(self.group(room_id)?.group_id())
     }
 
     pub fn group_epoch(&self, room_id: &str) -> Result<u64, ClientError> {
@@ -2742,6 +2839,13 @@ fn apply_log_entry_in_memory(
     if entry.seq <= device.last_applied_seq(room_id)? {
         return Ok(None);
     }
+    // Own application messages cannot be decrypted by their sender (MLS);
+    // they advance the cursor without producing an applied entry. Commits
+    // are never skipped: own commits go through the pending-merge rule.
+    if entry.kind == LogEntryKind::Application && entry.envelope.sender == *device.device_ref() {
+        device.set_last_applied_seq(room_id, entry.seq)?;
+        return Ok(None);
+    }
     let applied = device.apply_log_entry(room_id, entry)?;
     device.set_last_applied_seq(room_id, entry.seq)?;
     Ok(Some(applied))
@@ -2956,6 +3060,13 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
         let _: BootstrapAccountRoomResponse =
             self.post_json("/account-rooms/bootstrap", &request)?;
         Ok(())
+    }
+
+    pub fn append_activity(
+        &mut self,
+        request: &AppendEphemeralActivityRequest,
+    ) -> Result<EphemeralActivityAccepted, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json("/activities", request)
     }
 
     pub fn append_event(
@@ -3892,12 +4003,14 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
             if entry.message_id == prepared.message_id {
                 // The completion path persists the whole device state,
                 // including any entries applied in memory above.
+                let message_id = entry.message_id.clone();
                 if let Some(applied) = store.complete_link_fanout_room_from_log_and_save(
                     device, fanout_id, room_id, &entry,
                 )? {
                     report.applied_entries.push(RuntimeAppliedEntry {
                         room_id: room_id.to_string(),
                         seq,
+                        message_id,
                         entry: applied,
                     });
                     report.record_completed_room()?;
@@ -3909,6 +4022,7 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.to_string(),
                     seq,
+                    message_id: entry.message_id.clone(),
                     entry: applied,
                 });
             }
@@ -3969,11 +4083,13 @@ fn sync_room_pages<D: RuntimeDelivery>(
         let mut dirty = false;
         for entry in page.entries {
             let seq = entry.seq;
+            let message_id = entry.message_id.clone();
             if let Some(applied) = apply_log_entry_in_memory(device, &room_id, &entry)? {
                 dirty = true;
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.clone(),
                     seq,
+                    message_id,
                     entry: applied,
                 });
             }
@@ -4107,6 +4223,10 @@ pub enum ClientError {
     BuildKeyPackage,
     #[error("failed to draw randomness from the crypto provider")]
     Randomness,
+    #[error("failed to seal or open an ephemeral activity payload")]
+    ActivityCiphertext,
+    #[error("activity payload epoch {payload_epoch} does not match group epoch {group_epoch}")]
+    ActivityEpochMismatch { payload_epoch: u64, group_epoch: u64 },
     #[error("invite code is invalid: {0}")]
     InviteCode(String),
     #[error("invite session room {actual} does not match invite code room {expected}")]
@@ -4623,6 +4743,23 @@ fn mls_message_in_from_bytes(mut bytes: &[u8]) -> Result<MlsMessageIn, ClientErr
         return Err(ClientError::ParseProtocolMessage);
     }
     MlsMessageIn::tls_deserialize(&mut bytes).map_err(|_| ClientError::ParseProtocolMessage)
+}
+
+/// Generate a fresh account secret key from the crypto provider's RNG.
+/// Used by agent onboarding (`hermes init`): each agent gets its own Nostr
+/// identity that never needs a public relay (ADR 0006 §5).
+pub fn generate_account_secret() -> Result<NostrSecretKey, ClientError> {
+    let provider = OpenMlsRustCrypto::default();
+    for _ in 0..8 {
+        let bytes: [u8; NOSTR_SECRET_KEY_BYTES] = provider
+            .rand()
+            .random_array()
+            .map_err(|_| ClientError::Randomness)?;
+        if let Ok(secret) = NostrSecretKey::from_bytes(bytes) {
+            return Ok(secret);
+        }
+    }
+    Err(ClientError::Randomness)
 }
 
 fn account_public_key_from_device_ref(device: &DeviceRef) -> Result<NostrPublicKey, ClientError> {

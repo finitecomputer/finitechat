@@ -291,7 +291,10 @@ fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
     assert_eq!(report.applied_entries[0].seq, message_accepted.seq);
     assert_eq!(
         report.applied_entries[0].entry,
-        AppliedLogEntry::Application(plaintext.to_vec())
+        AppliedLogEntry::Application {
+            plaintext: plaintext.to_vec(),
+            sender: bob.device_ref().clone(),
+        }
     );
 
     let mut alice = alice_store.load_device(alice_config).unwrap();
@@ -412,7 +415,10 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
     assert_eq!(report.applied_entries[0].seq, message_accepted.seq);
     assert_eq!(
         report.applied_entries[0].entry,
-        AppliedLogEntry::Application(plaintext.to_vec())
+        AppliedLogEntry::Application {
+            plaintext: plaintext.to_vec(),
+            sender: bob.device_ref().clone(),
+        }
     );
     assert_eq!(
         alice.last_applied_seq(ROOM_ID).unwrap(),
@@ -482,7 +488,10 @@ fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
     assert_eq!(first_report.applied_entries[0].seq, sent_plaintexts[0].seq);
     assert_eq!(
         first_report.applied_entries[0].entry,
-        AppliedLogEntry::Application(sent_plaintexts[0].plaintext.clone())
+        AppliedLogEntry::Application {
+            plaintext: sent_plaintexts[0].plaintext.clone(),
+            sender: bob.device_ref().clone(),
+        }
     );
     assert_eq!(
         first_report.applied_entries.last().unwrap().seq,
@@ -505,11 +514,12 @@ fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
     );
     assert_eq!(
         repair_report.applied_entries[0].entry,
-        AppliedLogEntry::Application(
-            sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES]
+        AppliedLogEntry::Application {
+            sender: bob.device_ref().clone(),
+            plaintext: sent_plaintexts[MAX_HTTP_SYNC_PAGE_ENTRIES]
                 .plaintext
                 .clone()
-        )
+        }
     );
     assert_eq!(
         alice.last_applied_seq(ROOM_ID).unwrap(),
@@ -776,7 +786,10 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
     assert_eq!(report.applied_entries[0].seq, post.seq);
     assert_eq!(
         report.applied_entries[0].entry,
-        AppliedLogEntry::Application(post_plaintext.to_vec())
+        AppliedLogEntry::Application {
+            plaintext: post_plaintext.to_vec(),
+            sender: bob.device_ref().clone(),
+        }
     );
     assert_eq!(alice_phone.group_epoch(room_id).unwrap(), 1);
     assert_eq!(alice_phone.last_applied_seq(room_id).unwrap(), post.seq);
@@ -1076,7 +1089,8 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     assert_eq!(bob_after.entries.len(), 1);
     assert_eq!(
         bob.decrypt_application_entry(room_id, &bob_after.entries[0])
-            .unwrap(),
+            .unwrap()
+            .plaintext,
         b"after activation"
     );
 }
@@ -1253,16 +1267,16 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
     assert_eq!(report.submitted_commits, 1);
     assert_eq!(report.completed_rooms, 1);
     assert!(report.complete);
+    assert_eq!(report.applied_entries.len(), 1);
+    assert_eq!(report.applied_entries[0].room_id, room_id);
+    assert_eq!(report.applied_entries[0].seq, bob_join_seq + 1);
+    assert!(!report.applied_entries[0].message_id.is_empty());
     assert_eq!(
-        report.applied_entries,
-        vec![finitechat_client::RuntimeAppliedEntry {
-            room_id: room_id.to_owned(),
-            seq: bob_join_seq + 1,
-            entry: AppliedLogEntry::Commit {
-                sender: alice_browser.device_ref().clone(),
-                epoch: 2,
-            },
-        }]
+        report.applied_entries[0].entry,
+        AppliedLogEntry::Commit {
+            sender: alice_browser.device_ref().clone(),
+            epoch: 2,
+        }
     );
     let LinkFanoutRoomStatus::Done { accepted_seq } = alice_browser
         .link_fanout_room_status("fanout_http_link_phone", room_id)
@@ -2751,7 +2765,10 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
     assert_eq!(room_report.applied_entries.len(), 1);
     assert_eq!(
         room_report.applied_entries[0].entry,
-        AppliedLogEntry::Application(b"hello from your agent".to_vec())
+        AppliedLogEntry::Application {
+            plaintext: b"hello from your agent".to_vec(),
+            sender: agent.device_ref().clone(),
+        }
     );
 
     // The server pin survives the encrypted store round trip.
