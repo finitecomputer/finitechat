@@ -30,8 +30,8 @@ durability, and membership bookkeeping over bytes it cannot read.**
                 │ typed HTTP routes (JSON DTOs, finitechat-http)
 ┌───────────────┴────────────────────────────────────────────────────┐
 │ finitechat-server (Axum, single ordering authority per room)       │
-│  typed routes: /commits /events /sync/group /welcomes/* /rooms/*   │
-│                /key-packages/* /account-rooms/* /push-tokens ...   │
+│  typed routes: /commits /events /sync/group /sync/wait /invites/* │
+│     /welcomes/* /rooms/* /key-packages/* /account-rooms/* ...      │
 │  projections: membership intervals · admins · departed · directory │
 │               KeyPackage leases · delivery effects · idempotency   │
 │  volatile lanes: /activities (typing) · /devices/liveness          │
@@ -241,6 +241,8 @@ mode; history in `docs/perf-log.md`):
 | Sync page (100 entries, any depth) | ~6 µs | `partition_point` over the seq-sorted log |
 | Client apply per entry (decrypt + persist) | ~62 µs | page-batched saves, persistent connection |
 | Startup | snapshot + tail replay | full replay only for never-snapshotted stores |
+| Message latency after send | ~1 RTT | `/sync/wait` long-poll wake hints replace sleep loops |
+| Agent pairing e2e (invite → PIN → admitted → 4 round trips) | < 0.5 s | counts-keyed wake predicates; poll returns on admitted joins |
 
 Capacity is configured for the current phase (hundreds of users, dozens of
 long chats): 65,536 rooms, 262,144 entries per room
@@ -262,6 +264,9 @@ Decisions are ADRs; vocabulary is the glossary; running work is logged.
   free
 - `docs/adr/0005` — home servers and room servers: the sharded target
   topology, the migration principles, and the route taxonomy
+- `docs/adr/0006` — the agent invite flow: invite codes (URL/QR), the
+  rotating challenge PIN verified before the MLS add, invite sessions,
+  and the hermes bridge onboarding surface
 - `CONTEXT.md` / `docs/protocol-glossary.md` — domain language and the
   user-promise behind each mechanism
 - `docs/perf-plan.md` / `docs/perf-log.md` — performance program and ledger

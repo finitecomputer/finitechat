@@ -22,7 +22,8 @@ use finitechat_http::{
     HttpInviteSessionRecord, HttpInviteSessionState, InviteJoinStatusRequest,
     InviteJoinStatusResponse, LeaveRoomRequest, LeaveRoomResponse,
     ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, RespondInviteJoinRequest,
-    SubmitInviteJoinRequest, UpdateRoomAdminsRequest,
+    SubmitInviteJoinRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse,
+    SyncWaitRoom, UpdateRoomAdminsRequest,
     UpdateRoomAdminsResponse,
     DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
@@ -7228,4 +7229,195 @@ async fn sqlite_invite_join_validation_and_expiry_reject_before_persisting() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "invite_session_closed");
+}
+
+#[tokio::test]
+async fn sqlite_sync_wait_wakes_on_publish_and_invite_changes() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-agent");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-sync-wait".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: "mls-sync-wait".to_owned(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // No news: a short wait times out.
+    let started = std::time::Instant::now();
+    let response = post_json(
+        app.clone(),
+        "/sync/wait",
+        &SyncWaitRequest {
+            rooms: vec![SyncWaitRoom {
+                room_id: room_id.clone(),
+                after_seq: 0,
+            }],
+            invites: Vec::new(),
+            wait_ms: 120,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let waited: SyncWaitResponse = read_json(response).await;
+    assert!(!waited.woke);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+
+    // A commit advances the room: an armed waiter wakes promptly and a
+    // fresh waiter returns immediately.
+    let add_bob = submit_add_device_request_at_epoch(&room_id, "mls-sync-wait", &alice, &bob, 0);
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let waiter_app = app.clone();
+    let waiter_room = room_id.clone();
+    let waiter = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let response = post_json(
+            waiter_app,
+            "/sync/wait",
+            &SyncWaitRequest {
+                rooms: vec![SyncWaitRoom {
+                    room_id: waiter_room,
+                    after_seq: 0,
+                }],
+                invites: Vec::new(),
+                wait_ms: 10_000,
+            },
+        )
+        .await;
+        (read_json::<SyncWaitResponse>(response).await, started.elapsed())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (woke, elapsed) = waiter.await.expect("waiter");
+    assert!(woke.woke);
+    assert_eq!(woke.reason.as_deref(), Some("room:room-sync-wait"));
+    assert!(elapsed < std::time::Duration::from_secs(5));
+
+    let response = post_json(
+        app.clone(),
+        "/sync/wait",
+        &SyncWaitRequest {
+            rooms: vec![SyncWaitRoom {
+                room_id: room_id.clone(),
+                after_seq: 0,
+            }],
+            invites: Vec::new(),
+            wait_ms: 10_000,
+        },
+    )
+    .await;
+    let waited: SyncWaitResponse = read_json(response).await;
+    assert!(waited.woke);
+
+    // Invite watches wake on join submission, keyed by seen counts.
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-sync-wait".to_owned(),
+            room_id: room_id.clone(),
+            inviter: alice.clone(),
+            max_joins: 2,
+            expires_at_ms: u64::MAX,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let waiter_app = app.clone();
+    let waiter = tokio::spawn(async move {
+        let response = post_json(
+            waiter_app,
+            "/sync/wait",
+            &SyncWaitRequest {
+                rooms: Vec::new(),
+                invites: vec![SyncWaitInvite {
+                    invite_id: "invite-sync-wait".to_owned(),
+                    seen_requests: 0,
+                    seen_resolved: 0,
+                }],
+                wait_ms: 10_000,
+            },
+        )
+        .await;
+        read_json::<SyncWaitResponse>(response).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let response = post_json(
+        app.clone(),
+        "/invites/join",
+        &SubmitInviteJoinRequest {
+            invite_id: "invite-sync-wait".to_owned(),
+            request_id: "join-wait".to_owned(),
+            joiner: DeviceRef::new("carol", "carol-phone"),
+            key_package: b"kp".to_vec(),
+            pin_proof: invite_pin_proof_stub("carol"),
+            display_name: None,
+            submitted_at_ms: 1,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let woke = waiter.await.expect("invite waiter");
+    assert!(woke.woke);
+    assert_eq!(woke.reason.as_deref(), Some("invite:invite-sync-wait"));
+
+    // Counts already seen do not wake; a resolution does.
+    let waiter_app = app.clone();
+    let waiter = tokio::spawn(async move {
+        let response = post_json(
+            waiter_app,
+            "/sync/wait",
+            &SyncWaitRequest {
+                rooms: Vec::new(),
+                invites: vec![SyncWaitInvite {
+                    invite_id: "invite-sync-wait".to_owned(),
+                    seen_requests: 1,
+                    seen_resolved: 0,
+                }],
+                wait_ms: 10_000,
+            },
+        )
+        .await;
+        read_json::<SyncWaitResponse>(response).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let response = post_json(
+        app.clone(),
+        "/invites/respond",
+        &RespondInviteJoinRequest {
+            invite_id: "invite-sync-wait".to_owned(),
+            request_id: "join-wait".to_owned(),
+            accept: false,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let woke = waiter.await.expect("resolution waiter");
+    assert!(woke.woke);
+
+    // The joiner-visible status reports the resolved count for its own
+    // wake predicate.
+    let response = post_json(
+        app.clone(),
+        "/invites/status",
+        &InviteJoinStatusRequest {
+            invite_id: "invite-sync-wait".to_owned(),
+            request_id: "join-wait".to_owned(),
+        },
+    )
+    .await;
+    let status: InviteJoinStatusResponse = read_json(response).await;
+    assert_eq!(status.state, HttpInviteJoinState::Rejected);
+    assert_eq!(status.resolved_requests, 1);
 }

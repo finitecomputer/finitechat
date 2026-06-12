@@ -11,7 +11,8 @@ use finitechat_proto::{
     SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
 };
 use finitechat_http::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest, SyncWaitRequest,
+    SyncWaitResponse,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
     CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GroupSyncRequest,
     HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState,
@@ -3070,6 +3071,15 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
         Ok(())
     }
 
+    /// Long-poll wake hint (/sync/wait): purely advisory, never advances
+    /// state. Returns when a watched room/invite changes or wait_ms passes.
+    pub fn sync_wait(
+        &mut self,
+        request: &SyncWaitRequest,
+    ) -> Result<SyncWaitResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json("/sync/wait", request)
+    }
+
     pub fn append_activity(
         &mut self,
         request: &AppendEphemeralActivityRequest,
@@ -3646,6 +3656,9 @@ pub struct InviteAcceptReport {
     /// pending commit; run a sync tick (which merges own commits from the
     /// log) and call again.
     pub deferred_pending_commit: bool,
+    /// Session totals after this pass — the inviter's /sync/wait predicate.
+    pub total_requests: u32,
+    pub resolved_requests: u32,
 }
 
 /// Inviter-side processing of pending join requests (ADR 0006): verify each
@@ -3670,6 +3683,12 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
         }
         .into());
     }
+    report.total_requests = listing.requests.len() as u32;
+    report.resolved_requests = listing
+        .requests
+        .iter()
+        .filter(|request| request.state != HttpInviteJoinState::Pending)
+        .count() as u32;
     let pending = listing
         .requests
         .into_iter()
@@ -3708,6 +3727,7 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
                     })
                     .map_err(RuntimeWorkerError::Delivery)?;
                 report.rejected.push(join.joiner);
+                report.resolved_requests += 1;
             }
         }
     }
@@ -3761,6 +3781,7 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
             })
             .map_err(RuntimeWorkerError::Delivery)?;
         report.accepted.push(join.joiner.clone());
+        report.resolved_requests += 1;
     }
     Ok(report)
 }

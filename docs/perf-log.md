@@ -176,3 +176,33 @@ lookups on the already-locked projection).
   way; a binary format (postcard) for the snapshot blob is the cheap next
   step if startup ever matters more.
 - Push tokens and stream-lane kinds added with no hot-path impact.
+
+### 2026-06-12 — Agent invite flow + the latency story (/sync/wait)
+
+The invite/agent phase (ADR 0006) ended with the latency pass:
+
+- **`/sync/wait` long-poll wake hints.** One server-held request replaces
+  client-side sleep loops: it returns when a watched room log advances past
+  the caller's cursor or a watched invite session changes (counts-keyed
+  predicates so stale wakes cannot spin), capped at 25 s. Hints never
+  advance state — pull-based sync is untouched. Publish-side cost is one
+  `Notify::notify_waiters` (an atomic when nobody waits).
+- **Measured:** the full two-home CLI pairing e2e (init ×2 → invite → join
+  with PIN proof → admit → welcome → four message round trips) went
+  **15.4 s → 0.49 s** once `hermes poll`/`hermes join` rode the wait route
+  and poll returned on admitted joins. Message delivery latency is now
+  ~1 RTT after send; the PIN→chatting handshake is a handful of RTTs.
+- One hub `Notify` wakes all waiters who re-check their own predicates —
+  right-sized for hundreds of users; per-key channels are the documented
+  next step if waiter counts grow.
+- Own application messages no longer round-trip through MLS decryption
+  failure handling: the sync tick advances the cursor directly for
+  sender==self application entries (also removed a latent ProcessMessage
+  error for any client that sends and syncs).
+- Observation (bridge): the platform adapter spawns a subprocess per bridge
+  call, each reopening and decrypting the client store (~10 ms class). The
+  long-poll amortizes this for poll; a resident daemon mode (or SSE lane,
+  ADR 0003 §6) is the next step if send-side overhead ever matters.
+- Observation (redundant validation): none added — invite-session
+  verification is inviter-side only by design; the server stores opaque
+  rendezvous material and never re-checks proofs.

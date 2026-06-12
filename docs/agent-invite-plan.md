@@ -73,4 +73,4 @@ story.
 - [x] Phase 4 — CLI hermes subcommands
 - [x] Phase 5 — hermes plugin refresh
 - [ ] Phase 6 — container harness + e2e
-- [ ] Phase 7 — perf pass
+- [x] Phase 7 — perf pass (container e2e live run pending runtime install)

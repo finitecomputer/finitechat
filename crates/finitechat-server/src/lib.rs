@@ -33,7 +33,7 @@ pub use finitechat_http::{
     HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
     HttpInviteSessionState, InviteJoinStatusRequest, InviteJoinStatusResponse,
     ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, RespondInviteJoinRequest,
-    SubmitInviteJoinRequest,
+    SubmitInviteJoinRequest, SyncWaitRequest, SyncWaitResponse,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
@@ -104,6 +104,11 @@ pub struct HttpServerState {
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
+    /// Long-poll wake signal (/sync/wait). A single hub: every accepted
+    /// publish or invite mutation wakes all waiters, who re-check their
+    /// own predicates. Sized for the current phase (hundreds of users);
+    /// per-key channels are the documented next step if waiter counts grow.
+    wake: Arc<tokio::sync::Notify>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
 
@@ -125,6 +130,7 @@ impl HttpServerState {
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             push_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
+            wake: Arc::new(tokio::sync::Notify::new()),
             store: None,
         }
     }
@@ -193,6 +199,7 @@ impl HttpServerState {
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             push_tokens: Arc::new(Mutex::new(push_tokens)),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
+            wake: Arc::new(tokio::sync::Notify::new()),
             store: Some(store),
         })
     }
@@ -1080,9 +1087,15 @@ impl HttpServerState {
                 request_id: request.request_id.clone(),
             }
         })?;
+        let resolved_requests = session
+            .join_requests
+            .values()
+            .filter(|request| request.state != HttpInviteJoinState::Pending)
+            .count() as u32;
         Ok(InviteJoinStatusResponse {
             room_id: session.room_id.clone(),
             state: join.state.clone(),
+            resolved_requests,
         })
     }
 
@@ -1111,6 +1124,45 @@ impl HttpServerState {
             store.upsert_invite_session(&record)?;
         }
         Ok(ExpireInviteSessionResponse { expired: true })
+    }
+
+    /// The /sync/wait predicate: any watched room advanced past its cursor,
+    /// or any watched invite session gained requests / resolutions / closed.
+    fn check_wait_signal(&self, request: &SyncWaitRequest) -> Option<String> {
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            for watch in &request.rooms {
+                if let Some(projection) = rooms.get(&watch.room_id)
+                    && projection.last_seq > watch.after_seq
+                {
+                    return Some(format!("room:{}", watch.room_id));
+                }
+            }
+        }
+        let sessions = self
+            .invite_sessions
+            .lock()
+            .expect("HTTP invite-session mutex");
+        for watch in &request.invites {
+            let Some(session) = sessions.get(&watch.invite_id) else {
+                continue;
+            };
+            let resolved = session
+                .join_requests
+                .values()
+                .filter(|join| join.state != HttpInviteJoinState::Pending)
+                .count();
+            if session.join_requests.len() > watch.seen_requests as usize
+                || resolved > watch.seen_resolved as usize
+                || session.state != HttpInviteSessionState::Open
+            {
+                return Some(format!("invite:{}", watch.invite_id));
+            }
+        }
+        None
     }
 
     fn save_account_room(
@@ -2595,6 +2647,7 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
+        .route("/sync/wait", post(sync_wait))
         .route("/devices/revoke", post(revoke_device))
         .route("/devices/liveness", post(observe_device_liveness))
         .route("/devices/liveness/get", post(get_device_liveness))
@@ -2646,6 +2699,7 @@ async fn append_application_event(
 ) -> Result<Json<EventAccepted>, ServerHttpError> {
     let response = state.append_application_event(request)?;
     state.note_op_for_snapshot();
+    state.wake.notify_waiters();
     Ok(Json(response))
 }
 
@@ -2675,6 +2729,7 @@ async fn submit_commit(
 ) -> Result<Json<CommitAccepted>, ServerHttpError> {
     let response = state.submit_commit(request)?;
     state.note_op_for_snapshot();
+    state.wake.notify_waiters();
     Ok(Json(response))
 }
 
@@ -2691,6 +2746,35 @@ async fn sync_inbox(
 ) -> Result<Json<HttpSyncPage>, ServerHttpError> {
     let page = state.sync_inbox(&request.recipient, request.after_seq, request.limit)?;
     Ok(Json(page))
+}
+
+async fn sync_wait(
+    State(state): State<HttpServerState>,
+    Json(request): Json<SyncWaitRequest>,
+) -> Result<Json<SyncWaitResponse>, ServerHttpError> {
+    validate_sync_wait_request(&request)?;
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(request.wait_ms.min(MAX_SYNC_WAIT_MILLIS));
+    loop {
+        // Arm the notification before checking so a publish that lands
+        // between the check and the await still wakes this waiter.
+        let notified = state.wake.notified();
+        if let Some(reason) = state.check_wait_signal(&request) {
+            return Ok(Json(SyncWaitResponse {
+                woke: true,
+                reason: Some(reason),
+            }));
+        }
+        tokio::select! {
+            _ = notified => continue,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Ok(Json(SyncWaitResponse {
+                    woke: false,
+                    reason: None,
+                }));
+            }
+        }
+    }
 }
 
 async fn revoke_device(
@@ -2831,6 +2915,7 @@ async fn submit_invite_join(
     Json(request): Json<SubmitInviteJoinRequest>,
 ) -> Result<Json<HttpInviteJoinRequestRecord>, ServerHttpError> {
     let record = state.submit_invite_join(request)?;
+    state.wake.notify_waiters();
     Ok(Json(record))
 }
 
@@ -2847,6 +2932,7 @@ async fn respond_invite_join(
     Json(request): Json<RespondInviteJoinRequest>,
 ) -> Result<Json<HttpInviteJoinRequestRecord>, ServerHttpError> {
     let record = state.respond_invite_join(request)?;
+    state.wake.notify_waiters();
     Ok(Json(record))
 }
 
@@ -2863,6 +2949,7 @@ async fn expire_invite_session(
     Json(request): Json<ExpireInviteSessionRequest>,
 ) -> Result<Json<ExpireInviteSessionResponse>, ServerHttpError> {
     let response = state.expire_invite_session(request)?;
+    state.wake.notify_waiters();
     Ok(Json(response))
 }
 
@@ -5066,6 +5153,30 @@ fn validate_link_claim_token(claim_token: &str) -> Result<(), ServerHttpError> {
             reason: error.to_string(),
         },
     )
+}
+
+const MAX_SYNC_WAIT_MILLIS: u64 = 25_000;
+const MAX_SYNC_WAIT_ROOMS: usize = 256;
+const MAX_SYNC_WAIT_INVITES: usize = 64;
+
+fn validate_sync_wait_request(request: &SyncWaitRequest) -> Result<(), ServerHttpError> {
+    if request.rooms.len() > MAX_SYNC_WAIT_ROOMS {
+        return Err(ServerHttpError::InvalidInviteRequest {
+            reason: format!("sync_wait watches at most {MAX_SYNC_WAIT_ROOMS} rooms"),
+        });
+    }
+    if request.invites.len() > MAX_SYNC_WAIT_INVITES {
+        return Err(ServerHttpError::InvalidInviteRequest {
+            reason: format!("sync_wait watches at most {MAX_SYNC_WAIT_INVITES} invites"),
+        });
+    }
+    for room in &request.rooms {
+        validate_invite_room_id(&room.room_id)?;
+    }
+    for invite in &request.invites {
+        validate_invite_id(&invite.invite_id)?;
+    }
+    Ok(())
 }
 
 fn validate_invite_id(invite_id: &str) -> Result<(), ServerHttpError> {

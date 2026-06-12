@@ -19,7 +19,9 @@ use finitechat_client::{
     RuntimeDelivery, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
     run_runtime_sync_tick, submit_invite_join_request,
 };
-use finitechat_http::HttpInviteJoinState;
+use finitechat_http::{
+    HttpInviteJoinState, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom,
+};
 use finitechat_hermes::{
     HermesActivityRequestV1, HermesEditRequestV1, HermesMessagePayloadV1, HermesPollEventV1,
     HermesSendRequestV1, MAX_HERMES_POLL_TIMEOUT_MILLIS,
@@ -320,7 +322,23 @@ fn cmd_join<W: Write>(
                 if Instant::now() >= deadline {
                     break "pending";
                 }
-                std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                let wait = SyncWaitRequest {
+                    rooms: Vec::new(),
+                    invites: vec![SyncWaitInvite {
+                        invite_id: code.invite_id.clone(),
+                        // Wake only when a further request gets resolved
+                        // (ours is among the pending ones).
+                        seen_requests: u32::MAX,
+                        seen_resolved: status.resolved_requests,
+                    }],
+                    wait_ms: remaining,
+                };
+                if delivery.sync_wait(&wait).is_err() {
+                    std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+                }
             }
         }
     };
@@ -390,6 +408,8 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     let own_account = device.device_ref().account_id.clone();
     let mut events: Vec<HermesPollEventV1> = Vec::new();
     let mut joined: Vec<String> = Vec::new();
+    let mut invite_counts: std::collections::BTreeMap<String, (u32, u32)> =
+        std::collections::BTreeMap::new();
 
     loop {
         let mut report = run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
@@ -431,6 +451,13 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
             ) {
                 Ok(invite_report) => {
                     accepted_any |= !invite_report.accepted.is_empty();
+                    invite_counts.insert(
+                        code.invite_id.clone(),
+                        (
+                            invite_report.total_requests,
+                            invite_report.resolved_requests,
+                        ),
+                    );
                     joined.extend(
                         invite_report
                             .accepted
@@ -479,10 +506,49 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
             ));
         }
 
-        if !events.is_empty() || started.elapsed() >= timeout {
+        if !events.is_empty() || !joined.is_empty() || started.elapsed() >= timeout {
             break;
         }
-        std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+        // Long-poll on the home server instead of sleeping: wake on any
+        // watched room advancing or invite session changing. Rooms pinned
+        // to other servers bound the wait so they still get re-synced.
+        let cursors = device.room_sync_cursors();
+        let has_pinned_rooms = cursors.iter().any(|cursor| cursor.server_url.is_some());
+        let remaining = timeout.saturating_sub(started.elapsed()).as_millis() as u64;
+        let wait_ms = if has_pinned_rooms {
+            remaining.min(POLL_SLEEP_MS)
+        } else {
+            remaining
+        };
+        let wait = SyncWaitRequest {
+            rooms: cursors
+                .into_iter()
+                .filter(|cursor| cursor.server_url.is_none())
+                .map(|cursor| SyncWaitRoom {
+                    room_id: cursor.room_id,
+                    after_seq: cursor.after_seq,
+                })
+                .collect(),
+            invites: invites
+                .iter()
+                .map(|code| {
+                    let (seen_requests, seen_resolved) = invite_counts
+                        .get(&code.invite_id)
+                        .copied()
+                        .unwrap_or((u32::MAX, u32::MAX));
+                    SyncWaitInvite {
+                        invite_id: code.invite_id.clone(),
+                        seen_requests,
+                        seen_resolved,
+                    }
+                })
+                .collect(),
+            wait_ms,
+        };
+        if delivery.sync_wait(&wait).is_err() {
+            // Older servers without /sync/wait fall back to a short sleep.
+            std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+        }
     }
 
     crate::write_pretty_json(output, &json!({ "events": events, "joined": joined }))

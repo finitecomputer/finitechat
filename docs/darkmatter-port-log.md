@@ -1547,3 +1547,37 @@ deepening the single-URL assumption in the client" as the only item where
 waiting makes the work larger. Glossary gained Room server / Home server /
 Wake relay; architecture report §10/§11 updated. Nothing built; today's
 deployment is reframed as the degenerate one-server-both-roles topology.
+
+## Checkpoint: Agent Invite Flow (ADR 0006) Built End to End
+
+2026-06-12, second session. The flagship onboarding UX exists: a Hermes
+agent prints a QR (`finite://join?...` invite code v1, room-server address
+first per ADR 0005) plus a rotating 6-digit PIN; the user joins from the
+app; the agent verifies the token+PIN-bound join proof **before** the MLS
+add; both sides verify identities cryptographically. Built across seven
+phases, each committed:
+
+1. ADR 0006 + plan (`18c976a`).
+2. Server invite sessions: six home-scoped rendezvous routes, durable like
+   link sessions, opaque to the server (`25ab740`).
+3. Proto invite module (URL codec, PIN, join proof, npub) + client
+   room-server addressing (state v8), server-grouped sync ticks, and the
+   high-level invite API (`221c2d4`).
+4. The `hermes` CLI rebuilt over the real MLS client: init/invite/pin/
+   poll/send/edit/activity + the HermesMessagePayloadV1 plaintext schema,
+   MLS-authenticated senders on applied entries, exporter-keyed activity
+   encryption (`c18883c`).
+5. Plugin refresh to hermes-agent 0.16 plugin practice; invite surfaced at
+   gateway startup; FINITECHAT_HOME replaces required room ids (`8d894af`).
+6. `hermes join` (user-side CLI pairing), multi-server poll, the Apple
+   `container` e2e harness (Linux guest: pip hermes-agent + plugin +
+   binary; host: server + CLI user), and a real fix: member verification
+   filtered by device_id alone collided across accounts (`8e22363`).
+7. Latency: `/sync/wait` long-poll wake hints (counts-keyed predicates,
+   single Notify hub), CLI wiring, own-message cursor skip. Pairing e2e
+   **15.4 s → 0.49 s**; message latency ~1 RTT after send.
+
+Honest remainders: the live container run awaits the runtime install (the
+gated test and scripts are in place); bridge chat delivery is at-most-once
+across an agent crash (ledger row; command-inbox lane is the designed
+fix); ephemeral activities still lack a read route (ledger row).

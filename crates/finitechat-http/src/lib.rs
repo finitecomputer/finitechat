@@ -58,6 +58,41 @@ pub struct GroupSyncRequest {
     pub requester: Option<MemberId>,
 }
 
+/// Long-poll wake hint (ADR 0003 §5 wake contract over HTTP): returns when
+/// any watched room log advances past the supplied cursor or any watched
+/// invite session changes, or when `wait_ms` elapses. Purely advisory —
+/// hints never advance state; callers re-sync to observe actual entries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncWaitRequest {
+    #[serde(default)]
+    pub rooms: Vec<SyncWaitRoom>,
+    #[serde(default)]
+    pub invites: Vec<SyncWaitInvite>,
+    pub wait_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncWaitRoom {
+    pub room_id: String,
+    pub after_seq: HttpSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncWaitInvite {
+    pub invite_id: String,
+    /// Wake when join_requests.len() exceeds this.
+    pub seen_requests: u32,
+    /// Wake when resolved (non-pending) requests exceed this.
+    pub seen_resolved: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncWaitResponse {
+    pub woke: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxSyncRequest {
     pub recipient: MemberId,
@@ -278,6 +313,10 @@ pub struct InviteJoinStatusRequest {
 pub struct InviteJoinStatusResponse {
     pub room_id: String,
     pub state: HttpInviteJoinState,
+    /// Total resolved (non-pending) join requests in the session; the
+    /// joiner's wake predicate for /sync/wait.
+    #[serde(default)]
+    pub resolved_requests: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
