@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
-    RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, accept_pending_invite_joins,
-    create_room_invite, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
-    run_runtime_sync_tick, submit_invite_join_request,
+    RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppMessage,
+    accept_pending_invite_joins, create_room_invite, finalize_invited_room,
+    generate_account_secret, run_room_server_sync_tick, run_runtime_sync_tick,
+    submit_invite_join_request,
 };
 use finitechat_hermes::HermesMessagePayloadV1;
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
@@ -23,8 +24,9 @@ use thiserror::Error;
 
 const ACCOUNT_SECRET_FILE: &str = "account-secret.hex";
 const CLIENT_STORE_FILE: &str = "client.sqlite3";
-const APP_MESSAGES_FILE: &str = "app-messages.json";
+const LEGACY_APP_MESSAGES_FILE: &str = "app-messages.json";
 const MAX_APP_MESSAGES: usize = 5_000;
+const MAX_APP_MESSAGES_U32: u32 = 5_000;
 const DEFAULT_KEY_PACKAGE_TARGET_AVAILABLE: u32 = 2;
 const DEFAULT_MAX_SYNC_PAGES_PER_ROOM: u32 = 16;
 const DEFAULT_CREDENTIAL_VALIDITY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -401,9 +403,17 @@ impl FiniteChatRuntime {
 }
 
 impl AppRuntimeState {
-    fn new(core: CoreState) -> Result<Self, FiniteChatCoreError> {
+    fn new(mut core: CoreState) -> Result<Self, FiniteChatCoreError> {
         let identity = core.identity();
-        let messages = load_app_messages(&core.data_dir)?;
+        let owner = core.device.device_ref().clone();
+        migrate_legacy_app_messages(&mut core, &owner)?;
+        let messages = core
+            .store
+            .load_app_messages(&owner, MAX_APP_MESSAGES_U32)
+            .map_err(store_error)?
+            .into_iter()
+            .map(chat_message_from_stored)
+            .collect::<Vec<_>>();
         let mut rooms = core
             .known_room_ids()
             .into_iter()
@@ -846,12 +856,9 @@ impl AppRuntimeState {
             self.app.messages.push(message);
             changed = true;
         }
-        if changed {
-            if self.app.messages.len() > MAX_APP_MESSAGES {
-                let drop_count = self.app.messages.len() - MAX_APP_MESSAGES;
-                self.app.messages.drain(0..drop_count);
-            }
-            save_app_messages(&self.core.data_dir, &self.app.messages)?;
+        if changed && self.app.messages.len() > MAX_APP_MESSAGES {
+            let drop_count = self.app.messages.len() - MAX_APP_MESSAGES;
+            self.app.messages.drain(0..drop_count);
         }
         Ok(())
     }
@@ -1211,19 +1218,18 @@ impl CoreState {
             .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
             .map_err(delivery_error)?;
 
+        let message = ChatMessage {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+            message_id: accepted.message_id,
+            sender_account_id: sender.account_id,
+            sender_device_id: sender.device_id,
+            text: text.to_owned(),
+            payload: text.as_bytes().to_vec(),
+        };
+        self.persist_chat_messages(std::slice::from_ref(&message))?;
         let mut result = self.sync()?;
-        result.messages.insert(
-            0,
-            ChatMessage {
-                room_id: room_id.to_owned(),
-                seq: accepted.seq,
-                message_id: accepted.message_id,
-                sender_account_id: sender.account_id,
-                sender_device_id: sender.device_id,
-                text: text.to_owned(),
-                payload: text.as_bytes().to_vec(),
-            },
-        );
+        result.messages.insert(0, message);
         Ok(result)
     }
 
@@ -1264,6 +1270,23 @@ impl CoreState {
         }
 
         Ok(result)
+    }
+
+    fn persist_chat_messages(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> Result<(), FiniteChatCoreError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let owner = self.device.device_ref().clone();
+        let stored = messages
+            .iter()
+            .map(stored_message_from_chat)
+            .collect::<Vec<_>>();
+        self.store
+            .save_app_messages(&owner, &stored, MAX_APP_MESSAGES_U32)
+            .map_err(store_error)
     }
 }
 
@@ -1307,8 +1330,62 @@ fn chat_display_text(plaintext: &[u8]) -> String {
     String::from_utf8_lossy(plaintext).into_owned()
 }
 
-fn load_app_messages(data_dir: &Path) -> Result<Vec<ChatMessage>, FiniteChatCoreError> {
-    let path = data_dir.join(APP_MESSAGES_FILE);
+fn chat_message_from_stored(message: StoredAppMessage) -> ChatMessage {
+    ChatMessage {
+        room_id: message.room_id,
+        seq: message.seq,
+        message_id: message.message_id,
+        sender_account_id: message.sender.account_id,
+        sender_device_id: message.sender.device_id,
+        text: chat_display_text(&message.plaintext),
+        payload: message.plaintext,
+    }
+}
+
+fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
+    StoredAppMessage {
+        room_id: message.room_id.clone(),
+        seq: message.seq,
+        message_id: message.message_id.clone(),
+        sender: DeviceRef {
+            account_id: message.sender_account_id.clone(),
+            device_id: message.sender_device_id.clone(),
+        },
+        plaintext: message.payload.clone(),
+    }
+}
+
+fn migrate_legacy_app_messages(
+    core: &mut CoreState,
+    owner: &DeviceRef,
+) -> Result<(), FiniteChatCoreError> {
+    let path = core.data_dir.join(LEGACY_APP_MESSAGES_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    if !core
+        .store
+        .load_app_messages(owner, 1)
+        .map_err(store_error)?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let messages = load_legacy_app_messages(&core.data_dir)?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let stored = messages
+        .iter()
+        .map(stored_message_from_chat)
+        .collect::<Vec<_>>();
+    core.store
+        .save_app_messages(owner, &stored, MAX_APP_MESSAGES_U32)
+        .map_err(store_error)
+}
+
+fn load_legacy_app_messages(data_dir: &Path) -> Result<Vec<ChatMessage>, FiniteChatCoreError> {
+    let path = data_dir.join(LEGACY_APP_MESSAGES_FILE);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -1324,27 +1401,6 @@ fn load_app_messages(data_dir: &Path) -> Result<Vec<ChatMessage>, FiniteChatCore
         messages.drain(0..drop_count);
     }
     Ok(messages)
-}
-
-fn save_app_messages(data_dir: &Path, messages: &[ChatMessage]) -> Result<(), FiniteChatCoreError> {
-    fs::create_dir_all(data_dir).map_err(|error| FiniteChatCoreError::Filesystem {
-        reason: format!("failed to create {}: {error}", data_dir.display()),
-    })?;
-    let path = data_dir.join(APP_MESSAGES_FILE);
-    let tmp_path = data_dir.join(format!("{APP_MESSAGES_FILE}.tmp"));
-    let raw = serde_json::to_vec(messages).map_err(|error| FiniteChatCoreError::Store {
-        reason: format!("failed to encode app messages: {error}"),
-    })?;
-    fs::write(&tmp_path, raw).map_err(|error| FiniteChatCoreError::Filesystem {
-        reason: format!("failed to write {}: {error}", tmp_path.display()),
-    })?;
-    fs::rename(&tmp_path, &path).map_err(|error| FiniteChatCoreError::Filesystem {
-        reason: format!(
-            "failed to replace {} with {}: {error}",
-            path.display(),
-            tmp_path.display()
-        ),
-    })
 }
 
 fn apply_message_previews(rooms: &mut [AppRoomSummary], messages: &[ChatMessage]) {

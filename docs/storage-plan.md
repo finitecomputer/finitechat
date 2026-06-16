@@ -25,15 +25,30 @@ rollback.
 `finitechat-client` has the first local client SQLite store:
 
 - `client_device_states`
+- `client_app_messages`
 
-The table stores one encrypted binary snapshot per account/device. The
-plaintext snapshot contains the Nostr-rooted device profile metadata needed to
-reload, the Finite Chat room id to MLS group id mapping, the per-room applied
-server cursor, pending claimed Welcome payloads, durable link-fanout plans and
-prepared Commit replay values, and OpenMLS storage records for signer, group,
-and message-secret state. The wrapping key is derived from the user's Nostr
-secret and device id using HKDF with Finite Chat domain separation, and the
-account/device lookup key is bound into AEAD AAD.
+`client_device_states` stores one encrypted binary snapshot per
+account/device. The plaintext snapshot contains the Nostr-rooted device
+profile metadata needed to reload, the Finite Chat room id to MLS group id
+mapping, the per-room applied server cursor, pending claimed Welcome payloads,
+durable link-fanout plans and prepared Commit replay values, and OpenMLS
+storage records for signer, group, and message-secret state.
+
+`client_app_messages` stores the bounded local application-message projection
+that powers chat lists and room views. It is not an authoritative server log
+and it is not a profile-style cache: each row is scoped to the owning
+account/device, keyed by `(room_id, message_id)`, ordered by local insertion,
+and contains the authenticated sender plus decrypted application plaintext
+encrypted at rest. The row plaintext is sealed with the same client-store key
+as the device snapshot, and the AEAD AAD binds owner, room id, sequence,
+message id, and authenticated sender so copied or tampered rows fail closed
+on load. The table has owner and owner/room/seq indexes so startup can load a
+bounded recent projection without replaying room history.
+
+The wrapping key is derived from the user's Nostr secret and device id using
+HKDF with Finite Chat domain separation. SQLite metadata, row counts, WAL
+behavior, and account/device lookup ids remain visible to the local machine;
+the client store is application-level SQLite encryption, not SQLCipher.
 
 Client code should use store-backed operations for persisting claimed Welcomes,
 Welcome activation, link-fanout preparation/completion, and ordered-log
@@ -46,12 +61,16 @@ completed. Persisting prepared fanout Commits means a device can restart after
 creating local pending MLS state and still submit the exact server request that
 matches that pending Commit.
 
-This is application-level SQLite encryption for the client state snapshot, not
-SQLCipher. SQLite metadata, row counts, WAL behavior, and account/device lookup
-ids remain visible to the local machine. Production still needs the unlock
-policy that decides whether the Nostr key comes from OS keychain, user
-passphrase, hardware-backed storage, or an already-unlocked finitecomputer
-runtime.
+Received application messages are inserted in the same SQLite transaction that
+persists the device cursor that consumed them. Own sends are inserted by
+`CoreState::send_text` after the server append is accepted; Swift and the app
+runtime render the Rust state and do not own persistence. Startup reads the
+bounded SQLite projection. Full room-history sync remains a repair/recovery
+path, not the ordinary way the UI gets messages after launch.
+
+Production still needs the unlock policy that decides whether the Nostr key
+comes from OS keychain, user passphrase, hardware-backed storage, or an
+already-unlocked finitecomputer runtime.
 
 `finitechat-blob` owns the first attachment/blob boundary. It does not add a
 new database yet. Clients encrypt attachment bytes with per-attachment
