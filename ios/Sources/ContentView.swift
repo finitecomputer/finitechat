@@ -24,10 +24,19 @@ private enum AppSheet: Identifiable {
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var sheet: AppSheet?
+    @State private var path: [String] = []
 
     var body: some View {
-        NavigationStack {
-            RoomListView(model: model) { destination in
+        NavigationStack(path: $path) {
+            RoomListView(
+                model: model,
+                openRoom: { room in
+                    model.openRoom(room)
+                    if path.last != room.roomId {
+                        path.append(room.roomId)
+                    }
+                }
+            ) { destination in
                 sheet = destination
             }
             .navigationDestination(for: String.self) { roomID in
@@ -56,6 +65,7 @@ struct ContentView: View {
 
 private struct RoomListView: View {
     @ObservedObject var model: AppModel
+    let openRoom: (AppRoomSummary) -> Void
     let present: (AppSheet) -> Void
 
     var body: some View {
@@ -82,12 +92,13 @@ private struct RoomListView: View {
                 }
             } else {
                 List(model.rooms, id: \.roomId) { room in
-                    NavigationLink(value: room.roomId) {
+                    Button {
+                        openRoom(room)
+                    } label: {
                         RoomRow(room: room)
                     }
-                    .simultaneousGesture(TapGesture().onEnded {
-                        model.openRoom(room)
-                    })
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("RoomRow-\(room.roomId)")
                 }
                 .listStyle(.plain)
             }
