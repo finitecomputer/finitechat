@@ -23,6 +23,8 @@ use thiserror::Error;
 
 const ACCOUNT_SECRET_FILE: &str = "account-secret.hex";
 const CLIENT_STORE_FILE: &str = "client.sqlite3";
+const APP_MESSAGES_FILE: &str = "app-messages.json";
+const MAX_APP_MESSAGES: usize = 5_000;
 const DEFAULT_KEY_PACKAGE_TARGET_AVAILABLE: u32 = 2;
 const DEFAULT_MAX_SYNC_PAGES_PER_ROOM: u32 = 16;
 const DEFAULT_CREDENTIAL_VALIDITY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -212,6 +214,7 @@ pub enum AppAction {
 }
 
 struct CoreState {
+    data_dir: PathBuf,
     server_url: String,
     account_secret: NostrSecretKey,
     config: FiniteChatDeviceConfig,
@@ -350,7 +353,7 @@ impl FiniteChatRuntime {
     pub fn open(options: OpenOptions) -> Result<Arc<Self>, FiniteChatCoreError> {
         let core = CoreState::open(options)?;
         Ok(Arc::new(Self {
-            state: Mutex::new(AppRuntimeState::new(core)),
+            state: Mutex::new(AppRuntimeState::new(core)?),
         }))
     }
 
@@ -398,9 +401,10 @@ impl FiniteChatRuntime {
 }
 
 impl AppRuntimeState {
-    fn new(core: CoreState) -> Self {
+    fn new(core: CoreState) -> Result<Self, FiniteChatCoreError> {
         let identity = core.identity();
-        let rooms = core
+        let messages = load_app_messages(&core.data_dir)?;
+        let mut rooms = core
             .known_room_ids()
             .into_iter()
             .map(|room_id| AppRoomSummary {
@@ -412,7 +416,8 @@ impl AppRuntimeState {
                 unread_count: 0,
             })
             .collect::<Vec<_>>();
-        Self {
+        apply_message_previews(&mut rooms, &messages);
+        Ok(Self {
             core,
             app: AppState {
                 rev: 0,
@@ -423,7 +428,7 @@ impl AppRuntimeState {
                 active_profile_id: None,
                 status: "ready".to_owned(),
                 toast: None,
-                messages: Vec::new(),
+                messages,
                 profiles: Vec::new(),
                 devices: Vec::new(),
             },
@@ -432,7 +437,7 @@ impl AppRuntimeState {
             invite_watch_marks: BTreeMap::new(),
             profile_cache: BTreeMap::new(),
             revoked_devices: BTreeSet::new(),
-        }
+        })
     }
 
     fn dispatch(&mut self, action: AppAction) -> Result<(), FiniteChatCoreError> {
@@ -532,7 +537,7 @@ impl AppRuntimeState {
             }
         }
         let synced = self.core.sync()?;
-        self.append_messages(synced.messages);
+        self.append_messages(synced.messages)?;
         self.try_finalize_pending_rooms();
         self.app.status = "ready".to_owned();
         Ok(())
@@ -682,7 +687,7 @@ impl AppRuntimeState {
             });
         }
         let result = self.core.send_text(&room_id, trimmed)?;
-        self.append_messages(result.messages);
+        self.append_messages(result.messages)?;
         if let Some(room) = self.room_mut(&room_id) {
             room.last_message_preview = trimmed.to_owned();
         }
@@ -822,23 +827,33 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn append_messages(&mut self, messages: Vec<ChatMessage>) {
+    fn append_messages(&mut self, messages: Vec<ChatMessage>) -> Result<(), FiniteChatCoreError> {
         let mut existing = self
             .app
             .messages
             .iter()
-            .map(|message| message.message_id.clone())
+            .map(message_key)
             .collect::<BTreeSet<_>>();
+        let mut changed = false;
         for message in messages {
-            if existing.contains(&message.message_id) {
+            if existing.contains(&message_key(&message)) {
                 continue;
             }
-            existing.insert(message.message_id.clone());
+            existing.insert(message_key(&message));
             if let Some(room) = self.room_mut(&message.room_id) {
                 room.last_message_preview = message.text.clone();
             }
             self.app.messages.push(message);
+            changed = true;
         }
+        if changed {
+            if self.app.messages.len() > MAX_APP_MESSAGES {
+                let drop_count = self.app.messages.len() - MAX_APP_MESSAGES;
+                self.app.messages.drain(0..drop_count);
+            }
+            save_app_messages(&self.core.data_dir, &self.app.messages)?;
+        }
+        Ok(())
     }
 
     fn upsert_room(
@@ -981,6 +996,7 @@ impl CoreState {
         };
 
         Ok(Self {
+            data_dir,
             server_url: options.server_url,
             account_secret,
             config,
@@ -1289,6 +1305,61 @@ fn chat_display_text(plaintext: &[u8]) -> String {
         return payload.text;
     }
     String::from_utf8_lossy(plaintext).into_owned()
+}
+
+fn load_app_messages(data_dir: &Path) -> Result<Vec<ChatMessage>, FiniteChatCoreError> {
+    let path = data_dir.join(APP_MESSAGES_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read(&path).map_err(|error| FiniteChatCoreError::Filesystem {
+        reason: format!("failed to read {}: {error}", path.display()),
+    })?;
+    let mut messages: Vec<ChatMessage> =
+        serde_json::from_slice(&raw).map_err(|error| FiniteChatCoreError::Store {
+            reason: format!("failed to parse {}: {error}", path.display()),
+        })?;
+    if messages.len() > MAX_APP_MESSAGES {
+        let drop_count = messages.len() - MAX_APP_MESSAGES;
+        messages.drain(0..drop_count);
+    }
+    Ok(messages)
+}
+
+fn save_app_messages(data_dir: &Path, messages: &[ChatMessage]) -> Result<(), FiniteChatCoreError> {
+    fs::create_dir_all(data_dir).map_err(|error| FiniteChatCoreError::Filesystem {
+        reason: format!("failed to create {}: {error}", data_dir.display()),
+    })?;
+    let path = data_dir.join(APP_MESSAGES_FILE);
+    let tmp_path = data_dir.join(format!("{APP_MESSAGES_FILE}.tmp"));
+    let raw = serde_json::to_vec(messages).map_err(|error| FiniteChatCoreError::Store {
+        reason: format!("failed to encode app messages: {error}"),
+    })?;
+    fs::write(&tmp_path, raw).map_err(|error| FiniteChatCoreError::Filesystem {
+        reason: format!("failed to write {}: {error}", tmp_path.display()),
+    })?;
+    fs::rename(&tmp_path, &path).map_err(|error| FiniteChatCoreError::Filesystem {
+        reason: format!(
+            "failed to replace {} with {}: {error}",
+            path.display(),
+            tmp_path.display()
+        ),
+    })
+}
+
+fn apply_message_previews(rooms: &mut [AppRoomSummary], messages: &[ChatMessage]) {
+    for message in messages {
+        if let Some(room) = rooms
+            .iter_mut()
+            .find(|room| room.room_id == message.room_id)
+        {
+            room.last_message_preview = message.text.clone();
+        }
+    }
+}
+
+fn message_key(message: &ChatMessage) -> (String, String) {
+    (message.room_id.clone(), message.message_id.clone())
 }
 
 fn load_or_create_account_secret(
@@ -1613,8 +1684,9 @@ mod tests {
     fn app_runtime_auto_admits_invite_and_joiner_sends_without_protocol_actions() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
         let alice = FiniteChatRuntime::open(OpenOptions {
-            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
@@ -1623,7 +1695,7 @@ mod tests {
         .unwrap();
         let bob = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
-            server_url,
+            server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
@@ -1695,6 +1767,28 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.text == "hello from app actor")
+        );
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert!(
+            reopened_state
+                .messages
+                .iter()
+                .any(|message| message.text == "hello from app actor"),
+            "message projection should survive runtime reopen"
+        );
+        assert_eq!(
+            app_room(&reopened_state, &room_id).last_message_preview,
+            "hello from app actor"
         );
     }
 

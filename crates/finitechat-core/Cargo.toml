@@ -17,6 +17,7 @@ finitechat-mls = { path = "../finitechat-mls" }
 finitechat-proto = { path = "../finitechat-proto" }
 hex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 uniffi.workspace = true
 
