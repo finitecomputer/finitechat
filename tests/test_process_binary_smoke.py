@@ -9,7 +9,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -68,8 +67,8 @@ class ProcessBinarySmokeTests(unittest.TestCase):
         )
         if result.returncode != 0:
             raise AssertionError(f"cargo build failed:\n{result.stdout}")
-        cls.server_bin = _binary_path("finitechat-darkmatter-server")
-        cls.cli_bin = _binary_path("finitechat-darkmatter")
+        cls.server_bin = _binary_path("finitechat-server")
+        cls.cli_bin = _binary_path("finitechat")
 
     def test_server_and_cli_binaries_typed_event_replay_restart_and_sync(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -188,15 +187,12 @@ class ProcessBinarySmokeTests(unittest.TestCase):
         result = self._cli(server_url, *args)
         return json.loads(result.stdout)
 
-    def _cli(
-        self, server_url: str, *args: str, check: bool = True
-    ) -> subprocess.CompletedProcess:
+    def _cli(self, server_url: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         result = subprocess.run(
             [str(self.cli_bin), "http", "--server", server_url, *args],
             cwd=REPO_ROOT,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
         if check and result.returncode != 0:
             self.fail(

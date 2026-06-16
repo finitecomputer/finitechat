@@ -3,21 +3,18 @@
 //! These request/record types and pure helpers form the vocabulary between
 //! the runtime client, the HTTP route layer, and the CLI. They were extracted
 //! from the retired in-memory `finitechat-engine` delivery service when the
-//! Darkmatter HTTP path became the only delivery implementation.
+//! Finite Chat HTTP path became the only delivery implementation.
 
 use crate::{
     AccountId, ApplicationDeliveryPolicy, ConversationId, DeviceId, DeviceRef, Epoch,
     FiniteEnvelope, IdempotencyKey, KeyPackageHash, KeyPackageId, KeyPackageRef, KeyPackageState,
     LeaseToken, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ACCOUNT_ROOM_DISCOVERY_RESULTS,
-    MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    MAX_SYNC_PAGE_ENTRIES, MembershipDeltaError, MembershipDeltaV1,
-    MessageId, MlsGroupId, ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq,
-    StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
-    validate_idempotency_key, validate_item_count, validate_mls_group_id, validate_room_id,
-    validate_string_bytes,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    MAX_SYNC_PAGE_ENTRIES, MembershipDeltaError, MembershipDeltaV1, MessageId, MlsGroupId,
+    ProtocolLimitError, RoomId, RoomLogEntry, RoomStatus, Seq, StagedWelcomeV1, WelcomeId,
+    WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_idempotency_key,
+    validate_item_count, validate_mls_group_id, validate_room_id, validate_string_bytes,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,7 +76,6 @@ pub struct CreateRoomRequest {
     #[serde(default)]
     pub protocol: crate::RoomProtocol,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadKeyPackageRequest {
@@ -384,14 +380,9 @@ impl CreateRoomRequest {
     }
 }
 
-
 impl ListAccountRoomsRequest {
     pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
-        validate_string_bytes(
-            "account_id",
-            &self.account_id,
-            crate::MAX_ACCOUNT_ID_BYTES,
-        )?;
+        validate_string_bytes("account_id", &self.account_id, crate::MAX_ACCOUNT_ID_BYTES)?;
         if let Some(after_room_id) = &self.after_room_id {
             validate_room_id(after_room_id)?;
         }
@@ -523,7 +514,6 @@ impl SubmitCommitRequest {
     }
 }
 
-
 pub type LinkSessionId = String;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,7 +622,6 @@ impl From<serde_json::Error> for EngineError {
     }
 }
 
-
 pub fn staged_welcomes_by_id<'a>(
     delta: &MembershipDeltaV1,
     staged_welcomes: &'a [StagedWelcomeV1],
@@ -682,7 +671,6 @@ pub fn staged_welcomes_by_id<'a>(
     Ok(by_id)
 }
 
-
 fn length_prefixed(value: &str) -> String {
     format!("{}:{value}", value.len())
 }
@@ -694,7 +682,6 @@ fn device_membership_key(device: &DeviceRef) -> String {
         length_prefixed(&device.device_id)
     )
 }
-
 
 pub fn validate_activity_expiry(
     received_at_ms: u64,

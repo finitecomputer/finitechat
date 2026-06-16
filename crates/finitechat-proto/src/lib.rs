@@ -398,7 +398,6 @@ pub struct StreamFinishV1 {
     pub final_payload: Vec<u8>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecryptedApplicationEventV1 {
     pub kind: DurableAppEventKind,
@@ -5534,7 +5533,6 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&finish).unwrap()).unwrap();
         assert_eq!(decoded, finish);
     }
-
 }
 mod runtime;
 pub use runtime::*;

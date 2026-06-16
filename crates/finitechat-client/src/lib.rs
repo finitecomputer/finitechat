@@ -1,26 +1,18 @@
-use cgka_traits::engine::KeyPackage as HttpKeyPackage;
-use cgka_traits::{
-    GroupId as HttpGroupId, MemberId as HttpMemberId,
-    MessageId as HttpMessageId,
-};
-use finitechat_proto::{
-    AccountRoomRecord, AppendApplicationEventRequest, AppendEventRequest,
-    ApplicationDeliveryPolicy, ClaimKeyPackageResult, CommitAccepted,
-    CreateRoomRequest, EngineError, EventAccepted,
-    KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest, SubmitCommitRequest,
-    SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope, lease_token_for,
+use finitechat_delivery::{
+    HttpKeyPackageId, HttpKeyPackagePublication, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 use finitechat_http::{
-    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest, SyncWaitRequest,
-    SyncWaitResponse,
+    AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GroupSyncRequest,
-    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState,
-    HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
+    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
     InviteJoinStatusResponse, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
-    ListInviteJoinRequestsResponse, PublishKeyPackageResponse, RespondInviteJoinRequest,
-    SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
+    ListInviteJoinRequestsResponse, NostrProfileRecord, PublishKeyPackageResponse,
+    PutNostrProfileRequest, PutNostrProfileResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
+    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
+    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -28,8 +20,15 @@ use finitechat_mls::{
 };
 use finitechat_proto::message_id_for_bytes;
 use finitechat_proto::{
-    AppendEphemeralActivityRequest, EphemeralActivityAccepted, InviteCodeV1,
-    MAX_INVITE_TTL_MILLIS, invite_join_proof, verify_invite_join_proof,
+    AccountRoomRecord, AppendApplicationEventRequest, AppendEventRequest,
+    ApplicationDeliveryPolicy, ClaimKeyPackageResult, CommitAccepted, CreateRoomRequest,
+    EngineError, EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
+    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
+    lease_token_for,
+};
+use finitechat_proto::{
+    AppendEphemeralActivityRequest, EphemeralActivityAccepted, InviteCodeV1, MAX_INVITE_TTL_MILLIS,
+    invite_join_proof, verify_invite_join_proof,
 };
 use finitechat_proto::{
     DeviceRef, KeyPackageId, LogEntryKind, MAX_ACCOUNT_ID_BYTES,
@@ -41,6 +40,10 @@ use finitechat_proto::{
     RoomLogEntry, StagedWelcomeV1, WelcomeId, WelcomeState, validate_bytes_len,
     validate_bytes_non_empty, validate_idempotency_key, validate_item_count, validate_mls_group_id,
     validate_room_id, validate_string_bytes,
+};
+use finitechat_transport::engine::KeyPackage as HttpKeyPackage;
+use finitechat_transport::{
+    GroupId as HttpGroupId, MemberId as HttpMemberId, MessageId as HttpMessageId,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::{
@@ -57,11 +60,9 @@ use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use transport_http_server::{
-    HttpKeyPackageId, HttpKeyPackagePublication, HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
-};
 
 pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -227,7 +228,10 @@ pub enum AppliedLogEntry {
         /// verified credential), not the server-claimed envelope sender.
         sender: DeviceRef,
     },
-    Commit { sender: DeviceRef, epoch: u64 },
+    Commit {
+        sender: DeviceRef,
+        epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,7 +690,6 @@ impl FiniteChatDevice {
     pub fn device_ref(&self) -> &DeviceRef {
         &self.device_ref
     }
-
 
     pub fn create_group_state(
         &mut self,
@@ -2651,12 +2654,16 @@ impl SqliteClientStore {
     ) -> Result<FiniteChatDevice, ClientStoreError> {
         let account_id = hex_lower(config.account_secret_key.public_key().as_bytes());
         let device_id = config.device_id.clone();
-        let state =
-            load_device_state(&self.conn, &self.options.encryption_key, &account_id, &device_id)?
-                .ok_or(ClientStoreError::DeviceStateNotFound {
-                    account_id,
-                    device_id,
-                })?;
+        let state = load_device_state(
+            &self.conn,
+            &self.options.encryption_key,
+            &account_id,
+            &device_id,
+        )?
+        .ok_or(ClientStoreError::DeviceStateNotFound {
+            account_id,
+            device_id,
+        })?;
         Ok(FiniteChatDevice::from_state(config, state)?)
     }
 
@@ -2974,6 +2981,29 @@ impl ReqwestHttpRuntimeTransport {
             uri.trim_start_matches('/')
         )
     }
+
+    pub fn sync_stream(
+        &mut self,
+        request: &SyncStreamRequest,
+    ) -> Result<ReqwestSyncHintStream, ReqwestHttpRuntimeTransportError> {
+        let response = self
+            .client
+            .post(self.route_url("/sync/stream"))
+            .json(request)
+            .send()
+            .map_err(ReqwestHttpRuntimeTransportError::Request)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .map_err(ReqwestHttpRuntimeTransportError::Request)?;
+            return Err(ReqwestHttpRuntimeTransportError::Server { status, body });
+        }
+        Ok(ReqwestSyncHintStream {
+            response,
+            buffer: String::new(),
+        })
+    }
 }
 
 impl HttpRuntimeTransport for ReqwestHttpRuntimeTransport {
@@ -3014,6 +3044,59 @@ pub enum ReqwestHttpRuntimeTransportError {
     },
 }
 
+pub struct ReqwestSyncHintStream {
+    response: reqwest::blocking::Response,
+    buffer: String,
+}
+
+impl ReqwestSyncHintStream {
+    pub fn next_hint(&mut self) -> Result<SyncHintEvent, ReqwestSyncHintStreamError> {
+        loop {
+            while !self.buffer.contains("\n\n") {
+                let mut chunk = [0u8; 4096];
+                let read = self
+                    .response
+                    .read(&mut chunk)
+                    .map_err(ReqwestSyncHintStreamError::Read)?;
+                if read == 0 {
+                    return Err(ReqwestSyncHintStreamError::Ended);
+                }
+                let text = std::str::from_utf8(&chunk[..read])
+                    .map_err(ReqwestSyncHintStreamError::Utf8)?;
+                self.buffer.push_str(text);
+            }
+
+            let Some(split_at) = self.buffer.find("\n\n") else {
+                continue;
+            };
+            let raw_event = self.buffer[..split_at].to_owned();
+            self.buffer = self.buffer[split_at + 2..].to_owned();
+            let data = raw_event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if data.is_empty() {
+                continue;
+            }
+            return serde_json::from_str(&data).map_err(ReqwestSyncHintStreamError::Json);
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ReqwestSyncHintStreamError {
+    #[error("SSE hint stream read failed: {0}")]
+    Read(std::io::Error),
+    #[error("SSE hint stream was not UTF-8: {0}")]
+    Utf8(std::str::Utf8Error),
+    #[error("SSE hint event JSON was malformed: {0}")]
+    Json(serde_json::Error),
+    #[error("SSE hint stream ended")]
+    Ended,
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpRuntimeDelivery<T> {
     transport: T,
@@ -3038,9 +3121,6 @@ impl<T> HttpRuntimeDelivery<T> {
 }
 
 impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
-
-
-
     pub fn publish_account_room_record(
         &mut self,
         account_id: &str,
@@ -3087,6 +3167,44 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
         self.post_json("/activities", request)
     }
 
+    pub fn put_nostr_profile(
+        &mut self,
+        profile: &NostrProfileRecord,
+    ) -> Result<PutNostrProfileResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json(
+            "/profiles/nostr",
+            &PutNostrProfileRequest {
+                profile: profile.clone(),
+            },
+        )
+    }
+
+    pub fn get_nostr_profiles(
+        &mut self,
+        account_ids: Vec<String>,
+        now_ms: u64,
+    ) -> Result<GetNostrProfilesResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json(
+            "/profiles/nostr/get",
+            &GetNostrProfilesRequest {
+                account_ids,
+                now_ms,
+            },
+        )
+    }
+
+    pub fn revoke_device(
+        &mut self,
+        device: &DeviceRef,
+    ) -> Result<RevokeDeviceResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json(
+            "/devices/revoke",
+            &RevokeDeviceRequest {
+                device: device.clone(),
+            },
+        )
+    }
+
     pub fn append_event(
         &mut self,
         request: &AppendEventRequest,
@@ -3112,6 +3230,18 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
     {
         self.transport
             .post_json(uri, body)
+            .map_err(HttpRuntimeDeliveryError::Transport)
+    }
+}
+
+impl HttpRuntimeDelivery<ReqwestHttpRuntimeTransport> {
+    pub fn sync_stream(
+        &mut self,
+        request: &SyncStreamRequest,
+    ) -> Result<ReqwestSyncHintStream, HttpRuntimeDeliveryError<ReqwestHttpRuntimeTransportError>>
+    {
+        self.transport
+            .sync_stream(request)
             .map_err(HttpRuntimeDeliveryError::Transport)
     }
 }
@@ -3152,7 +3282,7 @@ impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
         &mut self,
         owner: &DeviceRef,
     ) -> Result<Option<ClaimKeyPackageResult>, Self::Error> {
-        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = self.post_json(
+        let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> = self.post_json(
             "/key-packages/claim",
             &ClaimKeyPackageRequest {
                 owner: http_member_id_for_device(owner)?,
@@ -3481,8 +3611,6 @@ fn http_member_id_for_device<E>(
 fn http_group_id_for_room(room_id: &str) -> HttpGroupId {
     HttpGroupId::new(room_id.as_bytes().to_vec())
 }
-
-
 
 pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
     store: &mut SqliteClientStore,
@@ -4255,7 +4383,10 @@ pub enum ClientError {
     #[error("failed to seal or open an ephemeral activity payload")]
     ActivityCiphertext,
     #[error("activity payload epoch {payload_epoch} does not match group epoch {group_epoch}")]
-    ActivityEpochMismatch { payload_epoch: u64, group_epoch: u64 },
+    ActivityEpochMismatch {
+        payload_epoch: u64,
+        group_epoch: u64,
+    },
     #[error("invite code is invalid: {0}")]
     InviteCode(String),
     #[error("invite session room {actual} does not match invite code room {expected}")]
@@ -5116,7 +5247,10 @@ fn encode_device_state(state: &FiniteChatDeviceState) -> Result<Vec<u8>, ClientS
             finitechat_proto::MAX_MLS_GROUP_ID_BYTES,
         )?;
         out.extend_from_slice(&room.last_applied_seq.to_be_bytes());
-        append_raw_len_prefixed(&mut out, room.server_url.as_deref().unwrap_or("").as_bytes())?;
+        append_raw_len_prefixed(
+            &mut out,
+            room.server_url.as_deref().unwrap_or("").as_bytes(),
+        )?;
     }
     append_count(
         &mut out,

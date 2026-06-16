@@ -8,11 +8,13 @@
 
 use std::time::{Duration, Instant};
 
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::{GroupId, MessageId};
+use finitechat_delivery::{HTTP_SERVER_SOURCE, HttpPublishTarget};
 use finitechat_http::{GroupSyncRequest, PublishMessageRequest};
 use finitechat_server::HttpServerState;
-use transport_http_server::{HTTP_SERVER_SOURCE, HttpPublishTarget};
+use finitechat_transport::transport::{
+    Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use finitechat_transport::{GroupId, MessageId};
 
 const ROOMS: usize = 20;
 const ENTRIES_PER_ROOM: usize = 500;

@@ -7,15 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cgka-traits.workspace = true
+finitechat-transport.workspace = true
 finitechat-http = { path = "../finitechat-http" }
 finitechat-mls = { path = "../finitechat-mls" }
 finitechat-proto = { path = "../finitechat-proto" }
 openmls.workspace = true
 openmls_basic_credential.workspace = true
-# Solo `-p finitechat-client` builds must unify openmls_memory_storage's
-# extensions-draft-08 feature with the openmls_traits feature that
-# darkmatter's cgka-traits turns on; workspace builds get it via cgka-engine.
 openmls_memory_storage.workspace = true
 openmls_rust_crypto.workspace = true
 rusqlite.workspace = true
@@ -23,7 +20,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-transport-http-server.workspace = true
+finitechat-delivery.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

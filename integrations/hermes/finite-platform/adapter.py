@@ -8,13 +8,14 @@ encryption, and attachment materialization.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shlex
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
@@ -47,7 +48,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = True
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform(FINITE_PLATFORM_NAME))
+        super().__init__(config, _finite_platform())
         extra = getattr(config, "extra", {}) or {}
         self.home = str(extra.get("home") or os.getenv("FINITECHAT_HOME") or "").strip()
         # Optional room filter; by default the adapter serves every room the
@@ -74,9 +75,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 maximum=120,
             )
         )
-        self._poll_task: Optional[asyncio.Task] = None
+        self._poll_task: asyncio.Task | None = None
         self._finitechat_cmd = _resolve_finitechat_command(str(extra.get("finitechat_bin") or ""))
-        self._activity_conversation_by_room: Dict[str, Optional[str]] = {}
+        self._activity_conversation_by_room: dict[str, str | None] = {}
 
     async def connect(self) -> bool:
         if not self.home:
@@ -122,10 +123,8 @@ class FiniteChatAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         if self._poll_task:
             self._poll_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
-            except asyncio.CancelledError:
-                pass
             self._poll_task = None
         await self.cancel_background_tasks()
         self._mark_disconnected()
@@ -135,8 +134,8 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         payload = self._send_payload(chat_id, content, reply_to, metadata)
         result = await self._finitechat_json("send", payload, timeout=30)
@@ -194,7 +193,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         chat_id: str,
         interval: float = DEFAULT_ACTIVITY_REFRESH_SECS,
         metadata=None,
-        stop_event: Optional[asyncio.Event] = None,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         grace_deadline = asyncio.get_running_loop().time() + 0.75
         while asyncio.get_running_loop().time() < grace_deadline:
@@ -210,16 +209,16 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 continue
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=refresh_secs)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     async def send_image(
         self,
         chat_id: str,
         image_url: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         return await self._send_media(
             chat_id,
@@ -233,9 +232,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         return await self._send_media(
             chat_id,
@@ -249,9 +248,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         video_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         return await self._send_media(
             chat_id,
@@ -265,7 +264,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         audio_path: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         return await self._send_media(
             chat_id,
@@ -278,9 +277,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         file_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         return await self._send_media(
             chat_id,
@@ -294,13 +293,13 @@ class FiniteChatAdapter(BasePlatformAdapter):
     def extract_local_files(content: str):
         return [], content
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         room_id = self._room_id(chat_id)
         return {"id": room_id, "name": room_id, "type": "finite"}
 
     async def _poll_loop(self) -> None:
         while self.is_connected:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "limit": self.poll_limit,
                 "timeout_millis": self.poll_timeout_secs * 1000,
             }
@@ -325,7 +324,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.error("[finite] failed to dispatch event: %s", exc, exc_info=True)
 
-    async def _handle_finitechat_event(self, raw_event: Dict[str, Any]) -> None:
+    async def _handle_finitechat_event(self, raw_event: dict[str, Any]) -> None:
         if not isinstance(raw_event, dict):
             return
         room_id = str(raw_event.get("room_id") or self.room_id)
@@ -338,9 +337,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
             logger.warning("[finite] ignored event without message_id")
             return
 
-        source_data = raw_event.get("source") if isinstance(raw_event.get("source"), dict) else {}
+        raw_source = raw_event.get("source")
+        source_data: dict[str, Any] = raw_source if isinstance(raw_source, dict) else {}
         conversation_id = _string_or_none(raw_event.get("conversation_id"))
-        attachments = raw_event.get("attachments") if isinstance(raw_event.get("attachments"), list) else []
+        raw_attachments = raw_event.get("attachments")
+        attachments: list[Any] = raw_attachments if isinstance(raw_attachments, list) else []
         media_urls, media_types = _event_media(attachments)
         source = self.build_source(
             chat_id=str(source_data.get("chat_id") or room_id),
@@ -375,10 +376,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         body: str,
-        attachment: Dict[str, Any],
+        attachment: dict[str, Any],
         *,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         meta = self._message_metadata(metadata)
         attachments = list(meta.get("attachments") or [])
@@ -391,9 +392,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
-        reply_to: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        reply_to: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         meta = self._message_metadata(metadata)
         conversation_id = self._conversation_id(meta)
         attachments = meta.pop("attachments", [])
@@ -413,10 +414,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
     def _activity_payload(
         self,
         chat_id: str,
-        metadata: Optional[Dict[str, Any]],
+        metadata: dict[str, Any] | None,
         *,
         action: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         meta = self._message_metadata(metadata)
         return {
             "room_id": self._room_id(chat_id),
@@ -428,11 +429,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
             "expires_in_millis": 60 * 1000,
         }
 
-    def _room_id(self, chat_id: Optional[str]) -> str:
+    def _room_id(self, chat_id: str | None) -> str:
         return str(chat_id or self.room_id).strip() or self.room_id
 
     @staticmethod
-    def _conversation_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _conversation_id(metadata: dict[str, Any] | None) -> str | None:
         if not isinstance(metadata, dict):
             return None
         return _string_or_none(metadata.pop("thread_id", None)) or _string_or_none(
@@ -440,7 +441,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _message_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _message_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(metadata, dict):
             return dict(metadata)
         return {}
@@ -448,10 +449,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
     async def _finitechat_json(
         self,
         action: str,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
         *,
         timeout: int,
-    ) -> "_FiniteChatResult":
+    ) -> _FiniteChatResult:
         if not self._finitechat_cmd:
             return _FiniteChatResult(False, {}, "finitechat CLI is not configured", False)
         command = [*self._finitechat_cmd, "hermes"]
@@ -468,7 +469,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             )
             stdin = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
             stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return _FiniteChatResult(False, {}, "finitechat timed out", True)
         except FileNotFoundError as exc:
             return _FiniteChatResult(False, {}, str(exc), False)
@@ -487,38 +488,38 @@ class FiniteChatAdapter(BasePlatformAdapter):
         if not stdout_text:
             return _FiniteChatResult(True, {}, None, False)
         try:
-            return _FiniteChatResult(True, json.loads(stdout_text.splitlines()[-1]), None, False)
+            return _FiniteChatResult(True, json.loads(stdout_text), None, False)
         except json.JSONDecodeError as exc:
-            return _FiniteChatResult(False, {}, f"finitechat returned invalid JSON: {exc}", False)
+            try:
+                return _FiniteChatResult(True, json.loads(stdout_text.splitlines()[-1]), None, False)
+            except json.JSONDecodeError:
+                return _FiniteChatResult(False, {}, f"finitechat returned invalid JSON: {exc}", False)
 
 
 class _FiniteChatResult:
-    def __init__(self, ok: bool, data: Dict[str, Any], error: Optional[str], retryable: bool):
+    def __init__(self, ok: bool, data: dict[str, Any], error: str | None, retryable: bool):
         self.ok = ok
         self.data = data
         self.error = error
         self.retryable = retryable
 
 
-def _resolve_finitechat_command(configured: str) -> List[str]:
+def _resolve_finitechat_command(configured: str) -> list[str]:
     raw = str(
-        configured
-        or os.getenv("FINITECHAT_HERMES_BIN")
-        or os.getenv("FINITECHAT_BIN")
-        or ""
+        configured or os.getenv("FINITECHAT_HERMES_BIN") or os.getenv("FINITECHAT_BIN") or ""
     ).strip()
     if raw:
         return shlex.split(raw)
-    for name in ("finitechat", "finitechat-darkmatter"):
+    for name in ("finitechat",):
         path = shutil.which(name)
         if path:
             return [path]
     return []
 
 
-def _event_media(attachments: List[Any]) -> tuple[List[str], List[str]]:
-    urls: List[str] = []
-    types: List[str] = []
+def _event_media(attachments: list[Any]) -> tuple[list[str], list[str]]:
+    urls: list[str] = []
+    types: list[str] = []
     for item in attachments:
         if not isinstance(item, dict):
             continue
@@ -534,7 +535,7 @@ def _event_media(attachments: List[Any]) -> tuple[List[str], List[str]]:
     return urls, types
 
 
-def _message_type(raw: str, media_types: List[str]) -> MessageType:
+def _message_type(raw: str, media_types: list[str]) -> MessageType:
     value = raw.strip()
     if value == "command":
         return MessageType.COMMAND
@@ -554,7 +555,7 @@ def _message_type(raw: str, media_types: List[str]) -> MessageType:
     return MessageType.DOCUMENT
 
 
-def _local_attachment(path: str, kind: str) -> Dict[str, Any]:
+def _local_attachment(path: str, kind: str) -> dict[str, Any]:
     local_path = Path(path)
     return {
         "kind": kind,
@@ -587,7 +588,7 @@ def _mime_type_for_path(path: Path) -> str:
     }.get(suffix, "application/octet-stream")
 
 
-def _string_or_none(value: Any) -> Optional[str]:
+def _string_or_none(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
@@ -607,6 +608,13 @@ def _is_retryable_cli_error(message: str) -> bool:
     return any(token in lowered for token in ("timed out", "connection", "temporarily", "busy"))
 
 
+def _finite_platform() -> Platform:
+    try:
+        return Platform(FINITE_PLATFORM_NAME)
+    except ValueError:
+        return Platform.LOCAL
+
+
 def register(ctx) -> None:
     ctx.register_platform(
         name=FINITE_PLATFORM_NAME,
@@ -617,7 +625,7 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=["FINITECHAT_HOME"],
         install_hint=(
-            "Install the finitechat binary, run `finitechat-darkmatter hermes "
+            "Install the finitechat binary, run `finitechat hermes "
             "init --server URL`, and set FINITECHAT_HOME to the agent home."
         ),
         allowed_users_env="FINITECHAT_ALLOWED_USERS",

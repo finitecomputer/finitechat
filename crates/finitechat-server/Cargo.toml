@@ -7,21 +7,21 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "finitechat-darkmatter-server"
+name = "finitechat-server"
 path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
-cgka-traits.workspace = true
-finitechat-darkmatter = { path = "../finitechat-darkmatter" }
+finitechat-transport.workspace = true
 finitechat-http = { path = "../finitechat-http" }
 finitechat-proto = { path = "../finitechat-proto" }
+futures-util.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-transport-http-server.workspace = true
+finitechat-delivery.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

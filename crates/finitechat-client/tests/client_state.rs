@@ -2,32 +2,28 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use finitechat_client::{
-    AppliedLogEntry, ClientError, ClientStoreError, FiniteChatDevice, FiniteChatDeviceConfig,
-    HttpRuntimeDelivery, HttpRuntimeDeliveryError, HttpRuntimeTransport,
+    AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
+    FiniteChatDeviceConfig, HttpRuntimeDelivery, HttpRuntimeDeliveryError, HttpRuntimeTransport,
     LinkFanoutRoomStatus, ReqwestHttpRuntimeTransport, ReqwestHttpRuntimeTransportError,
     RuntimeDelivery, RuntimeLinkFanoutOptions, RuntimeSyncOptions, RuntimeWorkerError,
-    CreateRoomInviteParams, SqliteClientStore, SqliteClientStoreOptions,
-    accept_pending_invite_joins, create_room_invite, finalize_invited_room, run_link_fanout_tick,
-    run_room_server_sync_tick, run_runtime_sync_tick, submit_invite_join_request,
+    SqliteClientStore, SqliteClientStoreOptions, accept_pending_invite_joins, create_room_invite,
+    finalize_invited_room, run_link_fanout_tick, run_room_server_sync_tick, run_runtime_sync_tick,
+    submit_invite_join_request,
 };
-use finitechat_http::HttpInviteJoinState;
-use finitechat_proto::{
-    InviteCodeV1, invite_current_pin,
-    RoomProtocol,
-    DurableAppEventKind,
-    AppendEventRequest, CreateRoomRequest,
-    EventAccepted, ListAccountRoomsRequest,
-    RoomSyncProjection,
-    WelcomeRecord, envelope, lease_token_for,
-};
+use finitechat_delivery::MAX_HTTP_SYNC_PAGE_ENTRIES;
+use finitechat_http::{HttpInviteJoinState, SyncHintEvent, SyncStreamRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::LogEntryKind;
+use finitechat_proto::{
+    AppendEventRequest, CreateRoomRequest, DurableAppEventKind, EventAccepted, InviteCodeV1,
+    ListAccountRoomsRequest, RoomProtocol, RoomSyncProjection, WelcomeRecord, envelope,
+    invite_current_pin, lease_token_for,
+};
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
-use transport_http_server::MAX_HTTP_SYNC_PAGE_ENTRIES;
 
 const ALICE_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [17; NOSTR_SECRET_KEY_BYTES];
 const BOB_ACCOUNT_SECRET_BYTES: [u8; NOSTR_SECRET_KEY_BYTES] = [19; NOSTR_SECRET_KEY_BYTES];
@@ -138,9 +134,9 @@ fn sqlite_client_store_encrypts_state_and_rejects_wrong_or_tampered_key_material
 }
 
 #[test]
-fn runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes() {
+fn runtime_sync_tick_replenishes_key_packages_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_runtime_worker");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
     let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
@@ -172,9 +168,9 @@ fn runtime_sync_tick_replenishes_key_packages_over_darkmatter_http_routes() {
 }
 
 #[test]
-fn runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes() {
+fn runtime_delivery_claims_key_package_metadata_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_key_package_claim");
     let request = bob.upload_key_package_request("kp_http_claim_bob").unwrap();
 
@@ -204,7 +200,7 @@ fn runtime_delivery_claims_key_package_metadata_over_darkmatter_http_routes() {
 #[test]
 fn reqwest_http_runtime_delivery_claims_key_package_over_live_server() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-live.sqlite3");
+    let server_db = dir.path().join("finitechat-http-live.sqlite3");
     let server_url = spawn_live_http_server(&server_db);
     let bob = test_device(BOB_ACCOUNT_SECRET_BYTES, "bob_http_live_key_package_claim");
     let request = bob
@@ -244,9 +240,56 @@ fn reqwest_http_runtime_delivery_claims_key_package_over_live_server() {
 }
 
 #[test]
+fn reqwest_http_runtime_delivery_reads_sync_stream_hints_over_live_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("finitechat-http-live-sse.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let room_id = "room_http_live_sse";
+    let mls_group_id = "mls_http_live_sse";
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_live_sse");
+    let mut alice = FiniteChatDevice::new(alice_config).unwrap();
+    alice.create_group_state(room_id, mls_group_id).unwrap();
+
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+    delivery
+        .bootstrap_account_room(&CreateRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: alice.device_ref().clone(),
+            protocol: RoomProtocol::default(),
+        })
+        .unwrap();
+    let mut stream = delivery
+        .sync_stream(&SyncStreamRequest {
+            rooms: vec![SyncWaitRoom {
+                room_id: room_id.to_owned(),
+                after_seq: 0,
+            }],
+            invites: Vec::new(),
+            heartbeat_ms: Some(60_000),
+        })
+        .unwrap();
+
+    let request = alice
+        .create_application_request(room_id, b"hello over sse", "app_http_live_sse")
+        .unwrap();
+    let accepted = delivery
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
+    assert_eq!(
+        stream.next_hint().unwrap(),
+        SyncHintEvent::RoomAdvanced {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+        }
+    );
+}
+
+#[test]
 fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-live-room-sync.sqlite3");
+    let server_db = dir.path().join("finitechat-http-live-room-sync.sqlite3");
     let server_url = spawn_live_http_server(&server_db);
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_live_room_sync");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -280,7 +323,9 @@ fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
     let message = bob
         .create_application_request(ROOM_ID, plaintext, "app_http_live_room_sync")
         .unwrap();
-    let message_accepted = delivery.append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let message_accepted = delivery
+        .append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
     assert_eq!(message_accepted.seq, add_accepted_seq + 1);
 
     let report =
@@ -305,9 +350,9 @@ fn reqwest_http_runtime_sync_tick_syncs_room_pages_over_live_server() {
 }
 
 #[test]
-fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
+fn runtime_sync_tick_claims_and_acks_welcomes_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_welcome_worker");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
     let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
@@ -365,15 +410,13 @@ fn runtime_sync_tick_claims_and_acks_welcomes_over_darkmatter_http_routes() {
         run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
     assert_eq!(replay.claimed_welcomes, 0);
     assert_eq!(replay.activated_welcome_acks_sent, 0);
-    delivery
-        .ack_welcome("welcome_http_runtime_alice")
-        .unwrap();
+    delivery.ack_welcome("welcome_http_runtime_alice").unwrap();
 }
 
 #[test]
-fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
+fn runtime_sync_tick_syncs_room_pages_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_room_sync");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
     let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
@@ -404,7 +447,9 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
     let message = bob
         .create_application_request(ROOM_ID, plaintext, "app_http_room_sync")
         .unwrap();
-    let message_accepted = delivery.append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let message_accepted = delivery
+        .append_event(&message, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
     assert_eq!(message_accepted.seq, add_accepted_seq + 1);
 
     let report =
@@ -437,9 +482,9 @@ fn runtime_sync_tick_syncs_room_pages_over_darkmatter_http_routes() {
 }
 
 #[test]
-fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
+fn runtime_sync_tick_repairs_partial_pull_pages_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-partial-pull.sqlite3");
+    let server_db = dir.path().join("finitechat-http-partial-pull.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_partial_pull");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
     let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
@@ -535,9 +580,9 @@ fn runtime_sync_tick_repairs_partial_pull_pages_over_darkmatter_http_routes() {
 }
 
 #[test]
-fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
+fn sync_projection_advances_only_from_finitechat_http_pull_pages() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-sync-projection.sqlite3");
+    let server_db = dir.path().join("finitechat-http-sync-projection.sqlite3");
     let room_id = "room_http_sync_projection";
     let mls_group_id = "mls_http_sync_projection";
     let alice = test_device(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_sync_projection");
@@ -555,19 +600,22 @@ fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
     for index in 1..=3 {
         let idempotency_key = format!("http_sync_projection_msg_{index}");
         delivery
-            .append_event(&AppendEventRequest {
-                room_id: room_id.to_owned(),
-                sender: alice.device_ref().clone(),
-                envelope: envelope(
-                    room_id.to_owned(),
-                    mls_group_id.to_owned(),
-                    alice.device_ref().clone(),
-                    0,
-                    LogEntryKind::Application,
-                    format!(r#"{{"body":"message {index}"}}"#).into_bytes(),
-                ),
-                idempotency_key,
-            }, DurableAppEventKind::ChatMessage.delivery_policy())
+            .append_event(
+                &AppendEventRequest {
+                    room_id: room_id.to_owned(),
+                    sender: alice.device_ref().clone(),
+                    envelope: envelope(
+                        room_id.to_owned(),
+                        mls_group_id.to_owned(),
+                        alice.device_ref().clone(),
+                        0,
+                        LogEntryKind::Application,
+                        format!(r#"{{"body":"message {index}"}}"#).into_bytes(),
+                    ),
+                    idempotency_key,
+                },
+                DurableAppEventKind::ChatMessage.delivery_policy(),
+            )
             .unwrap();
     }
 
@@ -624,11 +672,11 @@ fn sync_projection_advances_only_from_darkmatter_http_pull_pages() {
 }
 
 #[test]
-fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
+fn client_merges_pending_commit_only_after_finitechat_http_log_observation() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir
         .path()
-        .join("darkmatter-http-pending-observation.sqlite3");
+        .join("finitechat-http-pending-observation.sqlite3");
     let room_id = "room_http_pending_observation";
     let mls_group_id = "mls_http_pending_observation";
     let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
@@ -700,14 +748,16 @@ fn client_merges_pending_commit_only_after_darkmatter_http_log_observation() {
             "alice_after_http_pending_observation",
         )
         .unwrap();
-    let accepted_event = delivery.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let accepted_event = delivery
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
     assert_eq!(accepted_event.seq, 2);
 }
 
 #[test]
-fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
+fn runtime_later_device_history_starts_at_add_commit_over_finitechat_http() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-history-policy.sqlite3");
+    let server_db = dir.path().join("finitechat-http-history-policy.sqlite3");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_history_phone");
     let mut phone_store = sqlite_client_store(dir.path().join("phone.sqlite3"), &phone_config);
     let mut alice_phone = FiniteChatDevice::new(phone_config.clone()).unwrap();
@@ -730,7 +780,9 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
     let prior = bob
         .create_application_request(room_id, prior_plaintext, "history_http_before_invite")
         .unwrap();
-    let prior = delivery.append_event(&prior, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let prior = delivery
+        .append_event(&prior, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
     assert_eq!(prior.seq, 1);
 
     phone_store.save_device_state(&alice_phone).unwrap();
@@ -767,7 +819,9 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
     let post = bob
         .create_application_request(room_id, post_plaintext, "history_http_after_invite")
         .unwrap();
-    let post = delivery.append_event(&post, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let post = delivery
+        .append_event(&post, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
     assert_eq!(post.seq, 3);
 
     let report = run_runtime_sync_tick(
@@ -819,7 +873,7 @@ fn runtime_later_device_history_starts_at_add_commit_over_darkmatter_http() {
 #[test]
 fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-removed-device.sqlite3");
+    let server_db = dir.path().join("finitechat-http-removed-device.sqlite3");
     let charlie_config = test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "charlie_http_removed");
     let mut charlie_store =
         sqlite_client_store(dir.path().join("charlie.sqlite3"), &charlie_config);
@@ -905,7 +959,12 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     let stale_old_epoch_send = stale_charlie
         .create_application_request(room_id, b"stale", "charlie_removed_old_epoch_http")
         .unwrap();
-    let err = delivery.append_event(&stale_old_epoch_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
+    let err = delivery
+        .append_event(
+            &stale_old_epoch_send,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -940,7 +999,12 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
         ),
         idempotency_key: "charlie_removed_new_epoch_http".to_owned(),
     };
-    let err = delivery.append_event(&forged_new_epoch_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
+    let err = delivery
+        .append_event(
+            &forged_new_epoch_send,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -955,7 +1019,12 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     let post_removal = bob
         .create_application_request(room_id, plaintext, "bob_after_http_remove")
         .unwrap();
-    let post_removal = delivery.append_event(&post_removal, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let post_removal = delivery
+        .append_event(
+            &post_removal,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
     assert_eq!(post_removal.seq, 3);
     let bob_post_page = delivery
         .sync_events(room_id, bob.device_ref(), remove_acceptance.seq)
@@ -975,7 +1044,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
 #[test]
 fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let room_id = "room_http_membership_filter";
     let mls_group_id = "mls_http_membership_filter";
     let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
@@ -995,7 +1064,12 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
     let before_invite = bob
         .create_application_request(room_id, b"before invite", "bob_before_http_filter")
         .unwrap();
-    let before_invite = delivery.append_event(&before_invite, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let before_invite = delivery
+        .append_event(
+            &before_invite,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
     assert_eq!(before_invite.seq, 1);
 
     let alice_hidden = delivery
@@ -1044,7 +1118,12 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
         ),
         idempotency_key: "alice_pending_http_filter".to_owned(),
     };
-    let err = delivery.append_event(&pending_send, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap_err();
+    let err = delivery
+        .append_event(
+            &pending_send,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         HttpRuntimeDeliveryError::Transport(InProcessHttpTransportError::HttpStatus(
@@ -1080,7 +1159,12 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
             "alice_after_http_filter_activation",
         )
         .unwrap();
-    let after_activation = delivery.append_event(&after_activation, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+    let after_activation = delivery
+        .append_event(
+            &after_activation,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
     assert_eq!(after_activation.seq, 3);
 
     let bob_after = delivery
@@ -1096,9 +1180,9 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
 }
 
 #[test]
-fn runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes() {
+fn runtime_link_fanout_discovers_account_rooms_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_account_rooms");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_account_rooms");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -1172,9 +1256,9 @@ fn runtime_link_fanout_discovers_account_rooms_over_darkmatter_http_routes() {
 }
 
 #[test]
-fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
+fn runtime_link_fanout_tick_links_later_device_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_link_fanout");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_link_fanout");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -1353,7 +1437,7 @@ fn runtime_link_fanout_tick_links_later_device_over_darkmatter_http_routes() {
 #[test]
 fn reqwest_runtime_link_fanout_tick_links_later_device_over_live_server() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http-live-link.sqlite3");
+    let server_db = dir.path().join("finitechat-http-live-link.sqlite3");
     let server_url = spawn_live_http_server(&server_db);
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_live_link_fanout");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_live_link_fanout");
@@ -1461,9 +1545,9 @@ fn reqwest_runtime_link_fanout_tick_links_later_device_over_live_server() {
 }
 
 #[test]
-fn runtime_submit_commit_removes_account_room_over_darkmatter_http_routes() {
+fn runtime_submit_commit_removes_account_room_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
     let mut world = active_alice_bob_charlie_room(&mut delivery);
     let charlie_ref = world.charlie.device_ref().clone();
@@ -1516,7 +1600,7 @@ fn runtime_submit_commit_removes_account_room_over_darkmatter_http_routes() {
 #[test]
 fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_link_retry");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_link_retry");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -1659,9 +1743,9 @@ fn runtime_link_fanout_retries_http_submit_response_loss_without_duplicates() {
 }
 
 #[test]
-fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
+fn runtime_link_fanout_tick_links_multiple_rooms_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_multi_link");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_multi_link");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -1826,9 +1910,9 @@ fn runtime_link_fanout_tick_links_multiple_rooms_over_darkmatter_http_routes() {
 }
 
 #[test]
-fn runtime_link_fanout_retries_only_failed_room_over_darkmatter_http_routes() {
+fn runtime_link_fanout_retries_only_failed_room_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_partial_link");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_partial_link");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -2026,7 +2110,7 @@ fn runtime_link_fanout_retries_only_failed_room_over_darkmatter_http_routes() {
 #[test]
 fn runtime_link_fanout_reprepares_after_http_same_epoch_loss() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_link_race");
     let phone_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "phone_http_link_race");
     let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
@@ -2278,7 +2362,7 @@ struct GroupMemberSetup<'a> {
     idempotency_key: &'a str,
 }
 
-/// Bootstrap a typed room over the Darkmatter HTTP routes and add one member:
+/// Bootstrap a typed room over the Finite Chat HTTP routes and add one member:
 /// typed account-room bootstrap, KeyPackage upload/claim, typed `/commits`
 /// submit (which releases the Welcome server-side), creator merge from the
 /// ordered log, and member Welcome claim/activate/ack. Returns the member's
@@ -2329,8 +2413,7 @@ where
     alice
         .merge_pending_commit_from_log(setup.room_id, &alice_page.entries, &prepared.message_id)
         .unwrap();
-    let welcome =
-        claim_and_activate_room_record(delivery, member, setup.room_id, setup.welcome_id);
+    let welcome = claim_and_activate_room_record(delivery, member, setup.room_id, setup.welcome_id);
     assert_eq!(welcome.commit_seq, accepted.seq);
     assert_eq!(alice.group_epoch(setup.room_id).unwrap(), 1);
     assert_eq!(member.group_epoch(setup.room_id).unwrap(), 1);
@@ -2452,7 +2535,9 @@ fn send_bob_messages<T: HttpRuntimeTransport>(
                 format!("bob_msg_{scenario_index}_{}", *next_message_index),
             )
             .unwrap();
-        let accepted = delivery.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+        let accepted = delivery
+            .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+            .unwrap();
         assert_application_acceptance(&accepted, sent_plaintexts);
         sent_plaintexts.push(SentPlaintext {
             seq: accepted.seq,
@@ -2619,11 +2704,10 @@ fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[Se
     assert_eq!(accepted.seq, expected_seq);
 }
 
-
 #[test]
 fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let now_ms = NOW * 1000;
     let room_server_url = "http://rooms.finite.test:8787";
 
@@ -2634,8 +2718,10 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
     let mut bob_store = sqlite_client_store(dir.path().join("bob.sqlite3"), &bob_config);
     let mut bob = FiniteChatDevice::new(bob_config.clone()).unwrap();
     let mut mallory = test_device(CHARLIE_ACCOUNT_SECRET_BYTES, "mallory_laptop");
-    let mut mallory_store =
-        sqlite_client_store(dir.path().join("mallory.sqlite3"), &test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "mallory_laptop"));
+    let mut mallory_store = sqlite_client_store(
+        dir.path().join("mallory.sqlite3"),
+        &test_config(CHARLIE_ACCOUNT_SECRET_BYTES, "mallory_laptop"),
+    );
     let options = RuntimeSyncOptions {
         key_package_target_available: 0,
         max_sync_pages_per_room: 4,
@@ -2786,7 +2872,7 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
 #[test]
 fn invite_accept_defers_while_a_pending_commit_is_unmerged() {
     let dir = tempfile::tempdir().unwrap();
-    let server_db = dir.path().join("darkmatter-http.sqlite3");
+    let server_db = dir.path().join("finitechat-http.sqlite3");
     let now_ms = NOW * 1000;
 
     let agent_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "agent_hermes_defer");

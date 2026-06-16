@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cgka-traits.workspace = true
+finitechat-transport.workspace = true
 finitechat-proto = { path = "../finitechat-proto" }
 serde.workspace = true
 serde_json.workspace = true
-transport-http-server.workspace = true
+finitechat-delivery.workspace = true

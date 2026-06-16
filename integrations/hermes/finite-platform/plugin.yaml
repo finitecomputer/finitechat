@@ -11,7 +11,7 @@ author: finitecomputer
 requires_env:
   - name: FINITECHAT_HOME
     description: >
-      Agent home directory created by `finitechat-darkmatter hermes init
+      Agent home directory created by `finitechat hermes init
       --server URL` (holds the agent's Nostr identity, encrypted client
       store, and stored invites).
 optional_env:

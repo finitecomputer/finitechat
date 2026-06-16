@@ -34,7 +34,7 @@ the product); the plan removes the work that is not the fsync.
    `docs/perf-log.md`, not in test assertions (no flaky CI thresholds).
 2. **Tests are the safety rail.** Every change must keep
    `cargo test --workspace`, clippy `-D warnings`, the Python suite, and the
-   darkmatter conformance/compat tests green. The crash matrices pin the
+   delivery conformance tests green. The crash matrices pin the
    durability semantics each optimization must preserve.
 3. **Log as we go.** Every measurement, surprise, deferred idea, and
    redundant-validation observation goes in `docs/perf-log.md`.
@@ -55,7 +55,7 @@ the product); the plan removes the work that is not the fsync.
    source container already guarantees order — OpenMLS records come from the
    provider and may NOT be ordered; check before touching).
 
-### Phase B — upstream transport core (`../darkmatter`, additive)
+### Phase B — delivery core
 
 1. `sync_page` start via `partition_point` (entries are seq-sorted):
    O(log n) instead of O(n) skip scan.
@@ -86,7 +86,7 @@ the product); the plan removes the work that is not the fsync.
 ### Phase D — validation
 
 Re-run the harness; compare against baseline; record in `docs/perf-log.md`.
-Full workspace verification both repos. Ship.
+Full workspace verification. Ship.
 
 ### Phase E — queued next (not this turn)
 

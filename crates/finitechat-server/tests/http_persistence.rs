@@ -1,62 +1,63 @@
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, Request, Response, StatusCode};
-use cgka_traits::engine::KeyPackage;
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
-use finitechat_proto::{
-    RoomProtocol,
-    AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
-    AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
-    EventAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
+use finitechat_delivery::{
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
+    HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
+    HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 use finitechat_http::{
-    PushPlatform, RegisterPushTokenRequest, RemovePushTokenRequest, RemovePushTokenResponse,
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
     ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, CreateLinkSessionRequest, ExpireInviteSessionRequest,
-    ExpireInviteSessionResponse, HttpInviteJoinRequestRecord, HttpInviteJoinState,
-    HttpInviteSessionRecord, HttpInviteSessionState, InviteJoinStatusRequest,
-    InviteJoinStatusResponse, LeaveRoomRequest, LeaveRoomResponse,
-    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, RespondInviteJoinRequest,
-    SubmitInviteJoinRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse,
-    SyncWaitRoom, UpdateRoomAdminsRequest,
-    UpdateRoomAdminsResponse,
-    DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
+    CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
+    ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
     GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetLinkSessionRequest,
-    GroupSyncRequest, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpKeyPackageClaim, HttpKeyPackageInventory,
-    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
-    PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
-    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
-    SaveAccountRoomRequest, SaveAccountRoomResponse, UploadLinkPayloadRequest,
+    GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
+    InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
+    LeaveRoomRequest, LeaveRoomResponse, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
+    ListInviteJoinRequestsResponse, NostrProfileRecord, ObserveDeviceLivenessRequest,
+    PublishKeyPackageResponse, PublishMessageRequest, PushPlatform, PutNostrProfileRequest,
+    RegisterPushTokenRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest, SyncHintEvent,
+    SyncStreamRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse, SyncWaitRoom,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+};
+use finitechat_proto::{
+    AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
+    AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
+    EventAccepted, RoomProtocol, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
     LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
-    MAX_ENVELOPE_PAYLOAD_BYTES,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
+    MAX_ENVELOPE_PAYLOAD_BYTES, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MembershipAddV1,
     MembershipDeltaV1, MembershipRemoveV1, PushPolicy, RoomStatus, RuntimeStateProjection,
     RuntimeStateProjectionEntry, RuntimeStateProjectionError, RuntimeStateSnapshotV1,
     StagedWelcomeV1, UnreadPolicy, WelcomeState,
 };
 use finitechat_server::{HttpServerState, ServerHttpError, http_router};
+use finitechat_transport::engine::KeyPackage;
+use finitechat_transport::transport::{
+    Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use finitechat_transport::{EpochId, GroupId, MemberId, MessageId};
+use futures_util::StreamExt;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tower::ServiceExt;
-use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
-    HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
-    HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
-};
-
 
 #[tokio::test]
 async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
@@ -155,7 +156,6 @@ async fn sqlite_publish_idempotency_rejects_same_key_with_different_body() {
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].message.id, id("idempotency-conflict-a"));
 }
-
 
 #[tokio::test]
 async fn sqlite_log_rebuilds_key_package_claim_state_after_restart() {
@@ -706,8 +706,8 @@ async fn sqlite_revoked_device_blocks_welcome_activation_and_typed_routes_after_
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: alice.clone(),
-            protocol: RoomProtocol::default(),
-        },
+                protocol: RoomProtocol::default(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1006,8 +1006,6 @@ async fn sqlite_batch_key_package_claim_conflict_has_no_side_effects() {
         b"kp-conflict-laptop"
     );
 }
-
-
 
 #[tokio::test]
 async fn sqlite_link_session_state_machine_survives_restart_over_http() {
@@ -1414,8 +1412,8 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
             account_id: "alice".to_owned(),
             device_id: "alice-laptop".to_owned(),
         },
-            protocol: RoomProtocol::default(),
-        };
+        protocol: RoomProtocol::default(),
+    };
 
     let app = persistent_app(&db_path);
     let response = post_json(app, "/account-rooms/bootstrap", &bootstrap).await;
@@ -1469,9 +1467,6 @@ async fn sqlite_account_room_bootstrap_survives_restart_and_conflicts() {
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "account_room_bootstrap_conflict");
 }
-
-
-
 
 #[tokio::test]
 async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_after_restart() {
@@ -2264,8 +2259,8 @@ async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: creator.clone(),
-            protocol: RoomProtocol::default(),
-        },
+                protocol: RoomProtocol::default(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -2308,7 +2303,6 @@ async fn sqlite_submit_commit_crash_matrix_rolls_back_and_retry_converges() {
         assert_http_crash_commit_converged(&app, &room_id, &tablet, accepted.seq).await;
     }
 }
-
 
 #[tokio::test]
 async fn submit_commit_route_rejects_missing_staged_welcome_before_side_effects() {
@@ -2862,7 +2856,7 @@ async fn sqlite_multi_device_pending_invite_roles_stay_separate_over_http() {
                 b"still pending",
                 idempotency_key,
             )),
-    )
+        )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let error: ErrorResponse = read_json(response).await;
@@ -3871,8 +3865,8 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
                 room_id: room_id.clone(),
                 mls_group_id: mls_group_id.clone(),
                 creator: alice.clone(),
-            protocol: RoomProtocol::default(),
-        },
+                protocol: RoomProtocol::default(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -3930,7 +3924,6 @@ async fn sqlite_application_delivery_effect_crash_matrix_rolls_back_and_retry_co
     }
 }
 
-
 #[tokio::test]
 async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
     let temp = TempDir::new().expect("tempdir");
@@ -3965,7 +3958,7 @@ async fn sqlite_typed_event_sync_returns_bounded_pages_after_restart() {
                 format!("small-{index}").as_bytes(),
                 &format!("bounded-event-{index}"),
             )),
-    )
+        )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let accepted: EventAccepted = read_json(response).await;
@@ -4322,6 +4315,131 @@ async fn sqlite_ephemeral_activity_over_http_authorizes_members_and_bounds_cache
     let page: HttpSyncPage = read_json(response).await;
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.next_after_seq, 1);
+}
+
+#[tokio::test]
+async fn sqlite_nostr_profile_cache_survives_restart_and_reports_stale_reads() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let account_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+
+    let profile = NostrProfileRecord {
+        account_id: account_id.clone(),
+        name: Some("alice".to_owned()),
+        display_name: Some("Alice Finite".to_owned()),
+        about: Some("FiniteChat test profile".to_owned()),
+        picture: Some("https://example.invalid/alice.png".to_owned()),
+        fetched_at_ms: 1_000,
+        expires_at_ms: 2_000,
+    };
+
+    {
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app.clone(),
+            "/profiles/nostr",
+            &PutNostrProfileRequest {
+                profile: profile.clone(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = post_json(
+            app,
+            "/profiles/nostr/get",
+            &GetNostrProfilesRequest {
+                account_ids: vec![account_id.clone()],
+                now_ms: 1_500,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let profiles: GetNostrProfilesResponse = read_json(response).await;
+        assert_eq!(profiles.profiles.len(), 1);
+        assert_eq!(profiles.profiles[0].profile, profile);
+        assert!(!profiles.profiles[0].stale);
+    }
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/profiles/nostr/get",
+        &GetNostrProfilesRequest {
+            account_ids: vec![
+                account_id.clone(),
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            ],
+            now_ms: 2_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let profiles: GetNostrProfilesResponse = read_json(response).await;
+    assert_eq!(profiles.profiles.len(), 1);
+    assert_eq!(profiles.profiles[0].profile.account_id, account_id);
+    assert!(profiles.profiles[0].stale);
+}
+
+#[tokio::test]
+async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let app = persistent_app(&db_path);
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+
+    let response = post_json(
+        app.clone(),
+        "/profiles/nostr",
+        &PutNostrProfileRequest {
+            profile: NostrProfileRecord {
+                account_id: "not-an-account".to_owned(),
+                name: Some("alice".to_owned()),
+                display_name: None,
+                about: None,
+                picture: None,
+                fetched_at_ms: 1_000,
+                expires_at_ms: 2_000,
+            },
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_nostr_profile_request");
+
+    let response = post_json(
+        app.clone(),
+        "/profiles/nostr",
+        &PutNostrProfileRequest {
+            profile: NostrProfileRecord {
+                account_id: account_id.clone(),
+                name: Some("alice".to_owned()),
+                display_name: None,
+                about: None,
+                picture: Some("file:///tmp/alice.png".to_owned()),
+                fetched_at_ms: 1_000,
+                expires_at_ms: 2_000,
+            },
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = read_json(response).await;
+    assert_eq!(error.kind, "invalid_nostr_profile_request");
+
+    let response = post_json(
+        app,
+        "/profiles/nostr/get",
+        &GetNostrProfilesRequest {
+            account_ids: vec![account_id],
+            now_ms: 1_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let profiles: GetNostrProfilesResponse = read_json(response).await;
+    assert!(profiles.profiles.is_empty());
 }
 
 #[tokio::test]
@@ -4950,7 +5068,9 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
     };
 
     let state = persistent_state(&db_path);
-    state.publish_message(welcome.clone()).expect("seed welcome");
+    state
+        .publish_message(welcome.clone())
+        .expect("seed welcome");
     let app = http_router(state);
 
     let response = post_json(
@@ -5020,8 +5140,6 @@ async fn sqlite_welcome_claim_survives_restart_before_ack() {
     let acked: AckWelcomeResponse = read_json(response).await;
     assert!(acked.acked);
 }
-
-
 
 #[tokio::test]
 async fn sqlite_mixed_http_operation_fuzzer_survives_restarts() {
@@ -5243,8 +5361,7 @@ async fn run_mixed_http_operation_fuzz(seed: u64) {
             }
             _ => {
                 if let Some((request, accepted)) = &first_raw_event {
-                    let response =
-                        post_json(app, "/events", &typed_event_request(request)).await;
+                    let response = post_json(app, "/events", &typed_event_request(request)).await;
                     assert_eq!(response.status(), StatusCode::OK);
                     let replayed: EventAccepted = read_json(response).await;
                     assert_eq!(&replayed, accepted);
@@ -5321,7 +5438,6 @@ impl HttpFuzzRng {
     }
 }
 
-
 fn typed_event_request(event: &AppendEventRequest) -> AppendApplicationEventRequest {
     AppendApplicationEventRequest {
         event: event.clone(),
@@ -5355,6 +5471,38 @@ async fn read_json<T: DeserializeOwned>(response: Response<Body>) -> T {
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json response")
+}
+
+async fn read_next_sync_hint<S>(stream: &mut S) -> SyncHintEvent
+where
+    S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    let mut buffer = String::new();
+    loop {
+        while !buffer.contains("\n\n") {
+            let chunk = stream
+                .next()
+                .await
+                .expect("SSE stream ended before event")
+                .expect("SSE chunk");
+            buffer.push_str(std::str::from_utf8(&chunk).expect("SSE is UTF-8"));
+        }
+        let Some(split_at) = buffer.find("\n\n") else {
+            continue;
+        };
+        let raw_event = buffer[..split_at].to_owned();
+        buffer = buffer[split_at + 2..].to_owned();
+        let data = raw_event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        return serde_json::from_str(&data).expect("sync hint JSON");
+    }
 }
 
 async fn assert_inventory(app: Router, owner: MemberId, available: u32, claimed: u32) {
@@ -5756,7 +5904,12 @@ async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it(
         b"after leaving",
         "leave-post-message",
     );
-    let response = post_json(app.clone(), "/events", &typed_event_request(&post_leave_send)).await;
+    let response = post_json(
+        app.clone(),
+        "/events",
+        &typed_event_request(&post_leave_send),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // Later traffic is hidden from the departed account, but history through
@@ -5784,7 +5937,12 @@ async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it(
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let bob_page: HttpSyncPage = read_json(response).await;
-    assert!(bob_page.entries.iter().all(|entry| entry.seq <= left.departed_at_seq));
+    assert!(
+        bob_page
+            .entries
+            .iter()
+            .all(|entry| entry.seq <= left.departed_at_seq)
+    );
 
     // Bob's directory no longer lists the room.
     let response = post_json(
@@ -5803,14 +5961,8 @@ async fn sqlite_leave_room_closes_account_and_later_removal_commit_completes_it(
 
     // The admin's later MLS removal commit for the departed device is
     // accepted and completes the leave.
-    let remove_bob = submit_remove_device_request(
-        &room_id,
-        &mls_group_id,
-        &alice,
-        &bob,
-        1,
-        "leave-remove-bob",
-    );
+    let remove_bob =
+        submit_remove_device_request(&room_id, &mls_group_id, &alice, &bob, 1, "leave-remove-bob");
     let response = post_json(app.clone(), "/commits", &remove_bob).await;
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -6068,7 +6220,9 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
     let response = post_json(
         app.clone(),
         "/devices/revoke",
-        &RevokeDeviceRequest { device: bob.clone() },
+        &RevokeDeviceRequest {
+            device: bob.clone(),
+        },
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -6076,7 +6230,9 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
     let response = post_json(
         app.clone(),
         "/push-tokens/remove",
-        &RemovePushTokenRequest { device: bob.clone() },
+        &RemovePushTokenRequest {
+            device: bob.clone(),
+        },
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -6707,7 +6863,6 @@ fn commit_publish_request_for_test(
     }
 }
 
-
 fn insert_durable_commit_publish_without_projection(
     db_path: &std::path::Path,
     request: &PublishMessageRequest,
@@ -6755,7 +6910,6 @@ fn insert_durable_commit_publish_without_projection(
     .expect("insert durable publish idempotency");
 }
 
-
 fn append_application_request(
     room_id: &str,
     mls_group_id: &str,
@@ -6799,7 +6953,6 @@ fn ephemeral_activity_request(
     }
 }
 
-
 fn key_package_publication(
     key_package_id: &str,
     owner: MemberId,
@@ -6832,7 +6985,6 @@ fn finite_key_package_publication(
         key_package: KeyPackage::new(serde_json::to_vec(&upload).expect("upload json")),
     }
 }
-
 
 fn group_target(
     group_id: GroupId,
@@ -7294,7 +7446,10 @@ async fn sqlite_sync_wait_wakes_on_publish_and_invite_changes() {
             },
         )
         .await;
-        (read_json::<SyncWaitResponse>(response).await, started.elapsed())
+        (
+            read_json::<SyncWaitResponse>(response).await,
+            started.elapsed(),
+        )
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let response = post_json(app.clone(), "/commits", &add_bob).await;
@@ -7420,4 +7575,188 @@ async fn sqlite_sync_wait_wakes_on_publish_and_invite_changes() {
     let status: InviteJoinStatusResponse = read_json(response).await;
     assert_eq!(status.state, HttpInviteJoinState::Rejected);
     assert_eq!(status.resolved_requests, 1);
+}
+
+#[tokio::test]
+async fn sqlite_sync_stream_emits_coalesced_high_watermark_hints() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-agent");
+    let room_id = "room-sync-stream".to_owned();
+    let mls_group_id = "mls-sync-stream".to_owned();
+    let app = persistent_app(&db_path);
+
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.clone(),
+            mls_group_id: mls_group_id.clone(),
+            creator: alice.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app.clone(),
+        "/sync/stream",
+        &SyncStreamRequest {
+            rooms: vec![SyncWaitRoom {
+                room_id: room_id.clone(),
+                after_seq: 0,
+            }],
+            invites: Vec::new(),
+            heartbeat_ms: Some(60_000),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    );
+    let mut stream = response.into_body().into_data_stream();
+
+    for index in 0..2 {
+        let request = append_application_request(
+            &room_id,
+            &mls_group_id,
+            &alice,
+            0,
+            format!("stream payload {index}").as_bytes(),
+            &format!("sync-stream-event-{index}"),
+        );
+        let response = post_json(app.clone(), "/events", &typed_event_request(&request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    assert_eq!(
+        read_next_sync_hint(&mut stream).await,
+        SyncHintEvent::RoomAdvanced {
+            room_id: room_id.clone(),
+            seq: 2,
+        }
+    );
+    let response = post_json(
+        app.clone(),
+        "/sync/group",
+        &GroupSyncRequest {
+            group_id: group_id(room_id.as_str()),
+            after_seq: 0,
+            limit: 100,
+            requester: None,
+        },
+    )
+    .await;
+    let page: HttpSyncPage = read_json(response).await;
+    assert_eq!(page.entries.len(), 2);
+
+    let request = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        0,
+        b"stream payload 2",
+        "sync-stream-event-2",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&request)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        read_next_sync_hint(&mut stream).await,
+        SyncHintEvent::RoomAdvanced {
+            room_id: room_id.clone(),
+            seq: 3,
+        }
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-sync-stream".to_owned(),
+            room_id: room_id.clone(),
+            inviter: alice.clone(),
+            max_joins: 2,
+            expires_at_ms: u64::MAX,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/sync/stream",
+        &SyncStreamRequest {
+            rooms: Vec::new(),
+            invites: vec![SyncWaitInvite {
+                invite_id: "invite-sync-stream".to_owned(),
+                seen_requests: 0,
+                seen_resolved: 0,
+            }],
+            heartbeat_ms: Some(60_000),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut invite_stream = response.into_body().into_data_stream();
+
+    let response = post_json(
+        app.clone(),
+        "/invites/join",
+        &SubmitInviteJoinRequest {
+            invite_id: "invite-sync-stream".to_owned(),
+            request_id: "join-stream".to_owned(),
+            joiner: DeviceRef::new("bob", "bob-phone"),
+            key_package: b"kp".to_vec(),
+            pin_proof: invite_pin_proof_stub("bob"),
+            display_name: None,
+            submitted_at_ms: 1,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/invites/respond",
+        &RespondInviteJoinRequest {
+            invite_id: "invite-sync-stream".to_owned(),
+            request_id: "join-stream".to_owned(),
+            accept: false,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        read_next_sync_hint(&mut invite_stream).await,
+        SyncHintEvent::InviteChanged {
+            invite_id: "invite-sync-stream".to_owned(),
+            requests: 1,
+            resolved: 1,
+            state: HttpInviteSessionState::Open,
+        }
+    );
+
+    let response = post_json(
+        app.clone(),
+        "/invites/expire",
+        &ExpireInviteSessionRequest {
+            invite_id: "invite-sync-stream".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        read_next_sync_hint(&mut invite_stream).await,
+        SyncHintEvent::InviteChanged {
+            invite_id: "invite-sync-stream".to_owned(),
+            requests: 1,
+            resolved: 1,
+            state: HttpInviteSessionState::Expired,
+        }
+    );
 }

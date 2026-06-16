@@ -1,4 +1,10 @@
 /target/
+/ios/.build/
+/ios/Frameworks/
+/ios/Bindings/*.swift
+/ios/Bindings/*FFI.h
+/ios/Bindings/*FFI.modulemap
+/ios/*.xcodeproj/
 __pycache__/
 *.py[cod]
 /.state/

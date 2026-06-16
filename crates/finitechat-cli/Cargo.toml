@@ -7,13 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "finitechat-darkmatter"
+name = "finitechat"
 path = "src/main.rs"
 
 [dependencies]
-cgka-traits.workspace = true
+finitechat-transport.workspace = true
 finitechat-client = { path = "../finitechat-client" }
-finitechat-darkmatter = { path = "../finitechat-darkmatter" }
+finitechat-core = { path = "../finitechat-core" }
 finitechat-hermes = { path = "../finitechat-hermes" }
 finitechat-mls = { path = "../finitechat-mls" }
 qrcode.workspace = true
@@ -23,7 +23,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-transport-http-server.workspace = true
+finitechat-delivery.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

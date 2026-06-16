@@ -1,0 +1,43 @@
+name: FiniteChat
+options:
+  bundleIdPrefix: computer.finite
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: computer.finite.finitechat
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: 5.0
+    TARGETED_DEVICE_FAMILY: 1
+    ONLY_ACTIVE_ARCH: YES
+    ALWAYS_SEARCH_USER_PATHS: NO
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+
+targets:
+  FiniteChat:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Bindings
+        excludes:
+          - "*.h"
+          - "*.modulemap"
+    settings:
+      base:
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        INFOPLIST_FILE: Info.plist
+        ENABLE_TESTABILITY: YES
+    dependencies:
+      - framework: Frameworks/FinitechatCore.xcframework
+        embed: false
+
+schemes:
+  FiniteChat:
+    build:
+      targets:
+        FiniteChat: all
+    run:
+      config: Debug

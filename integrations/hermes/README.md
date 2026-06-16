@@ -15,10 +15,10 @@ to end-to-end-encrypted Finite Chat rooms. The dream flow (ADR 0006):
 
 ```bash
 # 1. The binary (one drop-in binary owns all crypto and state)
-cargo install --path crates/finitechat-cli   # installs `finitechat-darkmatter`
+cargo install --path crates/finitechat-cli   # installs `finitechat`
 
 # 2. The agent identity
-finitechat-darkmatter hermes --home ~/.finite-agent init --server http://your-server:8787
+finitechat hermes --home ~/.finite-agent init --server http://your-server:8787
 export FINITECHAT_HOME=~/.finite-agent
 
 # 3. The plugin (Hermes ≥ 0.16 plugin layout)
@@ -44,7 +44,7 @@ reachable from the Finite Chat app.
 
 ## How the pieces divide (ADR 0002)
 
-The Python adapter stays thin: it shells to `finitechat-darkmatter hermes
+The Python adapter stays thin: it shells to `finitechat hermes
 <action> --json` and translates JSON to Hermes `MessageEvent`s. The Rust
 binary owns identity, MLS encryption, invite verification, durable cursors,
 and storage. The bridge actions are `init`, `invite`, `pin`, `poll`,

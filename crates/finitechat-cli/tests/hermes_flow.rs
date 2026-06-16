@@ -70,7 +70,14 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let home_arg = home.display().to_string();
 
     // init: fresh nostr identity, encrypted store, 0600 secrets.
-    let init = hermes(&["hermes", "--home", &home_arg, "init", "--server", &server_url]);
+    let init = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+    ]);
     let agent_account = init["account_id"].as_str().unwrap().to_owned();
     assert!(init["npub"].as_str().unwrap().starts_with("npub1"));
     #[cfg(unix)]
@@ -181,13 +188,8 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     ]);
     let agent_message_id = sent["message_id"].as_str().unwrap().to_owned();
 
-    let report = run_runtime_sync_tick(
-        &mut user_store,
-        &mut user,
-        &mut user_delivery,
-        &options,
-    )
-    .unwrap();
+    let report =
+        run_runtime_sync_tick(&mut user_store, &mut user, &mut user_delivery, &options).unwrap();
     // The user's room is pinned to its room server; in this test home and
     // room server are the same process, so use the room-server tick.
     let report = if report.applied_entries.is_empty() {
@@ -229,10 +231,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .unwrap();
     user_store.save_device_state(&user).unwrap();
     user_delivery
-        .append_event(
-            &request,
-            DurableAppEventKind::ChatMessage.delivery_policy(),
-        )
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
         .unwrap();
 
     let poll = hermes(&[
@@ -251,6 +250,35 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         user.device_ref().account_id
     );
     assert_eq!(events[0]["source"]["user_name"], "Paul");
+
+    // The iOS app sends ordinary UTF-8 chat text, not a Hermes JSON
+    // envelope. The bridge still surfaces it as an authenticated inbound
+    // event for the agent.
+    let request = user
+        .create_application_request(&code.room_id, b"plain hello from iOS", "user-reply-plain")
+        .unwrap();
+    user_store.save_device_state(&user).unwrap();
+    user_delivery
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
+
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":5000}"#,
+    ]);
+    let events = poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["text"], "plain hello from iOS");
+    assert_eq!(
+        events[0]["source"]["user_id"].as_str().unwrap(),
+        user.device_ref().account_id
+    );
+    assert_eq!(events[0]["source"]["user_id_alt"], "user_phone");
+    assert_eq!(events[0]["source"]["user_name"], Value::Null);
 
     // Streaming edit finalization lands as a new payload superseding the
     // original message id.
@@ -320,8 +348,22 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
     let agent_home = dir.path().join("agent").display().to_string();
     let user_home = dir.path().join("user").display().to_string();
 
-    hermes(&["hermes", "--home", &agent_home, "init", "--server", &server_url]);
-    let user_init = hermes(&["hermes", "--home", &user_home, "init", "--server", &server_url]);
+    hermes(&[
+        "hermes",
+        "--home",
+        &agent_home,
+        "init",
+        "--server",
+        &server_url,
+    ]);
+    let user_init = hermes(&[
+        "hermes",
+        "--home",
+        &user_home,
+        "init",
+        "--server",
+        &server_url,
+    ]);
     let invite = hermes(&["hermes", "--home", &agent_home, "invite", "--json"]);
     let url = invite["url"].as_str().unwrap().to_owned();
     let code = InviteCodeV1::parse(&url).unwrap();
@@ -400,10 +442,7 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
     let events = agent_poll["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["text"], "hello from the cli user");
-    assert_eq!(
-        events[0]["source"]["user_id"],
-        user_init["account_id"]
-    );
+    assert_eq!(events[0]["source"]["user_id"], user_init["account_id"]);
 
     hermes(&[
         "hermes",

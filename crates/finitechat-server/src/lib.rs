@@ -1,15 +1,46 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cgka_traits::engine::KeyPackage;
-use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource};
-use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+use finitechat_delivery::{
+    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryLimits,
+    HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishCheck,
+    HttpPublishReceipt, HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
+    MAX_HTTP_SYNC_PAGE_ENTRIES,
+};
+pub use finitechat_http::{
+    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
+    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
+    CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
+    ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
+    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
+    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
+    InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
+    LeaveRoomRequest, LeaveRoomResponse, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
+    ListInviteJoinRequestsResponse, NostrProfileCacheEntry, NostrProfileRecord,
+    ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest,
+    PushTokenRecord, PutNostrProfileRequest, PutNostrProfileResponse, RegisterPushTokenRequest,
+    RegisterPushTokenResponse, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
+    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
+    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse, UpdateRoomAdminsRequest,
+    UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+};
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, DeviceMembership,
@@ -17,55 +48,30 @@ use finitechat_proto::{
     SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, lease_token_for,
     staged_welcomes_by_id, validate_activity_expiry,
 };
-pub use finitechat_http::{
-    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
-    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
-    CreateLinkSessionRequest,
-    DeviceLivenessRecord, ErrorResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
-    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetLinkSessionRequest, GroupSyncRequest, HealthResponse,
-    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpKeyPackageClaim, HttpKeyPackageInventory,
-    HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest, KeyPackageInventoryRequest,
-    CreateInviteSessionRequest, ExpireInviteSessionRequest, ExpireInviteSessionResponse,
-    HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
-    HttpInviteSessionState, InviteJoinStatusRequest, InviteJoinStatusResponse,
-    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, RespondInviteJoinRequest,
-    SubmitInviteJoinRequest, SyncWaitRequest, SyncWaitResponse,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
-    PublishMessageRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
-    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RevokeDeviceRequest,
-    LeaveRoomRequest, LeaveRoomResponse, PushTokenRecord, RegisterPushTokenRequest,
-    RegisterPushTokenResponse, RemovePushTokenRequest, RemovePushTokenResponse,
-    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse,
-    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, UploadLinkPayloadRequest,
-};
 use finitechat_proto::{
-    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_KEY_PACKAGES_PER_DEVICE, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
-    RoomProtocol,
+    DeviceRef, INVITE_PIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_INVITE_DISPLAY_NAME_BYTES, MAX_INVITE_JOIN_REQUESTS_PER_SESSION, MAX_INVITE_MAX_JOINS,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT,
-    INVITE_PIN_PROOF_HEX_BYTES,
-    MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES, MembershipAddV1, MembershipDeltaV1,
-    RoomLogEntry, RoomStatus, WelcomeState, validate_bytes_len, validate_bytes_non_empty,
-    validate_string_bytes,
+    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT, MIN_SUPPORTED_PROTOCOL_VERSION,
+    MembershipAddV1, MembershipDeltaV1, PROTOCOL_VERSION_V1, RoomLogEntry, RoomProtocol,
+    RoomStatus, WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_string_bytes,
 };
+use finitechat_transport::engine::KeyPackage;
+use finitechat_transport::transport::{
+    Timestamp, TransportEnvelope, TransportMessage, TransportSource,
+};
+use finitechat_transport::{EpochId, GroupId, MemberId, MessageId};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use transport_http_server::{
-    HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryLimits,
-    HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishCheck,
-    HttpPublishReceipt, HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
-    MAX_HTTP_SYNC_PAGE_ENTRIES,
-};
 
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
+const MAX_NOSTR_PROFILE_BATCH: usize = 64;
+const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
+const MAX_NOSTR_PROFILE_ABOUT_BYTES: usize = 4 * 1024;
+const MAX_NOSTR_PROFILE_PICTURE_BYTES: usize = 2 * 1024;
 
 /// Capacity limits for the durable finite chat server.
 ///
@@ -101,6 +107,7 @@ pub struct HttpServerState {
     application_effects: Arc<Mutex<BTreeMap<String, HttpApplicationDeliveryEffect>>>,
     ephemeral_activity: Arc<Mutex<BTreeMap<String, Vec<EphemeralActivityRecord>>>>,
     device_liveness: Arc<Mutex<BTreeMap<String, DeviceLivenessRecord>>>,
+    nostr_profiles: Arc<Mutex<BTreeMap<String, NostrProfileRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
@@ -110,6 +117,27 @@ pub struct HttpServerState {
     /// per-key channels are the documented next step if waiter counts grow.
     wake: Arc<tokio::sync::Notify>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
+}
+
+#[derive(Clone)]
+struct SyncStreamCursors {
+    rooms: Vec<finitechat_http::SyncWaitRoom>,
+    invites: Vec<SyncStreamInviteCursor>,
+}
+
+#[derive(Clone)]
+struct SyncStreamInviteCursor {
+    invite_id: String,
+    seen_requests: u32,
+    seen_resolved: u32,
+    seen_state: Option<HttpInviteSessionState>,
+}
+
+struct SyncStreamLoop {
+    state: HttpServerState,
+    cursors: SyncStreamCursors,
+    pending: VecDeque<SyncHintEvent>,
+    heartbeat_ms: u64,
 }
 
 impl HttpServerState {
@@ -127,6 +155,7 @@ impl HttpServerState {
             application_effects: Arc::new(Mutex::new(BTreeMap::new())),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
+            nostr_profiles: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             push_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
@@ -181,6 +210,7 @@ impl HttpServerState {
         let account_rooms = store.load_account_room_directory()?;
         let room_memberships = store.load_room_memberships()?;
         let application_effects = store.load_application_effects()?;
+        let nostr_profiles = store.load_nostr_profiles()?;
         let welcome_claims = store.load_welcome_claims()?;
         let push_tokens = store.load_push_tokens()?;
         Ok(Self {
@@ -196,6 +226,7 @@ impl HttpServerState {
             application_effects: Arc::new(Mutex::new(application_effects)),
             ephemeral_activity: Arc::new(Mutex::new(BTreeMap::new())),
             device_liveness: Arc::new(Mutex::new(BTreeMap::new())),
+            nostr_profiles: Arc::new(Mutex::new(nostr_profiles)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             push_tokens: Arc::new(Mutex::new(push_tokens)),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
@@ -204,9 +235,8 @@ impl HttpServerState {
         })
     }
 
-
-    /// Raw delivery-contract publish, also used by the upstream
-    /// `transport-http-server` conformance suite against this durable server.
+    /// Raw delivery-contract publish, also used by the shared delivery
+    /// conformance suite against this durable server.
     pub fn publish_message(
         &self,
         request: PublishMessageRequest,
@@ -273,7 +303,6 @@ impl HttpServerState {
         idempotency.insert(idempotency_key, record);
         Ok(receipt)
     }
-
 
     fn validate_raw_commit_import(
         &self,
@@ -580,6 +609,43 @@ impl HttpServerState {
         Ok(GetDeviceLivenessResponse { record, live })
     }
 
+    fn put_nostr_profile(
+        &self,
+        request: PutNostrProfileRequest,
+    ) -> Result<PutNostrProfileResponse, ServerHttpError> {
+        validate_nostr_profile_record(&request.profile)?;
+        let mut profiles = self
+            .nostr_profiles
+            .lock()
+            .expect("HTTP nostr-profile mutex");
+        profiles.insert(request.profile.account_id.clone(), request.profile.clone());
+        if let Some(store) = &self.store {
+            store.upsert_nostr_profile(&request.profile)?;
+        }
+        Ok(PutNostrProfileResponse { saved: true })
+    }
+
+    fn get_nostr_profiles(
+        &self,
+        request: GetNostrProfilesRequest,
+    ) -> Result<GetNostrProfilesResponse, ServerHttpError> {
+        validate_nostr_profile_batch(&request.account_ids)?;
+        let profiles = self
+            .nostr_profiles
+            .lock()
+            .expect("HTTP nostr-profile mutex");
+        let mut response = Vec::with_capacity(request.account_ids.len());
+        for account_id in request.account_ids {
+            if let Some(profile) = profiles.get(&account_id) {
+                response.push(NostrProfileCacheEntry {
+                    profile: profile.clone(),
+                    stale: request.now_ms >= profile.expires_at_ms,
+                });
+            }
+        }
+        Ok(GetNostrProfilesResponse { profiles: response })
+    }
+
     fn device_active_in_any_room(&self, device: &DeviceRef) -> bool {
         self.room_memberships
             .lock()
@@ -633,10 +699,6 @@ impl HttpServerState {
             claimed: usize_to_u32("claimed", claimed)?,
         })
     }
-
-
-
-
 
     fn create_link_session(
         &self,
@@ -855,12 +917,11 @@ impl HttpServerState {
                 .room_memberships
                 .lock()
                 .expect("HTTP room-membership mutex");
-            let projection =
-                rooms
-                    .get(&request.room_id)
-                    .ok_or_else(|| ServerHttpError::InvalidInviteRequest {
-                        reason: format!("room {} does not exist", request.room_id),
-                    })?;
+            let projection = rooms.get(&request.room_id).ok_or_else(|| {
+                ServerHttpError::InvalidInviteRequest {
+                    reason: format!("room {} does not exist", request.room_id),
+                }
+            })?;
             if !projection.admins.contains(&request.inviter.account_id) {
                 return Err(ServerHttpError::InvalidInviteRequest {
                     reason: format!(
@@ -1081,12 +1142,13 @@ impl HttpServerState {
                 invite_id: request.invite_id.clone(),
             }
         })?;
-        let join = session.join_requests.get(&request.request_id).ok_or_else(|| {
-            ServerHttpError::InviteJoinRequestNotFound {
+        let join = session
+            .join_requests
+            .get(&request.request_id)
+            .ok_or_else(|| ServerHttpError::InviteJoinRequestNotFound {
                 invite_id: request.invite_id.clone(),
                 request_id: request.request_id.clone(),
-            }
-        })?;
+            })?;
         let resolved_requests = session
             .join_requests
             .values()
@@ -1163,6 +1225,65 @@ impl HttpServerState {
             }
         }
         None
+    }
+
+    fn collect_sync_hints(&self, cursors: &mut SyncStreamCursors) -> Vec<SyncHintEvent> {
+        let mut events = Vec::new();
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            for watch in &mut cursors.rooms {
+                let Some(projection) = rooms.get(&watch.room_id) else {
+                    continue;
+                };
+                if projection.last_seq > watch.after_seq {
+                    watch.after_seq = projection.last_seq;
+                    events.push(SyncHintEvent::RoomAdvanced {
+                        room_id: watch.room_id.clone(),
+                        seq: projection.last_seq,
+                    });
+                }
+            }
+        }
+
+        let sessions = self
+            .invite_sessions
+            .lock()
+            .expect("HTTP invite-session mutex");
+        for watch in &mut cursors.invites {
+            let Some(session) = sessions.get(&watch.invite_id) else {
+                continue;
+            };
+            let requests = u32::try_from(session.join_requests.len()).unwrap_or(u32::MAX);
+            let resolved = u32::try_from(
+                session
+                    .join_requests
+                    .values()
+                    .filter(|join| join.state != HttpInviteJoinState::Pending)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
+            let state_changed = watch
+                .seen_state
+                .as_ref()
+                .is_some_and(|seen| seen != &session.state)
+                || (watch.seen_state.is_none() && session.state != HttpInviteSessionState::Open);
+            if requests > watch.seen_requests || resolved > watch.seen_resolved || state_changed {
+                watch.seen_requests = requests;
+                watch.seen_resolved = resolved;
+                watch.seen_state = Some(session.state.clone());
+                events.push(SyncHintEvent::InviteChanged {
+                    invite_id: watch.invite_id.clone(),
+                    requests,
+                    resolved,
+                    state: session.state.clone(),
+                });
+            }
+        }
+
+        events
     }
 
     fn save_account_room(
@@ -1302,7 +1423,6 @@ impl HttpServerState {
         self.bootstrap_room_membership(&request)?;
         Ok(BootstrapAccountRoomResponse { bootstrapped })
     }
-
 
     fn list_account_rooms(
         &self,
@@ -1539,8 +1659,6 @@ impl HttpServerState {
         })
     }
 
-
-
     fn record_submit_commit_projection(
         &self,
         request: &SubmitCommitRequest,
@@ -1709,8 +1827,7 @@ impl HttpServerState {
         let mut candidate_room_memberships = room_memberships.clone();
         let mut candidate_key_package_inventory = key_package_inventory.clone();
 
-        let commit_check =
-            check_publish_request(&service, &publish_idempotency, &commit_publish)?;
+        let commit_check = check_publish_request(&service, &publish_idempotency, &commit_publish)?;
         let receipt = commit_check.receipt.clone();
         let mut checked_publishes = vec![(commit_publish, commit_check)];
         let account_room_mutation = apply_account_room_membership_delta(
@@ -1846,7 +1963,13 @@ impl HttpServerState {
                 .adds
                 .iter()
                 .map(|add| &add.device)
-                .chain(request.membership_delta.removes.iter().map(|remove| &remove.device))
+                .chain(
+                    request
+                        .membership_delta
+                        .removes
+                        .iter()
+                        .map(|remove| &remove.device),
+                )
                 .any(|device| device.account_id != request.sender.account_id);
             if touches_other_account && !projection.admins.contains(&request.sender.account_id) {
                 return Err(ServerHttpError::CommitAuthorityRequired {
@@ -1895,11 +2018,8 @@ impl HttpServerState {
         // state, producing exactly the rows to persist.
         let (receipt, publish_mutation) =
             check_typed_event_publish(&service, &idempotency, &event_publish, &message_id)?;
-        let room_membership_projection = check_room_event_acceptance(
-            &room_memberships,
-            &request.event.room_id,
-            receipt.seq,
-        );
+        let room_membership_projection =
+            check_room_event_acceptance(&room_memberships, &request.event.room_id, receipt.seq);
         let effect = HttpApplicationDeliveryEffect {
             room_id: request.event.room_id.clone(),
             seq: receipt.seq,
@@ -1926,10 +2046,8 @@ impl HttpServerState {
         // Apply phase: infallible given the checks above ran under the held
         // locks.
         if let Some(mutation) = publish_mutation {
-            let published = service.publish(
-                event_publish.target.clone(),
-                event_publish.message.clone(),
-            )?;
+            let published =
+                service.publish(event_publish.target.clone(), event_publish.message.clone())?;
             debug_assert_eq!(published, receipt);
             idempotency.insert(mutation.idempotency_key, mutation.record);
         }
@@ -2113,7 +2231,6 @@ impl HttpServerState {
         })
     }
 
-
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -2180,10 +2297,7 @@ impl HttpServerState {
                 message_id: request.message_id,
             });
         };
-        ensure_welcome_message_recipient_not_revoked(
-            &self.revoked_device_keys(),
-            &record.message,
-        )?;
+        ensure_welcome_message_recipient_not_revoked(&self.revoked_device_keys(), &record.message)?;
         match record.state {
             WelcomeClaimState::Claimed => {
                 record.state = WelcomeClaimState::Acked;
@@ -2291,9 +2405,7 @@ impl HttpServerState {
         let account_id = request.sender.account_id.clone();
         let departed_at_seq = projection.last_seq;
         if projection.departed.contains(&account_id)
-            || projection
-                .current_or_pending_device_count_for_account(&account_id)
-                == 0
+            || projection.current_or_pending_device_count_for_account(&account_id) == 0
         {
             // Idempotent replay: the account already left (or was removed).
             return Ok(LeaveRoomResponse {
@@ -2422,10 +2534,7 @@ impl HttpServerState {
         }
 
         if grant {
-            if projection
-                .current_or_pending_device_count_for_account(&target)
-                == 0
-            {
+            if projection.current_or_pending_device_count_for_account(&target) == 0 {
                 return Err(ServerHttpError::InvalidAdminChange {
                     reason: format!("account {target} has no devices in the room"),
                 });
@@ -2647,10 +2756,13 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
+        .route("/sync/stream", post(sync_stream))
         .route("/sync/wait", post(sync_wait))
         .route("/devices/revoke", post(revoke_device))
         .route("/devices/liveness", post(observe_device_liveness))
         .route("/devices/liveness/get", post(get_device_liveness))
+        .route("/profiles/nostr", post(put_nostr_profile))
+        .route("/profiles/nostr/get", post(get_nostr_profiles))
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
@@ -2690,8 +2802,6 @@ async fn health() -> Json<HealthResponse> {
         status: "ok".to_owned(),
     })
 }
-
-
 
 async fn append_application_event(
     State(state): State<HttpServerState>,
@@ -2748,6 +2858,77 @@ async fn sync_inbox(
     Ok(Json(page))
 }
 
+async fn sync_stream(
+    State(state): State<HttpServerState>,
+    Json(request): Json<SyncStreamRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ServerHttpError> {
+    validate_sync_stream_request(&request)?;
+    let heartbeat_ms = request
+        .heartbeat_ms
+        .unwrap_or(DEFAULT_SYNC_STREAM_HEARTBEAT_MILLIS)
+        .clamp(
+            MIN_SYNC_STREAM_HEARTBEAT_MILLIS,
+            MAX_SYNC_STREAM_HEARTBEAT_MILLIS,
+        );
+    let cursors = SyncStreamCursors {
+        rooms: request.rooms,
+        invites: request
+            .invites
+            .into_iter()
+            .map(|invite| SyncStreamInviteCursor {
+                invite_id: invite.invite_id,
+                seen_requests: invite.seen_requests,
+                seen_resolved: invite.seen_resolved,
+                seen_state: None,
+            })
+            .collect(),
+    };
+    let stream = futures_util::stream::unfold(
+        SyncStreamLoop {
+            state,
+            cursors,
+            pending: VecDeque::new(),
+            heartbeat_ms,
+        },
+        |mut stream| async move {
+            loop {
+                if let Some(event) = stream.pending.pop_front() {
+                    return Some((Ok(sync_sse_event(event)), stream));
+                }
+
+                stream
+                    .pending
+                    .extend(stream.state.collect_sync_hints(&mut stream.cursors));
+                if let Some(event) = stream.pending.pop_front() {
+                    return Some((Ok(sync_sse_event(event)), stream));
+                }
+
+                let wake = Arc::clone(&stream.state.wake);
+                let notified = wake.notified();
+                tokio::select! {
+                    _ = notified => continue,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(stream.heartbeat_ms)) => {
+                        return Some((Ok(sync_sse_event(SyncHintEvent::Heartbeat)), stream));
+                    }
+                }
+            }
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn sync_sse_event(event: SyncHintEvent) -> Event {
+    let name = match &event {
+        SyncHintEvent::RoomAdvanced { .. } => "room_advanced",
+        SyncHintEvent::InviteChanged { .. } => "invite_changed",
+        SyncHintEvent::Heartbeat => "heartbeat",
+    };
+    Event::default()
+        .event(name)
+        .data(serde_json::to_string(&event).expect("SyncHintEvent serialization cannot fail"))
+}
+
 async fn sync_wait(
     State(state): State<HttpServerState>,
     Json(request): Json<SyncWaitRequest>,
@@ -2801,6 +2982,22 @@ async fn get_device_liveness(
     Ok(Json(response))
 }
 
+async fn put_nostr_profile(
+    State(state): State<HttpServerState>,
+    Json(request): Json<PutNostrProfileRequest>,
+) -> Result<Json<PutNostrProfileResponse>, ServerHttpError> {
+    let response = state.put_nostr_profile(request)?;
+    Ok(Json(response))
+}
+
+async fn get_nostr_profiles(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetNostrProfilesRequest>,
+) -> Result<Json<GetNostrProfilesResponse>, ServerHttpError> {
+    let response = state.get_nostr_profiles(request)?;
+    Ok(Json(response))
+}
+
 async fn publish_key_package(
     State(state): State<HttpServerState>,
     Json(publication): Json<HttpKeyPackagePublication>,
@@ -2841,10 +3038,6 @@ async fn expire_key_package_lease(
     let response = state.expire_key_package_lease(request)?;
     Ok(Json(response))
 }
-
-
-
-
 
 async fn create_link_session(
     State(state): State<HttpServerState>,
@@ -2953,7 +3146,6 @@ async fn expire_invite_session(
     Ok(Json(response))
 }
 
-
 async fn save_account_room(
     State(state): State<HttpServerState>,
     Json(request): Json<SaveAccountRoomRequest>,
@@ -3038,7 +3230,7 @@ async fn ack_welcome(
 enum PersistedOperation {
     PublishMessage {
         target: HttpPublishTarget,
-        message: cgka_traits::transport::TransportMessage,
+        message: finitechat_transport::transport::TransportMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
@@ -3075,7 +3267,7 @@ impl PersistedOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PublishMessageFingerprint {
     target: HttpPublishTarget,
-    message: cgka_traits::transport::TransportMessage,
+    message: finitechat_transport::transport::TransportMessage,
 }
 
 impl PublishMessageFingerprint {
@@ -3092,7 +3284,6 @@ struct PublishIdempotencyRecord {
     fingerprint: PublishMessageFingerprint,
     receipt: HttpPublishReceipt,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct KeyPackageClaimFingerprint {
@@ -3336,6 +3527,10 @@ impl SqliteHttpDeliveryStore {
             );
             CREATE TABLE IF NOT EXISTS http_invite_sessions (
                 invite_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_nostr_profiles (
+                account_id TEXT PRIMARY KEY,
                 record_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_account_rooms (
@@ -3593,12 +3788,9 @@ impl SqliteHttpDeliveryStore {
         Ok(max)
     }
 
-    fn load_push_tokens(
-        &self,
-    ) -> Result<BTreeMap<String, PushTokenRecord>, DurableStoreError> {
+    fn load_push_tokens(&self) -> Result<BTreeMap<String, PushTokenRecord>, DurableStoreError> {
         let conn = self.connection();
-        let mut statement =
-            conn.prepare("SELECT device_key, record_json FROM http_push_tokens")?;
+        let mut statement = conn.prepare("SELECT device_key, record_json FROM http_push_tokens")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -3778,8 +3970,6 @@ impl SqliteHttpDeliveryStore {
         Ok(inventory)
     }
 
-
-
     fn upsert_link_session(&self, record: &HttpLinkSessionRecord) -> Result<(), DurableStoreError> {
         let conn = self.connection();
         conn.execute(
@@ -3845,6 +4035,38 @@ impl SqliteHttpDeliveryStore {
             sessions.insert(invite_id, serde_json::from_str(&record_json)?);
         }
         Ok(sessions)
+    }
+
+    fn upsert_nostr_profile(&self, record: &NostrProfileRecord) -> Result<(), DurableStoreError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO http_nostr_profiles (account_id, record_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(account_id) DO UPDATE SET
+                record_json = excluded.record_json",
+            params![record.account_id, serde_json::to_string(record)?],
+        )?;
+        Ok(())
+    }
+
+    fn load_nostr_profiles(
+        &self,
+    ) -> Result<BTreeMap<String, NostrProfileRecord>, DurableStoreError> {
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT account_id, record_json
+             FROM http_nostr_profiles
+             ORDER BY account_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut profiles = BTreeMap::new();
+        for row in rows {
+            let (account_id, record_json) = row?;
+            profiles.insert(account_id, serde_json::from_str(&record_json)?);
+        }
+        Ok(profiles)
     }
 
     fn upsert_account_room(
@@ -4068,7 +4290,9 @@ impl SqliteHttpDeliveryStore {
     }
 
     fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("HTTP delivery store connection mutex")
+        self.conn
+            .lock()
+            .expect("HTTP delivery store connection mutex")
     }
 }
 
@@ -4281,7 +4505,6 @@ fn check_application_delivery_effect(
     }
     Ok(Some(effect))
 }
-
 
 fn apply_account_room_membership_delta(
     directory: &mut BTreeMap<String, BTreeMap<String, Value>>,
@@ -4504,7 +4727,7 @@ fn replay_operation(
             service.publish(target, message)?;
         }
         // KeyPackage lease/reclaim/consume state is rebuilt in the finite wrapper
-        // inventory; Darkmatter's core store has no claimed lease state.
+        // inventory; Finite Chat's core store has no claimed lease state.
         PersistedOperation::PublishKeyPackage { .. } => {}
         PersistedOperation::RevokeDevice { .. } => {}
         PersistedOperation::ClaimKeyPackage { .. }
@@ -4871,6 +5094,91 @@ fn validate_device_liveness_request(
     Ok(())
 }
 
+fn validate_nostr_profile_record(record: &NostrProfileRecord) -> Result<(), ServerHttpError> {
+    validate_nostr_account_id(&record.account_id)?;
+    validate_optional_profile_text(
+        "profile.name",
+        record.name.as_deref(),
+        MAX_NOSTR_PROFILE_NAME_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.display_name",
+        record.display_name.as_deref(),
+        MAX_NOSTR_PROFILE_NAME_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.about",
+        record.about.as_deref(),
+        MAX_NOSTR_PROFILE_ABOUT_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.picture",
+        record.picture.as_deref(),
+        MAX_NOSTR_PROFILE_PICTURE_BYTES,
+    )?;
+    if let Some(picture) = &record.picture
+        && !picture.starts_with("http://")
+        && !picture.starts_with("https://")
+    {
+        return Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: "profile.picture must be http(s)".to_owned(),
+        });
+    }
+    if record.expires_at_ms <= record.fetched_at_ms {
+        return Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: "profile.expires_at_ms must be greater than profile.fetched_at_ms".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_nostr_profile_batch(account_ids: &[String]) -> Result<(), ServerHttpError> {
+    if account_ids.is_empty() || account_ids.len() > MAX_NOSTR_PROFILE_BATCH {
+        return Err(ServerHttpError::InvalidNostrProfileBatch {
+            actual: account_ids.len(),
+            max: MAX_NOSTR_PROFILE_BATCH,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for account_id in account_ids {
+        validate_nostr_account_id(account_id)?;
+        if !seen.insert(account_id) {
+            return Err(ServerHttpError::InvalidNostrProfileRequest {
+                reason: format!("duplicate profile account_id {account_id}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_nostr_account_id(account_id: &str) -> Result<(), ServerHttpError> {
+    if account_id.len() != 64
+        || !account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: "profile.account_id must be 64 lowercase hex characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_profile_text(
+    field: &'static str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ServerHttpError> {
+    if let Some(value) = value
+        && value.len() > max_bytes
+    {
+        return Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: format!("{field} must be at most {max_bytes} bytes"),
+        });
+    }
+    Ok(())
+}
+
 fn commit_publish_request(
     request: &SubmitCommitRequest,
     message_id: &str,
@@ -5115,8 +5423,6 @@ fn default_membership_complete() -> bool {
     true
 }
 
-
-
 fn validate_link_session_id(link_session_id: &str) -> Result<(), ServerHttpError> {
     validate_string_bytes("link_session_id", link_session_id, MAX_OBJECT_ID_BYTES).map_err(
         |error| ServerHttpError::InvalidLinkSessionRequest {
@@ -5158,22 +5464,37 @@ fn validate_link_claim_token(claim_token: &str) -> Result<(), ServerHttpError> {
 const MAX_SYNC_WAIT_MILLIS: u64 = 25_000;
 const MAX_SYNC_WAIT_ROOMS: usize = 256;
 const MAX_SYNC_WAIT_INVITES: usize = 64;
+const DEFAULT_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 15_000;
+const MIN_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 1_000;
+const MAX_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 60_000;
 
 fn validate_sync_wait_request(request: &SyncWaitRequest) -> Result<(), ServerHttpError> {
-    if request.rooms.len() > MAX_SYNC_WAIT_ROOMS {
+    validate_sync_watch_bounds(&request.rooms, &request.invites, "sync_wait")
+}
+
+fn validate_sync_stream_request(request: &SyncStreamRequest) -> Result<(), ServerHttpError> {
+    validate_sync_watch_bounds(&request.rooms, &request.invites, "sync_stream")
+}
+
+fn validate_sync_watch_bounds(
+    rooms: &[finitechat_http::SyncWaitRoom],
+    invites: &[finitechat_http::SyncWaitInvite],
+    route: &str,
+) -> Result<(), ServerHttpError> {
+    if rooms.len() > MAX_SYNC_WAIT_ROOMS {
         return Err(ServerHttpError::InvalidInviteRequest {
-            reason: format!("sync_wait watches at most {MAX_SYNC_WAIT_ROOMS} rooms"),
+            reason: format!("{route} watches at most {MAX_SYNC_WAIT_ROOMS} rooms"),
         });
     }
-    if request.invites.len() > MAX_SYNC_WAIT_INVITES {
+    if invites.len() > MAX_SYNC_WAIT_INVITES {
         return Err(ServerHttpError::InvalidInviteRequest {
-            reason: format!("sync_wait watches at most {MAX_SYNC_WAIT_INVITES} invites"),
+            reason: format!("{route} watches at most {MAX_SYNC_WAIT_INVITES} invites"),
         });
     }
-    for room in &request.rooms {
+    for room in rooms {
         validate_invite_room_id(&room.room_id)?;
     }
-    for invite in &request.invites {
+    for invite in invites {
         validate_invite_id(&invite.invite_id)?;
     }
     Ok(())
@@ -5303,7 +5624,6 @@ fn account_scoped_account_room_record(
         })?;
     Ok(Some(record))
 }
-
 
 fn claim_key_packages_from_inventory(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
@@ -5468,6 +5788,13 @@ pub enum ServerHttpError {
     },
     InvalidDeviceLivenessRequest {
         reason: String,
+    },
+    InvalidNostrProfileRequest {
+        reason: String,
+    },
+    InvalidNostrProfileBatch {
+        actual: usize,
+        max: usize,
     },
     DeviceNotActive {
         device: DeviceRef,
@@ -5684,6 +6011,18 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::BAD_REQUEST,
                 "invalid_device_liveness_request".to_owned(),
                 reason,
+            ),
+            Self::InvalidNostrProfileRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_nostr_profile_request".to_owned(),
+                reason,
+            ),
+            Self::InvalidNostrProfileBatch { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_nostr_profile_batch".to_owned(),
+                format!(
+                    "Nostr profile batch must contain between 1 and {max} accounts, got {actual}"
+                ),
             ),
             Self::DeviceNotActive { device } => (
                 StatusCode::FORBIDDEN,

@@ -1,7 +1,7 @@
-//! Runs the upstream `transport-http-server` conformance suite against
+//! Runs the shared Finite Chat delivery conformance suite against
 //! finitechat's durable SQLite-backed HTTP server state.
 //!
-//! The upstream crate ships the `HttpDelivery` contract, an in-memory
+//! The delivery crate ships the `HttpDelivery` contract, an in-memory
 //! reference implementation, and an executable conformance module. This test
 //! adapts `HttpServerState` to that contract and proves it preserves every
 //! checked invariant, including the restart-survival checks the in-memory
@@ -9,17 +9,17 @@
 
 use std::path::PathBuf;
 
-use cgka_traits::transport::TransportMessage;
-use cgka_traits::{GroupId, MemberId};
-use finitechat_http::{ClaimKeyPackageRequest, GroupSyncRequest, PublishMessageRequest};
-use finitechat_server::{HttpServerState, ServerHttpError};
-use transport_http_server::conformance::{self, HttpDeliveryHarness};
-use transport_http_server::{
+use finitechat_delivery::conformance::{self, HttpDeliveryHarness};
+use finitechat_delivery::{
     HttpClaimedKeyPackage, HttpDelivery, HttpKeyPackagePublication, HttpPublishReceipt,
     HttpPublishTarget, HttpSequence, HttpServerError, HttpSyncPage,
 };
+use finitechat_http::{ClaimKeyPackageRequest, GroupSyncRequest, PublishMessageRequest};
+use finitechat_server::{HttpServerState, ServerHttpError};
+use finitechat_transport::transport::TransportMessage;
+use finitechat_transport::{GroupId, MemberId};
 
-/// The durable server state viewed through the upstream delivery contract.
+/// The durable server state viewed through the shared delivery contract.
 struct DurableDelivery {
     state: HttpServerState,
 }

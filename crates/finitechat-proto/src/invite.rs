@@ -7,9 +7,8 @@
 //! token and cannot mint a passing proof.
 
 use crate::{
-    INVITE_CODE_VERSION_V1, INVITE_JOIN_PROOF_DOMAIN, INVITE_PIN_DOMAIN,
-    INVITE_PIN_WINDOW_SECONDS, INVITE_TOKEN_BYTES, MAX_INVITE_DISPLAY_NAME_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_ROOM_ID_BYTES,
+    INVITE_CODE_VERSION_V1, INVITE_JOIN_PROOF_DOMAIN, INVITE_PIN_DOMAIN, INVITE_PIN_WINDOW_SECONDS,
+    INVITE_TOKEN_BYTES, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, MAX_ROOM_ID_BYTES,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -20,9 +19,9 @@ type HmacSha256 = Hmac<Sha256>;
 pub const INVITE_URL_SCHEME: &str = "finite";
 pub const INVITE_URL_PREFIX: &str = "finite://join?";
 pub const NOSTR_NPUB_HRP: &str = "npub";
-/// Accept proofs computed in the previous/next PIN window to absorb clock
-/// skew and the human typing delay.
-pub const INVITE_PIN_WINDOW_SKEW: u64 = 1;
+/// Accept proofs computed in nearby PIN windows to absorb clock skew and the
+/// human copy/paste delay in local/manual invite flows.
+pub const INVITE_PIN_WINDOW_SKEW: u64 = 10;
 pub const MAX_INVITE_URL_BYTES: usize = 2048;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -34,10 +33,7 @@ pub enum InviteCodeError {
     #[error("invite code is missing required field {0}")]
     MissingField(&'static str),
     #[error("invite code field {field} is invalid: {reason}")]
-    InvalidField {
-        field: &'static str,
-        reason: String,
-    },
+    InvalidField { field: &'static str, reason: String },
     #[error("invite code is too long")]
     TooLong,
 }
@@ -114,21 +110,18 @@ impl InviteCodeV1 {
                 "r" => room_id = Some(percent_decode("r", value)?),
                 "i" => invite_id = Some(percent_decode("i", value)?),
                 "t" => {
-                    invite_token =
-                        Some(
-                            decode_hex(value).map_err(|reason| InviteCodeError::InvalidField {
-                                field: "t",
-                                reason,
-                            })?,
-                        )
+                    invite_token = Some(
+                        decode_hex(value).map_err(|reason| InviteCodeError::InvalidField {
+                            field: "t",
+                            reason,
+                        })?,
+                    )
                 }
                 "a" => {
-                    inviter_account_id = Some(npub_decode(value).map_err(|reason| {
-                        InviteCodeError::InvalidField {
-                            field: "a",
-                            reason,
-                        }
-                    })?)
+                    inviter_account_id =
+                        Some(npub_decode(value).map_err(|reason| {
+                            InviteCodeError::InvalidField { field: "a", reason }
+                        })?)
                 }
                 "n" => display_name = Some(percent_decode("n", value)?),
                 // Unknown fields are ignored so v1 parsers tolerate
@@ -188,11 +181,7 @@ impl InviteCodeV1 {
     }
 }
 
-fn check_field(
-    field: &'static str,
-    value: &str,
-    max_bytes: usize,
-) -> Result<(), InviteCodeError> {
+fn check_field(field: &'static str, value: &str, max_bytes: usize) -> Result<(), InviteCodeError> {
     if value.is_empty() || value.len() > max_bytes {
         return Err(InviteCodeError::InvalidField {
             field,
@@ -262,8 +251,7 @@ pub fn verify_invite_join_proof(
     let last = window.saturating_add(INVITE_PIN_WINDOW_SKEW);
     for candidate in first..=last {
         let pin = invite_pin_for_window(invite_token, candidate);
-        let expected =
-            invite_join_proof(invite_token, &pin, account_id, device_id, key_package);
+        let expected = invite_join_proof(invite_token, &pin, account_id, device_id, key_package);
         // Proofs are one-shot rendezvous artifacts, not an oracle the
         // attacker can query repeatedly, so plain comparison is fine here.
         if expected == proof {
@@ -288,8 +276,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     (0..value.len())
         .step_by(2)
         .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16)
-                .map_err(|_| "invalid hex".to_owned())
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| "invalid hex".to_owned())
         })
         .collect()
 }
@@ -348,12 +335,11 @@ fn percent_decode(field: &'static str, value: &str) -> Result<String, InviteCode
                         reason: "truncated percent escape".to_owned(),
                     }
                 })?;
-                let byte = u8::from_str_radix(hex, 16).map_err(|_| {
-                    InviteCodeError::InvalidField {
+                let byte =
+                    u8::from_str_radix(hex, 16).map_err(|_| InviteCodeError::InvalidField {
                         field,
                         reason: "invalid percent escape".to_owned(),
-                    }
-                })?;
+                    })?;
                 out.push(byte);
                 index += 3;
             }
@@ -437,7 +423,10 @@ mod tests {
         assert_eq!(first.len(), 6);
         assert!(first.bytes().all(|b| b.is_ascii_digit()));
         assert_ne!(first, second);
-        assert_eq!(invite_current_pin(&TOKEN, 45), invite_pin_for_window(&TOKEN, 1));
+        assert_eq!(
+            invite_current_pin(&TOKEN, 45),
+            invite_pin_for_window(&TOKEN, 1)
+        );
     }
 
     #[test]
@@ -446,7 +435,12 @@ mod tests {
         let pin = invite_current_pin(&TOKEN, now);
         let proof = invite_join_proof(&TOKEN, &pin, "acct", "device", b"kp-bytes");
         assert!(verify_invite_join_proof(
-            &TOKEN, now, "acct", "device", b"kp-bytes", &proof
+            &TOKEN,
+            now,
+            "acct",
+            "device",
+            b"kp-bytes",
+            &proof
         ));
         // Previous-window proofs still verify (skew).
         assert!(verify_invite_join_proof(
@@ -457,10 +451,10 @@ mod tests {
             b"kp-bytes",
             &proof
         ));
-        // Two windows out, the proof dies.
+        // Proofs outside the tolerated manual-entry window die.
         assert!(!verify_invite_join_proof(
             &TOKEN,
-            now + 3 * INVITE_PIN_WINDOW_SECONDS,
+            now + (INVITE_PIN_WINDOW_SKEW + 2) * INVITE_PIN_WINDOW_SECONDS,
             "acct",
             "device",
             b"kp-bytes",
@@ -468,19 +462,35 @@ mod tests {
         ));
         // Any tampering kills it: identity, device, or key package bytes.
         assert!(!verify_invite_join_proof(
-            &TOKEN, now, "other", "device", b"kp-bytes", &proof
+            &TOKEN,
+            now,
+            "other",
+            "device",
+            b"kp-bytes",
+            &proof
         ));
         assert!(!verify_invite_join_proof(
-            &TOKEN, now, "acct", "other", b"kp-bytes", &proof
+            &TOKEN,
+            now,
+            "acct",
+            "other",
+            b"kp-bytes",
+            &proof
         ));
         assert!(!verify_invite_join_proof(
-            &TOKEN, now, "acct", "device", b"tampered", &proof
+            &TOKEN,
+            now,
+            "acct",
+            "device",
+            b"tampered",
+            &proof
         ));
         // A wrong PIN produces a proof that fails verification.
         let bad = invite_join_proof(&TOKEN, "000000", "acct", "device", b"kp-bytes");
-        assert!(!verify_invite_join_proof(
-            &TOKEN, now, "acct", "device", b"kp-bytes", &bad
-        ) || invite_current_pin(&TOKEN, now) == "000000");
+        assert!(
+            !verify_invite_join_proof(&TOKEN, now, "acct", "device", b"kp-bytes", &bad)
+                || invite_current_pin(&TOKEN, now) == "000000"
+        );
     }
 
     #[test]

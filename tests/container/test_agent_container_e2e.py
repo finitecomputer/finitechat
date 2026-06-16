@@ -21,7 +21,6 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DARKMATTER_ROOT = REPO_ROOT.parent / "darkmatter"
 IMAGE = "finite-agent-e2e"
 CONTAINER = "finite-agent-e2e-run"
 SERVER_PORT = 18787
@@ -37,10 +36,7 @@ def run(args, *, timeout=600, check=True, **kwargs):
 
 
 def stage_build_context(ctx: Path) -> None:
-    for name, source in (
-        ("finite-chat-darkmatter", REPO_ROOT),
-        ("darkmatter", DARKMATTER_ROOT),
-    ):
+    for name, source in (("finitechat", REPO_ROOT),):
         run(
             [
                 "rsync",
@@ -103,8 +99,8 @@ class AgentContainerE2ETest(unittest.TestCase):
             cwd=REPO_ROOT,
             timeout=1800,
         )
-        self.cli_bin = REPO_ROOT / "target/release/finitechat-darkmatter"
-        server_bin = REPO_ROOT / "target/release/finitechat-darkmatter-server"
+        self.cli_bin = REPO_ROOT / "target/release/finitechat"
+        server_bin = REPO_ROOT / "target/release/finitechat-server"
 
         # Guest image: latest hermes-agent + plugin + Linux finitechat build.
         ctx = tmp / "ctx"
@@ -117,7 +113,7 @@ class AgentContainerE2ETest(unittest.TestCase):
                 "--tag",
                 IMAGE,
                 "--file",
-                str(ctx / "finite-chat-darkmatter/containers/agent/Dockerfile"),
+                str(ctx / "finitechat/containers/agent/Dockerfile"),
                 str(ctx),
             ],
             timeout=3600,
@@ -161,7 +157,7 @@ class AgentContainerE2ETest(unittest.TestCase):
                     "container",
                     "exec",
                     CONTAINER,
-                    "finitechat-darkmatter",
+                    "finitechat",
                     "hermes",
                     "--home",
                     "/data/agent",
@@ -177,8 +173,16 @@ class AgentContainerE2ETest(unittest.TestCase):
         self.user_home = tmp / "user-home"
         self.hermes_user("init", "--server", f"http://127.0.0.1:{SERVER_PORT}")
         joined = self.hermes_user(
-            "join", "--url", invite_url, "--pin", pin, "--name", "E2E User",
-            "--timeout-ms", "90000", timeout=180,
+            "join",
+            "--url",
+            invite_url,
+            "--pin",
+            pin,
+            "--name",
+            "E2E User",
+            "--timeout-ms",
+            "90000",
+            timeout=180,
         )
         self.assertEqual(joined["state"], "joined")
         room_id = joined["room_id"]
@@ -202,7 +206,9 @@ class AgentContainerE2ETest(unittest.TestCase):
         echoed = None
         while time.monotonic() < deadline and echoed is None:
             poll = self.hermes_user(
-                "poll", "--request-json", json.dumps({"timeout_millis": 10000}),
+                "poll",
+                "--request-json",
+                json.dumps({"timeout_millis": 10000}),
                 timeout=60,
             )
             for event in poll.get("events", []):
@@ -224,9 +230,7 @@ class AgentContainerE2ETest(unittest.TestCase):
                 timeout=60,
             ).stdout
         )
-        self.assertEqual(
-            echoed["source"]["user_id"], agent_config["account_id"]
-        )
+        self.assertEqual(echoed["source"]["user_id"], agent_config["account_id"])
 
     def _wait_for_health(self, url: str, timeout: float = 30) -> None:
         import urllib.request
@@ -249,6 +253,4 @@ class AgentContainerE2ETest(unittest.TestCase):
                 return
             time.sleep(2)
         logs = run(["container", "logs", CONTAINER], check=False, timeout=60)
-        self.fail(
-            f"container never printed {marker!r}; logs:\n{(logs.stdout or '')[-4000:]}"
-        )
+        self.fail(f"container never printed {marker!r}; logs:\n{(logs.stdout or '')[-4000:]}")

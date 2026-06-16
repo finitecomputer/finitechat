@@ -16,6 +16,7 @@ import importlib.util
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import types
@@ -26,7 +27,8 @@ logger = logging.getLogger("echo-agent")
 
 HOME = Path(os.environ["FINITECHAT_HOME"])
 SERVER_URL = os.environ["FINITE_SERVER_URL"]
-PLUGIN_DIR = Path("/root/.hermes/plugins/finite")
+PLUGIN_DIR = Path(os.environ.get("FINITECHAT_PLUGIN_DIR", "/root/.hermes/plugins/finite"))
+FINITECHAT_CMD = shlex.split(os.environ.get("FINITECHAT_BIN", "finitechat"))
 
 
 def ensure_initialized() -> None:
@@ -35,7 +37,7 @@ def ensure_initialized() -> None:
         return
     result = subprocess.run(
         [
-            "finitechat-darkmatter",
+            *FINITECHAT_CMD,
             "hermes",
             "--home",
             str(HOME),
@@ -54,9 +56,9 @@ def ensure_initialized() -> None:
 
 def load_adapter_class():
     """Load FiniteChatAdapter against the real hermes gateway modules."""
-    spec = importlib.util.spec_from_file_location(
-        "finite_platform", PLUGIN_DIR / "adapter.py"
-    )
+    spec = importlib.util.spec_from_file_location("finite_platform", PLUGIN_DIR / "adapter.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load finite platform plugin from {PLUGIN_DIR}")
     module = importlib.util.module_from_spec(spec)
     sys.modules["finite_platform"] = module
     spec.loader.exec_module(module)

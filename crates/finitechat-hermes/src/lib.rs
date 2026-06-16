@@ -358,6 +358,46 @@ impl HermesSourceV1 {
 }
 
 impl HermesPollEventV1 {
+    pub fn finite_chat_text(
+        room_id: impl Into<RoomId>,
+        seq: Seq,
+        message_id: impl Into<MessageId>,
+        sender_account_id: impl Into<String>,
+        sender_device_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<Self, HermesBridgeError> {
+        let room_id = room_id.into();
+        let event = Self {
+            room_id: room_id.clone(),
+            seq,
+            message_id: message_id.into(),
+            conversation_id: None,
+            text: text.into(),
+            message_type: HermesMessageTypeV1::Text,
+            source: HermesSourceV1 {
+                platform: FINITECHAT_HERMES_PLATFORM_NAME.to_owned(),
+                chat_id: room_id,
+                chat_name: None,
+                chat_type: HermesChatTypeV1::Group,
+                user_id: Some(sender_account_id.into()),
+                user_name: None,
+                thread_id: None,
+                chat_topic: None,
+                user_id_alt: Some(sender_device_id.into()),
+                chat_id_alt: None,
+                is_bot: false,
+            },
+            attachments: Vec::new(),
+            reply_to_message_id: None,
+            reply_to_text: None,
+            auto_skill: None,
+            channel_prompt: None,
+            internal: false,
+        };
+        event.validate_limits()?;
+        Ok(event)
+    }
+
     pub fn validate_limits(&self) -> Result<(), HermesBridgeError> {
         validate_hermes_room_id(&self.room_id)?;
         validate_message_id(&self.message_id)?;
@@ -977,6 +1017,25 @@ mod tests {
         let decoded: HermesPollEventV1 = serde_json::from_slice(&bytes).expect("event decodes");
         decoded.validate_limits().expect("decoded event is valid");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn finite_chat_text_builds_authenticated_plain_message_event() {
+        let event = HermesPollEventV1::finite_chat_text(
+            "room-agent-1",
+            8,
+            "message-8",
+            "alice-account",
+            "ios",
+            "hello from iOS",
+        )
+        .expect("plain text event is valid");
+
+        assert_eq!(event.text, "hello from iOS");
+        assert_eq!(event.message_type, HermesMessageTypeV1::Text);
+        assert_eq!(event.source.chat_type, HermesChatTypeV1::Group);
+        assert_eq!(event.source.user_id.as_deref(), Some("alice-account"));
+        assert_eq!(event.source.user_id_alt.as_deref(), Some("ios"));
     }
 
     #[test]

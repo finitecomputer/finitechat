@@ -36,7 +36,7 @@ durability, and membership bookkeeping over bytes it cannot read.**
 │               KeyPackage leases · delivery effects · idempotency   │
 │  volatile lanes: /activities (typing) · /devices/liveness          │
 ├────────────────────────────────────────────────────────────────────┤
-│ transport-http-server (upstreamed to Marmot)                       │
+│ finitechat-delivery                                                │
 │  ordered per-room log · per-device inbox · epoch admission ·       │
 │  digest dedup · KeyPackage consume-once · dry-run check_publish    │
 ├────────────────────────────────────────────────────────────────────┤
@@ -50,9 +50,8 @@ shared by both sides), `finitechat-http` (route request/response types),
 machine + workers + store), `finitechat-mls` (OpenMLS helpers + device
 credentials), `finitechat-blob` (encrypted attachment references),
 `finitechat-hermes` (LLM-gateway bridge DTOs), `finitechat-cli` (route
-client), `finitechat-darkmatter` (compatibility report). The transport core
-lives in the Marmot repo (`../darkmatter/crates/transport-http-server`) and
-is consumed as a path dependency.
+client), `finitechat-transport` (shared transport value types), and
+`finitechat-delivery` (the ordered delivery service and conformance suite).
 
 ## 3. Identity and cryptography
 
@@ -64,10 +63,9 @@ is consumed as a path dependency.
   every KeyPackage parse, commit merge, and Welcome activation; **the server
   is never an identity authority** (ADR 0001).
 - A **Room** is one OpenMLS group plus one server-ordered delivery log.
-  Group key agreement is plain OpenMLS driven directly by the client (not
-  Marmot's engine): commits rotate epochs, Welcomes carry group secrets to
-  new devices, application messages are MLS ciphertexts the server stores as
-  opaque payloads.
+  Group key agreement is plain OpenMLS driven directly by the client: commits
+  rotate epochs, Welcomes carry group secrets to new devices, application
+  messages are MLS ciphertexts the server stores as opaque payloads.
 - Client state at rest is a single versioned snapshot (all rooms, cursors,
   pending work, OpenMLS storage records) encrypted with AES-256-GCM under a
   key derived from the account secret.
@@ -97,14 +95,12 @@ Everything is **pull-based**: stream-style hints may only mark "a pull is
 needed"; only ordered `/sync/group` pages advance client state. This is why
 unreliable push delivery can never corrupt anyone.
 
-## 5. The transport core and the Marmot relationship
+## 5. The Delivery Core
 
-The bottom layer is `transport-http-server`, which this project wrote and
-upstreamed to Marmot (commits `8c241d5`, `4354cd4`, `0b9a61b` on
-`http-delivery-upstream`). It is deliberately tiny: it sequences opaque
-`TransportMessage` bytes per group, queues Welcomes per device inbox,
-enforces one admitted commit per source epoch, dedups by content digest,
-leases KeyPackages consume-once — and exports two things that shape
+The bottom layer is `finitechat-delivery`. It is deliberately tiny: it
+sequences opaque `TransportMessage` bytes per group, queues Welcomes per
+device inbox, enforces one admitted commit per source epoch, dedups by content
+digest, leases KeyPackages consume-once, and exports two things that shape
 everything above it:
 
 - **`check_publish`** — a dry-run admission check whose `Fresh` variant
@@ -116,10 +112,8 @@ everything above it:
   run. `finitechat-server` passes it over SQLite, restart checks included
   (`crates/finitechat-server/tests/http_conformance.rs`).
 
-The standing posture (ADR 0004): **Marmot interop is kept only when it is
-free.** We upstream the contract because it costs nothing; we never bend the
-product surface to preserve interop. Typed rooms accept only typed routes —
-the raw `/messages` route does not exist in the product.
+Typed rooms accept only typed routes; raw delivery-contract publishes exist
+only as an internal conformance boundary.
 
 ## 6. The server: typed routes over opaque bytes
 
@@ -271,7 +265,6 @@ Decisions are ADRs; vocabulary is the glossary; running work is logged.
   user-promise behind each mechanism
 - `docs/perf-plan.md` / `docs/perf-log.md` — performance program and ledger
 - `docs/feature-audit-marmot-pika.md` — what adjacent projects taught us
-- `docs/darkmatter-port-log.md` — the full historical record
 
 ## 11. Deliberately not built yet
 

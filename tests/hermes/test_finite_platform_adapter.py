@@ -7,8 +7,7 @@ import unittest
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
-
+from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADAPTER_PATH = REPO_ROOT / "integrations" / "hermes" / "finite-platform" / "adapter.py"
@@ -42,22 +41,22 @@ class MessageEvent:
     message_type: MessageType = MessageType.TEXT
     source: Any = None
     raw_message: Any = None
-    message_id: Optional[str] = None
-    platform_update_id: Optional[int] = None
+    message_id: str | None = None
+    platform_update_id: int | None = None
     media_urls: list[str] = field(default_factory=list)
     media_types: list[str] = field(default_factory=list)
-    reply_to_message_id: Optional[str] = None
-    reply_to_text: Optional[str] = None
+    reply_to_message_id: str | None = None
+    reply_to_text: str | None = None
     auto_skill: Any = None
-    channel_prompt: Optional[str] = None
+    channel_prompt: str | None = None
     internal: bool = False
 
 
 @dataclass
 class SendResult:
     success: bool
-    message_id: Optional[str] = None
-    error: Optional[str] = None
+    message_id: str | None = None
+    error: str | None = None
     raw_response: Any = None
     retryable: bool = False
 
@@ -96,12 +95,14 @@ def install_gateway_stubs() -> None:
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
 
-    config.Platform = Platform
-    config.PlatformConfig = PlatformConfig
-    base.BasePlatformAdapter = BasePlatformAdapter
-    base.MessageEvent = MessageEvent
-    base.MessageType = MessageType
-    base.SendResult = SendResult
+    config_module = cast(Any, config)
+    base_module = cast(Any, base)
+    config_module.Platform = Platform
+    config_module.PlatformConfig = PlatformConfig
+    base_module.BasePlatformAdapter = BasePlatformAdapter
+    base_module.MessageEvent = MessageEvent
+    base_module.MessageType = MessageType
+    base_module.SendResult = SendResult
 
     sys.modules["gateway"] = gateway
     sys.modules["gateway.config"] = config
@@ -114,8 +115,9 @@ def load_adapter_module():
     module_name = "finite_platform_adapter_under_test"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, ADAPTER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load adapter from {ADAPTER_PATH}")
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
@@ -133,7 +135,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
     def setUp(self):
         self.module = load_adapter_module()
 
-    def adapter(self, room_id="room-agent-1"):
+    def adapter(self, room_id: str | None = "room-agent-1"):
         extra = {"home": "/tmp/finite-agent-home", "finitechat_bin": "/bin/echo"}
         if room_id:
             extra["room_id"] = room_id
@@ -149,7 +151,9 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(entry["label"], "Finite Chat")
         self.assertEqual(entry["required_env"], ["FINITECHAT_HOME"])
         self.assertEqual(entry["allowed_users_env"], "FINITECHAT_ALLOWED_USERS")
-        self.assertEqual(entry["max_message_length"], self.module.FiniteChatAdapter.MAX_MESSAGE_LENGTH)
+        self.assertEqual(
+            entry["max_message_length"], self.module.FiniteChatAdapter.MAX_MESSAGE_LENGTH
+        )
         self.assertTrue(callable(entry["adapter_factory"]))
 
     def test_check_requirements_uses_finitechat_bin_not_finitecomputer(self):
@@ -292,9 +296,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
     def test_home_is_required_and_room_is_optional(self):
         self.assertTrue(
-            self.module.validate_config(
-                PlatformConfig(extra={"home": "/tmp/finite-agent-home"})
-            )
+            self.module.validate_config(PlatformConfig(extra={"home": "/tmp/finite-agent-home"}))
         )
         old_home = os.environ.pop("FINITECHAT_HOME", None)
         try:

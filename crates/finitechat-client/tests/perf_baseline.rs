@@ -52,7 +52,8 @@ impl HttpRuntimeTransport for BenchTransport {
                 .uri(uri)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(body).map_err(|error| BenchTransportError(error.to_string()))?,
+                    serde_json::to_vec(body)
+                        .map_err(|error| BenchTransportError(error.to_string()))?,
                 ))
                 .map_err(|error| BenchTransportError(error.to_string()))?;
             let response = self
@@ -164,20 +165,21 @@ fn client_sync_tick_and_save_timings() {
         key_package_target_available: 0,
         max_sync_pages_per_room: 1,
     };
-    let join = run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &join_options)
-        .unwrap();
+    let join =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut server, &join_options).unwrap();
     assert_eq!(join.claimed_welcomes, 1);
     assert_eq!(alice.last_applied_seq(room_id).unwrap(), accepted.seq);
 
     // Bob publishes the backlog alice will sync.
     let populate_started = Instant::now();
     for index in 0..MESSAGES {
-        let plaintext =
-            format!(r#"{{"type":"finitecomputer.command.v1","body":{{"n":{index}}}}}"#);
+        let plaintext = format!(r#"{{"type":"finitecomputer.command.v1","body":{{"n":{index}}}}}"#);
         let request = bob
             .create_application_request(room_id, plaintext.as_bytes(), format!("perf_msg_{index}"))
             .unwrap();
-        server.append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy()).unwrap();
+        server
+            .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+            .unwrap();
     }
     println!(
         "populate: {MESSAGES} MLS messages in {:?} ({:?}/message avg)",

@@ -1,13 +1,14 @@
-use cgka_traits::transport::TransportMessage;
-use cgka_traits::{GroupId, MemberId, MessageId};
+use finitechat_delivery::{
+    HttpClaimedKeyPackage, HttpKeyPackageId, HttpPublishTarget, HttpSequence,
+};
 use finitechat_proto::{
-    RoomProtocol,ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry};
+    ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry, RoomProtocol,
+};
+use finitechat_transport::transport::TransportMessage;
+use finitechat_transport::{GroupId, MemberId, MessageId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use transport_http_server::{
-    HttpClaimedKeyPackage, HttpKeyPackageId, HttpPublishTarget, HttpSequence,
-};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -93,6 +94,34 @@ pub struct SyncWaitResponse {
     pub reason: Option<String>,
 }
 
+/// SSE wake-hint request. This watches the same scopes as `/sync/wait`, but
+/// streams high-watermark hint events until the client disconnects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStreamRequest {
+    #[serde(default)]
+    pub rooms: Vec<SyncWaitRoom>,
+    #[serde(default)]
+    pub invites: Vec<SyncWaitInvite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SyncHintEvent {
+    RoomAdvanced {
+        room_id: String,
+        seq: HttpSequence,
+    },
+    InviteChanged {
+        invite_id: String,
+        requests: u32,
+        resolved: u32,
+        state: HttpInviteSessionState,
+    },
+    Heartbeat,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxSyncRequest {
     pub recipient: MemberId,
@@ -138,6 +167,48 @@ pub struct GetDeviceLivenessResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NostrProfileRecord {
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    pub fetched_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutNostrProfileRequest {
+    pub profile: NostrProfileRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutNostrProfileResponse {
+    pub saved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetNostrProfilesRequest {
+    pub account_ids: Vec<String>,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NostrProfileCacheEntry {
+    pub profile: NostrProfileRecord,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetNostrProfilesResponse {
+    pub profiles: Vec<NostrProfileCacheEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
 }
@@ -176,14 +247,6 @@ pub struct HttpKeyPackageClaim {
     pub owner: MemberId,
     pub claimed: Option<HttpClaimedKeyPackage>,
 }
-
-
-
-
-
-
-
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateLinkSessionRequest {
@@ -418,7 +481,6 @@ pub struct BootstrapAccountRoomRequest {
 pub struct BootstrapAccountRoomResponse {
     pub bootstrapped: bool,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListAccountRoomDirectoryRequest {

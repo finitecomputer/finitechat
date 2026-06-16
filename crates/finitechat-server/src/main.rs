@@ -1,5 +1,7 @@
 use std::env;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::Path;
 
 use finitechat_server::{HttpServerState, http_router};
 
@@ -23,20 +25,35 @@ async fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let options = ServeOptions::parse(args)?;
     let addr = options.addr.parse::<SocketAddr>()?;
     let state = match options.sqlite_path {
-        Some(path) => HttpServerState::from_sqlite_path(path)?,
+        Some(path) => {
+            create_sqlite_parent_dir(&path)?;
+            HttpServerState::from_sqlite_path(path)?
+        }
         None => HttpServerState::default(),
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("finitechat-darkmatter-server: listening on http://{addr}");
+    println!("finitechat-server: listening on http://{addr}");
     axum::serve(listener, http_router(state)).await?;
     Ok(())
 }
 
+fn create_sqlite_parent_dir(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(path);
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent)?;
+    Ok(())
+}
+
 fn smoke() {
-    let ids = finitechat_darkmatter::prove_http_delivery_core_orders_commit_then_message()
+    let ids = finitechat_delivery::prove_http_delivery_core_orders_commit_then_message()
         .expect("HTTP delivery core smoke passes");
     println!(
-        "finitechat-darkmatter-server: in-memory Darkmatter HTTP delivery core ready ({} smoke messages)",
+        "finitechat-server: in-memory Finite Chat HTTP delivery core ready ({} smoke messages)",
         ids.len()
     );
 }
@@ -76,5 +93,24 @@ impl ServeOptions {
             addr: addr.unwrap_or_else(|| "127.0.0.1:8787".to_owned()),
             sqlite_path,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_sqlite_parent_dir;
+
+    #[test]
+    fn sqlite_parent_dir_is_created_before_open() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp
+            .path()
+            .join(".state")
+            .join("nested")
+            .join("finitechat.sqlite3");
+
+        create_sqlite_parent_dir(db_path.to_str().expect("utf8 path")).expect("create parent dir");
+
+        assert!(db_path.parent().expect("parent").is_dir());
     }
 }

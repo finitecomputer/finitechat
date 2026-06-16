@@ -557,15 +557,15 @@ application payload behavior:
 - `runtime_wake_hint_is_non_authoritative`
 - `runtime_target_policy_uses_decrypted_payload`
 
-Darkmatter HTTP port status:
+FiniteChat HTTP/runtime status:
 
 | Responsibility | Status |
 | --- | --- |
 | Opaque command request delivery | Covered by `/application-events` tests that persist command-inbox work, preserve opaque request ids, replay exact idempotent publishes, and reject duplicate durable message ids with new idempotency keys. |
 | Command result/cancel delivery policy | Covered at the HTTP effect layer: result/cancel events are durable, non-notifying application events and survive SQLite restart. |
-| Decrypted command validation, target policy, terminal races, resource serialization, and activity clears | Product-layer behavior above Darkmatter. Coverage remains in `finitechat-proto` and daemon-survival tests because the server must not parse encrypted command payloads. |
-| Runtime daemon execution and crash recovery | Product runtime behavior. The current repo has fake-daemon survival coverage; Darkmatter HTTP should only provide ordered durable input/output and idempotent publish routes until a production daemon entrypoint exists. |
-| Hosted runner and management queue boundaries | Product architecture behavior outside the chat transport. These scenarios should stay out of Darkmatter unless a future adapter exposes a concrete route boundary. |
+| Decrypted command validation, target policy, terminal races, resource serialization, and activity clears | Product-layer behavior above the HTTP delivery service. Coverage remains in `finitechat-proto` and daemon-survival tests because the server must not parse encrypted command payloads. |
+| Runtime daemon execution and crash recovery | Product runtime behavior. The current repo has fake-daemon survival coverage; the HTTP delivery service only provides ordered durable input/output and idempotent publish routes until a production daemon entrypoint exists. |
+| Hosted runner and management queue boundaries | Product architecture behavior outside the chat transport. These scenarios should stay outside the delivery service unless a future adapter exposes a concrete route boundary. |
 
 ## Transport Scenarios
 
@@ -585,19 +585,19 @@ V1 transport should prove streams are hints and pull sync is authoritative:
 this rule: stream/SSE/push hints only set `needs_pull`; only bounded
 `sync_events` pages can advance the cursor or apply room-log entries.
 
-Darkmatter HTTP port status:
+FiniteChat HTTP/runtime status:
 
 | Scenario | Status |
 | --- | --- |
 | `http_post_append_retries_are_idempotent` | Covered by raw `/messages`, typed `/events`, live-server CLI, and process-level replay tests over SQLite. |
-| `sync_projection_advances_only_from_pull_pages_not_stream_hints` | Covered by the projection unit test and by `sync_projection_advances_only_from_darkmatter_http_pull_pages` against the SQLite-backed Darkmatter HTTP adapter. |
-| `sse_drop_duplicate_reorder_repairs_by_pull_sync` | Covered at the transport rule level by projection and partial-pull repair tests. A concrete SSE drop/reorder route test should wait until an SSE hint adapter exists. |
+| `sync_projection_advances_only_from_pull_pages_not_stream_hints` | Covered by the projection unit test and by `sync_projection_advances_only_from_finitechat_http_pull_pages` against the SQLite-backed FiniteChat HTTP adapter. |
+| `sse_drop_duplicate_reorder_repairs_by_pull_sync` | Covered at the transport rule level by projection and partial-pull repair tests. `/sync/stream` route coverage proves coalesced high-watermark hints; `app_runtime_wait_for_update_uses_sse_hints_for_admission_and_messages` proves the app runtime treats hints as wakeups and still pulls state. |
 | `sync_projection_rejects_replayed_or_wrong_room_pages` | Covered at the projection layer; the HTTP runtime adapter also rejects decoded room entries whose embedded room id does not match the requested sync room. |
 | `sync_projection_rebuilds_same_view_after_restart` | Covered at the projection layer and by HTTP/runtime restart tests that rebuild state from pulled ordered log pages. |
-| `stream_callback_never_executes_command_directly` | Product runtime callback behavior. The current repo has fake-daemon coverage but no production stream callback entrypoint to drive through Darkmatter HTTP. |
-| `runtime_stream_callback_only_triggers_sync` | Product runtime callback behavior. The current HTTP proof is that only pull pages advance state; daemon callback coverage should move when a production runtime daemon exists. |
+| `stream_callback_never_executes_command_directly` | Product runtime callback behavior. `FiniteChatRuntime::wait_for_update` only converts SSE events into a pull/admission tick; command execution remains outside the hint path. Daemon-specific callback coverage should move when a production runtime daemon exists. |
+| `runtime_stream_callback_only_triggers_sync` | Covered for the app runtime by `app_runtime_wait_for_update_uses_sse_hints_for_admission_and_messages`; only pulled pages and invite admission state change `AppState`. |
 | `websocket_transport_not_required_for_v1` | Covered by the HTTP-only route, CLI, live-server, process-binary, and runtime-delivery tests; no WebSocket path is needed for the current V1 port. |
-| `push_wake_and_sse_share_hint_only_semantics` | Covered at the shared projection primitive. Concrete push/SSE adapter tests should wait until those hint adapters exist. |
+| `push_wake_and_sse_share_hint_only_semantics` | Covered for SSE by `/sync/stream` route tests and the Rust app runtime wait test. Push can reuse the same hint-only rule when a push adapter lands. |
 
 ## Runtime Status Snapshot Scenarios
 
@@ -616,15 +616,15 @@ The typed projection read path rejects missing, stale, schema-mismatched, and
 malformed payloads without issuing command work. Page loads should read this
 projection or fail loudly; an explicit refresh remains a command.
 
-Darkmatter HTTP port status:
+FiniteChat HTTP/runtime status:
 
 | Responsibility | Status |
 | --- | --- |
-| Snapshot payload validation and dashboard read semantics | Product-layer coverage in `finitechat-proto`; Darkmatter treats snapshots as opaque encrypted application payloads. |
+| Snapshot payload validation and dashboard read semantics | Product-layer coverage in `finitechat-proto`; the delivery service treats snapshots as opaque encrypted application payloads. |
 | Durable snapshot transport without notification side effects | Covered by HTTP application-delivery policy tests; runtime state snapshots are durable but do not create push, unread, or command-inbox work. |
 | Rebuilding projected status from the ordered HTTP log | Covered by `sqlite_runtime_state_snapshot_projects_from_http_log_after_restart`, which syncs the snapshot after SQLite restart and rebuilds `RuntimeStateProjection`. |
 | Runtime liveness separation | Covered by `/devices/liveness` tests: heartbeats are volatile server-visible delivery state, do not advance room sync, and are cleared by restart. |
-| Slow refresh cadence and explicit refresh command behavior | Product runtime/client behavior; it should stay above Darkmatter unless a future runtime daemon entrypoint owns refresh scheduling. |
+| Slow refresh cadence and explicit refresh command behavior | Product runtime/client behavior; it should stay above the delivery service unless a future runtime daemon entrypoint owns refresh scheduling. |
 
 ## Chat Payload Scenarios
 

@@ -1,108 +1,135 @@
-# Finite Chat Darkmatter
+# Finite Chat
 
-Finite Chat Darkmatter is the port of Finite Chat's product and test surface
-onto the Marmot/Darkmatter protocol stack.
+Finite Chat is an end-to-end encrypted chat and command transport for the
+finite computer product. It is now its own standalone Rust workspace: clients
+own MLS cryptography and local state, while the server owns ordering,
+durability, idempotency, and delivery projections over opaque bytes.
 
-This repository starts from the existing Finite Chat source tree so the current
-tests remain the acceptance surface. The implementation goal is to replace the
-bespoke protocol internals with Darkmatter-backed engine, HTTP delivery, CLI,
-and daemon/server code while keeping a running compatibility log.
-
-The current `finitecomputer` chat spine is intentionally useful but plaintext:
-dashboard routes create typed relay events, `finitec relay run` polls outbound
-from the runtime, and Hermes replies through `finitec gateway`. This repo keeps
-that machine-outbound product boundary, then replaces the chat payload model
-with a server-ordered MLS Delivery Service.
+The current product target is a server-ordered MLS delivery service that works
+for humans, multiple devices, and agent runtimes. The server can sequence and
+filter messages, release Welcomes, lease KeyPackages, and drive push/unread
+policy, but it never reads message contents or acts as an identity authority.
 
 ## Decision
 
-Build a new Rust workspace that uses Darkmatter as the protocol substrate and
-keeps Finite-owned product behavior above that boundary.
-
 - Keep Nostr account keys as portable user identity.
-- Use Marmot/Darkmatter's OpenMLS engine for room encryption, device
-  membership, forward secrecy, and post-compromise recovery where it can satisfy
-  the Finite Chat tests.
-- Use one ordered HTTP delivery service per room in v1, backed by Darkmatter's
-  HTTP delivery work where possible.
-- Treat the server as trusted for ordering and availability only where an
-  explicit ordered-delivery profile says so, never message confidentiality or
-  membership-policy truth.
-- Keep fake-MLS reducer tests as compatibility fixtures until each behavior is
-  proven through Darkmatter.
-- Integrate with `finitecomputer` by adding an encrypted chat mode behind the
-  existing relay/gateway shape before changing the UI surface.
+- Use OpenMLS directly for room encryption, device membership, forward
+  secrecy, and post-compromise recovery.
+- Use one ordered HTTP delivery service per room in v1.
+- Treat the server as trusted for ordering, durability, and availability, not
+  message confidentiality or cryptographic membership truth.
+- Integrate with `finitecomputer` behind the existing relay/gateway product
+  shape before changing the UI surface.
 
 ## Workspace
 
+- `crates/finitechat-transport`: shared transport IDs, envelopes, messages,
+  timestamps, and opaque KeyPackage wrappers.
+- `crates/finitechat-delivery`: in-memory ordered HTTP delivery service and
+  executable conformance suite.
 - `crates/finitechat-proto`: DTOs, message ids, membership deltas, and wire
   validation helpers.
 - `crates/finitechat-blob`: encrypted attachment references and
   Blossom-compatible content-addressed blob-store proof.
-- `crates/finitechat-engine`: deterministic in-memory Delivery Service model.
-- `crates/finitechat-store`: SQLite-backed server parity store.
-- `crates/finitechat-client`: OpenMLS/Nostr client state machine.
-- `crates/finitechat-sim`: executable scenario tests for protocol invariants.
-- `crates/finitechat-hermes`: typed JSON bridge contract for the Hermes
-  platform plugin.
+- `crates/finitechat-mls`: OpenMLS helpers and finite device credentials.
+- `crates/finitechat-client`: device state machine, runtime delivery adapter,
+  sync/fanout workers, and encrypted SQLite snapshot store.
+- `crates/finitechat-core`: persisted app/runtime facade shared by CLI,
+  future daemon entrypoints, and UniFFI/iOS.
 - `crates/finitechat-http`: shared HTTP route DTOs used by the server, CLI, and
   runtime delivery client.
-- `crates/finitechat-darkmatter`: small adapter layer that records which
-  Darkmatter primitives are already usable from this repo.
-- `crates/finitechat-server`: Axum HTTP route layer over Darkmatter's delivery
-  service core, with optional SQLite operation-log replay for local durability.
-- `crates/finitechat-cli`: CLI entrypoint for compatibility reports, local
-  smoke checks, and HTTP delivery route calls.
+- `crates/finitechat-server`: Axum HTTP route layer with optional SQLite
+  operation-log replay and snapshots for local durability.
+- `crates/finitechat-hermes`: typed JSON bridge contract for the Hermes
+  platform plugin.
+- `crates/finitechat-cli`: `finitechat` CLI for HTTP route calls, local smoke
+  checks, Hermes bridge commands, and `finitechat core ...` app/runtime flows.
+- `crates/finitechat-rmp`: Rust Multiplatform helper for UniFFI Swift binding,
+  XCFramework, Xcode project, and simulator runs.
+- `uniffi-bindgen`: local UniFFI bindgen binary used by the RMP helper.
+- `ios`: minimal SwiftUI app shell built on the shared `finitechat-core`
+  UniFFI surface.
 - `integrations/hermes/finite-platform`: thin Hermes plugin over the Finite
   Chat bridge.
-- `docs/implementation-plan.md`: concrete ship plan.
-- `docs/finitecomputer-integration.md`: how this lands in `../finitecomputer`.
-- `docs/hermes-integration.md`: Hermes plugin ownership, bridge commands, and
-  test contract.
-- `docs/source-notes.md`: source-of-truth notes from Justin's planning repo,
-  Pika/Marmot, and finitecomputer.
-- `docs/scenario-coverage.md`: named simulator scenarios proven so far.
-- `docs/storage-plan.md`: SQLite/Postgres/client-store decision record.
-- `docs/engineering-style.md`: local rules for debt, asserts, and invariants.
-- `docs/technical-debt-ledger.md`: observed finitecomputer integration debt,
-  risks, proofs, and delete conditions.
-- `docs/daemon-survival-testing.md`: strategy for proving chat/status/recovery
-  still work when Hermes, inference, or bridge adapters are down.
-- `docs/darkmatter-port-log.md`: running compatibility log for out-of-box,
-  easy-owned, thick/wonky, and fork-required work.
 
-## First Checks
+RMP/iOS work should use the
+[RMP Architecture Bible](https://github.com/rust-multiplatform/rmp/blob/master/rmp-architecture-bible.md)
+as the best-practices baseline: Rust owns app state, protocol logic,
+persistence, networking, and policy; native layers stay thin and focused on
+rendering or bounded platform capabilities.
+
+## Local App Loop
+
+Start the standalone HTTP service:
 
 ```sh
-cargo test
+cargo run -p finitechat-server -- serve 127.0.0.1:8787 --sqlite .state/finitechat.sqlite3
+```
+
+Build and launch the iOS simulator app against that server:
+
+```sh
+FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run ios
+```
+
+The normal app flow is intentionally chat-shaped:
+
+1. Tap **New Room**.
+2. Enter the room and tap **Invite**.
+3. The inviter shows a QR/code URL and PIN.
+4. Another device opens **Scan**, scans or pastes the invite URL or an `npub`,
+   enters the PIN, and lands in the room once admitted.
+5. Messages appear through the Rust-owned SSE hint loop. There is no user-facing
+   sync, accept, or finalize step.
+
+The `finitechat core ...` commands expose the underlying protocol pieces for
+tests and low-level debugging. They are not the product flow. A developer smoke
+sequence can still drive two local devices explicitly:
+
+```sh
+finitechat core --data-dir .state/alice --device-id alice bootstrap-room --room-id room-main
+finitechat core --data-dir .state/alice --device-id alice invite --room-id room-main
+finitechat core --data-dir .state/bob --device-id bob join --invite-url "$INVITE_URL" --pin "$PIN"
+finitechat core --data-dir .state/alice --device-id alice accept --invite-url "$INVITE_URL"
+finitechat core --data-dir .state/bob --device-id bob finalize --invite-url "$INVITE_URL"
+finitechat core --data-dir .state/alice --device-id alice send --room-id room-main --text "hello"
+finitechat core --data-dir .state/bob --device-id bob sync
+```
+
+## Checks
+
+```sh
+cargo test --workspace
+cargo run -p finitechat-rmp -- doctor
+cargo run -p finitechat-rmp -- bindings swift
+uvx --no-config ruff format --check .
+uvx --no-config ruff check .
+uvx --no-config --with hermes-agent basedpyright
 python3 -m unittest discover -s tests -p '*test*.py'
 cargo test -p finitechat-server --test http_routes
 cargo test -p finitechat-server --test http_persistence
-cargo test -p finitechat-server --test http_engine_routes
+cargo test -p finitechat-server --test http_conformance
 cargo test -p finitechat-cli
 cargo run -p finitechat-server -- smoke
 cargo run -p finitechat-cli -- http-smoke
 ```
 
-The fake simulator tests prove the server-side ordering and persistence
-contract that Marmot-over-relays could not make reliable:
+The high-risk coverage proves the server-side ordering and persistence
+contract:
 
 - one accepted Commit per room epoch;
 - idempotent mutation retries;
 - no Welcome before durable Commit;
 - KeyPackage leases consumed only by accepted Commits;
 - removed devices can sync through their removal Commit;
-- invalid accepted Commits fail closed into `NeedsRepair`.
-
-The SQLite suite replays the highest-risk reducer scenarios across reopen
-boundaries, including accepted and rejected idempotency results. The OpenMLS
-suite proves the first real credential, Welcome, Commit, and application-message
-bytes through the same ordering path.
+- invalid accepted Commits fail closed into `NeedsRepair`;
+- durable SQLite replay matches the delivery conformance contract after
+  restart.
 
 ## Ship Target
 
-The first finitecomputer merge should be a library and local-loop integration,
-not a dashboard rewrite:
+The first `finitecomputer` merge should be a library and local-loop
+integration, not a dashboard rewrite:
 
 1. vend or import these crates under `finitecomputer/crates/finitechat-*`;
 2. add a `finitec encrypted-chat` or feature-flagged `chat.v2` path;

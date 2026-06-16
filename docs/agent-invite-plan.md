@@ -4,7 +4,7 @@ Companion to ADR 0006. Status ledger lives at the bottom; commit per phase.
 
 ## Goal
 
-`hermes-agent` (latest upstream) + the `finitechat-darkmatter` binary +
+`hermes-agent` (latest upstream) + the `finitechat` binary +
 the `finite-platform` plugin = drop-in agent you can start chatting with
 from the Finite Chat app by scanning a QR and typing a PIN. Proven by an
 end-to-end test where Hermes runs in a Linux container (Apple `container`)

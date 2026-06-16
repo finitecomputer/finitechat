@@ -1,30 +1,27 @@
 use std::io::Write;
 
+mod core;
 mod hermes;
 
-use cgka_traits::engine::KeyPackage;
-use cgka_traits::{GroupId, MemberId, MessageId};
+use finitechat_delivery::{HttpKeyPackageId, HttpKeyPackagePublication};
 use finitechat_http::{
     AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
     BootstrapAccountRoomRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimLinkPayloadRequest, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, CreateLinkSessionRequest, ExpireInviteSessionRequest,
-    ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest,
-    InviteJoinStatusRequest, ListInviteJoinRequestsRequest, RespondInviteJoinRequest,
-    SubmitInviteJoinRequest,
-    GetDeviceLivenessRequest, GetLinkSessionRequest, GroupSyncRequest,
-    InboxSyncRequest, KeyPackageInventoryRequest,
-    ListAccountRoomDirectoryRequest,     ObserveDeviceLivenessRequest, ReleaseLinkClaimRequest,
-    LeaveRoomRequest, ReportInvalidCommitRequest, RevokeDeviceRequest, UpdateRoomAdminsRequest, SaveAccountRoomRequest,
+    ClaimLinkPayloadRequest, ClaimWelcomesRequest, CreateInviteSessionRequest,
+    CreateLinkSessionRequest, ExpireInviteSessionRequest, ExpireKeyPackageLeaseRequest,
+    ExpireLinkSessionRequest, GetDeviceLivenessRequest, GetLinkSessionRequest, GroupSyncRequest,
+    InboxSyncRequest, InviteJoinStatusRequest, KeyPackageInventoryRequest, LeaveRoomRequest,
+    ListAccountRoomDirectoryRequest, ListInviteJoinRequestsRequest, ObserveDeviceLivenessRequest,
+    ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RespondInviteJoinRequest,
+    RevokeDeviceRequest, SaveAccountRoomRequest, SubmitInviteJoinRequest, UpdateRoomAdminsRequest,
     UploadLinkPayloadRequest,
 };
 use finitechat_proto::{DeviceRef, RoomProtocol};
+use finitechat_transport::engine::KeyPackage;
+use finitechat_transport::{GroupId, MemberId, MessageId};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
-use transport_http_server::{
-    HttpKeyPackageId, HttpKeyPackagePublication,
-};
 
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_SYNC_LIMIT: usize = 50;
@@ -61,6 +58,8 @@ pub enum CliError {
     Output(std::io::Error),
     #[error("hermes: {0}")]
     Hermes(String),
+    #[error("core: {0}")]
+    Core(String),
 }
 
 impl CliError {
@@ -72,7 +71,8 @@ impl CliError {
             | Self::Http(_)
             | Self::Server { .. }
             | Self::Output(_)
-            | Self::Hermes(_) => 1,
+            | Self::Hermes(_)
+            | Self::Core(_) => 1,
         }
     }
 }
@@ -85,21 +85,18 @@ where
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
-        Some("compat-report") => {
-            let findings = finitechat_darkmatter::current_port_findings();
-            write_pretty_json(output, &findings)
-        }
         Some("http-smoke") => {
-            let ids = finitechat_darkmatter::prove_http_delivery_core_orders_commit_then_message()
+            let ids = finitechat_delivery::prove_http_delivery_core_orders_commit_then_message()
                 .expect("HTTP delivery core smoke passes");
             writeln!(
                 output,
-                "ordered {} messages through Darkmatter HTTP delivery core",
+                "ordered {} messages through the Finite Chat HTTP delivery core",
                 ids.len()
             )
             .map_err(CliError::Output)
         }
         Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
+        Some("core") => core::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
             let request = prepare_http_request(args.into_iter().skip(1))?;
             execute_http_request(&request, output)
@@ -168,8 +165,6 @@ where
         _ => Err(CliError::Usage(http_usage())),
     }
 }
-
-
 
 fn submit_commit_request(server: &str, args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
     request_json_passthrough(server, "/commits", args)
@@ -382,10 +377,6 @@ fn expire_key_package_lease_request(
     post_json_request(server, "/key-packages/leases/expire", &request)
 }
 
-
-
-
-
 fn invite_create_request(
     server: &str,
     mut args: Vec<String>,
@@ -592,7 +583,6 @@ fn link_session_expire_request(
     post_json_request(server, "/link-sessions/expire", &request)
 }
 
-
 fn account_room_save_request(
     server: &str,
     mut args: Vec<String>,
@@ -627,8 +617,8 @@ fn account_room_bootstrap_request(
             account_id,
             device_id,
         },
-            protocol: RoomProtocol::default(),
-        };
+        protocol: RoomProtocol::default(),
+    };
     post_json_request(server, "/account-rooms/bootstrap", &request)
 }
 
@@ -649,7 +639,10 @@ fn account_rooms_list_request(
     post_json_request(server, "/account-rooms/list", &request)
 }
 
-fn room_leave_request(server: &str, mut args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
+fn room_leave_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
     let room_id = required_option(&mut args, "--room-id")?;
     let account_id = required_option(&mut args, "--account-id")?;
     let device_id = required_option(&mut args, "--device-id")?;
@@ -665,7 +658,10 @@ fn room_leave_request(server: &str, mut args: Vec<String>) -> Result<PreparedHtt
     post_json_request(server, "/rooms/leave", &request)
 }
 
-fn room_admins_request(server: &str, mut args: Vec<String>) -> Result<PreparedHttpRequest, CliError> {
+fn room_admins_request(
+    server: &str,
+    mut args: Vec<String>,
+) -> Result<PreparedHttpRequest, CliError> {
     let room_id = required_option(&mut args, "--room-id")?;
     let account_id = required_option(&mut args, "--account-id")?;
     let device_id = required_option(&mut args, "--device-id")?;
@@ -778,7 +774,10 @@ fn execute_http_request<W: Write>(
     writeln!(output, "{body}").map_err(CliError::Output)
 }
 
-pub(crate) fn write_pretty_json<T: Serialize, W: Write>(output: &mut W, value: &T) -> Result<(), CliError> {
+pub(crate) fn write_pretty_json<T: Serialize, W: Write>(
+    output: &mut W,
+    value: &T,
+) -> Result<(), CliError> {
     serde_json::to_writer_pretty(&mut *output, value).map_err(CliError::Serialize)?;
     writeln!(output).map_err(CliError::Output)
 }
@@ -791,7 +790,7 @@ fn route_url(server: &str, path: &str) -> String {
     )
 }
 
-fn take_positional(args: &mut Vec<String>) -> Option<String> {
+pub(crate) fn take_positional(args: &mut Vec<String>) -> Option<String> {
     if args.is_empty() {
         None
     } else {
@@ -799,11 +798,17 @@ fn take_positional(args: &mut Vec<String>) -> Option<String> {
     }
 }
 
-pub(crate) fn required_option(args: &mut Vec<String>, name: &'static str) -> Result<String, CliError> {
+pub(crate) fn required_option(
+    args: &mut Vec<String>,
+    name: &'static str,
+) -> Result<String, CliError> {
     take_option(args, name)?.ok_or_else(|| CliError::Usage(format!("missing required {name}")))
 }
 
-pub(crate) fn take_option(args: &mut Vec<String>, name: &'static str) -> Result<Option<String>, CliError> {
+pub(crate) fn take_option(
+    args: &mut Vec<String>,
+    name: &'static str,
+) -> Result<Option<String>, CliError> {
     let Some(index) = args.iter().position(|arg| arg == name) else {
         return Ok(None);
     };
@@ -872,7 +877,6 @@ pub(crate) fn parse_hex(name: &'static str, value: &str) -> Result<Vec<u8>, CliE
         .collect()
 }
 
-
 pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         Ok(())
@@ -886,38 +890,37 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat-darkmatter <compat-report|http-smoke|http>\n\n{}",
+        "usage: finitechat <http-smoke|http|hermes|core>\n\n{}\n\n{}",
+        core::usage(),
         http_usage()
     )
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat-darkmatter http [--server URL] health\n  finitechat-darkmatter http [--server URL] submit-commit --request-json JSON\n  finitechat-darkmatter http [--server URL] append-event --request-json JSON\n  finitechat-darkmatter http [--server URL] application-effect-get --message-id ID\n  finitechat-darkmatter http [--server URL] application-effect-counts\n  finitechat-darkmatter http [--server URL] append-activity --request-json JSON\n  finitechat-darkmatter http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat-darkmatter http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat-darkmatter http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat-darkmatter http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat-darkmatter http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat-darkmatter http [--server URL] key-package-inventory --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-package --owner ID\n  finitechat-darkmatter http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat-darkmatter http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat-darkmatter http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat-darkmatter http [--server URL] link-session-get --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat-darkmatter http [--server URL] link-session-claim --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-release --link-session-id ID\n  finitechat-darkmatter http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat-darkmatter http [--server URL] link-session-expire --link-session-id ID\n  finitechat-darkmatter http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat-darkmatter http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --pin-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat-darkmatter http [--server URL] invite-requests --invite-id ID\n  finitechat-darkmatter http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat-darkmatter http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat-darkmatter http [--server URL] invite-expire --invite-id ID\n  finitechat-darkmatter http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat-darkmatter http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat-darkmatter http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat-darkmatter http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat-darkmatter http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat-darkmatter http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat-darkmatter http [--server URL] ack-welcome --message-id ID".to_owned()
+    "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --pin-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat http [--server URL] invite-requests --invite-id ID\n  finitechat http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat http [--server URL] invite-expire --invite-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use finitechat_proto::{
-        CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    };
+    use finitechat_delivery::HttpSyncPage;
     use finitechat_http::{
         AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
         BootstrapAccountRoomRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
-        ClaimWelcomesRequest, CreateLinkSessionRequest,
-        ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest, GetDeviceLivenessRequest,
-        GetLinkSessionRequest, GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim,
-        KeyPackageInventoryRequest,
-        ListAccountRoomDirectoryRequest,         ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+        ClaimWelcomesRequest, CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest,
+        ExpireLinkSessionRequest, GetDeviceLivenessRequest, GetLinkSessionRequest,
+        GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim, KeyPackageInventoryRequest,
+        ListAccountRoomDirectoryRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
         ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
         SaveAccountRoomRequest, UploadLinkPayloadRequest,
+    };
+    use finitechat_proto::{
+        CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
     };
     use finitechat_proto::{
         FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
         WelcomeState,
     };
-    use transport_http_server::HttpSyncPage;
-
 
     #[test]
     fn sync_group_command_defaults_cursor_and_limit() {
@@ -959,7 +962,6 @@ mod tests {
             b"alice-phone"
         );
     }
-
 
     #[test]
     fn submit_commit_command_posts_request_json() {
@@ -1158,8 +1160,6 @@ mod tests {
         assert_eq!(body.key_package_id.as_slice(), b"kp-lease-expired");
     }
 
-
-
     #[test]
     fn link_session_commands_build_route_dtos() {
         let create = prepare_http_request([
@@ -1350,8 +1350,8 @@ mod tests {
 
     #[test]
     fn ack_welcome_command_builds_ack_request() {
-        let request = prepare_http_request(["ack-welcome", "--message-id", "welcome-bob"])
-            .expect("request");
+        let request =
+            prepare_http_request(["ack-welcome", "--message-id", "welcome-bob"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
         assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/ack");
@@ -1420,7 +1420,7 @@ mod tests {
         ]))
         .expect("publish commit KeyPackage");
         assert!(published.published);
-        let claimed: Option<transport_http_server::HttpClaimedKeyPackage> =
+        let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> =
             serde_json::from_value(run_cli_json([
                 "http",
                 "--server",
@@ -1543,7 +1543,6 @@ mod tests {
         assert_eq!(listed["rooms"][0]["devices"][1]["active"], true);
     }
 
-
     #[test]
     fn live_cli_batch_key_package_claim_replays_over_http_server() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1603,7 +1602,7 @@ mod tests {
         .expect("batch claim replay");
         assert_eq!(replayed, claims);
 
-        let remaining: transport_http_server::HttpClaimedKeyPackage =
+        let remaining: finitechat_delivery::HttpClaimedKeyPackage =
             serde_json::from_value(run_cli_json([
                 "http",
                 "--server",
@@ -1616,7 +1615,6 @@ mod tests {
         assert_eq!(remaining.key_package_id.as_slice(), b"live-phone-2");
         assert_eq!(remaining.owner.as_slice(), b"live-phone");
     }
-
 
     #[test]
     fn unknown_option_is_usage_error() {

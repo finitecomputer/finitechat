@@ -1,4 +1,4 @@
-//! The `finitechat-darkmatter hermes` subcommand family: the JSON bridge
+//! The `finitechat hermes` subcommand family: the JSON bridge
 //! the Hermes platform plugin shells to (ADR 0002), plus agent onboarding
 //! (ADR 0006: init → invite URL/QR/PIN → chat).
 //!
@@ -14,18 +14,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use finitechat_client::{
     AppliedLogEntry, CreateRoomInviteParams, FiniteChatDevice, FiniteChatDeviceConfig,
-    HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeSyncOptions,
+    HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery, RuntimeSyncOptions,
     SqliteClientStore, SqliteClientStoreOptions, accept_pending_invite_joins, create_room_invite,
-    RuntimeDelivery, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
+    finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
     run_runtime_sync_tick, submit_invite_join_request,
-};
-use finitechat_http::{
-    HttpInviteJoinState, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom,
 };
 use finitechat_hermes::{
     HermesActivityRequestV1, HermesEditRequestV1, HermesMessagePayloadV1, HermesPollEventV1,
     HermesSendRequestV1, MAX_HERMES_POLL_TIMEOUT_MILLIS,
 };
+use finitechat_http::{HttpInviteJoinState, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     AppendEphemeralActivityRequest, CreateRoomRequest, DurableAppEventKind,
@@ -230,7 +228,7 @@ fn cmd_invite<W: Write>(
         .map_err(CliError::Output)?;
         writeln!(
             output,
-            "Re-display with: finitechat-darkmatter hermes pin --invite-id {}",
+            "Re-display with: finitechat hermes pin --invite-id {}",
             code.invite_id
         )
         .map_err(CliError::Output)
@@ -296,9 +294,8 @@ fn cmd_join<W: Write>(
     let home = load_home(home_dir)?;
     let (mut store, mut device, _home_delivery) = open_agent(&home)?;
     // The invite names the room's server; every leg of the join talks to it.
-    let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(
-        code.server_url.clone(),
-    ));
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(code.server_url.clone()));
     let handle = submit_invite_join_request(
         &mut store,
         &mut device,
@@ -352,7 +349,9 @@ fn cmd_join<W: Write>(
                 "join was rejected (wrong or expired PIN?)".to_owned(),
             ))
         } else {
-            Err(CliError::Hermes("join timed out awaiting the agent".to_owned()))
+            Err(CliError::Hermes(
+                "join timed out awaiting the agent".to_owned(),
+            ))
         };
     }
 
@@ -492,18 +491,35 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
             if sender.account_id == own_account {
                 continue;
             }
-            let Some(payload) = HermesMessagePayloadV1::decode(plaintext)
+            let event = match HermesMessagePayloadV1::decode(plaintext)
                 .map_err(|error| CliError::Hermes(error.to_string()))?
-            else {
-                continue;
+            {
+                Some(payload) => payload.into_poll_event(
+                    applied.room_id.clone(),
+                    applied.seq,
+                    applied.message_id.clone(),
+                    sender.account_id.clone(),
+                    sender.device_id.clone(),
+                ),
+                None => {
+                    let Ok(text) = std::str::from_utf8(plaintext) else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    HermesPollEventV1::finite_chat_text(
+                        applied.room_id.clone(),
+                        applied.seq,
+                        applied.message_id.clone(),
+                        sender.account_id.clone(),
+                        sender.device_id.clone(),
+                        text.to_owned(),
+                    )
+                    .map_err(|error| CliError::Hermes(error.to_string()))?
+                }
             };
-            events.push(payload.into_poll_event(
-                applied.room_id.clone(),
-                applied.seq,
-                applied.message_id.clone(),
-                sender.account_id.clone(),
-                sender.device_id.clone(),
-            ));
+            events.push(event);
         }
 
         if !events.is_empty() || !joined.is_empty() || started.elapsed() >= timeout {
@@ -596,10 +612,7 @@ fn append_payload<W: Write>(
         .save_device_state(&device)
         .map_err(|error| CliError::Hermes(error.to_string()))?;
     let accepted = delivery
-        .append_event(
-            &request,
-            DurableAppEventKind::ChatMessage.delivery_policy(),
-        )
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
         .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
     crate::write_pretty_json(
         output,
@@ -659,23 +672,22 @@ fn resolve_home(args: &mut Vec<String>) -> Result<PathBuf, CliError> {
 }
 
 fn load_home(dir: &Path) -> Result<AgentHome, CliError> {
-    let config: AgentConfig = serde_json::from_str(
-        &fs::read_to_string(dir.join(CONFIG_FILE)).map_err(|_| {
+    let config: AgentConfig =
+        serde_json::from_str(&fs::read_to_string(dir.join(CONFIG_FILE)).map_err(|_| {
             CliError::Hermes(format!(
                 "agent home {} is not initialized (run hermes init)",
                 dir.display()
             ))
-        })?,
-    )
-    .map_err(CliError::Json)?;
+        })?)
+        .map_err(CliError::Json)?;
     let nsec_hex = fs::read_to_string(dir.join(NSEC_FILE))
         .map_err(|error| CliError::Hermes(error.to_string()))?;
     let bytes = crate::parse_hex("agent.nsec", nsec_hex.trim())?;
     let bytes: [u8; NOSTR_SECRET_KEY_BYTES] = bytes
         .try_into()
         .map_err(|_| CliError::Hermes("agent.nsec must be 32 bytes of hex".to_owned()))?;
-    let secret = NostrSecretKey::from_bytes(bytes)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let secret =
+        NostrSecretKey::from_bytes(bytes).map_err(|error| CliError::Hermes(error.to_string()))?;
     Ok(AgentHome {
         dir: dir.to_path_buf(),
         config,
@@ -737,9 +749,7 @@ fn load_invites(dir: &Path) -> Result<Vec<InviteCodeV1>, CliError> {
     let urls: Vec<String> = serde_json::from_str(&raw).map_err(CliError::Json)?;
     let mut codes = Vec::with_capacity(urls.len());
     for url in urls {
-        codes.push(
-            InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?,
-        );
+        codes.push(InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?);
     }
     Ok(codes)
 }
@@ -818,5 +828,5 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat-darkmatter hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat-darkmatter hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat-darkmatter hermes [--home DIR] pin [--invite-id ID]\n  finitechat-darkmatter hermes [--home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat-darkmatter hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat-darkmatter hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat-darkmatter hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat-darkmatter hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--home DIR] pin [--invite-id ID]\n  finitechat hermes [--home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
 }

@@ -13,9 +13,9 @@
 
 use finitechat_client::{
     AppliedLogEntry, FiniteChatDevice, FiniteChatDeviceConfig, HttpRuntimeDelivery,
-    ReqwestHttpRuntimeTransport, RuntimeSyncOptions, SqliteClientStore,
-    SqliteClientStoreOptions, finalize_invited_room, run_room_server_sync_tick,
-    run_runtime_sync_tick, submit_invite_join_request,
+    ReqwestHttpRuntimeTransport, RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions,
+    finalize_invited_room, run_room_server_sync_tick, run_runtime_sync_tick,
+    submit_invite_join_request,
 };
 use finitechat_http::{SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
@@ -102,7 +102,7 @@ fn device(secret: [u8; NOSTR_SECRET_KEY_BYTES], device_id: &str) -> FiniteChatDe
 fn bridge_path_latency_breakdown() {
     let dir = tempfile::tempdir().unwrap();
     let server_url = spawn_live_http_server(&dir.path().join("server.sqlite3"));
-    let bin = env!("CARGO_BIN_EXE_finitechat-darkmatter");
+    let bin = env!("CARGO_BIN_EXE_finitechat");
 
     // --- Pair an agent (CLI home) with an in-process user device. ---
     let agent_home = dir.path().join("agent").display().to_string();
@@ -187,8 +187,13 @@ fn bridge_path_latency_breakdown() {
     .unwrap();
     let _ = join2;
     cli(&["poll", "--request-json", r#"{"timeout_millis":5000}"#]);
-    run_runtime_sync_tick(&mut agent2_store, &mut agent2, &mut agent2_delivery, &options)
-        .unwrap();
+    run_runtime_sync_tick(
+        &mut agent2_store,
+        &mut agent2,
+        &mut agent2_delivery,
+        &options,
+    )
+    .unwrap();
     finalize_invited_room(&mut agent2_store, &mut agent2, &code).unwrap();
     run_room_server_sync_tick(
         &mut user_store,
@@ -231,7 +236,7 @@ fn bridge_path_latency_breakdown() {
     let mut published_seq = 0;
     time_n(N, |i| {
         published_seq = agent2_delivery
-            .append_event(&encrypted[i], policy.clone())
+            .append_event(&encrypted[i], policy)
             .unwrap()
             .seq;
     })
@@ -265,8 +270,7 @@ fn bridge_path_latency_breakdown() {
         let url = waiter_url.clone();
         let watch = waiter_room.clone();
         let armed = std::thread::spawn(move || {
-            let mut delivery =
-                HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(url));
+            let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(url));
             delivery
                 .sync_wait(&SyncWaitRequest {
                     rooms: vec![SyncWaitRoom {
@@ -283,7 +287,7 @@ fn bridge_path_latency_breakdown() {
             .create_application_request(&room_id, &payload_1k, format!("bench-wake-{i}"))
             .unwrap();
         let send_at = Instant::now();
-        agent2_delivery.append_event(&request, policy.clone()).unwrap();
+        agent2_delivery.append_event(&request, policy).unwrap();
         let woke = armed.join().unwrap();
         assert!(woke.woke);
         // Report publish→wake, excluding the staged 20ms arming sleep.
@@ -308,7 +312,7 @@ fn bridge_path_latency_breakdown() {
         wire_big.len() as f64 / (32.0 * 1024.0)
     );
     time_n(16, |i| {
-        agent2_delivery.append_event(&big[i], policy.clone()).unwrap();
+        agent2_delivery.append_event(&big[i], policy).unwrap();
     })
     .report("leg 5  HTTP POST /events with 32 KiB payload");
 
@@ -350,8 +354,7 @@ fn bridge_path_latency_breakdown() {
         let url = server_url.clone();
         let watch = room_id.clone();
         let armed = std::thread::spawn(move || {
-            let mut delivery =
-                HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(url));
+            let mut delivery = HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(url));
             delivery
                 .sync_wait(&SyncWaitRequest {
                     rooms: vec![SyncWaitRoom {

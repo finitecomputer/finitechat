@@ -1,20 +1,14 @@
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode};
-use cgka_traits::engine::KeyPackage;
-use cgka_traits::MemberId;
-use finitechat_http::{
-    ClaimKeyPackageRequest, HealthResponse,
-    PublishKeyPackageResponse,
-};
+use finitechat_delivery::{HttpKeyPackageId, HttpKeyPackagePublication};
+use finitechat_http::{ClaimKeyPackageRequest, HealthResponse, PublishKeyPackageResponse};
 use finitechat_server::{HttpServerState, http_router};
+use finitechat_transport::MemberId;
+use finitechat_transport::engine::KeyPackage;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
-use transport_http_server::{
-    HttpKeyPackageId,
-    HttpKeyPackagePublication,
-};
 
 #[tokio::test]
 async fn health_reports_ok() {
@@ -35,9 +29,6 @@ async fn health_reports_ok() {
     let body: HealthResponse = read_json(response).await;
     assert_eq!(body.status, "ok");
 }
-
-
-
 
 #[tokio::test]
 async fn key_package_publish_and_claim_is_single_use() {
@@ -64,7 +55,7 @@ async fn key_package_publish_and_claim_is_single_use() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> = read_json(response).await;
     let claimed = claimed.expect("published KeyPackage can be claimed once");
     assert_eq!(claimed.key_package_id, key_package_id);
     assert_eq!(claimed.owner, owner);
@@ -79,7 +70,7 @@ async fn key_package_publish_and_claim_is_single_use() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let claimed: Option<transport_http_server::HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> = read_json(response).await;
     assert_eq!(claimed, None);
 }
 
@@ -103,11 +94,6 @@ async fn read_json<T: DeserializeOwned>(response: Response<Body>) -> T {
     serde_json::from_slice(&bytes).expect("json response")
 }
 
-
-
 fn member(label: &str) -> MemberId {
     MemberId::new(label.as_bytes().to_vec())
 }
-
-
-
