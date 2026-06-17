@@ -414,6 +414,21 @@ pub struct ChatReactionV1 {
     pub emoji: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatReceiptStateV1 {
+    Delivered,
+    Read,
+    Seen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatReceiptV1 {
+    pub target_message_id: MessageId,
+    pub target_seq: Seq,
+    pub state: ChatReceiptStateV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshotV1 {
     pub state_key: RuntimeStateKey,
@@ -2212,6 +2227,26 @@ impl ChatReactionV1 {
     }
 }
 
+impl ChatReceiptV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty(
+            "chat_receipt.target_message_id",
+            self.target_message_id.len(),
+        )?;
+        validate_string_bytes(
+            "chat_receipt.target_message_id",
+            &self.target_message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if self.target_seq == 0 {
+            return Err(ProtocolLimitError::BytesEmpty {
+                field: "chat_receipt.target_seq".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl FiniteEnvelope {
     pub fn message_id(&self) -> Result<MessageId, serde_json::Error> {
         message_id_for_envelope(self)
@@ -2923,6 +2958,33 @@ mod tests {
             oversized.validate_limits().unwrap_err(),
             ProtocolLimitError::BytesTooLong { field, .. } if field == "chat_reaction.emoji"
         ));
+    }
+
+    #[test]
+    fn chat_receipt_rejects_empty_target_and_zero_sequence() {
+        let empty_target = ChatReceiptV1 {
+            target_message_id: String::new(),
+            target_seq: 1,
+            state: ChatReceiptStateV1::Read,
+        };
+        assert_eq!(
+            empty_target.validate_limits().unwrap_err(),
+            ProtocolLimitError::BytesEmpty {
+                field: "chat_receipt.target_message_id".to_owned()
+            }
+        );
+
+        let zero_seq = ChatReceiptV1 {
+            target_message_id: "msg-1".to_owned(),
+            target_seq: 0,
+            state: ChatReceiptStateV1::Seen,
+        };
+        assert_eq!(
+            zero_seq.validate_limits().unwrap_err(),
+            ProtocolLimitError::BytesEmpty {
+                field: "chat_receipt.target_seq".to_owned()
+            }
+        );
     }
 
     #[test]

@@ -193,6 +193,10 @@ private struct RoomThreadView: View {
         model.projection(for: roomID)
     }
 
+    private var latestMessageID: String? {
+        projection.messages.last?.messageId
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if let room {
@@ -221,6 +225,12 @@ private struct RoomThreadView: View {
         .onAppear {
             if let room {
                 model.openRoom(room)
+                model.markRoomRead(room)
+            }
+        }
+        .onChange(of: latestMessageID) {
+            if let room {
+                model.markRoomRead(room)
             }
         }
     }

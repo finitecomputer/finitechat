@@ -230,6 +230,10 @@ final class AppModel: ObservableObject {
         ))
     }
 
+    func markRoomRead(_ room: AppRoomSummary) {
+        dispatch(.markRoomRead(roomId: room.roomId))
+    }
+
     func applyDevSettings() {
         do {
             try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()

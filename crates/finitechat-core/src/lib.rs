@@ -16,9 +16,10 @@ use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessag
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    ChatReactionV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind,
-    InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol,
-    invite_current_pin, npub_decode, npub_encode,
+    ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1, CreateRoomRequest,
+    DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind, InviteCodeV1,
+    ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol, invite_current_pin,
+    npub_decode, npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -280,6 +281,9 @@ pub enum AppAction {
         message_id: String,
         emoji: String,
     },
+    MarkRoomRead {
+        room_id: String,
+    },
     RetryRoom {
         room_id: String,
     },
@@ -347,6 +351,8 @@ struct CoreSyncProjection {
 struct ChatProjectionState {
     messages: BTreeMap<(String, String), ChatMessage>,
     reaction_senders: BTreeSet<(String, String, String, String)>,
+    delivered_through: BTreeMap<(String, String), u64>,
+    read_through: BTreeMap<(String, String), u64>,
 }
 
 #[uniffi::export]
@@ -576,6 +582,7 @@ impl AppRuntimeState {
                 message_id,
                 emoji,
             } => self.react_to_message(room_id, message_id, emoji)?,
+            AppAction::MarkRoomRead { room_id } => self.mark_room_read(room_id)?,
             AppAction::RetryRoom { room_id } => self.retry_room(room_id)?,
             AppAction::RefreshDevices => self.refresh_devices()?,
             AppAction::RevokeDevice {
@@ -888,6 +895,29 @@ impl AppRuntimeState {
         let event = self.core.send_reaction(&room_id, &message_id, &emoji)?;
         self.apply_projection_events(vec![event]);
         self.app.status = "reacted".to_owned();
+        Ok(())
+    }
+
+    fn mark_room_read(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Ok(());
+        }
+        let owner = self.core.device.device_ref().clone();
+        let Some((message_id, seq)) = self
+            .chat_projection
+            .latest_peer_message_needing_read_receipt(&room_id, &owner)
+        else {
+            return Ok(());
+        };
+
+        match self
+            .core
+            .send_read_receipt(&room_id, &message_id, seq, ChatReceiptStateV1::Read)
+        {
+            Ok(event) => self.apply_projection_events(vec![event]),
+            Err(FiniteChatCoreError::Delivery { .. }) => {}
+            Err(error) => return Err(error),
+        }
         Ok(())
     }
 
@@ -1511,6 +1541,61 @@ impl CoreState {
         Ok(event)
     }
 
+    fn send_read_receipt(
+        &mut self,
+        room_id: &str,
+        target_message_id: &str,
+        target_seq: u64,
+        state: ChatReceiptStateV1,
+    ) -> Result<StoredAppEvent, FiniteChatCoreError> {
+        let receipt = ChatReceiptV1 {
+            target_message_id: target_message_id.to_owned(),
+            target_seq,
+            state,
+        };
+        receipt.validate_limits().map_err(client_error)?;
+        let receipt_payload = serde_json::to_vec(&receipt).map_err(client_error)?;
+        let app_event_plaintext =
+            encode_application_event(DurableAppEventKind::ChatReceipt, None, &receipt_payload)?;
+        let idempotency_key = self
+            .device
+            .generate_object_id("receipt")
+            .map_err(client_error)?;
+        let request = self
+            .device
+            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .map_err(|error| send_error(room_id, error))?;
+        let sender = request.sender.clone();
+        self.store
+            .save_device_state(&self.device)
+            .map_err(store_error)?;
+
+        let room_server_url = self
+            .device
+            .room_server_url(room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.server_url.clone());
+        let mut delivery = delivery_for(&room_server_url);
+        let accepted = delivery
+            .append_event(&request, DurableAppEventKind::ChatReceipt.delivery_policy())
+            .map_err(delivery_error)?;
+        let event = StoredAppEvent {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+            message_id: accepted.message_id,
+            sender,
+            plaintext: app_event_plaintext,
+        };
+        self.store
+            .save_app_events(
+                self.device.device_ref(),
+                std::slice::from_ref(&event),
+                MAX_APP_MESSAGES_U32,
+            )
+            .map_err(store_error)?;
+        Ok(event)
+    }
+
     fn sync(&mut self) -> Result<SyncResult, FiniteChatCoreError> {
         Ok(self.sync_with_projection()?.result)
     }
@@ -1638,6 +1723,7 @@ enum DecodedAppEvent {
         payload: Vec<u8>,
     },
     ChatReaction(ChatReactionV1),
+    ChatReceipt(ChatReceiptV1),
     Ignored,
 }
 
@@ -1701,7 +1787,9 @@ fn chat_projection_payload_from_application_plaintext(
             }
             Some(projection)
         }
-        DecodedAppEvent::ChatReaction(_) | DecodedAppEvent::Ignored => None,
+        DecodedAppEvent::ChatReaction(_)
+        | DecodedAppEvent::ChatReceipt(_)
+        | DecodedAppEvent::Ignored => None,
     }
 }
 
@@ -1758,12 +1846,16 @@ fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> Decode
                 .map(DecodedAppEvent::ChatReaction)
                 .unwrap_or(DecodedAppEvent::Ignored)
         }
+        DurableAppEventKind::ChatReceipt => serde_json::from_slice::<ChatReceiptV1>(&event.payload)
+            .ok()
+            .filter(|receipt| receipt.validate_limits().is_ok())
+            .map(DecodedAppEvent::ChatReceipt)
+            .unwrap_or(DecodedAppEvent::Ignored),
         DurableAppEventKind::ConversationCreate
         | DurableAppEventKind::ConversationUpdate
         | DurableAppEventKind::ConversationArchive
         | DurableAppEventKind::ConversationSegmentStart
         | DurableAppEventKind::ChatEdit
-        | DurableAppEventKind::ChatReceipt
         | DurableAppEventKind::RuntimeStateSnapshot
         | DurableAppEventKind::RuntimeCommandRequest
         | DurableAppEventKind::RuntimeCommandResult
@@ -1925,6 +2017,9 @@ impl ChatProjectionState {
             DecodedAppEvent::ChatReaction(reaction) => {
                 self.apply_reaction(&event.room_id, &event.sender, owner, reaction);
             }
+            DecodedAppEvent::ChatReceipt(receipt) => {
+                self.apply_receipt(&event.room_id, &event.sender, receipt);
+            }
             DecodedAppEvent::Ignored => {}
         }
         self.trim_to_limit();
@@ -1936,8 +2031,34 @@ impl ChatProjectionState {
         messages
     }
 
-    fn insert_message(&mut self, message: ChatMessage) {
+    fn insert_message(&mut self, mut message: ChatMessage) {
+        message.read_receipt =
+            receipt_summary_for_message(&message, &self.delivered_through, &self.read_through);
         self.messages.insert(message_key(&message), message);
+    }
+
+    fn latest_peer_message_needing_read_receipt(
+        &self,
+        room_id: &str,
+        owner: &DeviceRef,
+    ) -> Option<(String, u64)> {
+        let owner_key = device_label(owner);
+        let read_through = self
+            .read_through
+            .get(&(room_id.to_owned(), owner_key))
+            .copied()
+            .unwrap_or_default();
+        self.messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| !message.is_mine)
+            .filter(|message| message.seq > read_through)
+            .max_by(|left, right| {
+                left.seq
+                    .cmp(&right.seq)
+                    .then_with(|| left.message_id.cmp(&right.message_id))
+            })
+            .map(|message| (message.message_id.clone(), message.seq))
     }
 
     fn apply_reaction(
@@ -1976,6 +2097,44 @@ impl ChatProjectionState {
         summary.reacted_by_me |= sender == owner;
     }
 
+    fn apply_receipt(&mut self, room_id: &str, sender: &DeviceRef, receipt: ChatReceiptV1) {
+        let target_key = (room_id.to_owned(), receipt.target_message_id);
+        let Some(target) = self.messages.get(&target_key) else {
+            return;
+        };
+        if target.seq != receipt.target_seq {
+            return;
+        }
+
+        let receipt_key = (room_id.to_owned(), device_label(sender));
+        match receipt.state {
+            ChatReceiptStateV1::Delivered => {
+                upsert_receipt_marker(&mut self.delivered_through, receipt_key, receipt.target_seq);
+            }
+            ChatReceiptStateV1::Read | ChatReceiptStateV1::Seen => {
+                upsert_receipt_marker(&mut self.read_through, receipt_key, receipt.target_seq);
+            }
+        }
+        self.refresh_receipts_for_room(room_id);
+    }
+
+    fn refresh_receipts_for_room(&mut self, room_id: &str) {
+        let keys = self
+            .messages
+            .keys()
+            .filter(|(message_room_id, _)| message_room_id == room_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let summary = self.messages.get(&key).and_then(|message| {
+                receipt_summary_for_message(message, &self.delivered_through, &self.read_through)
+            });
+            if let Some(message) = self.messages.get_mut(&key) {
+                message.read_receipt = summary;
+            }
+        }
+    }
+
     fn trim_to_limit(&mut self) {
         if self.messages.len() <= MAX_APP_MESSAGES {
             return;
@@ -2000,7 +2159,66 @@ impl ChatProjectionState {
         self.reaction_senders.retain(|(room_id, message_id, _, _)| {
             message_keys.contains(&(room_id.clone(), message_id.clone()))
         });
+        let message_rooms = message_keys
+            .into_iter()
+            .map(|(room_id, _)| room_id)
+            .collect::<BTreeSet<_>>();
+        self.delivered_through
+            .retain(|(room_id, _), _| message_rooms.contains(room_id));
+        self.read_through
+            .retain(|(room_id, _), _| message_rooms.contains(room_id));
     }
+}
+
+fn upsert_receipt_marker(
+    markers: &mut BTreeMap<(String, String), u64>,
+    key: (String, String),
+    target_seq: u64,
+) {
+    let entry = markers.entry(key).or_default();
+    if target_seq > *entry {
+        *entry = target_seq;
+    }
+}
+
+fn receipt_summary_for_message(
+    message: &ChatMessage,
+    delivered_through: &BTreeMap<(String, String), u64>,
+    read_through: &BTreeMap<(String, String), u64>,
+) -> Option<ChatReadReceiptSummary> {
+    let sender_key = format!("{}/{}", message.sender_account_id, message.sender_device_id);
+    let mut delivered = BTreeSet::new();
+    let mut read = BTreeSet::new();
+    for ((room_id, device), through_seq) in delivered_through {
+        if room_id == &message.room_id && *through_seq >= message.seq && device != &sender_key {
+            delivered.insert(device.clone());
+        }
+    }
+    for ((room_id, device), through_seq) in read_through {
+        if room_id == &message.room_id && *through_seq >= message.seq && device != &sender_key {
+            read.insert(device.clone());
+            delivered.insert(device.clone());
+        }
+    }
+    let read_count = bounded_u32_count(read.len());
+    let delivered_count = bounded_u32_count(delivered.len());
+    if read_count == 0 && delivered_count == 0 {
+        return None;
+    }
+    let display_text = if read_count > 0 {
+        format!("Read by {read_count}")
+    } else {
+        format!("Delivered to {delivered_count}")
+    };
+    Some(ChatReadReceiptSummary {
+        delivered_count,
+        read_count,
+        display_text,
+    })
+}
+
+fn bounded_u32_count(count: usize) -> u32 {
+    count.min(u32::MAX as usize) as u32
 }
 
 fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
@@ -2451,6 +2669,15 @@ mod tests {
         let reaction_event =
             encode_application_event(DurableAppEventKind::ChatReaction, None, &reaction_payload)
                 .unwrap();
+        let receipt = ChatReceiptV1 {
+            target_message_id: "message-1".to_owned(),
+            target_seq: 1,
+            state: ChatReceiptStateV1::Read,
+        };
+        let receipt_payload = serde_json::to_vec(&receipt).unwrap();
+        let receipt_event =
+            encode_application_event(DurableAppEventKind::ChatReceipt, None, &receipt_payload)
+                .unwrap();
 
         let messages = chat_messages_from_stored(
             Vec::new(),
@@ -2473,7 +2700,7 @@ mod tests {
                     room_id: "room-main".to_owned(),
                     seq: 3,
                     message_id: "reaction-duplicate".to_owned(),
-                    sender: peer,
+                    sender: peer.clone(),
                     plaintext: encode_application_event(
                         DurableAppEventKind::ChatReaction,
                         None,
@@ -2493,6 +2720,13 @@ mod tests {
                     )
                     .unwrap(),
                 },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 5,
+                    message_id: "receipt-1".to_owned(),
+                    sender: peer.clone(),
+                    plaintext: receipt_event,
+                },
             ],
             &owner,
         );
@@ -2506,6 +2740,14 @@ mod tests {
                 count: 2,
                 reacted_by_me: true,
             }]
+        );
+        assert_eq!(
+            messages[0].read_receipt,
+            Some(ChatReadReceiptSummary {
+                delivered_count: 1,
+                read_count: 1,
+                display_text: "Read by 1".to_owned(),
+            })
         );
     }
 
@@ -3219,6 +3461,103 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_read_receipts_are_durable_and_live_projected() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Receipt Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let bob_state = bob
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "read me".to_owned(),
+            })
+            .unwrap();
+        let target_message_id = bob_state
+            .messages
+            .iter()
+            .find(|message| message.text == "read me")
+            .expect("sent message projects")
+            .message_id
+            .clone();
+
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        alice
+            .dispatch(AppAction::MarkRoomRead {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+        alice
+            .dispatch(AppAction::MarkRoomRead {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert_read_receipt(&bob_state, &target_message_id, 1, 1, "Read by 1");
+        drop(bob);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert_read_receipt(
+            &reopened.state().unwrap(),
+            &target_message_id,
+            1,
+            1,
+            "Read by 1",
+        );
+    }
+
+    #[test]
     fn app_runtime_lists_and_revokes_same_account_devices() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -3388,6 +3727,27 @@ mod tests {
             .unwrap_or_else(|| panic!("missing reaction {emoji} on {message_id}"));
         assert_eq!(reaction.count, count);
         assert_eq!(reaction.reacted_by_me, reacted_by_me);
+    }
+
+    fn assert_read_receipt(
+        state: &AppState,
+        message_id: &str,
+        delivered_count: u32,
+        read_count: u32,
+        display_text: &str,
+    ) {
+        let message = state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .unwrap_or_else(|| panic!("missing message {message_id}"));
+        let receipt = message
+            .read_receipt
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing read receipt on {message_id}"));
+        assert_eq!(receipt.delivered_count, delivered_count);
+        assert_eq!(receipt.read_count, read_count);
+        assert_eq!(receipt.display_text, display_text);
     }
 
     fn put_profile(server_url: &str, profile: NostrProfileRecord) {
