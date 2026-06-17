@@ -385,6 +385,10 @@ pub enum AppAction {
     RetryRoom {
         room_id: String,
     },
+    RetryMessage {
+        room_id: String,
+        message_id: String,
+    },
     RefreshDevices,
     RevokeDevice {
         account_id: String,
@@ -803,6 +807,10 @@ impl AppRuntimeState {
             } => self.react_to_message(room_id, message_id, emoji)?,
             AppAction::MarkRoomRead { room_id } => self.mark_room_read(room_id)?,
             AppAction::RetryRoom { room_id } => self.retry_room(room_id)?,
+            AppAction::RetryMessage {
+                room_id,
+                message_id,
+            } => self.retry_message(room_id, message_id)?,
             AppAction::RefreshDevices => self.refresh_devices()?,
             AppAction::RevokeDevice {
                 account_id,
@@ -1472,6 +1480,95 @@ impl AppRuntimeState {
         } else {
             self.runtime_tick()?;
         }
+        Ok(())
+    }
+
+    fn retry_message(
+        &mut self,
+        room_id: String,
+        message_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to retry sends"),
+            });
+        }
+        let Some(message) = self.chat_projection.message(&room_id, &message_id).cloned() else {
+            self.app.status = "message unavailable".to_owned();
+            return Ok(());
+        };
+        match &message.delivery {
+            MessageDeliveryState::Failed { .. } => {}
+            MessageDeliveryState::Pending => {
+                self.app.status = "sending".to_owned();
+                return Ok(());
+            }
+            MessageDeliveryState::Sent => {
+                self.app.status = "sent".to_owned();
+                return Ok(());
+            }
+        }
+
+        let owner = self.core.device.device_ref().clone();
+        let retry_input = match retry_attachment_input_from_outbox_message(&message) {
+            Ok(input) => input,
+            Err(error) => {
+                let is_attachment_retry = !message.media.is_empty();
+                self.persist_failed_retry_message(message, &owner, &error, is_attachment_retry)?;
+                return Ok(());
+            }
+        };
+        let is_attachment_retry = retry_input.is_some();
+
+        let mut retrying = message;
+        retrying.delivery = MessageDeliveryState::Pending;
+        self.persist_outbox_message(&retrying)?;
+        self.chat_projection
+            .append_messages(vec![retrying.clone()], &owner);
+        self.sync_chat_projection();
+
+        let send_result = if let Some(input) = retry_input {
+            self.core.send_attachment(input)
+        } else {
+            self.core
+                .send_application_plaintext(&room_id, retrying.payload.clone())
+        };
+        match send_result {
+            Ok(result) => {
+                self.remove_outbox_message(&room_id, &message_id)?;
+                self.chat_projection.remove_message(&room_id, &message_id);
+                self.append_messages(result.messages);
+                self.app.status = "sent".to_owned();
+            }
+            Err(error) => {
+                self.persist_failed_retry_message(retrying, &owner, &error, is_attachment_retry)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_failed_retry_message(
+        &mut self,
+        mut message: ChatMessage,
+        owner: &DeviceRef,
+        error: &FiniteChatCoreError,
+        is_attachment_retry: bool,
+    ) -> Result<(), FiniteChatCoreError> {
+        message.delivery = MessageDeliveryState::Failed {
+            reason: compact_error_reason(error),
+        };
+        self.persist_outbox_message(&message)?;
+        self.chat_projection.append_messages(vec![message], owner);
+        self.sync_chat_projection();
+        self.app.status = "delivery failed".to_owned();
+        self.app.toast = Some(
+            if is_attachment_retry {
+                "Attachment saved locally; delivery failed."
+            } else {
+                "Message saved locally; delivery failed."
+            }
+            .to_owned(),
+        );
         Ok(())
     }
 
@@ -3065,6 +3162,71 @@ fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> Decode
     }
 }
 
+fn retry_attachment_input_from_outbox_message(
+    message: &ChatMessage,
+) -> Result<Option<SendAttachmentInput>, FiniteChatCoreError> {
+    let DecodedAppEvent::ChatMessage { payload, .. } = decode_application_event(&message.payload)
+    else {
+        return Ok(None);
+    };
+    let Some(hermes) = HermesMessagePayloadV1::decode(&payload).map_err(client_error)? else {
+        return Ok(None);
+    };
+    if hermes.attachments.is_empty() {
+        return Ok(None);
+    }
+
+    let local_attachment_count = hermes
+        .attachments
+        .iter()
+        .filter(|attachment| {
+            attachment
+                .path
+                .as_ref()
+                .map(|path| !path.trim().is_empty())
+                .unwrap_or(false)
+                && attachment.url.is_none()
+                && attachment.blob.is_none()
+        })
+        .count();
+    if local_attachment_count == 0 {
+        return Ok(None);
+    }
+    if local_attachment_count != hermes.attachments.len() {
+        return Err(FiniteChatCoreError::Client {
+            reason: "failed attachment retry must use only local cached attachments".to_owned(),
+        });
+    }
+
+    let mut attachments = Vec::with_capacity(hermes.attachments.len());
+    for attachment in hermes.attachments {
+        let path = attachment
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| FiniteChatCoreError::Client {
+                reason: "failed attachment retry is missing a local cache path".to_owned(),
+            })?;
+        let bytes = fs::read(path).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!("failed to read retry attachment {path}: {error}"),
+        })?;
+        attachments.push(OutboundAttachment {
+            filename: attachment.name,
+            mime_type: attachment.mime_type,
+            kind: chat_media_kind_from_hermes(attachment.kind),
+            bytes,
+        });
+    }
+
+    Ok(Some(SendAttachmentInput {
+        room_id: message.room_id.clone(),
+        attachments,
+        caption: hermes.text,
+        reply_to_message_id: hermes.reply_to_message_id,
+    }))
+}
+
 fn encode_text_message_payload(
     text: &str,
     reply_to_message_id: Option<&str>,
@@ -3270,6 +3432,15 @@ fn hermes_attachment_kind(kind: &ChatMediaKind) -> HermesAttachmentKindV1 {
         ChatMediaKind::VoiceNote => HermesAttachmentKindV1::Audio,
         ChatMediaKind::Video => HermesAttachmentKindV1::Video,
         ChatMediaKind::File => HermesAttachmentKindV1::File,
+    }
+}
+
+fn chat_media_kind_from_hermes(kind: HermesAttachmentKindV1) -> ChatMediaKind {
+    match kind {
+        HermesAttachmentKindV1::Image => ChatMediaKind::Image,
+        HermesAttachmentKindV1::Video => ChatMediaKind::Video,
+        HermesAttachmentKindV1::Audio => ChatMediaKind::VoiceNote,
+        HermesAttachmentKindV1::File => ChatMediaKind::File,
     }
 }
 
@@ -5202,6 +5373,113 @@ mod tests {
     }
 
     #[test]
+    fn app_send_failure_retries_failed_outbox_after_force_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Retry Outbox".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        drop(alice);
+
+        let offline = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let failed = offline
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "retry after force close".to_owned(),
+            })
+            .unwrap();
+        let failed_message_id = failed
+            .messages
+            .iter()
+            .find(|message| message.text == "retry after force close")
+            .expect("failed local message projects immediately")
+            .message_id
+            .clone();
+        drop(offline);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let before_retry = reopened.state().unwrap();
+        assert!(before_retry.messages.iter().any(|message| {
+            message.message_id == failed_message_id
+                && matches!(message.delivery, MessageDeliveryState::Failed { .. })
+        }));
+
+        let retried = reopened
+            .dispatch(AppAction::RetryMessage {
+                room_id: room_id.clone(),
+                message_id: failed_message_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(retried.status, "sent");
+        assert!(
+            !retried
+                .messages
+                .iter()
+                .any(|message| message.message_id == failed_message_id)
+        );
+        let accepted = retried
+            .messages
+            .iter()
+            .find(|message| message.text == "retry after force close")
+            .expect("retried message projects as accepted transcript row");
+        assert!(matches!(accepted.delivery, MessageDeliveryState::Sent));
+        drop(reopened);
+
+        let persisted = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap()
+        .state()
+        .unwrap();
+        assert!(
+            !persisted
+                .messages
+                .iter()
+                .any(|message| message.message_id == failed_message_id)
+        );
+        let persisted_message = persisted
+            .messages
+            .iter()
+            .find(|message| message.text == "retry after force close")
+            .expect("accepted retry survives force-close reopen");
+        assert!(matches!(
+            persisted_message.delivery,
+            MessageDeliveryState::Sent
+        ));
+    }
+
+    #[test]
     fn app_send_attachment_failure_persists_failed_media_outbox_across_force_close() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -5316,6 +5594,138 @@ mod tests {
         assert_eq!(
             app_room(&local_snapshot, &room_id).last_message_preview,
             "saved failed media"
+        );
+    }
+
+    #[test]
+    fn app_send_attachment_failure_retries_cached_media_after_force_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Retry Media Outbox".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        drop(alice);
+
+        let plaintext = b"retry cached media after force close".to_vec();
+        let offline = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let failed = offline
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "retry-photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: plaintext.clone(),
+                caption: "retry saved media".to_owned(),
+                reply_to_message_id: None,
+            })
+            .unwrap();
+        let failed_message = failed
+            .messages
+            .iter()
+            .find(|message| message.text == "retry saved media" && !message.media.is_empty())
+            .expect("failed local media projects immediately");
+        let failed_message_id = failed_message.message_id.clone();
+        let failed_local_path = failed_message.media[0]
+            .local_path
+            .clone()
+            .expect("failed media has cached plaintext path");
+        assert_eq!(std::fs::read(&failed_local_path).unwrap(), plaintext);
+        drop(offline);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let before_retry = reopened.state().unwrap();
+        assert!(before_retry.messages.iter().any(|message| {
+            message.message_id == failed_message_id
+                && matches!(message.delivery, MessageDeliveryState::Failed { .. })
+        }));
+
+        let retried = reopened
+            .dispatch(AppAction::RetryMessage {
+                room_id: room_id.clone(),
+                message_id: failed_message_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(retried.status, "sent");
+        assert!(
+            !retried
+                .messages
+                .iter()
+                .any(|message| message.message_id == failed_message_id)
+        );
+        let accepted = retried
+            .messages
+            .iter()
+            .find(|message| message.text == "retry saved media" && !message.media.is_empty())
+            .expect("retried media projects as accepted transcript row");
+        assert!(matches!(accepted.delivery, MessageDeliveryState::Sent));
+        let media = &accepted.media[0];
+        assert_eq!(media.filename, "retry-photo.jpg");
+        assert!(media.url.is_some());
+        assert_eq!(media.upload_progress_per_mille, None);
+        let accepted_local_path = media
+            .local_path
+            .as_ref()
+            .expect("accepted media keeps readable local plaintext cache");
+        assert_eq!(std::fs::read(accepted_local_path).unwrap(), plaintext);
+        drop(reopened);
+
+        let persisted = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap()
+        .state()
+        .unwrap();
+        assert!(
+            !persisted
+                .messages
+                .iter()
+                .any(|message| message.message_id == failed_message_id)
+        );
+        let persisted_message = persisted
+            .messages
+            .iter()
+            .find(|message| message.text == "retry saved media" && !message.media.is_empty())
+            .expect("accepted retried media survives force-close reopen");
+        assert!(matches!(
+            persisted_message.delivery,
+            MessageDeliveryState::Sent
+        ));
+        assert!(persisted_message.media[0].url.is_some());
+        assert_eq!(persisted_message.media[0].upload_progress_per_mille, None);
+        assert_eq!(
+            std::fs::read(persisted_message.media[0].local_path.as_ref().unwrap()).unwrap(),
+            plaintext
         );
     }
 

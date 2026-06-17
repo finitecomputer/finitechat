@@ -79,7 +79,10 @@ Runtime startup merges these rows into the Rust-owned chat projection after
 accepted messages/events, so a force-close after a failed send reopens with the
 visible failed bubble instead of an empty transcript. When a send is accepted by
 the room server, the runtime writes the accepted app message/event projection
-and deletes the matching outbox row.
+and deletes the matching outbox row. Message retry is a Rust action over this
+stored row, keyed by `(room_id, message_id)`; Swift only asks to retry the
+projected failed message and never reconstructs plaintext send intent from UI
+state.
 
 Attachment outbox rows do not store plaintext bytes in SQLite. Before upload,
 the runtime validates and writes the plaintext into the local attachment cache,
@@ -87,7 +90,10 @@ then stores a path-only Hermes media payload in `client_app_outbox` so Swift can
 render the pending or failed bubble after restart. Successful delivery removes
 that local outbox row and replaces it with the accepted encrypted blob-reference
 message; the cached plaintext remains addressable through the verified
-plaintext hash path used by the accepted blob reference.
+plaintext hash path used by the accepted blob reference. Retrying a failed media
+row reads the path-only cached plaintext from Rust, uploads it, sends the
+encrypted blob-reference payload, and leaves the failed placeholder behind only
+if the retry still cannot complete.
 
 The wrapping key is derived from the user's Nostr secret and device id using
 HKDF with Finite Chat domain separation. SQLite metadata, row counts, WAL
@@ -109,8 +115,10 @@ Received application messages are inserted in the same SQLite transaction that
 persists the device cursor that consumed them. Own sends are first inserted into
 `client_app_outbox` before network delivery, then promoted by deleting the
 outbox row after the server append is accepted and the accepted app
-message/event projection is saved. Swift and the app runtime render the Rust
-state and do not own persistence. Startup reads the bounded SQLite app-state,
+message/event projection is saved. Failed own sends are retried through the same
+stored outbox row after restart; successful retry promotes to the accepted
+server-backed row and removes the local failed id. Swift and the app runtime
+render the Rust state and do not own persistence. Startup reads the bounded SQLite app-state,
 room, message, outbox, and profile projections before network sync; delivery
 failure during startup must return the saved chat list and selected transcript
 as offline local state, not an empty UI. Full room-history sync remains a

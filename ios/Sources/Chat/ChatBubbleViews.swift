@@ -17,6 +17,7 @@ struct ChatTimelineRowView: View {
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
+    let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     var body: some View {
@@ -30,6 +31,7 @@ struct ChatTimelineRowView: View {
                 onDownloadAttachment: onDownloadAttachment,
                 onOpenAttachment: onOpenAttachment,
                 onVotePoll: onVotePoll,
+                onRetryMessage: onRetryMessage,
                 onLongPressMessage: onLongPressMessage
             )
                 .padding(.horizontal, 12)
@@ -52,6 +54,7 @@ struct FocusedChatMessageCard: View {
             onDownloadAttachment: { _, _ in },
             onOpenAttachment: { _, _ in },
             onVotePoll: { _, _ in },
+            onRetryMessage: { _ in },
             onLongPressMessage: nil
         )
         .allowsHitTesting(false)
@@ -66,6 +69,7 @@ private struct ChatMessageGroupRow: View {
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
+    let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     private let avatarSize: CGFloat = 28
@@ -105,6 +109,7 @@ private struct ChatMessageGroupRow: View {
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
+                    onRetryMessage: onRetryMessage,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .leading
                 )
@@ -128,12 +133,13 @@ private struct ChatMessageGroupRow: View {
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
+                    onRetryMessage: onRetryMessage,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
 
                 if let last = group.messages.last {
-                    MessageStatusLine(message: last)
+                    MessageStatusLine(message: last, onRetryMessage: onRetryMessage)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -160,6 +166,7 @@ private struct ChatBubbleStack: View {
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
+    let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let alignment: HorizontalAlignment
 
@@ -175,6 +182,7 @@ private struct ChatBubbleStack: View {
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
+                    onRetryMessage: onRetryMessage,
                     onLongPressMessage: onLongPressMessage
                 )
             }
@@ -203,6 +211,7 @@ private struct ChatMessageBubble: View {
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
+    let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: ((ChatMessage, CGRect) -> Void)?
 
     @State private var isPressed = false
@@ -976,9 +985,26 @@ private struct AttachmentProgressOverlay: View {
 
 private struct MessageStatusLine: View {
     let message: ChatMessage
+    let onRetryMessage: (ChatMessage) -> Void
 
     var body: some View {
-        if let text = readReceiptText ?? deliveryText {
+        if isFailed {
+            HStack(spacing: 6) {
+                Button {
+                    onRetryMessage(message)
+                } label: {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Retry message")
+
+                Text("Not sent")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        } else if let text = readReceiptText ?? deliveryText {
             Text(text)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -998,10 +1024,16 @@ private struct MessageStatusLine: View {
             return "Sending"
         case .sent:
             return nil
-        case .failed(let reason):
-            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "Failed" : "Failed: \(trimmed)"
+        case .failed:
+            return "Not sent"
         }
+    }
+
+    private var isFailed: Bool {
+        if case .failed = message.delivery {
+            return true
+        }
+        return false
     }
 }
 

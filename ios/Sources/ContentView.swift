@@ -259,10 +259,17 @@ private struct RoomThreadView: View {
                         composerFocused = true
                         dismissFocusedMessage()
                     },
+                    onRetry: {
+                        model.retry(focusedMessage)
+                        dismissFocusedMessage()
+                    },
                     onCopy: {
                         UIPasteboard.general.string = messageClipboardText(focusedMessage)
                         dismissFocusedMessage()
                     },
+                    canReact: messageCanUseSentActions(focusedMessage),
+                    canReply: messageCanUseSentActions(focusedMessage),
+                    canRetry: messageCanRetry(focusedMessage),
                     canCopy: !messageClipboardText(focusedMessage).isEmpty
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
@@ -353,6 +360,9 @@ private struct RoomThreadView: View {
                 onVotePoll: { message, option in
                     model.votePoll(message: message, option: option)
                 },
+                onRetryMessage: { message in
+                    model.retry(message)
+                },
                 onLongPressMessage: { message, frame in
                     presentFocusedMessage(message, frame: frame)
                 },
@@ -377,6 +387,21 @@ private struct RoomThreadView: View {
                 model.retry(room)
             }
         }
+    }
+
+    private func messageCanRetry(_ message: ChatMessage) -> Bool {
+        guard message.isMine else { return false }
+        if case .failed = message.delivery {
+            return true
+        }
+        return false
+    }
+
+    private func messageCanUseSentActions(_ message: ChatMessage) -> Bool {
+        if case .sent = message.delivery {
+            return true
+        }
+        return false
     }
 
     private func handleImportedAttachment(_ result: Result<[URL], Error>) {
@@ -612,7 +637,11 @@ private struct FocusedMessageOverlay: View {
     let onDismiss: () -> Void
     let onReact: (String) -> Void
     let onReply: () -> Void
+    let onRetry: () -> Void
     let onCopy: () -> Void
+    let canReact: Bool
+    let canReply: Bool
+    let canRetry: Bool
     let canCopy: Bool
 
     var body: some View {
@@ -624,7 +653,9 @@ private struct FocusedMessageOverlay: View {
                     .onTapGesture(perform: onDismiss)
 
                 VStack(alignment: message.isMine ? .trailing : .leading, spacing: 10) {
-                    FocusedReactionBar(onReact: onReact)
+                    if canReact {
+                        FocusedReactionBar(onReact: onReact)
+                    }
 
                     FocusedChatMessageCard(
                         message: message,
@@ -634,8 +665,11 @@ private struct FocusedMessageOverlay: View {
 
                     if actionsVisible {
                         FocusedMessageActionCard(
+                            canReply: canReply,
+                            canRetry: canRetry,
                             canCopy: canCopy,
                             onReply: onReply,
+                            onRetry: onRetry,
                             onCopy: onCopy
                         )
                         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -656,7 +690,7 @@ private struct FocusedMessageOverlay: View {
     private func overlayTop(in geometry: GeometryProxy) -> CGFloat {
         let overlayOriginY = geometry.frame(in: .global).minY
         let localAnchorY = anchorFrame.minY - overlayOriginY
-        let reactionBarSpace: CGFloat = 58
+        let reactionBarSpace: CGFloat = canReact ? 58 : 0
         let idealTop = localAnchorY - reactionBarSpace
         let maxTop = max(12, geometry.size.height * 0.58)
         return min(max(idealTop, 12), maxTop)
@@ -689,12 +723,30 @@ private struct FocusedReactionBar: View {
 }
 
 private struct FocusedMessageActionCard: View {
+    let canReply: Bool
+    let canRetry: Bool
     let canCopy: Bool
     let onReply: () -> Void
+    let onRetry: () -> Void
     let onCopy: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
+            if canRetry {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onRetry()
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+
+                Divider()
+            }
+
             Button {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 onReply()
@@ -705,6 +757,7 @@ private struct FocusedMessageActionCard: View {
                     .padding(.vertical, 10)
             }
             .buttonStyle(.plain)
+            .disabled(!canReply)
 
             Divider()
 

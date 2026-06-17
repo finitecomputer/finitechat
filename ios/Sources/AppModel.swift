@@ -422,6 +422,7 @@ final class AppModel: ObservableObject {
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
+    private var messageRetriesInFlight = Set<String>()
     private var didRunLaunchAutomation = false
 
     deinit {
@@ -561,6 +562,36 @@ final class AppModel: ObservableObject {
 
     func retry(_ room: AppRoomSummary) {
         dispatch(.retryRoom(roomId: room.roomId))
+    }
+
+    func retry(_ message: ChatMessage) {
+        let key = "\(message.roomId)|\(message.messageId)"
+        guard !messageRetriesInFlight.contains(key) else { return }
+        messageRetriesInFlight.insert(key)
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                messageRetriesInFlight.remove(key)
+            }
+            do {
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                let action = AppAction.retryMessage(
+                    roomId: message.roomId,
+                    messageId: message.messageId
+                )
+                let nextState = try await Task.detached(priority: .userInitiated) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard openKey == runtimeKey else { return }
+                state = nextState
+                errorText = nil
+                restartUpdateLoopIfEnabled()
+            } catch {
+                errorText = String(describing: error)
+            }
+        }
     }
 
     func refreshDevices() {
@@ -845,6 +876,7 @@ final class AppModel: ObservableObject {
         updateTask = nil
         launchAutomationTask = nil
         attachmentDownloadsInFlight.removeAll()
+        messageRetriesInFlight.removeAll()
         runtime = nil
         openKey = ""
         state = nil

@@ -14,6 +14,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
+    let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let accessoryContent: AccessoryContent
     let isInputFocused: Bool
@@ -84,6 +85,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                     onDownloadAttachment: coordinator.parent.onDownloadAttachment,
                     onOpenAttachment: coordinator.parent.onOpenAttachment,
                     onVotePoll: coordinator.parent.onVotePoll,
+                    onRetryMessage: coordinator.parent.onRetryMessage,
                     onLongPressMessage: coordinator.parent.onLongPressMessage
                 )
             }
