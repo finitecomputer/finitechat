@@ -81,6 +81,14 @@ visible failed bubble instead of an empty transcript. When a send is accepted by
 the room server, the runtime writes the accepted app message/event projection
 and deletes the matching outbox row.
 
+Attachment outbox rows do not store plaintext bytes in SQLite. Before upload,
+the runtime validates and writes the plaintext into the local attachment cache,
+then stores a path-only Hermes media payload in `client_app_outbox` so Swift can
+render the pending or failed bubble after restart. Successful delivery removes
+that local outbox row and replaces it with the accepted encrypted blob-reference
+message; the cached plaintext remains addressable through the verified
+plaintext hash path used by the accepted blob reference.
+
 The wrapping key is derived from the user's Nostr secret and device id using
 HKDF with Finite Chat domain separation. SQLite metadata, row counts, WAL
 behavior, and account/device lookup ids remain visible to the local machine;

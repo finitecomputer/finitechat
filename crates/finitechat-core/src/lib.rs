@@ -25,9 +25,10 @@ use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     ApplicationDeliveryPolicy, AttachmentBlobMetadataV1, AttachmentBlobReferenceV1, ChatReactionV1,
     ChatReceiptStateV1, ChatReceiptV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef,
-    DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
-    MAX_OBJECT_ID_BYTES, RoomProtocol, invite_current_pin, npub_decode, npub_encode,
-    validate_item_count, validate_string_bytes,
+    DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest, MAX_ATTACHMENT_PLAINTEXT_BYTES,
+    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, RoomProtocol, invite_current_pin,
+    npub_decode, npub_encode, validate_bytes_len, validate_bytes_non_empty, validate_item_count,
+    validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -1170,9 +1171,10 @@ impl AppRuntimeState {
         &mut self,
         mut input: SendAttachmentInput,
     ) -> Result<(), FiniteChatCoreError> {
-        if !self.room_is_connected(&input.room_id) {
+        let room_id = input.room_id.clone();
+        if !self.room_is_connected(&room_id) {
             return Err(FiniteChatCoreError::Client {
-                reason: format!("room '{}' is not ready to send", input.room_id),
+                reason: format!("room '{room_id}' is not ready to send"),
             });
         }
         if input.attachments.is_empty() {
@@ -1187,10 +1189,53 @@ impl AppRuntimeState {
         )
         .map_err(client_error)?;
         input.reply_to_message_id =
-            self.normalize_reply_target(&input.room_id, input.reply_to_message_id)?;
-        let result = self.core.send_attachment(input)?;
-        self.append_messages(result.messages);
-        self.app.status = "sent".to_owned();
+            self.normalize_reply_target(&room_id, input.reply_to_message_id)?;
+
+        let owner = self.core.device.device_ref().clone();
+        let local_message_id = self.core.generate_object_id("local-msg")?;
+        let local_chat_payload = self.core.local_attachment_message_payload(
+            input.caption.trim(),
+            &input.attachments,
+            input.reply_to_message_id.as_deref(),
+        )?;
+        let app_event_plaintext =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &local_chat_payload)?;
+        let mut pending = project_chat_message(
+            room_id.clone(),
+            u64::MAX,
+            local_message_id.clone(),
+            owner.clone(),
+            app_event_plaintext,
+            &owner,
+        )
+        .ok_or_else(|| FiniteChatCoreError::Client {
+            reason: "local attachment message did not project as a transcript row".to_owned(),
+        })?;
+        pending.delivery = MessageDeliveryState::Pending;
+        self.persist_outbox_message(&pending)?;
+        self.chat_projection
+            .append_messages(vec![pending.clone()], &owner);
+        self.sync_chat_projection();
+
+        match self.core.send_attachment(input) {
+            Ok(result) => {
+                self.remove_outbox_message(&room_id, &local_message_id)?;
+                self.chat_projection
+                    .remove_message(&room_id, &local_message_id);
+                self.append_messages(result.messages);
+                self.app.status = "sent".to_owned();
+            }
+            Err(error) => {
+                pending.delivery = MessageDeliveryState::Failed {
+                    reason: compact_error_reason(&error),
+                };
+                self.persist_outbox_message(&pending)?;
+                self.chat_projection.append_messages(vec![pending], &owner);
+                self.sync_chat_projection();
+                self.app.status = "delivery failed".to_owned();
+                self.app.toast = Some("Attachment saved locally; delivery failed.".to_owned());
+            }
+        }
         Ok(())
     }
 
@@ -2270,6 +2315,49 @@ impl CoreState {
         Ok(result)
     }
 
+    fn local_attachment_message_payload(
+        &self,
+        caption: &str,
+        attachments: &[OutboundAttachment],
+        reply_to_message_id: Option<&str>,
+    ) -> Result<Vec<u8>, FiniteChatCoreError> {
+        validate_item_count(
+            "attachments",
+            attachments.len(),
+            MAX_ATTACHMENTS_PER_MESSAGE,
+        )
+        .map_err(client_error)?;
+        let mut projected = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let filename = attachment.filename.trim().to_owned();
+            let mime_type = attachment.mime_type.trim().to_owned();
+            let metadata = AttachmentBlobMetadataV1 {
+                mime_type: mime_type.clone(),
+                filename: filename.clone(),
+                dimensions: None,
+            };
+            metadata.validate_limits().map_err(client_error)?;
+            validate_bytes_non_empty("attachment.plaintext", attachment.bytes.len())
+                .map_err(client_error)?;
+            validate_bytes_len(
+                "attachment.plaintext",
+                attachment.bytes.len(),
+                MAX_ATTACHMENT_PLAINTEXT_BYTES,
+            )
+            .map_err(client_error)?;
+            let path = self.cache_local_attachment_plaintext(&filename, &attachment.bytes)?;
+            projected.push(HermesAttachmentV1 {
+                kind: hermes_attachment_kind(&attachment.kind),
+                name: filename,
+                mime_type,
+                path: Some(path.to_string_lossy().into_owned()),
+                url: None,
+                blob: None,
+            });
+        }
+        encode_attachment_message_payload(caption, projected, reply_to_message_id)
+    }
+
     fn send_chat_payload(
         &mut self,
         room_id: &str,
@@ -2433,6 +2521,23 @@ impl CoreState {
             });
         }
         let path = self.attachment_cache_path(reference);
+        self.write_attachment_cache_file(&path, plaintext)
+    }
+
+    fn cache_local_attachment_plaintext(
+        &self,
+        filename: &str,
+        plaintext: &[u8],
+    ) -> Result<PathBuf, FiniteChatCoreError> {
+        let path = self.local_attachment_cache_path(&sha256_hex(plaintext), filename);
+        self.write_attachment_cache_file(&path, plaintext)
+    }
+
+    fn write_attachment_cache_file(
+        &self,
+        path: &Path,
+        plaintext: &[u8],
+    ) -> Result<PathBuf, FiniteChatCoreError> {
         let Some(parent) = path.parent() else {
             return Err(FiniteChatCoreError::Filesystem {
                 reason: format!("attachment cache path has no parent: {}", path.display()),
@@ -2450,21 +2555,25 @@ impl CoreState {
         fs::write(&tmp_path, plaintext).map_err(|error| FiniteChatCoreError::Filesystem {
             reason: format!("failed to write {}: {error}", tmp_path.display()),
         })?;
-        fs::rename(&tmp_path, &path).map_err(|error| FiniteChatCoreError::Filesystem {
+        fs::rename(&tmp_path, path).map_err(|error| FiniteChatCoreError::Filesystem {
             reason: format!(
                 "failed to move {} to {}: {error}",
                 tmp_path.display(),
                 path.display()
             ),
         })?;
-        Ok(path)
+        Ok(path.to_path_buf())
     }
 
     fn attachment_cache_path(&self, reference: &AttachmentBlobReferenceV1) -> PathBuf {
+        self.local_attachment_cache_path(&reference.plaintext_sha256, &reference.metadata.filename)
+    }
+
+    fn local_attachment_cache_path(&self, plaintext_sha256: &str, filename: &str) -> PathBuf {
         self.data_dir
             .join(ATTACHMENT_CACHE_DIR)
-            .join(&reference.plaintext_sha256)
-            .join(sanitized_attachment_filename(&reference.metadata.filename))
+            .join(plaintext_sha256)
+            .join(sanitized_attachment_filename(filename))
     }
 
     fn room_server_url(&self, room_id: &str) -> String {
@@ -3179,6 +3288,8 @@ fn encode_application_event(
 }
 
 fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMediaAttachment {
+    let local_pending_upload =
+        attachment.path.is_some() && attachment.url.is_none() && attachment.blob.is_none();
     let blob = attachment.blob;
     let dimensions = blob
         .as_ref()
@@ -3217,7 +3328,7 @@ fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMe
         width: dimensions.map(|dimensions| dimensions.width),
         height: dimensions.map(|dimensions| dimensions.height),
         local_path: attachment.path,
-        upload_progress_per_mille: None,
+        upload_progress_per_mille: local_pending_upload.then_some(0),
     }
 }
 
@@ -5091,6 +5202,124 @@ mod tests {
     }
 
     #[test]
+    fn app_send_attachment_failure_persists_failed_media_outbox_across_force_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Failed Media Outbox".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        drop(alice);
+
+        let plaintext = b"local media must survive failed upload".to_vec();
+        let offline = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let failed = offline
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "offline-photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: plaintext.clone(),
+                caption: "saved failed media".to_owned(),
+                reply_to_message_id: None,
+            })
+            .unwrap();
+        assert_eq!(failed.status, "delivery failed");
+        assert_eq!(
+            failed.toast.as_deref(),
+            Some("Attachment saved locally; delivery failed.")
+        );
+        let failed_message = failed
+            .messages
+            .iter()
+            .find(|message| message.text == "saved failed media" && !message.media.is_empty())
+            .expect("failed local media message projects immediately");
+        assert!(matches!(
+            failed_message.delivery,
+            MessageDeliveryState::Failed { .. }
+        ));
+        assert_eq!(failed_message.media.len(), 1);
+        let media = &failed_message.media[0];
+        assert_eq!(media.filename, "offline-photo.jpg");
+        assert_eq!(media.url, None);
+        assert_eq!(media.upload_progress_per_mille, Some(0));
+        let local_path = media
+            .local_path
+            .as_ref()
+            .expect("failed local media keeps cached plaintext path");
+        assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
+        assert_eq!(
+            app_room(&failed, &room_id).last_message_preview,
+            "saved failed media"
+        );
+
+        let DecodedAppEvent::ChatMessage { payload, .. } =
+            decode_application_event(&failed_message.payload)
+        else {
+            panic!("failed media row must carry a chat message application event");
+        };
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("failed media row must carry Hermes message payload");
+        assert_eq!(hermes.attachments.len(), 1);
+        assert!(hermes.attachments[0].path.is_some());
+        assert_eq!(hermes.attachments[0].url, None);
+        assert_eq!(hermes.attachments[0].blob, None);
+        drop(offline);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+        let reopened_message = local_snapshot
+            .messages
+            .iter()
+            .find(|message| message.text == "saved failed media" && !message.media.is_empty())
+            .expect("failed local media message survives force-close reopen");
+        assert!(matches!(
+            reopened_message.delivery,
+            MessageDeliveryState::Failed { .. }
+        ));
+        let reopened_media = &reopened_message.media[0];
+        assert_eq!(reopened_media.filename, "offline-photo.jpg");
+        assert_eq!(reopened_media.url, None);
+        assert_eq!(reopened_media.upload_progress_per_mille, Some(0));
+        let reopened_path = reopened_media
+            .local_path
+            .as_ref()
+            .expect("reopened failed media keeps local cache path");
+        assert_eq!(std::fs::read(reopened_path).unwrap(), plaintext);
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).last_message_preview,
+            "saved failed media"
+        );
+    }
+
+    #[test]
     fn app_reopens_last_selected_room_before_network_sync() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -5501,6 +5730,7 @@ mod tests {
         assert_eq!(media.kind, ChatMediaKind::Image);
         assert_eq!(media.filename, "photo.jpg");
         assert_eq!(media.mime_type, "image/jpeg");
+        assert_eq!(media.upload_progress_per_mille, None);
         let local_path = media
             .local_path
             .as_ref()
@@ -5542,8 +5772,17 @@ mod tests {
             .iter()
             .find(|message| message.room_id == room_id && !message.media.is_empty())
             .expect("attachment projection survives reopen");
+        assert_eq!(
+            reopened_state
+                .messages
+                .iter()
+                .filter(|message| message.room_id == room_id && !message.media.is_empty())
+                .count(),
+            1
+        );
         assert_eq!(reopened_message.media[0].filename, "photo.jpg");
         assert!(reopened_message.media[0].local_path.is_some());
+        assert_eq!(reopened_message.media[0].upload_progress_per_mille, None);
         assert_eq!(
             app_room(&reopened_state, &room_id).last_message_preview,
             "photo.jpg"
