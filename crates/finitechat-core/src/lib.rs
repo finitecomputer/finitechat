@@ -1541,13 +1541,65 @@ fn normalized_transcript_page_size(limit: u32) -> usize {
     usize::try_from(limit).expect("u32 transcript page limit fits usize")
 }
 
+fn recover_or_create_device_state(
+    data_dir: &Path,
+    account_secret: &NostrSecretKey,
+    requested_config: FiniteChatDeviceConfig,
+    explicit_account_secret: bool,
+) -> Result<(SqliteClientStore, FiniteChatDeviceConfig), FiniteChatCoreError> {
+    let db_path = data_dir.join(CLIENT_STORE_FILE);
+    let account_id = hex::encode(account_secret.public_key().as_bytes());
+    let mut requested_store = SqliteClientStore::open(
+        &db_path,
+        SqliteClientStoreOptions::from_nostr_secret(account_secret, &requested_config.device_id)
+            .map_err(store_error)?,
+    )
+    .map_err(store_error)?;
+    let stored_device_ids = requested_store
+        .load_device_ids_for_account(&account_id)
+        .map_err(store_error)?;
+
+    if stored_device_ids.is_empty() || explicit_account_secret {
+        let device = FiniteChatDevice::new(requested_config.clone()).map_err(client_error)?;
+        requested_store
+            .save_device_state(&device)
+            .map_err(store_error)?;
+        return Ok((requested_store, requested_config));
+    }
+
+    if stored_device_ids.len() == 1 {
+        let mut recovered_config = requested_config;
+        recovered_config.device_id = stored_device_ids[0].clone();
+        let recovered_store = SqliteClientStore::open(
+            db_path,
+            SqliteClientStoreOptions::from_nostr_secret(
+                account_secret,
+                &recovered_config.device_id,
+            )
+            .map_err(store_error)?,
+        )
+        .map_err(store_error)?;
+        return Ok((recovered_store, recovered_config));
+    }
+
+    Err(FiniteChatCoreError::Client {
+        reason: format!(
+            "device state not found for requested device '{}'; stored devices for this account are: {}",
+            requested_config.device_id,
+            stored_device_ids.join(", ")
+        ),
+    })
+}
+
 impl CoreState {
     fn open(options: OpenOptions) -> Result<Self, FiniteChatCoreError> {
-        if options.device_id.trim().is_empty() {
+        let requested_device_id = options.device_id.trim().to_owned();
+        if requested_device_id.is_empty() {
             return Err(FiniteChatCoreError::Client {
                 reason: "device id cannot be empty".to_owned(),
             });
         }
+        let explicit_account_secret = options.account_secret_hex.is_some();
 
         let data_dir = PathBuf::from(options.data_dir);
         fs::create_dir_all(&data_dir).map_err(|error| FiniteChatCoreError::Filesystem {
@@ -1559,9 +1611,9 @@ impl CoreState {
         let now = options
             .now_unix_seconds
             .unwrap_or_else(current_unix_seconds);
-        let config = FiniteChatDeviceConfig {
+        let mut config = FiniteChatDeviceConfig {
             account_secret_key: account_secret.clone(),
-            device_id: options.device_id,
+            device_id: requested_device_id.clone(),
             now_unix_seconds: now,
             credential_not_before_unix_seconds: now.saturating_sub(60),
             credential_not_after_unix_seconds: now
@@ -1576,9 +1628,15 @@ impl CoreState {
         let device = match store.load_device(config.clone()) {
             Ok(device) => device,
             Err(finitechat_client::ClientStoreError::DeviceStateNotFound { .. }) => {
-                let device = FiniteChatDevice::new(config.clone()).map_err(client_error)?;
-                store.save_device_state(&device).map_err(store_error)?;
-                device
+                let (next_store, recovered_config) = recover_or_create_device_state(
+                    &data_dir,
+                    &account_secret,
+                    config,
+                    explicit_account_secret,
+                )?;
+                store = next_store;
+                config = recovered_config;
+                store.load_device(config.clone()).map_err(store_error)?
             }
             Err(error) => return Err(store_error(error)),
         };
@@ -3910,6 +3968,67 @@ mod tests {
             "startup sync failure must not hide the durable local transcript"
         );
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
+    }
+
+    #[test]
+    fn app_reopens_unique_local_device_when_requested_device_id_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let data_dir = dir.path().join("stable-app-store");
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "qt433".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let state = app
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Recovered".to_owned(),
+            })
+            .unwrap();
+        let room_id = state.rooms.first().unwrap().room_id.clone();
+        app.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "still here after stale config".to_owned(),
+        })
+        .unwrap();
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "codex-persist-check".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+
+        assert_eq!(local_snapshot.identity.device_id, "qt433");
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).display_name,
+            "Recovered"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "still here after stale config"),
+            "stale launch config must recover the durable local transcript before sync"
+        );
+
+        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(started.status, "offline");
+        assert!(
+            started
+                .messages
+                .iter()
+                .any(|message| message.text == "still here after stale config"),
+            "offline startup after stale config recovery must keep the transcript visible"
+        );
     }
 
     #[test]

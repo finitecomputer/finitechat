@@ -79,6 +79,35 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(persisted.deviceID, "persisted-device")
     }
 
+    func testLaunchAutomationOverridesDoNotRewritePersistedConfig() throws {
+        let url = try temporaryConfigURL()
+        try RuntimeConfig(
+            serverURL: "http://persisted.example",
+            deviceID: "persisted-device"
+        ).save(storageURL: url)
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: [
+                "FiniteChat",
+                "--finitechat-server",
+                "http://127.0.0.1:1",
+                "--finitechat-device",
+                "codex-persist-check",
+                "--finitechat-auto-send",
+                "probe",
+            ],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(loaded.deviceID, "codex-persist-check")
+
+        let persisted = try persistedConfig(at: url)
+        XCTAssertEqual(persisted.serverURL, "http://persisted.example")
+        XCTAssertEqual(persisted.deviceID, "persisted-device")
+    }
+
     func testFirstLaunchOverridesSeedPersistedConfigForRelaunch() throws {
         let url = try temporaryConfigURL()
 
@@ -212,14 +241,81 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
+    func testRuntimeDataStoreMigratesRequestedLegacyStoreToStableStore() throws {
+        let supportURL = try temporarySupportURL()
+        let legacyStoreURL = supportURL
+            .appendingPathComponent("FiniteChat", isDirectory: true)
+            .appendingPathComponent("qt433", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: legacyStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data("secret".utf8)
+            .write(to: legacyStoreURL.appendingPathComponent("account-secret.hex"))
+        try Data("sqlite".utf8)
+            .write(to: legacyStoreURL.appendingPathComponent("client.sqlite3"))
+
+        let dataDir = try RuntimeDataStore.dataDir(
+            deviceID: "qt433",
+            applicationSupportURL: supportURL
+        )
+        let migratedURL = URL(fileURLWithPath: dataDir)
+
+        XCTAssertEqual(migratedURL.lastPathComponent, "FiniteChatStore")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: migratedURL.appendingPathComponent("account-secret.hex").path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: migratedURL.appendingPathComponent("client.sqlite3")),
+            Data("sqlite".utf8)
+        )
+    }
+
+    func testRuntimeDataStoreKeepsExistingStableStore() throws {
+        let supportURL = try temporarySupportURL()
+        let stableStoreURL = supportURL.appendingPathComponent("FiniteChatStore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stableStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data("stable".utf8)
+            .write(to: stableStoreURL.appendingPathComponent("account-secret.hex"))
+
+        let legacyStoreURL = supportURL
+            .appendingPathComponent("FiniteChat", isDirectory: true)
+            .appendingPathComponent("qt433", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: legacyStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data("legacy".utf8)
+            .write(to: legacyStoreURL.appendingPathComponent("account-secret.hex"))
+
+        let dataDir = try RuntimeDataStore.dataDir(
+            deviceID: "qt433",
+            applicationSupportURL: supportURL
+        )
+        let selectedURL = URL(fileURLWithPath: dataDir)
+
+        XCTAssertEqual(selectedURL, stableStoreURL)
+        XCTAssertEqual(
+            try Data(contentsOf: stableStoreURL.appendingPathComponent("account-secret.hex")),
+            Data("stable".utf8)
+        )
+    }
+
     private func temporaryConfigURL() throws -> URL {
+        try temporarySupportURL().appendingPathComponent("finitechat_config.json")
+    }
+
+    private func temporarySupportURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true
         )
-        return directory.appendingPathComponent("finitechat_config.json")
+        return directory
     }
 
     private func persistedConfig(at url: URL) throws -> RuntimeConfig {

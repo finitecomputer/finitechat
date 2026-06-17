@@ -3109,6 +3109,28 @@ impl SqliteClientStore {
         Ok(FiniteChatDevice::from_state(config, state)?)
     }
 
+    pub fn load_device_ids_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<String>, ClientStoreError> {
+        validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)
+            .map_err(ClientError::from)?;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT device_id
+            FROM client_device_states
+            WHERE account_id = ?1
+            ORDER BY device_id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+        let mut device_ids = Vec::new();
+        for row in rows {
+            device_ids.push(row?);
+        }
+        Ok(device_ids)
+    }
+
     pub fn activate_welcome_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
@@ -7879,6 +7901,12 @@ mod tests {
 
         let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
         store.save_device_state(&device).unwrap();
+        assert_eq!(
+            store
+                .load_device_ids_for_account(&owner.account_id)
+                .unwrap(),
+            vec![device_id.to_owned()]
+        );
         let first = app_message(&owner, 1, "msg-1", "one");
         let second = app_message(&owner, 2, "msg-2", "two");
         store

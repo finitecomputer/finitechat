@@ -8,9 +8,6 @@ struct RuntimeConfig: Codable, Equatable {
 
     private static let defaultServerURL = "http://127.0.0.1:8787"
     private static let defaultDeviceID = "ios"
-    private static let dataRootDirectoryName = "FiniteChat"
-    private static let clientStoreFileName = "client.sqlite3"
-    private static let accountSecretFileName = "account-secret.hex"
     private static let transientConfigArgument = "--finitechat-transient-config"
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
 
@@ -56,12 +53,18 @@ struct RuntimeConfig: Codable, Equatable {
             deviceID: deviceID ?? fallback.deviceID
         )
         let hasLaunchOverride = serverURL != nil || deviceID != nil
+        let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
+        let launchAutomation = argumentFlag("--finitechat-auto-join", in: args)
+            || argumentFlag("--finitechat-auto-send", in: args)
+            || argumentFlag("--finitechat-room", in: args)
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
+            || hostedUnitTest
+            || launchAutomation
         // Runtime identity is product state. A phone launched from Xcode with a
         // LAN server or device id must reopen that same SQLite store after a
-        // manual force-close. Tests/debug harnesses can still opt into a
-        // process-local override with the transient flag.
+        // manual force-close. Tests and launch automations stay process-local
+        // so they cannot poison normal app relaunches.
         if !transientOverride && (persisted != config || hasLaunchOverride) {
             try? config.save(storageURL: storageURL)
         }
@@ -132,36 +135,7 @@ struct RuntimeConfig: Codable, Equatable {
             return []
         }
 
-        let dataRoot = supportURL.appendingPathComponent(dataRootDirectoryName, isDirectory: true)
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: dataRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        return entries.compactMap { entry in
-            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            guard isDirectory else { return nil }
-            guard deviceStoreIsRecoverable(entry) else { return nil }
-            let deviceID = entry.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
-            return deviceID.isEmpty ? nil : deviceID
-        }
-    }
-
-    private static func deviceStoreIsRecoverable(_ url: URL) -> Bool {
-        let accountSecret = url.appendingPathComponent(accountSecretFileName)
-        if FileManager.default.fileExists(atPath: accountSecret.path) {
-            return true
-        }
-
-        let clientStore = url.appendingPathComponent(clientStoreFileName)
-        guard FileManager.default.fileExists(atPath: clientStore.path) else {
-            return false
-        }
-        let size = (try? clientStore.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return size > 0
+        return RuntimeDataStore.recoverableLegacyDeviceStoreIDs(applicationSupportURL: supportURL)
     }
 
     enum ConfigError: Error {
@@ -205,6 +179,151 @@ struct RuntimeConfig: Codable, Equatable {
         }
         return !["0", "false", "no", "off"].contains(value)
     }
+}
+
+struct RuntimeDataStore {
+    private static let legacyDataRootDirectoryName = "FiniteChat"
+    private static let currentDataDirectoryName = "FiniteChatStore"
+    private static let clientStoreFileName = "client.sqlite3"
+    private static let accountSecretFileName = "account-secret.hex"
+
+    static func dataDir(
+        deviceID: String,
+        applicationSupportURL: URL? = nil
+    ) throws -> String {
+        let supportURL: URL
+        if let applicationSupportURL {
+            supportURL = applicationSupportURL
+        } else {
+            supportURL = try defaultApplicationSupportURL(create: true)
+        }
+        let currentStoreURL = supportURL.appendingPathComponent(
+            currentDataDirectoryName,
+            isDirectory: true
+        )
+        if !deviceStoreIsRecoverable(currentStoreURL) {
+            try migrateLegacyStoreIfNeeded(
+                to: currentStoreURL,
+                requestedDeviceID: deviceID,
+                applicationSupportURL: supportURL
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: currentStoreURL,
+            withIntermediateDirectories: true
+        )
+        return currentStoreURL.path
+    }
+
+    static func recoverableLegacyDeviceStoreIDs(applicationSupportURL: URL) -> [String] {
+        recoverableLegacyDeviceStores(applicationSupportURL: applicationSupportURL)
+            .map(\.deviceID)
+    }
+
+    private static func migrateLegacyStoreIfNeeded(
+        to currentStoreURL: URL,
+        requestedDeviceID: String,
+        applicationSupportURL: URL
+    ) throws {
+        let candidates = recoverableLegacyDeviceStores(applicationSupportURL: applicationSupportURL)
+        guard !candidates.isEmpty else { return }
+        let requestedID = safeDeviceDirectoryName(requestedDeviceID)
+        let selected = candidates.first { $0.deviceID == requestedID }
+            ?? candidates.sorted { lhs, rhs in
+                if lhs.modifiedAt == rhs.modifiedAt {
+                    return lhs.deviceID < rhs.deviceID
+                }
+                return lhs.modifiedAt > rhs.modifiedAt
+            }.first
+        guard let selected else { return }
+
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: currentStoreURL.path) {
+            try fileManager.removeItem(at: currentStoreURL)
+        }
+        try fileManager.copyItem(at: selected.url, to: currentStoreURL)
+    }
+
+    private static func recoverableLegacyDeviceStores(
+        applicationSupportURL: URL
+    ) -> [LegacyDeviceStore] {
+        let dataRoot = applicationSupportURL.appendingPathComponent(
+            legacyDataRootDirectoryName,
+            isDirectory: true
+        )
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: dataRoot,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return entries.compactMap { entry in
+            let values = try? entry.resourceValues(
+                forKeys: [.isDirectoryKey, .contentModificationDateKey]
+            )
+            guard values?.isDirectory == true else { return nil }
+            guard deviceStoreIsRecoverable(entry) else { return nil }
+            let deviceID = entry.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !deviceID.isEmpty else { return nil }
+            return LegacyDeviceStore(
+                deviceID: deviceID,
+                url: entry,
+                modifiedAt: latestModificationDate(for: entry)
+                    ?? values?.contentModificationDate
+                    ?? .distantPast
+            )
+        }
+    }
+
+    private static func deviceStoreIsRecoverable(_ url: URL) -> Bool {
+        let accountSecret = url.appendingPathComponent(accountSecretFileName)
+        if FileManager.default.fileExists(atPath: accountSecret.path) {
+            return true
+        }
+
+        let clientStore = url.appendingPathComponent(clientStoreFileName)
+        guard FileManager.default.fileExists(atPath: clientStore.path) else {
+            return false
+        }
+        let size = (try? clientStore.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return size > 0
+    }
+
+    private static func latestModificationDate(for storeURL: URL) -> Date? {
+        let candidates = [
+            storeURL,
+            storeURL.appendingPathComponent(accountSecretFileName),
+            storeURL.appendingPathComponent(clientStoreFileName),
+            storeURL.appendingPathComponent("\(clientStoreFileName)-wal"),
+            storeURL.appendingPathComponent("\(clientStoreFileName)-shm"),
+        ]
+        return candidates.compactMap { url in
+            try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        }.max()
+    }
+
+    private static func safeDeviceDirectoryName(_ deviceID: String) -> String {
+        deviceID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+    }
+
+    private static func defaultApplicationSupportURL(create: Bool) throws -> URL {
+        try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: create
+        )
+    }
+}
+
+private struct LegacyDeviceStore {
+    let deviceID: String
+    let url: URL
+    let modifiedAt: Date
 }
 
 @MainActor
@@ -508,7 +627,7 @@ final class AppModel: ObservableObject {
         if let runtime, openKey == key {
             return runtime
         }
-        let dataDir = try Self.dataDir(deviceID: deviceID)
+        let dataDir = try RuntimeDataStore.dataDir(deviceID: deviceID)
         let opened = try FiniteChatRuntime.open(
             options: OpenOptions(
                 dataDir: dataDir,
@@ -518,8 +637,13 @@ final class AppModel: ObservableObject {
                 nowUnixSeconds: nil
             )
         )
+        let openedState = try opened.state()
+        if openedState.identity.deviceId != deviceID {
+            deviceID = openedState.identity.deviceId
+            try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+        }
         runtime = opened
-        openKey = key
+        openKey = "\(serverURL)|\(deviceID)"
         return opened
     }
 
@@ -599,21 +723,6 @@ final class AppModel: ObservableObject {
         }
         outboundText = text
         errorText = "Launch automation timed out waiting for the room to connect"
-    }
-
-    private static func dataDir(deviceID: String) throws -> String {
-        let safeDeviceID = deviceID
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "/", with: "-")
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let dir = base.appendingPathComponent("FiniteChat/\(safeDeviceID)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.path
     }
 
     private static func argumentValue(_ name: String, in args: [String]) -> String? {
