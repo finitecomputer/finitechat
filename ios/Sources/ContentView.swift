@@ -1014,6 +1014,16 @@ private struct SettingsSheet: View {
                     if let notice = model.userNoticeText {
                         LabeledContent("Last Notice", value: notice)
                     }
+                    if let storePath = model.runtimeStorePath {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Client Store")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(storePath)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
                     if let errorText = model.developerErrorText {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Last Error")

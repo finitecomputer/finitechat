@@ -16,7 +16,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(persisted.deviceID, "ios")
     }
 
-    func testLaunchOverridesUseTransientStoreAndDoNotRewritePersistedConfigByDefault() throws {
+    func testLaunchOverridesPersistConfigByDefaultForManualRelaunch() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://persisted.example",
@@ -37,11 +37,11 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://args.example")
         XCTAssertEqual(loaded.deviceID, "transient-device")
-        XCTAssertTrue(loaded.usesTransientStore)
+        XCTAssertFalse(loaded.usesTransientStore)
 
         let persisted = try persistedConfig(at: url)
-        XCTAssertEqual(persisted.serverURL, "http://persisted.example")
-        XCTAssertEqual(persisted.deviceID, "persisted-device")
+        XCTAssertEqual(persisted.serverURL, "http://args.example")
+        XCTAssertEqual(persisted.deviceID, "transient-device")
         XCTAssertFalse(persisted.usesTransientStore)
 
         let relaunched = RuntimeConfig.load(
@@ -50,8 +50,8 @@ final class RuntimeConfigTests: XCTestCase {
             storageURL: url
         )
 
-        XCTAssertEqual(relaunched.serverURL, "http://persisted.example")
-        XCTAssertEqual(relaunched.deviceID, "persisted-device")
+        XCTAssertEqual(relaunched.serverURL, "http://args.example")
+        XCTAssertEqual(relaunched.deviceID, "transient-device")
         XCTAssertFalse(relaunched.usesTransientStore)
     }
 
@@ -288,7 +288,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(persisted.deviceID, "ios")
     }
 
-    func testFirstLaunchOverridesWithoutPersistDoNotSeedStableConfig() throws {
+    func testFirstLaunchOverridesSeedStableConfigForManualRelaunch() throws {
         let url = try temporaryConfigURL()
 
         let firstLaunch = RuntimeConfig.load(
@@ -305,8 +305,18 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(firstLaunch.serverURL, "http://192.168.1.226:8789")
         XCTAssertEqual(firstLaunch.deviceID, "qt433")
-        XCTAssertTrue(firstLaunch.usesTransientStore)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertFalse(firstLaunch.usesTransientStore)
+        XCTAssertEqual(try persistedConfig(at: url), firstLaunch)
+
+        let relaunched = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(relaunched.serverURL, "http://192.168.1.226:8789")
+        XCTAssertEqual(relaunched.deviceID, "qt433")
+        XCTAssertFalse(relaunched.usesTransientStore)
     }
 
     func testFirstLaunchOverridesWithPersistSeedPersistedConfigForRelaunch() throws {
@@ -594,6 +604,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(firstLaunch.chatProjections["room-main"]?.messages.map(\.text), [
             "saved before force close",
         ])
+        XCTAssertEqual(firstLaunch.runtimeStorePath, openedOptions[0].dataDir)
         XCTAssertEqual(firstLaunch.state?.status, "offline")
         XCTAssertEqual(firstLaunch.userNoticeText, "Showing saved chats. Connection will retry.")
         XCTAssertEqual(firstLaunch.developerRuntimeStatus, "offline")
@@ -629,6 +640,7 @@ final class AppModelPersistenceTests: XCTestCase {
             URL(fileURLWithPath: openedOptions[1].dataDir).lastPathComponent,
             "FiniteChatStore"
         )
+        XCTAssertEqual(relaunch.runtimeStorePath, openedOptions[1].dataDir)
         XCTAssertEqual(relaunch.rooms.map(\.roomId), ["room-main"])
         XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
         XCTAssertEqual(relaunch.state?.status, "offline")
@@ -697,7 +709,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.developerRuntimeStatus, "offline")
     }
 
-    func testDiagnosticLaunchOverridesUseTransientStoreAndStableRelaunchKeepsSavedIdentity() throws {
+    func testExplicitTransientDiagnosticLaunchKeepsStableRelaunchOnSavedIdentity() throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")
         try RuntimeConfig(
@@ -711,6 +723,7 @@ final class AppModelPersistenceTests: XCTestCase {
             "http://127.0.0.1:1",
             "--finitechat-device",
             "diagnostics-visual",
+            "--finitechat-transient-config",
         ]
         let diagnosticConfig = RuntimeConfig.load(
             environment: [:],
@@ -741,6 +754,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let diagnosticStore = URL(fileURLWithPath: openedOptions[0].dataDir)
         XCTAssertEqual(diagnosticStore.lastPathComponent, "diagnostics-visual")
         XCTAssertEqual(diagnosticStore.deletingLastPathComponent().lastPathComponent, "FiniteChatTransient")
+        XCTAssertEqual(diagnosticLaunch.runtimeStorePath, openedOptions[0].dataDir)
 
         let relaunchConfig = RuntimeConfig.load(
             environment: [:],
@@ -771,6 +785,7 @@ final class AppModelPersistenceTests: XCTestCase {
             URL(fileURLWithPath: openedOptions[1].dataDir).lastPathComponent,
             "FiniteChatStore"
         )
+        XCTAssertEqual(relaunch.runtimeStorePath, openedOptions[1].dataDir)
         XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
     }
 

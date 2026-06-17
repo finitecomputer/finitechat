@@ -79,15 +79,14 @@ struct RuntimeConfig: Codable, Equatable {
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
             || (hasLaunchAutomation && !persistLaunchOverride)
-            || (hasLaunchOverride && !persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
             usesTransientStore: transientOverride
         )
-        // Runtime identity is product state. Launch-provided server/device
-        // values are one-shot unless explicitly persisted, so diagnostics and
-        // automation cannot strand a home-screen relaunch on the wrong store.
+        // Runtime identity is product state. Ordinary server/device launch
+        // values persist so a Home Screen relaunch opens the same client store.
+        // Automation stays transient unless it explicitly opts into persistence.
         if !transientOverride
             && (
                 persisted.serverURL != config.serverURL
@@ -410,6 +409,7 @@ final class AppModel: ObservableObject {
     @Published var scanDraft: String = ""
     @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
+    @Published private(set) var runtimeStorePath: String?
 
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
@@ -847,6 +847,7 @@ final class AppModel: ObservableObject {
             applicationSupportURL: applicationSupportURL,
             transient: usesTransientStore
         )
+        runtimeStorePath = dataDir
         let opened = try runtimeFactory(
             OpenOptions(
                 dataDir: dataDir,
@@ -880,6 +881,7 @@ final class AppModel: ObservableObject {
         runtime = nil
         openKey = ""
         state = nil
+        runtimeStorePath = nil
     }
 
     private func rebuildChatProjections() {
