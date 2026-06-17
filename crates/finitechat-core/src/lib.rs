@@ -7,17 +7,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
-    RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppMessage,
-    StoredAppRoom, StoredAppRoomState, accept_pending_invite_joins, create_room_invite,
-    finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
+    RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent,
+    StoredAppMessage, StoredAppRoom, StoredAppRoomState, accept_pending_invite_joins,
+    create_room_invite, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
     run_runtime_sync_tick, submit_invite_join_request,
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    CreateRoomRequest, DeviceRef, DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest,
-    MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol, invite_current_pin, npub_decode, npub_encode,
+    ChatReactionV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind,
+    InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol,
+    invite_current_pin, npub_decode, npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -476,13 +477,15 @@ impl AppRuntimeState {
         let identity = core.identity();
         let owner = core.device.device_ref().clone();
         migrate_legacy_app_messages(&mut core, &owner)?;
-        let messages = core
+        let stored_messages = core
             .store
             .load_app_messages(&owner, MAX_APP_MESSAGES_U32)
-            .map_err(store_error)?
-            .into_iter()
-            .map(|message| chat_message_from_stored(message, &owner))
-            .collect::<Vec<_>>();
+            .map_err(store_error)?;
+        let stored_events = core
+            .store
+            .load_app_events(&owner, MAX_APP_MESSAGES_U32)
+            .map_err(store_error)?;
+        let messages = chat_messages_from_stored(stored_messages, stored_events, &owner);
         let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
         let known_room_ids = core.known_room_ids().into_iter().collect::<BTreeSet<_>>();
         let mut persisted_room_ids = BTreeSet::new();
@@ -1349,9 +1352,12 @@ impl CoreState {
             .device
             .generate_object_id("msg")
             .map_err(client_error)?;
+        let chat_payload = encode_text_message_payload(text)?;
+        let app_event_plaintext =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
         let request = self
             .device
-            .create_application_request(room_id, text.as_bytes(), idempotency_key)
+            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
             .map_err(|error| send_error(room_id, error))?;
         let sender = request.sender.clone();
         self.store
@@ -1373,10 +1379,13 @@ impl CoreState {
             accepted.seq,
             accepted.message_id,
             sender,
-            text.as_bytes().to_vec(),
+            app_event_plaintext,
             self.device.device_ref(),
-        );
-        self.persist_chat_messages(std::slice::from_ref(&message))?;
+        )
+        .ok_or_else(|| FiniteChatCoreError::Client {
+            reason: "sent chat message did not project as a transcript row".to_owned(),
+        })?;
+        self.persist_chat_messages_and_events(std::slice::from_ref(&message))?;
         let mut result = self.sync()?;
         result.messages.insert(0, message);
         Ok(result)
@@ -1422,7 +1431,7 @@ impl CoreState {
         Ok(result)
     }
 
-    fn persist_chat_messages(
+    fn persist_chat_messages_and_events(
         &mut self,
         messages: &[ChatMessage],
     ) -> Result<(), FiniteChatCoreError> {
@@ -1430,12 +1439,21 @@ impl CoreState {
             return Ok(());
         }
         let owner = self.device.device_ref().clone();
-        let stored = messages
+        let stored_messages = messages
             .iter()
             .map(stored_message_from_chat)
             .collect::<Vec<_>>();
+        let stored_events = messages
+            .iter()
+            .map(stored_event_from_chat)
+            .collect::<Vec<_>>();
         self.store
-            .save_app_messages(&owner, &stored, MAX_APP_MESSAGES_U32)
+            .save_app_messages_and_events(
+                &owner,
+                &stored_messages,
+                &stored_events,
+                MAX_APP_MESSAGES_U32,
+            )
             .map_err(store_error)
     }
 }
@@ -1458,16 +1476,14 @@ impl SyncResult {
                     .applied_entries
                     .into_iter()
                     .filter_map(|entry| match entry.entry {
-                        AppliedLogEntry::Application { plaintext, sender } => {
-                            Some(project_chat_message(
-                                entry.room_id,
-                                entry.seq,
-                                entry.message_id,
-                                sender,
-                                plaintext,
-                                owner,
-                            ))
-                        }
+                        AppliedLogEntry::Application { plaintext, sender } => project_chat_message(
+                            entry.room_id,
+                            entry.seq,
+                            entry.message_id,
+                            sender,
+                            plaintext,
+                            owner,
+                        ),
                         AppliedLogEntry::Commit { .. } => None,
                     }),
             );
@@ -1476,10 +1492,19 @@ impl SyncResult {
 
 #[cfg(test)]
 fn chat_display_text(plaintext: &[u8]) -> String {
-    if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(plaintext) {
-        return payload.text;
-    }
-    String::from_utf8_lossy(plaintext).into_owned()
+    chat_projection_payload_from_application_plaintext(plaintext)
+        .map(|payload| payload.text)
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DecodedAppEvent {
+    ChatMessage {
+        conversation_id: Option<String>,
+        payload: Vec<u8>,
+    },
+    ChatReaction(ChatReactionV1),
+    Ignored,
 }
 
 struct ChatProjectionPayload {
@@ -1498,11 +1523,11 @@ fn project_chat_message(
     sender: DeviceRef,
     plaintext: Vec<u8>,
     owner: &DeviceRef,
-) -> ChatMessage {
-    let projection = chat_projection_payload(&plaintext);
+) -> Option<ChatMessage> {
+    let projection = chat_projection_payload_from_application_plaintext(&plaintext)?;
     let is_mine = sender == *owner;
     let sender_npub = npub_encode(&sender.account_id).ok();
-    ChatMessage {
+    Some(ChatMessage {
         room_id,
         seq,
         message_id,
@@ -1525,11 +1550,29 @@ fn project_chat_message(
         media: projection.media,
         read_receipt: None,
         display_timestamp: String::new(),
+    })
+}
+
+fn chat_projection_payload_from_application_plaintext(
+    plaintext: &[u8],
+) -> Option<ChatProjectionPayload> {
+    match decode_application_event(plaintext) {
+        DecodedAppEvent::ChatMessage {
+            conversation_id,
+            payload,
+        } => {
+            let mut projection = chat_projection_payload(&payload);
+            if projection.conversation_id.is_none() {
+                projection.conversation_id = conversation_id;
+            }
+            Some(projection)
+        }
+        DecodedAppEvent::ChatReaction(_) | DecodedAppEvent::Ignored => None,
     }
 }
 
-fn chat_projection_payload(plaintext: &[u8]) -> ChatProjectionPayload {
-    if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(plaintext) {
+fn chat_projection_payload(payload_bytes: &[u8]) -> ChatProjectionPayload {
+    if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(payload_bytes) {
         return ChatProjectionPayload {
             display_content: payload.text.clone(),
             text: payload.text,
@@ -1544,7 +1587,7 @@ fn chat_projection_payload(plaintext: &[u8]) -> ChatProjectionPayload {
                 .collect(),
         };
     }
-    let text = String::from_utf8_lossy(plaintext).into_owned();
+    let text = String::from_utf8_lossy(payload_bytes).into_owned();
     ChatProjectionPayload {
         display_content: text.clone(),
         text,
@@ -1553,6 +1596,79 @@ fn chat_projection_payload(plaintext: &[u8]) -> ChatProjectionPayload {
         sender_name: None,
         media: Vec::new(),
     }
+}
+
+fn decode_application_event(plaintext: &[u8]) -> DecodedAppEvent {
+    match serde_json::from_slice::<DecryptedApplicationEventV1>(plaintext) {
+        Ok(event) => decoded_typed_application_event(event),
+        Err(_) => DecodedAppEvent::ChatMessage {
+            conversation_id: None,
+            payload: plaintext.to_vec(),
+        },
+    }
+}
+
+fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> DecodedAppEvent {
+    if event.validate_limits().is_err() {
+        return DecodedAppEvent::Ignored;
+    }
+    match event.kind {
+        DurableAppEventKind::ChatMessage => DecodedAppEvent::ChatMessage {
+            conversation_id: event.conversation_id,
+            payload: event.payload,
+        },
+        DurableAppEventKind::ChatReaction => {
+            serde_json::from_slice::<ChatReactionV1>(&event.payload)
+                .ok()
+                .filter(|reaction| reaction.validate_limits().is_ok())
+                .map(DecodedAppEvent::ChatReaction)
+                .unwrap_or(DecodedAppEvent::Ignored)
+        }
+        DurableAppEventKind::ConversationCreate
+        | DurableAppEventKind::ConversationUpdate
+        | DurableAppEventKind::ConversationArchive
+        | DurableAppEventKind::ConversationSegmentStart
+        | DurableAppEventKind::ChatEdit
+        | DurableAppEventKind::ChatReceipt
+        | DurableAppEventKind::RuntimeStateSnapshot
+        | DurableAppEventKind::RuntimeCommandRequest
+        | DurableAppEventKind::RuntimeCommandResult
+        | DurableAppEventKind::RuntimeCommandCancel
+        | DurableAppEventKind::StreamStart
+        | DurableAppEventKind::StreamFinish
+        | DurableAppEventKind::Namespaced { .. } => DecodedAppEvent::Ignored,
+    }
+}
+
+fn encode_text_message_payload(text: &str) -> Result<Vec<u8>, FiniteChatCoreError> {
+    HermesMessagePayloadV1 {
+        payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+        conversation_id: None,
+        text: text.to_owned(),
+        kind: finitechat_hermes::HermesSendKindV1::Message,
+        status: finitechat_hermes::HermesMessageStatusV1::Complete,
+        edit_of: None,
+        attachments: Vec::new(),
+        reply_to_message_id: None,
+        sender_name: None,
+        metadata: BTreeMap::new(),
+    }
+    .encode()
+    .map_err(client_error)
+}
+
+fn encode_application_event(
+    kind: DurableAppEventKind,
+    conversation_id: Option<String>,
+    payload: &[u8],
+) -> Result<Vec<u8>, FiniteChatCoreError> {
+    let event = DecryptedApplicationEventV1 {
+        kind,
+        conversation_id,
+        payload: payload.to_vec(),
+    };
+    event.validate_limits().map_err(client_error)?;
+    serde_json::to_vec(&event).map_err(client_error)
 }
 
 fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMediaAttachment {
@@ -1612,7 +1728,7 @@ fn sender_display_name(sender: &DeviceRef, payload_name: Option<&str>, is_mine: 
     )
 }
 
-fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> ChatMessage {
+fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Option<ChatMessage> {
     project_chat_message(
         message.room_id,
         message.seq,
@@ -1623,8 +1739,98 @@ fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Cha
     )
 }
 
+fn chat_messages_from_stored(
+    stored_messages: Vec<StoredAppMessage>,
+    stored_events: Vec<StoredAppEvent>,
+    owner: &DeviceRef,
+) -> Vec<ChatMessage> {
+    let mut by_key = BTreeMap::<(String, String), ChatMessage>::new();
+    for message in stored_messages {
+        if let Some(projected) = chat_message_from_stored(message, owner) {
+            by_key.insert(message_key(&projected), projected);
+        }
+    }
+    for event in stored_events {
+        apply_stored_app_event(&mut by_key, event, owner);
+    }
+    let mut messages = by_key.into_values().collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.seq
+            .cmp(&right.seq)
+            .then_with(|| left.room_id.cmp(&right.room_id))
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    messages
+}
+
+fn apply_stored_app_event(
+    messages: &mut BTreeMap<(String, String), ChatMessage>,
+    event: StoredAppEvent,
+    owner: &DeviceRef,
+) {
+    match decode_application_event(&event.plaintext) {
+        DecodedAppEvent::ChatMessage { .. } => {
+            if let Some(message) = project_chat_message(
+                event.room_id,
+                event.seq,
+                event.message_id,
+                event.sender,
+                event.plaintext,
+                owner,
+            ) {
+                messages.insert(message_key(&message), message);
+            }
+        }
+        DecodedAppEvent::ChatReaction(reaction) => {
+            apply_chat_reaction(messages, &event.room_id, &event.sender, owner, reaction);
+        }
+        DecodedAppEvent::Ignored => {}
+    }
+}
+
+fn apply_chat_reaction(
+    messages: &mut BTreeMap<(String, String), ChatMessage>,
+    room_id: &str,
+    sender: &DeviceRef,
+    owner: &DeviceRef,
+    reaction: ChatReactionV1,
+) {
+    let key = (room_id.to_owned(), reaction.target_message_id);
+    let Some(message) = messages.get_mut(&key) else {
+        return;
+    };
+    let emoji = reaction.emoji.trim().to_owned();
+    let Some(summary) = message
+        .reactions
+        .iter_mut()
+        .find(|summary| summary.emoji == emoji)
+    else {
+        message.reactions.push(ChatReactionSummary {
+            emoji,
+            count: 1,
+            reacted_by_me: sender == owner,
+        });
+        return;
+    };
+    summary.count = summary.count.saturating_add(1);
+    summary.reacted_by_me |= sender == owner;
+}
+
 fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
     StoredAppMessage {
+        room_id: message.room_id.clone(),
+        seq: message.seq,
+        message_id: message.message_id.clone(),
+        sender: DeviceRef {
+            account_id: message.sender_account_id.clone(),
+            device_id: message.sender_device_id.clone(),
+        },
+        plaintext: message.payload.clone(),
+    }
+}
+
+fn stored_event_from_chat(message: &ChatMessage) -> StoredAppEvent {
+    StoredAppEvent {
         room_id: message.room_id.clone(),
         seq: message.seq,
         message_id: message.message_id.clone(),
@@ -1990,7 +2196,99 @@ mod tests {
         .unwrap();
 
         assert_eq!(chat_display_text(&payload), "echo: hello from iOS");
+        let wrapped =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &payload).unwrap();
+        assert_eq!(chat_display_text(&wrapped), "echo: hello from iOS");
         assert_eq!(chat_display_text(b"plain hello"), "plain hello");
+    }
+
+    #[test]
+    fn chat_projection_ignores_reaction_app_events_as_messages() {
+        let reaction = ChatReactionV1 {
+            target_message_id: "message-1".to_owned(),
+            emoji: "+1".to_owned(),
+        };
+        let payload = serde_json::to_vec(&reaction).unwrap();
+        let event =
+            encode_application_event(DurableAppEventKind::ChatReaction, None, &payload).unwrap();
+        let sender = DeviceRef {
+            account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            device_id: "phone".to_owned(),
+        };
+        let owner = sender.clone();
+
+        assert_eq!(chat_display_text(&event), "");
+        assert!(
+            project_chat_message(
+                "room-main".to_owned(),
+                8,
+                "reaction-1".to_owned(),
+                sender,
+                event,
+                &owner,
+            )
+            .is_none(),
+            "typed reaction events must not become transcript rows"
+        );
+    }
+
+    #[test]
+    fn chat_projection_rebuilds_from_stored_app_events_without_message_cache() {
+        let owner = DeviceRef {
+            account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            device_id: "phone".to_owned(),
+        };
+        let peer = DeviceRef {
+            account_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+            device_id: "tablet".to_owned(),
+        };
+        let chat_payload = encode_text_message_payload("event sourced hello").unwrap();
+        let chat_event =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)
+                .unwrap();
+        let reaction = ChatReactionV1 {
+            target_message_id: "message-1".to_owned(),
+            emoji: "+1".to_owned(),
+        };
+        let reaction_payload = serde_json::to_vec(&reaction).unwrap();
+        let reaction_event =
+            encode_application_event(DurableAppEventKind::ChatReaction, None, &reaction_payload)
+                .unwrap();
+
+        let messages = chat_messages_from_stored(
+            Vec::new(),
+            vec![
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 1,
+                    message_id: "message-1".to_owned(),
+                    sender: owner.clone(),
+                    plaintext: chat_event,
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 2,
+                    message_id: "reaction-1".to_owned(),
+                    sender: peer,
+                    plaintext: reaction_event,
+                },
+            ],
+            &owner,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "event sourced hello");
+        assert_eq!(
+            messages[0].reactions,
+            vec![ChatReactionSummary {
+                emoji: "+1".to_owned(),
+                count: 1,
+                reacted_by_me: false,
+            }]
+        );
     }
 
     #[test]
@@ -2059,7 +2357,8 @@ mod tests {
             sender,
             payload,
             &owner,
-        );
+        )
+        .expect("hermes chat payload should project");
 
         assert_eq!(message.conversation_id.as_deref(), Some("topic-main"));
         assert_eq!(message.text, "photo from Hermes");

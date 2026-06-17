@@ -76,6 +76,7 @@ pub const MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT: u32 = 256;
 pub const MAX_INVITE_MAX_JOINS: u32 = 64;
 pub const MAX_INVITE_TTL_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const MAX_INVITE_DISPLAY_NAME_BYTES: u32 = 128;
+pub const MAX_CHAT_REACTION_EMOJI_BYTES: u32 = 32;
 pub const INVITE_PIN_PROOF_HEX_BYTES: u32 = 64;
 pub const INVITE_PIN_WINDOW_SECONDS: u64 = 30;
 pub const INVITE_TOKEN_BYTES: u32 = 16;
@@ -118,6 +119,7 @@ const _: () = {
     assert!(MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT > 0);
     assert!(MAX_INVITE_TTL_MILLIS > 0);
     assert!(MAX_INVITE_DISPLAY_NAME_BYTES > 0);
+    assert!(MAX_CHAT_REACTION_EMOJI_BYTES > 0);
     assert!(INVITE_PIN_PROOF_HEX_BYTES == 64);
     assert!(INVITE_PIN_WINDOW_SECONDS >= 10);
     assert!(INVITE_TOKEN_BYTES == 16);
@@ -404,6 +406,12 @@ pub struct DecryptedApplicationEventV1 {
     pub conversation_id: Option<ConversationId>,
     #[serde(with = "bytes_as_vec")]
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatReactionV1 {
+    pub target_message_id: MessageId,
+    pub emoji: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2186,6 +2194,24 @@ impl DecryptedApplicationEventV1 {
     }
 }
 
+impl ChatReactionV1 {
+    pub fn validate_limits(&self) -> Result<(), ProtocolLimitError> {
+        validate_bytes_non_empty(
+            "chat_reaction.target_message_id",
+            self.target_message_id.len(),
+        )?;
+        validate_string_bytes(
+            "chat_reaction.target_message_id",
+            &self.target_message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        let emoji = self.emoji.trim();
+        validate_bytes_non_empty("chat_reaction.emoji", emoji.len())?;
+        validate_string_bytes("chat_reaction.emoji", emoji, MAX_CHAT_REACTION_EMOJI_BYTES)?;
+        Ok(())
+    }
+}
+
 impl FiniteEnvelope {
     pub fn message_id(&self) -> Result<MessageId, serde_json::Error> {
         message_id_for_envelope(self)
@@ -2874,6 +2900,29 @@ mod tests {
                 field: "conversation_id".to_string()
             }
         );
+    }
+
+    #[test]
+    fn chat_reaction_rejects_empty_and_oversized_emoji() {
+        let empty = ChatReactionV1 {
+            target_message_id: "msg-1".to_owned(),
+            emoji: "  ".to_owned(),
+        };
+        assert_eq!(
+            empty.validate_limits().unwrap_err(),
+            ProtocolLimitError::BytesEmpty {
+                field: "chat_reaction.emoji".to_owned()
+            }
+        );
+
+        let oversized = ChatReactionV1 {
+            target_message_id: "msg-1".to_owned(),
+            emoji: "a".repeat(MAX_CHAT_REACTION_EMOJI_BYTES as usize + 1),
+        };
+        assert!(matches!(
+            oversized.validate_limits().unwrap_err(),
+            ProtocolLimitError::BytesTooLong { field, .. } if field == "chat_reaction.emoji"
+        ));
     }
 
     #[test]

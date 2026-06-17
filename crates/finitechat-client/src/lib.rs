@@ -70,6 +70,7 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
 const CLIENT_APP_MESSAGE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-message.v1";
+const CLIENT_APP_EVENT_AAD_DOMAIN: &[u8] = b"finitechat.client-app-event.v1";
 const CLIENT_APP_ROOM_AAD_DOMAIN: &[u8] = b"finitechat.client-app-room.v1";
 const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 8;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
@@ -95,6 +96,8 @@ const MAX_CLIENT_STATE_PLAINTEXT_BYTES: u32 = 32 * 1024 * 1024;
 const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
     MAX_CLIENT_STATE_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_MESSAGE_CIPHERTEXT_BYTES: u32 =
+    MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
+const MAX_APP_EVENT_CIPHERTEXT_BYTES: u32 =
     MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_ROOM_DISPLAY_NAME_BYTES: u32 = 256;
 const MAX_APP_ROOM_STATUS_BYTES: u32 = 512;
@@ -131,6 +134,7 @@ const _: () = {
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
     assert!(MAX_CLIENT_STATE_CIPHERTEXT_BYTES > MAX_CLIENT_STATE_PLAINTEXT_BYTES);
     assert!(MAX_APP_MESSAGE_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_APP_EVENT_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES > MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES);
     assert!(MAX_APP_ROOM_INVITE_URL_BYTES >= MAX_ROOM_SERVER_URL_BYTES);
     assert!(MAX_STORED_APP_MESSAGES > 0);
@@ -306,6 +310,33 @@ impl StoredAppMessage {
         self.sender.validate_limits().map_err(ClientError::from)?;
         validate_bytes_len(
             "app_message.plaintext",
+            self.plaintext.len(),
+            MAX_ENVELOPE_PAYLOAD_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAppEvent {
+    pub room_id: RoomId,
+    pub seq: u64,
+    pub message_id: MessageId,
+    pub sender: DeviceRef,
+    pub plaintext: Vec<u8>,
+}
+
+impl StoredAppEvent {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_room_id(&self.room_id)?;
+        validate_string_bytes(
+            "app_event.message_id",
+            &self.message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        self.sender.validate_limits().map_err(ClientError::from)?;
+        validate_bytes_len(
+            "app_event.plaintext",
             self.plaintext.len(),
             MAX_ENVELOPE_PAYLOAD_BYTES,
         )?;
@@ -2759,6 +2790,25 @@ impl SqliteClientStore {
         })
     }
 
+    pub fn save_device_state_and_app_messages_and_events(
+        &mut self,
+        device: &FiniteChatDevice,
+        messages: &[StoredAppMessage],
+        events: &[StoredAppEvent],
+    ) -> Result<(), ClientStoreError> {
+        let state = device.export_state()?;
+        let owner = state.device_ref.clone();
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_device_state_tx(tx, &state, &encryption_key)?;
+            save_app_messages_tx(tx, &encryption_key, &owner, messages)?;
+            save_app_events_tx(tx, &encryption_key, &owner, events)?;
+            prune_app_messages_tx(tx, &owner, MAX_STORED_APP_MESSAGES)?;
+            prune_app_events_tx(tx, &owner, MAX_STORED_APP_MESSAGES)?;
+            Ok(())
+        })
+    }
+
     pub fn load_app_messages(
         &self,
         owner: &DeviceRef,
@@ -2853,6 +2903,120 @@ impl SqliteClientStore {
         self.with_transaction(|tx| {
             save_app_messages_tx(tx, &encryption_key, owner, messages)?;
             prune_app_messages_tx(tx, owner, max_messages)
+        })
+    }
+
+    pub fn save_app_messages_and_events(
+        &mut self,
+        owner: &DeviceRef,
+        messages: &[StoredAppMessage],
+        events: &[StoredAppEvent],
+        max_items: u32,
+    ) -> Result<(), ClientStoreError> {
+        validate_app_message_limit(max_items)?;
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_app_messages_tx(tx, &encryption_key, owner, messages)?;
+            save_app_events_tx(tx, &encryption_key, owner, events)?;
+            prune_app_messages_tx(tx, owner, max_items)?;
+            prune_app_events_tx(tx, owner, max_items)
+        })
+    }
+
+    pub fn load_app_events(
+        &self,
+        owner: &DeviceRef,
+        limit: u32,
+    ) -> Result<Vec<StoredAppEvent>, ClientStoreError> {
+        validate_app_message_owner(owner)?;
+        validate_app_event_limit(limit)?;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT room_id, seq, message_id, sender_account_id, sender_device_id, nonce, ciphertext
+            FROM (
+              SELECT
+                rowid AS row_id,
+                room_id,
+                seq,
+                message_id,
+                sender_account_id,
+                sender_device_id,
+                nonce,
+                ciphertext
+              FROM client_app_events
+              WHERE account_id = ?1 AND device_id = ?2
+              ORDER BY rowid DESC
+              LIMIT ?3
+            )
+            ORDER BY row_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![&owner.account_id, &owner.device_id, i64::from(limit)],
+            |row| {
+                Ok((
+                    row.get::<_, RoomId>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, MessageId>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (
+                room_id,
+                stored_seq,
+                message_id,
+                sender_account_id,
+                sender_device_id,
+                nonce,
+                ciphertext,
+            ) = row?;
+            let seq = sqlite_app_event_seq_to_u64(stored_seq)?;
+            let sender = DeviceRef {
+                account_id: sender_account_id,
+                device_id: sender_device_id,
+            };
+            let plaintext = decrypt_app_event_plaintext(
+                &self.options.encryption_key,
+                AppMessageIdentity {
+                    owner,
+                    room_id: &room_id,
+                    seq,
+                    message_id: &message_id,
+                    sender: &sender,
+                },
+                &nonce,
+                &ciphertext,
+            )?;
+            let event = StoredAppEvent {
+                room_id,
+                seq,
+                message_id,
+                sender,
+                plaintext,
+            };
+            event.validate_limits()?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    pub fn save_app_events(
+        &mut self,
+        owner: &DeviceRef,
+        events: &[StoredAppEvent],
+        max_events: u32,
+    ) -> Result<(), ClientStoreError> {
+        validate_app_event_limit(max_events)?;
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_app_events_tx(tx, &encryption_key, owner, events)?;
+            prune_app_events_tx(tx, owner, max_events)
         })
     }
 
@@ -3075,7 +3239,11 @@ impl SqliteClientStore {
             stored_app_message_from_applied(room_id, entry.seq, &entry.message_id, &applied)
                 .into_iter()
                 .collect::<Vec<_>>();
-        self.save_device_state_and_app_messages(device, &app_messages)?;
+        let app_events =
+            stored_app_event_from_applied(room_id, entry.seq, &entry.message_id, &applied)
+                .into_iter()
+                .collect::<Vec<_>>();
+        self.save_device_state_and_app_messages_and_events(device, &app_messages, &app_events)?;
         Ok(Some(applied))
     }
 
@@ -3100,7 +3268,19 @@ impl SqliteClientStore {
                 })
                 .into_iter()
                 .collect::<Vec<_>>();
-            self.save_device_state_and_app_messages(device, &app_messages)?;
+            let app_events = applied
+                .as_ref()
+                .and_then(|applied_entry| {
+                    stored_app_event_from_applied(
+                        room_id,
+                        entry.seq,
+                        &entry.message_id,
+                        applied_entry,
+                    )
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.save_device_state_and_app_messages_and_events(device, &app_messages, &app_events)?;
         }
         Ok(applied)
     }
@@ -3172,6 +3352,24 @@ fn stored_app_message_from_applied(
         return None;
     };
     Some(StoredAppMessage {
+        room_id: room_id.to_owned(),
+        seq,
+        message_id: message_id.to_owned(),
+        sender: sender.clone(),
+        plaintext: plaintext.clone(),
+    })
+}
+
+fn stored_app_event_from_applied(
+    room_id: &str,
+    seq: u64,
+    message_id: &str,
+    applied: &AppliedLogEntry,
+) -> Option<StoredAppEvent> {
+    let AppliedLogEntry::Application { plaintext, sender } = applied else {
+        return None;
+    };
+    Some(StoredAppEvent {
         room_id: room_id.to_owned(),
         seq,
         message_id: message_id.to_owned(),
@@ -4469,6 +4667,7 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
 
         let mut dirty = false;
         let mut app_messages = Vec::new();
+        let mut app_events = Vec::new();
         for entry in page.entries {
             let seq = entry.seq;
             if entry.message_id == prepared.message_id {
@@ -4496,6 +4695,11 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
                 {
                     app_messages.push(message);
                 }
+                if let Some(event) =
+                    stored_app_event_from_applied(room_id, seq, &entry.message_id, &applied)
+                {
+                    app_events.push(event);
+                }
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.to_string(),
                     seq,
@@ -4514,7 +4718,11 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
             dirty = true;
         }
         if dirty {
-            store.save_device_state_and_app_messages(device, &app_messages)?;
+            store.save_device_state_and_app_messages_and_events(
+                device,
+                &app_messages,
+                &app_events,
+            )?;
         }
         if !page.has_more {
             break;
@@ -4561,6 +4769,7 @@ fn sync_room_pages<D: RuntimeDelivery>(
 
         let mut dirty = false;
         let mut app_messages = Vec::new();
+        let mut app_events = Vec::new();
         for entry in page.entries {
             let seq = entry.seq;
             let message_id = entry.message_id.clone();
@@ -4571,6 +4780,11 @@ fn sync_room_pages<D: RuntimeDelivery>(
                     stored_app_message_from_applied(&room_id, seq, &message_id, &applied)
                 {
                     app_messages.push(message);
+                }
+                if let Some(event) =
+                    stored_app_event_from_applied(&room_id, seq, &message_id, &applied)
+                {
+                    app_events.push(event);
                 }
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.clone(),
@@ -4590,7 +4804,11 @@ fn sync_room_pages<D: RuntimeDelivery>(
             dirty = true;
         }
         if dirty {
-            store.save_device_state_and_app_messages(device, &app_messages)?;
+            store.save_device_state_and_app_messages_and_events(
+                device,
+                &app_messages,
+                &app_events,
+            )?;
         }
 
         if !page.has_more {
@@ -4703,6 +4921,18 @@ pub enum ClientStoreError {
     NegativeStoredAppMessageSeq { seq: i64 },
     #[error("stored app message count cannot be represented in sqlite")]
     StoredAppMessageCountOverflow,
+    #[error("stored app event seq {seq} cannot be represented in sqlite")]
+    StoredAppEventSeqOutOfRange { seq: u64 },
+    #[error("stored app event seq is negative: {seq}")]
+    NegativeStoredAppEventSeq { seq: i64 },
+    #[error("stored app event count cannot be represented in sqlite")]
+    StoredAppEventCountOverflow,
+    #[error("failed to encrypt stored app event")]
+    EncryptAppEvent,
+    #[error("failed to decrypt stored app event")]
+    DecryptAppEvent,
+    #[error("stored app event nonce has {actual_bytes} bytes")]
+    InvalidAppEventNonceLength { actual_bytes: usize },
     #[error("encrypted app room nonce has {actual_bytes} bytes")]
     InvalidAppRoomNonceLength { actual_bytes: usize },
     #[error("failed to encrypt app room metadata")]
@@ -5365,6 +5595,28 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
         CREATE INDEX IF NOT EXISTS client_app_messages_owner_idx
           ON client_app_messages(account_id, device_id);
 
+        CREATE TABLE IF NOT EXISTS client_app_events (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          message_id TEXT NOT NULL,
+          sender_account_id TEXT NOT NULL,
+          sender_device_id TEXT NOT NULL,
+          nonce BLOB NOT NULL,
+          ciphertext BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id, room_id, message_id),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_device_states(account_id, device_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS client_app_events_owner_room_seq_idx
+          ON client_app_events(account_id, device_id, room_id, seq);
+
+        CREATE INDEX IF NOT EXISTS client_app_events_owner_idx
+          ON client_app_events(account_id, device_id);
+
         CREATE TABLE IF NOT EXISTS client_app_rooms (
           account_id TEXT NOT NULL,
           device_id TEXT NOT NULL,
@@ -5632,6 +5884,10 @@ fn validate_app_message_limit(limit: u32) -> Result<(), ClientStoreError> {
     })
 }
 
+fn validate_app_event_limit(limit: u32) -> Result<(), ClientStoreError> {
+    validate_app_message_limit(limit)
+}
+
 fn validate_optional_app_room_url(
     field: &'static str,
     value: &Option<String>,
@@ -5650,6 +5906,14 @@ fn sqlite_seq_from_u64(seq: u64) -> Result<i64, ClientStoreError> {
 
 fn sqlite_seq_to_u64(seq: i64) -> Result<u64, ClientStoreError> {
     u64::try_from(seq).map_err(|_| ClientStoreError::NegativeStoredAppMessageSeq { seq })
+}
+
+fn sqlite_app_event_seq_from_u64(seq: u64) -> Result<i64, ClientStoreError> {
+    i64::try_from(seq).map_err(|_| ClientStoreError::StoredAppEventSeqOutOfRange { seq })
+}
+
+fn sqlite_app_event_seq_to_u64(seq: i64) -> Result<u64, ClientStoreError> {
+    u64::try_from(seq).map_err(|_| ClientStoreError::NegativeStoredAppEventSeq { seq })
 }
 
 fn save_app_messages_tx(
@@ -5691,6 +5955,52 @@ fn save_app_messages_tx(
             &message.message_id,
             &message.sender.account_id,
             &message.sender.device_id,
+            &sealed.nonce,
+            &sealed.ciphertext,
+        ])?;
+    }
+    Ok(())
+}
+
+fn save_app_events_tx(
+    tx: &Transaction<'_>,
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    events: &[StoredAppEvent],
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO client_app_events (
+          account_id,
+          device_id,
+          room_id,
+          seq,
+          message_id,
+          sender_account_id,
+          sender_device_id,
+          nonce,
+          ciphertext
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(account_id, device_id, room_id, message_id) DO UPDATE SET
+          seq = excluded.seq,
+          sender_account_id = excluded.sender_account_id,
+          sender_device_id = excluded.sender_device_id,
+          nonce = excluded.nonce,
+          ciphertext = excluded.ciphertext
+        "#,
+    )?;
+    for event in events {
+        event.validate_limits()?;
+        let sealed = encrypt_app_event_plaintext(encryption_key, owner, event)?;
+        stmt.execute(params![
+            &owner.account_id,
+            &owner.device_id,
+            &event.room_id,
+            sqlite_app_event_seq_from_u64(event.seq)?,
+            &event.message_id,
+            &event.sender.account_id,
+            &event.sender.device_id,
             &sealed.nonce,
             &sealed.ciphertext,
         ])?;
@@ -5771,6 +6081,43 @@ fn prune_app_messages_tx(
     Ok(())
 }
 
+fn prune_app_events_tx(
+    tx: &Transaction<'_>,
+    owner: &DeviceRef,
+    max_events: u32,
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    validate_app_event_limit(max_events)?;
+    let count = tx.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM client_app_events
+        WHERE account_id = ?1 AND device_id = ?2
+        "#,
+        params![&owner.account_id, &owner.device_id],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let excess = count.saturating_sub(u64::from(max_events));
+    if excess == 0 {
+        return Ok(());
+    }
+    let limit = i64::try_from(excess).map_err(|_| ClientStoreError::StoredAppEventCountOverflow)?;
+    tx.execute(
+        r#"
+        DELETE FROM client_app_events
+        WHERE rowid IN (
+          SELECT rowid
+          FROM client_app_events
+          WHERE account_id = ?1 AND device_id = ?2
+          ORDER BY rowid ASC
+          LIMIT ?3
+        )
+        "#,
+        params![&owner.account_id, &owner.device_id, limit],
+    )?;
+    Ok(())
+}
+
 fn load_device_state(
     conn: &Connection,
     encryption_key: &ClientStoreEncryptionKey,
@@ -5812,6 +6159,12 @@ struct SealedClientState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SealedAppMessage {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedAppEvent {
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
 }
@@ -5910,6 +6263,48 @@ fn encrypt_app_message_plaintext(
     )
     .map_err(ClientError::from)?;
     Ok(SealedAppMessage {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
+fn encrypt_app_event_plaintext(
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    event: &StoredAppEvent,
+) -> Result<SealedAppEvent, ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    event.validate_limits()?;
+    let identity = AppMessageIdentity {
+        owner,
+        room_id: &event.room_id,
+        seq: event.seq,
+        message_id: &event.message_id,
+        sender: &event.sender,
+    };
+    let aad = app_event_aad(identity)?;
+    let provider = OpenMlsRustCrypto::default();
+    let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider
+        .rand()
+        .random_array()
+        .map_err(|_| ClientStoreError::Randomness)?;
+    let ciphertext = provider
+        .crypto()
+        .aead_encrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            &event.plaintext,
+            &nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::EncryptAppEvent)?;
+    validate_bytes_len(
+        "app_event.ciphertext",
+        ciphertext.len(),
+        MAX_APP_EVENT_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(SealedAppEvent {
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -6043,6 +6438,46 @@ fn decrypt_app_message_plaintext(
     Ok(plaintext)
 }
 
+fn decrypt_app_event_plaintext(
+    encryption_key: &ClientStoreEncryptionKey,
+    identity: AppMessageIdentity<'_>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, ClientStoreError> {
+    if nonce.len() != CLIENT_STORE_NONCE_BYTES {
+        return Err(ClientStoreError::InvalidAppEventNonceLength {
+            actual_bytes: nonce.len(),
+        });
+    }
+    validate_bytes_non_empty("app_event.ciphertext", ciphertext.len())
+        .map_err(ClientError::from)?;
+    validate_bytes_len(
+        "app_event.ciphertext",
+        ciphertext.len(),
+        MAX_APP_EVENT_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_event_aad(identity)?;
+    let provider = OpenMlsRustCrypto::default();
+    let plaintext = provider
+        .crypto()
+        .aead_decrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            ciphertext,
+            nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::DecryptAppEvent)?;
+    validate_bytes_len(
+        "app_event.plaintext",
+        plaintext.len(),
+        MAX_ENVELOPE_PAYLOAD_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(plaintext)
+}
+
 fn decrypt_app_room_metadata(
     encryption_key: &ClientStoreEncryptionKey,
     identity: AppRoomIdentity<'_>,
@@ -6122,20 +6557,36 @@ fn client_store_aad(account_id: &str, device_id: &str) -> Result<Vec<u8>, Client
 }
 
 fn app_message_aad(identity: AppMessageIdentity<'_>) -> Result<Vec<u8>, ClientStoreError> {
+    app_event_or_message_aad(
+        CLIENT_APP_MESSAGE_AAD_DOMAIN,
+        "app_message.message_id",
+        identity,
+    )
+}
+
+fn app_event_aad(identity: AppMessageIdentity<'_>) -> Result<Vec<u8>, ClientStoreError> {
+    app_event_or_message_aad(
+        CLIENT_APP_EVENT_AAD_DOMAIN,
+        "app_event.message_id",
+        identity,
+    )
+}
+
+fn app_event_or_message_aad(
+    domain: &[u8],
+    message_id_field: &'static str,
+    identity: AppMessageIdentity<'_>,
+) -> Result<Vec<u8>, ClientStoreError> {
     validate_app_message_owner(identity.owner)?;
     validate_room_id(identity.room_id).map_err(ClientError::from)?;
-    validate_string_bytes(
-        "app_message.message_id",
-        identity.message_id,
-        MAX_OBJECT_ID_BYTES,
-    )
-    .map_err(ClientError::from)?;
+    validate_string_bytes(message_id_field, identity.message_id, MAX_OBJECT_ID_BYTES)
+        .map_err(ClientError::from)?;
     identity
         .sender
         .validate_limits()
         .map_err(ClientError::from)?;
     let mut aad = Vec::with_capacity(
-        CLIENT_APP_MESSAGE_AAD_DOMAIN.len()
+        domain.len()
             + U32_BYTES
             + identity.owner.account_id.len()
             + U32_BYTES
@@ -6150,7 +6601,7 @@ fn app_message_aad(identity: AppMessageIdentity<'_>) -> Result<Vec<u8>, ClientSt
             + U32_BYTES
             + identity.sender.device_id.len(),
     );
-    aad.extend_from_slice(CLIENT_APP_MESSAGE_AAD_DOMAIN);
+    aad.extend_from_slice(domain);
     append_raw_len_prefixed(&mut aad, identity.owner.account_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.owner.device_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.room_id.as_bytes())?;
@@ -7470,6 +7921,64 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_client_store_persists_app_events_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([6; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: secret.clone(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(60),
+        };
+        let device = FiniteChatDevice::new(config).unwrap();
+        let owner = device.device_ref().clone();
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+
+        let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+        store.save_device_state(&device).unwrap();
+        let first = app_event(&owner, 1, "event-1", "one");
+        let second = app_event(&owner, 2, "event-2", "two");
+        store
+            .save_app_events(&owner, &[first.clone(), second.clone()], 10)
+            .unwrap();
+        assert_eq!(
+            store.load_app_events(&owner, 10).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        drop(store);
+
+        let mut reopened = SqliteClientStore::open(&db_path, options).unwrap();
+        assert_eq!(
+            reopened.load_app_events(&owner, 10).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+
+        let replacement = StoredAppEvent {
+            plaintext: b"one-edited".to_vec(),
+            ..first.clone()
+        };
+        reopened
+            .save_app_events(&owner, std::slice::from_ref(&replacement), 10)
+            .unwrap();
+        assert_eq!(
+            reopened.load_app_events(&owner, 10).unwrap(),
+            vec![replacement, second.clone()]
+        );
+
+        let third = app_event(&owner, 3, "event-3", "three");
+        reopened
+            .save_app_events(&owner, std::slice::from_ref(&third), 2)
+            .unwrap();
+        assert_eq!(
+            reopened.load_app_events(&owner, 10).unwrap(),
+            vec![second, third]
+        );
+    }
+
+    #[test]
     fn sqlite_client_store_persists_app_rooms_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let secret = NostrSecretKey::from_bytes([8; NOSTR_SECRET_KEY_BYTES]).unwrap();
@@ -7611,6 +8120,7 @@ mod tests {
                 plaintext: b"legacy-message".to_vec(),
             }]
         );
+        assert_eq!(store.load_app_events(&owner, 10).unwrap(), Vec::new());
     }
 
     fn app_message(
@@ -7620,6 +8130,21 @@ mod tests {
         plaintext: &str,
     ) -> StoredAppMessage {
         StoredAppMessage {
+            room_id: "room-store".to_owned(),
+            seq,
+            message_id: message_id.to_owned(),
+            sender: sender.clone(),
+            plaintext: plaintext.as_bytes().to_vec(),
+        }
+    }
+
+    fn app_event(
+        sender: &DeviceRef,
+        seq: u64,
+        message_id: &str,
+        plaintext: &str,
+    ) -> StoredAppEvent {
+        StoredAppEvent {
             room_id: "room-store".to_owned(),
             seq,
             message_id: message_id.to_owned(),
