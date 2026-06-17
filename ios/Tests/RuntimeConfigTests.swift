@@ -757,6 +757,32 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    func testInjectedApplicationSupportKeepsRuntimeIdentityConfigLocal() throws {
+        let supportURL = try temporarySupportURL()
+        let localConfigURL = supportURL.appendingPathComponent("finitechat_config.json")
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: supportURL,
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        XCTAssertEqual(try persistedConfig(at: localConfigURL).serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(try persistedConfig(at: localConfigURL).deviceID, "qt433")
+    }
+
     func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -929,6 +955,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.rooms.map(\.roomId), ["room-main"])
         XCTAssertEqual(model.selectedRoom?.state, .needsAttention)
         XCTAssertEqual(model.selectedRoom?.status, "room is not available on this device")
+        XCTAssertEqual(model.selectedRoom?.userStatusText, "Read-only on this device")
         XCTAssertEqual(model.selectedRoomMessages.map(\.text), ["saved before force close"])
         XCTAssertEqual(model.chatProjections["room-main"]?.messages.map(\.text), [
             "saved before force close",
@@ -1117,6 +1144,7 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Main Room",
             state: roomState,
             status: roomStatus,
+            userStatusText: roomUserStatusText(state: roomState, status: roomStatus),
             lastMessagePreview: "saved before force close",
             unreadCount: 0,
             canLoadOlder: false
@@ -1186,6 +1214,27 @@ final class AppModelPersistenceTests: XCTestCase {
             devices: [],
             typingMembers: []
         )
+    }
+
+    private func roomUserStatusText(state: AppRoomState, status: String) -> String {
+        switch state {
+        case .connected:
+            return "Connected"
+        case .waitingForApproval:
+            if status.localizedCaseInsensitiveContains("pin") {
+                return "Enter the invite PIN"
+            }
+            return "Waiting for approval"
+        case .joining:
+            return "Joining"
+        case .needsAttention:
+            if status == "room is not available on this device" {
+                return "Read-only on this device"
+            }
+            return "Needs attention"
+        case .offline:
+            return "Offline"
+        }
     }
 
     private func temporarySupportURL() throws -> URL {

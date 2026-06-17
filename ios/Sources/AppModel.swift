@@ -459,6 +459,7 @@ final class AppModel: ObservableObject {
         persistsRuntimeIdentityUpdates = config.persistsRuntimeIdentityUpdates
         self.applicationSupportURL = applicationSupportURL
         self.configStorageURL = configStorageURL
+            ?? applicationSupportURL?.appendingPathComponent("finitechat_config.json")
         self.args = args
         self.runtimeFactory = runtimeFactory
         self.startsUpdateLoop = startsUpdateLoop

@@ -494,9 +494,7 @@ private struct RoomThreadView: View {
                 }
             } else {
                 transcriptView(room: room) {
-                    RoomUnavailableComposerBar(room: room) {
-                        model.retry(room)
-                    }
+                    ReadOnlyComposerBar(room: room)
                 }
             }
         }
@@ -1383,13 +1381,12 @@ private struct NeedsAttentionView: View {
     }
 }
 
-private struct RoomUnavailableComposerBar: View {
+private struct ReadOnlyComposerBar: View {
     let room: AppRoomSummary
-    let retry: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
+            Image(systemName: "lock")
                 .font(.body.weight(.semibold))
                 .foregroundStyle(.secondary)
 
@@ -1398,16 +1395,6 @@ private struct RoomUnavailableComposerBar: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                retry()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 36, height: 36)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityLabel("Retry")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -1809,26 +1796,6 @@ private extension AppRoomState {
             .red
         case .offline:
             .gray
-        }
-    }
-}
-
-private extension AppRoomSummary {
-    var userStatusText: String {
-        switch state {
-        case .connected:
-            return "Connected"
-        case .waitingForApproval:
-            if status.localizedCaseInsensitiveContains("PIN") {
-                return "Enter the invite PIN"
-            }
-            return "Waiting for approval"
-        case .joining:
-            return "Joining"
-        case .needsAttention:
-            return "Needs attention"
-        case .offline:
-            return "Offline"
         }
     }
 }
