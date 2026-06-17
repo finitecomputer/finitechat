@@ -81,11 +81,15 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                     row: row,
                     messagesById: coordinator.parent.messagesById,
                     messageFrameRegistry: coordinator.messageFrameRegistry,
+                    highlightedMessageID: coordinator.highlightedMessageID,
                     onReact: coordinator.parent.onReact,
                     onDownloadAttachment: coordinator.parent.onDownloadAttachment,
                     onOpenAttachment: coordinator.parent.onOpenAttachment,
                     onVotePoll: coordinator.parent.onVotePoll,
                     onRetryMessage: coordinator.parent.onRetryMessage,
+                    onJumpToMessage: { messageID in
+                        coordinator.jumpToMessage(messageID)
+                    },
                     onLongPressMessage: coordinator.parent.onLongPressMessage
                 )
             }
@@ -203,6 +207,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         var pendingViewportAnchor: ScrollAnchor?
         let messageFrameRegistry = ChatMessageFrameRegistry()
         private var lastLongPressFocus: (messageID: String, time: TimeInterval)?
+        private(set) var highlightedMessageID: String?
 
         init(parent: ChatTranscriptView) {
             self.parent = parent
@@ -426,6 +431,33 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
             parent.onLongPressMessage(message, hit.frame)
         }
 
+        func jumpToMessage(_ messageID: String) {
+            guard let collectionView,
+                  let dataSource,
+                  let rowItemID = rowID(containingMessageID: messageID),
+                  let indexPath = dataSource.indexPath(for: rowItemID)
+            else { return }
+
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            let previousHighlightedRowID = highlightedMessageID.flatMap {
+                rowID(containingMessageID: $0)
+            }
+            highlightedMessageID = messageID
+            var rowsToReconfigure: Set<String> = [rowItemID]
+            if let previousHighlightedRowID {
+                rowsToReconfigure.insert(previousHighlightedRowID)
+            }
+            reconfigureItemIDs(rowsToReconfigure)
+            collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: true)
+            viewController?.setJumpButtonVisible(!isNearBottom(), animated: true)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { [weak self] in
+                guard let self, self.highlightedMessageID == messageID else { return }
+                self.highlightedMessageID = nil
+                self.reconfigureItemIDs([rowItemID])
+            }
+        }
+
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
             if !isNearTop(scrollView) {
                 requestedOldestId = nil
@@ -454,6 +486,21 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
             return collectionView.indexPathsForVisibleItems
                 .sorted(by: indexPathSort)
                 .compactMap { dataSource.itemIdentifier(for: $0) }
+        }
+
+        private func rowID(containingMessageID messageID: String) -> String? {
+            let rows = currentIDs.compactMap { rowsByID[$0] }
+            return ChatTimeline.rowID(containingMessageID: messageID, rows: rows)
+        }
+
+        private func reconfigureItemIDs(_ itemIDs: Set<String>) {
+            guard let dataSource else { return }
+            let existing = itemIDs.filter { currentIDs.contains($0) }
+            guard !existing.isEmpty else { return }
+
+            var snapshot = dataSource.snapshot()
+            snapshot.reconfigureItems(Array(existing))
+            dataSource.apply(snapshot, animatingDifferences: false)
         }
 
         private func applyInitialScrollPosition(_ position: SavedChatTranscriptPosition) {

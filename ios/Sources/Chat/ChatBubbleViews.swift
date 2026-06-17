@@ -13,11 +13,13 @@ struct ChatTimelineRowView: View {
     let row: ChatTimelineRow
     let messagesById: [String: ChatMessage]
     let messageFrameRegistry: ChatMessageFrameRegistry?
+    let highlightedMessageID: String?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onRetryMessage: (ChatMessage) -> Void
+    let onJumpToMessage: (String) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     var body: some View {
@@ -27,11 +29,13 @@ struct ChatTimelineRowView: View {
                 group: group,
                 messagesById: messagesById,
                 messageFrameRegistry: messageFrameRegistry,
+                highlightedMessageID: highlightedMessageID,
                 onReact: onReact,
                 onDownloadAttachment: onDownloadAttachment,
                 onOpenAttachment: onOpenAttachment,
                 onVotePoll: onVotePoll,
                 onRetryMessage: onRetryMessage,
+                onJumpToMessage: onJumpToMessage,
                 onLongPressMessage: onLongPressMessage
             )
                 .padding(.horizontal, 12)
@@ -54,11 +58,13 @@ struct FocusedChatMessageCard: View {
             replyTarget: replyTarget,
             position: .single,
             messageFrameRegistry: nil,
+            isHighlighted: false,
             onReact: { _, _ in },
             onDownloadAttachment: { _, _ in },
             onOpenAttachment: { _, _ in },
             onVotePoll: { _, _ in },
             onRetryMessage: { _ in },
+            onJumpToMessage: { _ in },
             onLongPressMessage: nil
         )
         .allowsHitTesting(false)
@@ -69,11 +75,13 @@ private struct ChatMessageGroupRow: View {
     let group: ChatTimelineMessageGroup
     let messagesById: [String: ChatMessage]
     let messageFrameRegistry: ChatMessageFrameRegistry?
+    let highlightedMessageID: String?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onRetryMessage: (ChatMessage) -> Void
+    let onJumpToMessage: (String) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     private let avatarSize: CGFloat = 28
@@ -109,11 +117,13 @@ private struct ChatMessageGroupRow: View {
                     messages: group.messages,
                     messagesById: messagesById,
                     messageFrameRegistry: messageFrameRegistry,
+                    highlightedMessageID: highlightedMessageID,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
                     onRetryMessage: onRetryMessage,
+                    onJumpToMessage: onJumpToMessage,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .leading
                 )
@@ -133,11 +143,13 @@ private struct ChatMessageGroupRow: View {
                     messages: group.messages,
                     messagesById: messagesById,
                     messageFrameRegistry: messageFrameRegistry,
+                    highlightedMessageID: highlightedMessageID,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
                     onRetryMessage: onRetryMessage,
+                    onJumpToMessage: onJumpToMessage,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
@@ -166,11 +178,13 @@ private struct ChatBubbleStack: View {
     let messages: [ChatMessage]
     let messagesById: [String: ChatMessage]
     let messageFrameRegistry: ChatMessageFrameRegistry?
+    let highlightedMessageID: String?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onRetryMessage: (ChatMessage) -> Void
+    let onJumpToMessage: (String) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let alignment: HorizontalAlignment
 
@@ -182,11 +196,13 @@ private struct ChatBubbleStack: View {
                     replyTarget: replyTarget(for: message),
                     position: bubblePosition(at: index, count: messages.count),
                     messageFrameRegistry: messageFrameRegistry,
+                    isHighlighted: highlightedMessageID == message.messageId,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
                     onVotePoll: onVotePoll,
                     onRetryMessage: onRetryMessage,
+                    onJumpToMessage: onJumpToMessage,
                     onLongPressMessage: onLongPressMessage
                 )
             }
@@ -211,11 +227,13 @@ private struct ChatMessageBubble: View {
     let replyTarget: ChatMessage?
     let position: ChatBubblePosition
     let messageFrameRegistry: ChatMessageFrameRegistry?
+    let isHighlighted: Bool
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onRetryMessage: (ChatMessage) -> Void
+    let onJumpToMessage: (String) -> Void
     let onLongPressMessage: ((ChatMessage, CGRect) -> Void)?
 
     @State private var isPressed = false
@@ -245,7 +263,12 @@ private struct ChatMessageBubble: View {
         VStack(alignment: message.isMine ? .trailing : .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 if message.replyToMessageId != nil {
-                    ReplyPreview(message: message, target: replyTarget, isMine: message.isMine)
+                    ReplyPreview(
+                        message: message,
+                        target: replyTarget,
+                        isMine: message.isMine,
+                        onJumpToMessage: onJumpToMessage
+                    )
                         .padding(.horizontal, 8)
                         .padding(.top, 8)
                 }
@@ -297,6 +320,14 @@ private struct ChatMessageBubble: View {
             .frame(maxWidth: 326, alignment: message.isMine ? .trailing : .leading)
             .background(bubbleColor)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                if isHighlighted {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(Color.yellow.opacity(0.95), lineWidth: 2)
+                        .shadow(color: .yellow.opacity(0.38), radius: 9)
+                        .allowsHitTesting(false)
+                }
+            }
             .background(
                 GeometryReader { proxy in
                     let frame = proxy.frame(in: .global)
@@ -312,6 +343,7 @@ private struct ChatMessageBubble: View {
             .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .scaleEffect(isPressed ? 0.97 : 1)
             .animation(.spring(response: 0.24, dampingFraction: 0.76), value: isPressed)
+            .animation(.easeInOut(duration: 0.18), value: isHighlighted)
             .onLongPressGesture(minimumDuration: 0.3, maximumDistance: 44) {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 onLongPressMessage?(message, frameRef.frame)
@@ -568,8 +600,25 @@ private struct ReplyPreview: View {
     let message: ChatMessage
     let target: ChatMessage?
     let isMine: Bool
+    let onJumpToMessage: (String) -> Void
 
     var body: some View {
+        Group {
+            if let replyToMessageID = message.replyToMessageId, target != nil {
+                Button {
+                    onJumpToMessage(replyToMessageID)
+                } label: {
+                    content
+                }
+                .buttonStyle(.plain)
+            } else {
+                content
+            }
+        }
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var content: some View {
         HStack(spacing: 8) {
             Capsule()
                 .fill(isMine ? .white.opacity(0.72) : Color.accentColor)
@@ -583,8 +632,12 @@ private struct ReplyPreview: View {
                 Text(replySnippet)
                     .font(.caption)
                     .foregroundStyle(isMine ? .white.opacity(0.78) : .secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
             }
+
+            Spacer(minLength: 0)
+
+            mediaThumbnail
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 6)
@@ -613,6 +666,52 @@ private struct ReplyPreview: View {
             return mediaLabel(for: firstMedia.kind)
         }
         return "Message"
+    }
+
+    private var firstVisualMedia: ChatMediaAttachment? {
+        target?.media.first { $0.kind == .image || $0.kind == .video }
+    }
+
+    @ViewBuilder
+    private var mediaThumbnail: some View {
+        if let media = firstVisualMedia {
+            let size: CGFloat = 34
+            Group {
+                if media.kind == .image,
+                   let path = attachmentLocalURL(media)?.path {
+                    VerifiedLocalImageView(path: path) {
+                        replyMediaPlaceholder(media)
+                    }
+                } else if media.kind == .video,
+                          let path = attachmentLocalURL(media)?.path {
+                    LocalVideoThumbnailView(path: path) {
+                        replyMediaPlaceholder(media)
+                    }
+                } else {
+                    replyMediaPlaceholder(media)
+                }
+            }
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func replyMediaPlaceholder(_ media: ChatMediaAttachment) -> some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(isMine ? .white.opacity(0.18) : Color(uiColor: .systemGroupedBackground))
+            .overlay {
+                Image(systemName: iconName(for: media.kind))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(isMine ? .white.opacity(0.82) : .secondary)
+            }
+    }
+
+    private var accessibilityLabel: String {
+        if target == nil {
+            return "Reply preview, original message unavailable"
+        }
+        return "Reply preview, jump to original message"
     }
 }
 

@@ -50,6 +50,15 @@ enum ChatTimelineRow: Identifiable, Equatable {
             nil
         }
     }
+
+    func containsMessage(_ messageID: String) -> Bool {
+        switch self {
+        case .messageGroup(let group):
+            group.messages.contains { $0.messageId == messageID }
+        case .typing:
+            false
+        }
+    }
 }
 
 enum ChatTimeline {
@@ -82,6 +91,15 @@ enum ChatTimeline {
 
     static func messagesById(_ messages: [ChatMessage]) -> [String: ChatMessage] {
         Dictionary(uniqueKeysWithValues: messages.map { ($0.messageId, $0) })
+    }
+
+    static func rowID(containingMessageID messageID: String, rows: [ChatTimelineRow]) -> String? {
+        for row in rows {
+            if row.containsMessage(messageID) {
+                return row.id
+            }
+        }
+        return nil
     }
 
     private static func orderedMessages(_ messages: [ChatMessage]) -> [ChatMessage] {

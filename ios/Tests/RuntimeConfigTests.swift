@@ -591,6 +591,49 @@ final class ChatTimelineTypingTests: XCTestCase {
         XCTAssertEqual(row.id, "typing-indicator")
         XCTAssertNil(row.oldestMessageID)
     }
+
+    func testGroupedMessageRowCanBeFoundByAnyContainedMessageID() {
+        let first = chatMessage(id: "message-1", seq: 1, text: "first")
+        let second = chatMessage(id: "message-2", seq: 2, text: "second")
+
+        let rows = ChatTimeline.rows(messages: [first, second])
+
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(
+            ChatTimeline.rowID(containingMessageID: "message-1", rows: rows),
+            "group-message-1"
+        )
+        XCTAssertEqual(
+            ChatTimeline.rowID(containingMessageID: "message-2", rows: rows),
+            "group-message-1"
+        )
+        XCTAssertNil(ChatTimeline.rowID(containingMessageID: "missing-message", rows: rows))
+    }
+
+    private func chatMessage(id: String, seq: UInt64, text: String) -> ChatMessage {
+        ChatMessage(
+            roomId: "room-main",
+            seq: seq,
+            messageId: id,
+            conversationId: nil,
+            senderAccountId: "alice-account",
+            senderDeviceId: "alice-ios",
+            senderDisplayName: "Alice",
+            senderNpub: nil,
+            text: text,
+            displayContent: text,
+            payload: Data(text.utf8),
+            replyToMessageId: nil,
+            isMine: false,
+            delivery: .sent,
+            reactions: [],
+            media: [],
+            readReceipt: nil,
+            poll: nil,
+            timestampUnixSeconds: 1_700_000_000 + seq,
+            displayTimestamp: "now"
+        )
+    }
 }
 
 @MainActor
