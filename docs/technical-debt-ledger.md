@@ -32,6 +32,12 @@ finitecomputer integration shortcut without adding or updating a row here.
 | Ephemeral activity has no read route | `/activities` appends to the server cache; no HTTP route serves the cache to other members yet | Typing/working indicators are sent (encrypted, exporter-keyed) but peers cannot fetch them over HTTP | The payloads are disposable and epoch-pinned; nothing corrupts | Add an activities read route (or fold hints into /sync/wait responses) when a client renders presence |
 | Hermes `stop_typing` lacks thread metadata | Hermes base adapter API calls `stop_typing(chat_id)` without the metadata passed to `send_typing` | Topic-scoped activity can be harder to clear exactly when several conversations in one room are active | The Finite Chat plugin records the last room/topic activity route, refreshes every 30s, expires activity after 60s, and tests clear the simple topic case | Hermes passes thread metadata or an activity handle to `stop_typing`, or Finite Chat bridge returns an activity handle that the adapter can clear exactly |
 
+## Client Projection Debt
+
+| Debt | Observed Source | Why It Is Risky | First Proof | Delete Condition |
+| --- | --- | --- | --- | --- |
+| In-memory-only app runtime projections | `AppRuntimeState` still keeps pending invites, owned invite watches, profile cache, revoked-device marks, and any future offline-send intent outside the encrypted client SQLite projection | Force-closing at the wrong moment can lose non-MLS product state even though the room log and device state are durable | `client_app_rooms` and `client_app_messages` now rebuild room labels and transcripts before startup sync; `app_start_runtime_returns_durable_chat_when_delivery_is_offline` covers force-close reopen with HTTP offline | Store-backed Rust projections exist for pending invite state, profile cache freshness, revoked-device local marks, and the offline outbox; Swift renders those projections without owning persistence |
+
 ## Review Rule
 
 Before each finitecomputer integration checkpoint, review this ledger and answer:

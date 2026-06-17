@@ -145,9 +145,17 @@ final class AppModel: ObservableObject {
 
     func start() {
         runLaunchAutomationIfRequested()
-        run {
+        do {
             let runtime = try currentRuntime()
-            self.state = try runtime.dispatch(action: .startRuntime)
+            state = try runtime.state()
+            do {
+                state = try runtime.dispatch(action: .startRuntime)
+                errorText = nil
+            } catch {
+                errorText = String(describing: error)
+            }
+        } catch {
+            errorText = String(describing: error)
         }
         startUpdateLoop()
     }

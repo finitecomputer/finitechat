@@ -55,8 +55,8 @@ use openmls::prelude::{
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -70,6 +70,7 @@ pub const FINITECHAT_CIPHERSUITE: Ciphersuite =
 const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.v1";
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
 const CLIENT_APP_MESSAGE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-message.v1";
+const CLIENT_APP_ROOM_AAD_DOMAIN: &[u8] = b"finitechat.client-app-room.v1";
 const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 8;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
@@ -95,6 +96,10 @@ const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
     MAX_CLIENT_STATE_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_MESSAGE_CIPHERTEXT_BYTES: u32 =
     MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
+const MAX_APP_ROOM_DISPLAY_NAME_BYTES: u32 = 256;
+const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 1024;
+const MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES: u32 =
+    MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_STORED_APP_MESSAGES: u32 = 5_000;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
@@ -124,6 +129,7 @@ const _: () = {
     assert!(MAX_OPENMLS_STORAGE_VALUE_BYTES > MAX_OPENMLS_STORAGE_KEY_BYTES);
     assert!(MAX_CLIENT_STATE_CIPHERTEXT_BYTES > MAX_CLIENT_STATE_PLAINTEXT_BYTES);
     assert!(MAX_APP_MESSAGE_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
+    assert!(MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES > MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES);
     assert!(MAX_STORED_APP_MESSAGES > 0);
 };
 
@@ -302,6 +308,30 @@ impl StoredAppMessage {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAppRoom {
+    pub room_id: RoomId,
+    pub display_name: String,
+}
+
+impl StoredAppRoom {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_room_id(&self.room_id)?;
+        validate_string_bytes(
+            "app_room.display_name",
+            &self.display_name,
+            MAX_APP_ROOM_DISPLAY_NAME_BYTES,
+        )?;
+        validate_bytes_non_empty("app_room.display_name", self.display_name.len())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredAppRoomMetadataV1 {
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2794,6 +2824,72 @@ impl SqliteClientStore {
         })
     }
 
+    pub fn load_app_rooms(
+        &self,
+        owner: &DeviceRef,
+    ) -> Result<Vec<StoredAppRoom>, ClientStoreError> {
+        validate_app_message_owner(owner)?;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT room_id, nonce, ciphertext
+            FROM client_app_rooms
+            WHERE account_id = ?1 AND device_id = ?2
+            ORDER BY room_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![&owner.account_id, &owner.device_id], |row| {
+            Ok((
+                row.get::<_, RoomId>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut rooms = Vec::new();
+        for row in rows {
+            let (room_id, nonce, ciphertext) = row?;
+            validate_room_id(&room_id).map_err(ClientError::from)?;
+            let metadata = decrypt_app_room_metadata(
+                &self.options.encryption_key,
+                AppRoomIdentity {
+                    owner,
+                    room_id: &room_id,
+                },
+                &nonce,
+                &ciphertext,
+            )?;
+            let room = StoredAppRoom {
+                room_id,
+                display_name: metadata.display_name,
+            };
+            room.validate_limits()?;
+            rooms.push(room);
+        }
+        Ok(rooms)
+    }
+
+    pub fn save_app_rooms(
+        &mut self,
+        owner: &DeviceRef,
+        rooms: &[StoredAppRoom],
+    ) -> Result<(), ClientStoreError> {
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| save_app_rooms_tx(tx, &encryption_key, owner, rooms))
+    }
+
+    pub fn save_device_state_and_app_rooms(
+        &mut self,
+        device: &FiniteChatDevice,
+        rooms: &[StoredAppRoom],
+    ) -> Result<(), ClientStoreError> {
+        let state = device.export_state()?;
+        let owner = state.device_ref.clone();
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_device_state_tx(tx, &state, &encryption_key)?;
+            save_app_rooms_tx(tx, &encryption_key, &owner, rooms)
+        })
+    }
+
     pub fn load_device(
         &self,
         config: FiniteChatDeviceConfig,
@@ -4571,6 +4667,16 @@ pub enum ClientStoreError {
     NegativeStoredAppMessageSeq { seq: i64 },
     #[error("stored app message count cannot be represented in sqlite")]
     StoredAppMessageCountOverflow,
+    #[error("encrypted app room nonce has {actual_bytes} bytes")]
+    InvalidAppRoomNonceLength { actual_bytes: usize },
+    #[error("failed to encrypt app room metadata")]
+    EncryptAppRoom,
+    #[error("failed to decrypt app room metadata")]
+    DecryptAppRoom,
+    #[error("failed to encode app room metadata")]
+    EncodeAppRoomMetadata,
+    #[error("failed to decode app room metadata")]
+    DecodeAppRoomMetadata,
 }
 
 #[derive(Debug, Error)]
@@ -5222,6 +5328,21 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
 
         CREATE INDEX IF NOT EXISTS client_app_messages_owner_idx
           ON client_app_messages(account_id, device_id);
+
+        CREATE TABLE IF NOT EXISTS client_app_rooms (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          nonce BLOB NOT NULL,
+          ciphertext BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id, room_id),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_device_states(account_id, device_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS client_app_rooms_owner_idx
+          ON client_app_rooms(account_id, device_id);
         "#,
     )?;
     Ok(())
@@ -5529,6 +5650,41 @@ fn save_app_messages_tx(
     Ok(())
 }
 
+fn save_app_rooms_tx(
+    tx: &Transaction<'_>,
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    rooms: &[StoredAppRoom],
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO client_app_rooms (
+          account_id,
+          device_id,
+          room_id,
+          nonce,
+          ciphertext
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(account_id, device_id, room_id) DO UPDATE SET
+          nonce = excluded.nonce,
+          ciphertext = excluded.ciphertext
+        "#,
+    )?;
+    for room in rooms {
+        room.validate_limits()?;
+        let sealed = encrypt_app_room_metadata(encryption_key, owner, room)?;
+        stmt.execute(params![
+            &owner.account_id,
+            &owner.device_id,
+            &room.room_id,
+            &sealed.nonce,
+            &sealed.ciphertext,
+        ])?;
+    }
+    Ok(())
+}
+
 fn prune_app_messages_tx(
     tx: &Transaction<'_>,
     owner: &DeviceRef,
@@ -5612,6 +5768,12 @@ struct SealedAppMessage {
     ciphertext: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedAppRoom {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 struct AppMessageIdentity<'a> {
     owner: &'a DeviceRef,
@@ -5619,6 +5781,12 @@ struct AppMessageIdentity<'a> {
     seq: u64,
     message_id: &'a str,
     sender: &'a DeviceRef,
+}
+
+#[derive(Clone, Copy)]
+struct AppRoomIdentity<'a> {
+    owner: &'a DeviceRef,
+    room_id: &'a str,
 }
 
 fn encrypt_device_state(
@@ -5699,6 +5867,55 @@ fn encrypt_app_message_plaintext(
     })
 }
 
+fn encrypt_app_room_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    room: &StoredAppRoom,
+) -> Result<SealedAppRoom, ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    room.validate_limits()?;
+    let metadata = StoredAppRoomMetadataV1 {
+        display_name: room.display_name.clone(),
+    };
+    let plaintext =
+        serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppRoomMetadata)?;
+    validate_bytes_len(
+        "app_room.metadata",
+        plaintext.len(),
+        MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_room_aad(AppRoomIdentity {
+        owner,
+        room_id: &room.room_id,
+    })?;
+    let provider = OpenMlsRustCrypto::default();
+    let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider
+        .rand()
+        .random_array()
+        .map_err(|_| ClientStoreError::Randomness)?;
+    let ciphertext = provider
+        .crypto()
+        .aead_encrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            &plaintext,
+            &nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::EncryptAppRoom)?;
+    validate_bytes_len(
+        "app_room.ciphertext",
+        ciphertext.len(),
+        MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(SealedAppRoom {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
 fn decrypt_device_state(
     encryption_key: &ClientStoreEncryptionKey,
     account_id: &str,
@@ -5774,6 +5991,55 @@ fn decrypt_app_message_plaintext(
     Ok(plaintext)
 }
 
+fn decrypt_app_room_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    identity: AppRoomIdentity<'_>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<StoredAppRoomMetadataV1, ClientStoreError> {
+    if nonce.len() != CLIENT_STORE_NONCE_BYTES {
+        return Err(ClientStoreError::InvalidAppRoomNonceLength {
+            actual_bytes: nonce.len(),
+        });
+    }
+    validate_bytes_non_empty("app_room.ciphertext", ciphertext.len()).map_err(ClientError::from)?;
+    validate_bytes_len(
+        "app_room.ciphertext",
+        ciphertext.len(),
+        MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_room_aad(identity)?;
+    let provider = OpenMlsRustCrypto::default();
+    let plaintext = provider
+        .crypto()
+        .aead_decrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            ciphertext,
+            nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::DecryptAppRoom)?;
+    validate_bytes_len(
+        "app_room.metadata",
+        plaintext.len(),
+        MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let metadata = serde_json::from_slice::<StoredAppRoomMetadataV1>(&plaintext)
+        .map_err(|_| ClientStoreError::DecodeAppRoomMetadata)?;
+    validate_string_bytes(
+        "app_room.display_name",
+        &metadata.display_name,
+        MAX_APP_ROOM_DISPLAY_NAME_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    validate_bytes_non_empty("app_room.display_name", metadata.display_name.len())
+        .map_err(ClientError::from)?;
+    Ok(metadata)
+}
+
 fn client_store_aad(account_id: &str, device_id: &str) -> Result<Vec<u8>, ClientStoreError> {
     validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)
         .map_err(ClientError::from)?;
@@ -5832,6 +6098,25 @@ fn app_message_aad(identity: AppMessageIdentity<'_>) -> Result<Vec<u8>, ClientSt
     append_raw_len_prefixed(&mut aad, identity.message_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.sender.account_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.sender.device_id.as_bytes())?;
+    Ok(aad)
+}
+
+fn app_room_aad(identity: AppRoomIdentity<'_>) -> Result<Vec<u8>, ClientStoreError> {
+    validate_app_message_owner(identity.owner)?;
+    validate_room_id(identity.room_id).map_err(ClientError::from)?;
+    let mut aad = Vec::with_capacity(
+        CLIENT_APP_ROOM_AAD_DOMAIN.len()
+            + U32_BYTES
+            + identity.owner.account_id.len()
+            + U32_BYTES
+            + identity.owner.device_id.len()
+            + U32_BYTES
+            + identity.room_id.len(),
+    );
+    aad.extend_from_slice(CLIENT_APP_ROOM_AAD_DOMAIN);
+    append_raw_len_prefixed(&mut aad, identity.owner.account_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.owner.device_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.room_id.as_bytes())?;
     Ok(aad)
 }
 
@@ -7121,6 +7406,61 @@ mod tests {
         assert_eq!(
             reopened.load_app_messages(&owner, 10).unwrap(),
             vec![second, third]
+        );
+    }
+
+    #[test]
+    fn sqlite_client_store_persists_app_rooms_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([8; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: secret.clone(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(60),
+        };
+        let device = FiniteChatDevice::new(config).unwrap();
+        let owner = device.device_ref().clone();
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+
+        let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+        store.save_device_state(&device).unwrap();
+        let first = StoredAppRoom {
+            room_id: "room-main".to_owned(),
+            display_name: "Main Room".to_owned(),
+        };
+        let second = StoredAppRoom {
+            room_id: "room-side".to_owned(),
+            display_name: "Side Room".to_owned(),
+        };
+        store
+            .save_app_rooms(&owner, &[second.clone(), first.clone()])
+            .unwrap();
+        assert_eq!(
+            store.load_app_rooms(&owner).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        drop(store);
+
+        let mut reopened = SqliteClientStore::open(&db_path, options).unwrap();
+        assert_eq!(
+            reopened.load_app_rooms(&owner).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+
+        let renamed = StoredAppRoom {
+            display_name: "Renamed Room".to_owned(),
+            ..first
+        };
+        reopened
+            .save_app_rooms(&owner, std::slice::from_ref(&renamed))
+            .unwrap();
+        assert_eq!(
+            reopened.load_app_rooms(&owner).unwrap(),
+            vec![renamed, second]
         );
     }
 

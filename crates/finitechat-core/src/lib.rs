@@ -8,16 +8,16 @@ use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
     RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppMessage,
-    accept_pending_invite_joins, create_room_invite, finalize_invited_room,
+    StoredAppRoom, accept_pending_invite_joins, create_room_invite, finalize_invited_room,
     generate_account_secret, run_room_server_sync_tick, run_runtime_sync_tick,
     submit_invite_join_request,
 };
-use finitechat_hermes::HermesMessagePayloadV1;
+use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     CreateRoomRequest, DeviceRef, DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest,
-    RoomProtocol, invite_current_pin, npub_decode, npub_encode,
+    MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol, invite_current_pin, npub_decode, npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -101,14 +101,83 @@ pub struct AcceptInvitesResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatReactionSummary {
+    pub emoji: String,
+    pub count: u32,
+    pub reacted_by_me: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatReadReceiptSummary {
+    pub delivered_count: u32,
+    pub read_count: u32,
+    pub display_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum ChatMediaKind {
+    Image,
+    VoiceNote,
+    Video,
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatMediaAttachment {
+    pub attachment_id: String,
+    pub url: Option<String>,
+    pub mime_type: String,
+    pub filename: String,
+    pub kind: ChatMediaKind,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub local_path: Option<String>,
+    /// Integer progress in 0..=1000. Kept integral so the FFI-visible
+    /// projection stays Eq/Hash-friendly and deterministic across platforms.
+    pub upload_progress_per_mille: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum MessageDeliveryState {
+    Pending,
+    #[default]
+    Sent,
+    Failed {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct ChatMessage {
     pub room_id: String,
     pub seq: u64,
     pub message_id: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub sender_account_id: String,
     pub sender_device_id: String,
+    #[serde(default)]
+    pub sender_display_name: String,
+    #[serde(default)]
+    pub sender_npub: Option<String>,
     pub text: String,
+    #[serde(default)]
+    pub display_content: String,
     pub payload: Vec<u8>,
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default)]
+    pub is_mine: bool,
+    #[serde(default)]
+    pub delivery: MessageDeliveryState,
+    #[serde(default)]
+    pub reactions: Vec<ChatReactionSummary>,
+    #[serde(default)]
+    pub media: Vec<ChatMediaAttachment>,
+    #[serde(default)]
+    pub read_receipt: Option<ChatReadReceiptSummary>,
+    #[serde(default)]
+    pub display_timestamp: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -412,13 +481,23 @@ impl AppRuntimeState {
             .load_app_messages(&owner, MAX_APP_MESSAGES_U32)
             .map_err(store_error)?
             .into_iter()
-            .map(chat_message_from_stored)
+            .map(|message| chat_message_from_stored(message, &owner))
             .collect::<Vec<_>>();
+        let room_metadata = core
+            .store
+            .load_app_rooms(&owner)
+            .map_err(store_error)?
+            .into_iter()
+            .map(|room| (room.room_id, room.display_name))
+            .collect::<BTreeMap<_, _>>();
         let mut rooms = core
             .known_room_ids()
             .into_iter()
             .map(|room_id| AppRoomSummary {
-                display_name: room_id.clone(),
+                display_name: room_metadata
+                    .get(&room_id)
+                    .cloned()
+                    .unwrap_or_else(|| room_id.clone()),
                 room_id,
                 state: AppRoomState::Connected,
                 status: "connected".to_owned(),
@@ -453,7 +532,7 @@ impl AppRuntimeState {
     fn dispatch(&mut self, action: AppAction) -> Result<(), FiniteChatCoreError> {
         self.app.toast = None;
         match action {
-            AppAction::StartRuntime => self.runtime_tick()?,
+            AppAction::StartRuntime => self.start_runtime()?,
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
             AppAction::OpenRoom { room_id } => self.open_room(room_id),
             AppAction::CreateRoom { display_name } => self.create_room(display_name)?,
@@ -473,6 +552,18 @@ impl AppRuntimeState {
         }
         self.bump_rev();
         Ok(())
+    }
+
+    fn start_runtime(&mut self) -> Result<(), FiniteChatCoreError> {
+        match self.runtime_tick() {
+            Ok(()) => Ok(()),
+            Err(FiniteChatCoreError::Delivery { .. }) => {
+                self.app.status = "offline".to_owned();
+                self.app.toast = Some("Showing saved chats. Connection will retry.".to_owned());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn wait_plan(&self, timeout_millis: u64) -> AppRuntimeWaitPlan {
@@ -567,6 +658,13 @@ impl AppRuntimeState {
 
     fn create_room(&mut self, display_name: String) -> Result<(), FiniteChatCoreError> {
         let label = display_name.trim();
+        if label.len() > MAX_INVITE_DISPLAY_NAME_BYTES as usize {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!(
+                    "room display name must be at most {MAX_INVITE_DISPLAY_NAME_BYTES} bytes"
+                ),
+            });
+        }
         let room_id = self.core.generate_object_id("room")?;
         let display_name = if label.is_empty() {
             room_id.clone()
@@ -640,20 +738,26 @@ impl AppRuntimeState {
             return Ok(());
         }
         let code = parse_invite(trimmed)?;
+        let room_id = code.room_id.clone();
+        let display_name = code
+            .display_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| room_id.clone());
         self.app.active_profile_id = None;
         self.pending_invites.insert(
-            code.room_id.clone(),
+            room_id.clone(),
             PendingInvite {
                 invite_url: trimmed.to_owned(),
             },
         );
         self.upsert_room(
-            &code.room_id,
-            &code.room_id,
+            &room_id,
+            &display_name,
             AppRoomState::WaitingForApproval,
             "enter PIN to request admission",
         );
-        self.app.selected_room_id = Some(code.room_id);
+        self.app.selected_room_id = Some(room_id);
         self.app.status = "invite scanned".to_owned();
         Ok(())
     }
@@ -729,6 +833,11 @@ impl AppRuntimeState {
         let Some(pending) = self.pending_invites.get(room_id).cloned() else {
             return Ok(());
         };
+        let display_name = parse_invite(&pending.invite_url)
+            .ok()
+            .and_then(|code| code.display_name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| room_id.to_owned());
         if let Some(room) = self.room_mut(room_id) {
             room.state = AppRoomState::Joining;
             room.status = "joining".to_owned();
@@ -736,7 +845,7 @@ impl AppRuntimeState {
         self.core.sync()?;
         self.core.finalize_invite(&pending.invite_url)?;
         self.pending_invites.remove(room_id);
-        self.upsert_room(room_id, room_id, AppRoomState::Connected, "connected");
+        self.upsert_room(room_id, &display_name, AppRoomState::Connected, "connected");
         self.app.status = "joined".to_owned();
         Ok(())
     }
@@ -1056,13 +1165,14 @@ impl CoreState {
     fn bootstrap_room(
         &mut self,
         room_id: &str,
-        _display_name: Option<String>,
+        display_name: Option<String>,
     ) -> Result<BootstrapRoomResult, FiniteChatCoreError> {
         if self.has_room(room_id) {
             return Err(FiniteChatCoreError::Client {
                 reason: format!("room '{room_id}' already exists on this device"),
             });
         }
+        let app_room = app_room_metadata(room_id, display_name.as_deref());
         let mls_group_id = self.generate_object_id("mls")?;
         let mut delivery = self.home_delivery();
         delivery
@@ -1077,7 +1187,7 @@ impl CoreState {
             .create_group_state(room_id, &mls_group_id)
             .map_err(client_error)?;
         self.store
-            .save_device_state(&self.device)
+            .save_device_state_and_app_rooms(&self.device, std::slice::from_ref(&app_room))
             .map_err(store_error)?;
         Ok(BootstrapRoomResult {
             room_id: room_id.to_owned(),
@@ -1191,7 +1301,11 @@ impl CoreState {
         )
         .map_err(runtime_error)?;
         finalize_invited_room(&mut self.store, &mut self.device, &code)
-            .map_err(|error| finalize_error(&code.room_id, error))
+            .map_err(|error| finalize_error(&code.room_id, error))?;
+        let app_room = app_room_metadata(&code.room_id, code.display_name.as_deref());
+        self.store
+            .save_app_rooms(self.device.device_ref(), std::slice::from_ref(&app_room))
+            .map_err(store_error)
     }
 
     fn send_text(&mut self, room_id: &str, text: &str) -> Result<SyncResult, FiniteChatCoreError> {
@@ -1218,15 +1332,14 @@ impl CoreState {
             .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
             .map_err(delivery_error)?;
 
-        let message = ChatMessage {
-            room_id: room_id.to_owned(),
-            seq: accepted.seq,
-            message_id: accepted.message_id,
-            sender_account_id: sender.account_id,
-            sender_device_id: sender.device_id,
-            text: text.to_owned(),
-            payload: text.as_bytes().to_vec(),
-        };
+        let message = project_chat_message(
+            room_id.to_owned(),
+            accepted.seq,
+            accepted.message_id,
+            sender,
+            text.as_bytes().to_vec(),
+            self.device.device_ref(),
+        );
         self.persist_chat_messages(std::slice::from_ref(&message))?;
         let mut result = self.sync()?;
         result.messages.insert(0, message);
@@ -1248,7 +1361,8 @@ impl CoreState {
             &options,
         )
         .map_err(runtime_error)?;
-        result.merge_report(home_report);
+        let owner = self.device.device_ref().clone();
+        result.merge_report(home_report, &owner);
 
         let room_servers = self
             .device
@@ -1266,7 +1380,7 @@ impl CoreState {
                 &server_url,
             )
             .map_err(runtime_error)?;
-            result.merge_report(report);
+            result.merge_report(report, &owner);
         }
 
         Ok(result)
@@ -1291,7 +1405,7 @@ impl CoreState {
 }
 
 impl SyncResult {
-    fn merge_report(&mut self, report: finitechat_client::RuntimeSyncReport) {
+    fn merge_report(&mut self, report: finitechat_client::RuntimeSyncReport, owner: &DeviceRef) {
         self.uploaded_key_packages = self
             .uploaded_key_packages
             .saturating_add(report.uploaded_key_packages);
@@ -1308,21 +1422,23 @@ impl SyncResult {
                     .applied_entries
                     .into_iter()
                     .filter_map(|entry| match entry.entry {
-                        AppliedLogEntry::Application { plaintext, sender } => Some(ChatMessage {
-                            room_id: entry.room_id,
-                            seq: entry.seq,
-                            message_id: entry.message_id,
-                            sender_account_id: sender.account_id,
-                            sender_device_id: sender.device_id,
-                            text: chat_display_text(&plaintext),
-                            payload: plaintext,
-                        }),
+                        AppliedLogEntry::Application { plaintext, sender } => {
+                            Some(project_chat_message(
+                                entry.room_id,
+                                entry.seq,
+                                entry.message_id,
+                                sender,
+                                plaintext,
+                                owner,
+                            ))
+                        }
                         AppliedLogEntry::Commit { .. } => None,
                     }),
             );
     }
 }
 
+#[cfg(test)]
 fn chat_display_text(plaintext: &[u8]) -> String {
     if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(plaintext) {
         return payload.text;
@@ -1330,16 +1446,145 @@ fn chat_display_text(plaintext: &[u8]) -> String {
     String::from_utf8_lossy(plaintext).into_owned()
 }
 
-fn chat_message_from_stored(message: StoredAppMessage) -> ChatMessage {
+struct ChatProjectionPayload {
+    text: String,
+    display_content: String,
+    conversation_id: Option<String>,
+    reply_to_message_id: Option<String>,
+    sender_name: Option<String>,
+    media: Vec<ChatMediaAttachment>,
+}
+
+fn project_chat_message(
+    room_id: String,
+    seq: u64,
+    message_id: String,
+    sender: DeviceRef,
+    plaintext: Vec<u8>,
+    owner: &DeviceRef,
+) -> ChatMessage {
+    let projection = chat_projection_payload(&plaintext);
+    let is_mine = sender == *owner;
+    let sender_npub = npub_encode(&sender.account_id).ok();
     ChatMessage {
-        room_id: message.room_id,
-        seq: message.seq,
-        message_id: message.message_id,
-        sender_account_id: message.sender.account_id,
-        sender_device_id: message.sender.device_id,
-        text: chat_display_text(&message.plaintext),
-        payload: message.plaintext,
+        room_id,
+        seq,
+        message_id,
+        conversation_id: projection.conversation_id,
+        sender_account_id: sender.account_id.clone(),
+        sender_device_id: sender.device_id.clone(),
+        sender_display_name: sender_display_name(
+            &sender,
+            projection.sender_name.as_deref(),
+            is_mine,
+        ),
+        sender_npub,
+        text: projection.text,
+        display_content: projection.display_content,
+        payload: plaintext,
+        reply_to_message_id: projection.reply_to_message_id,
+        is_mine,
+        delivery: MessageDeliveryState::Sent,
+        reactions: Vec::new(),
+        media: projection.media,
+        read_receipt: None,
+        display_timestamp: String::new(),
     }
+}
+
+fn chat_projection_payload(plaintext: &[u8]) -> ChatProjectionPayload {
+    if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(plaintext) {
+        return ChatProjectionPayload {
+            display_content: payload.text.clone(),
+            text: payload.text,
+            conversation_id: payload.conversation_id,
+            reply_to_message_id: payload.reply_to_message_id,
+            sender_name: payload.sender_name,
+            media: payload
+                .attachments
+                .into_iter()
+                .enumerate()
+                .map(|(index, attachment)| chat_media_attachment(index, attachment))
+                .collect(),
+        };
+    }
+    let text = String::from_utf8_lossy(plaintext).into_owned();
+    ChatProjectionPayload {
+        display_content: text.clone(),
+        text,
+        conversation_id: None,
+        reply_to_message_id: None,
+        sender_name: None,
+        media: Vec::new(),
+    }
+}
+
+fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMediaAttachment {
+    let blob = attachment.blob;
+    let dimensions = blob
+        .as_ref()
+        .and_then(|blob| blob.metadata.dimensions.as_ref());
+    let attachment_id = blob
+        .as_ref()
+        .map(|blob| blob.plaintext_sha256.clone())
+        .or_else(|| attachment.url.clone())
+        .or_else(|| attachment.path.clone())
+        .unwrap_or_else(|| format!("attachment-{index}"));
+    let url = blob
+        .as_ref()
+        .map(|blob| blob.url.clone())
+        .or(attachment.url);
+    let mime_type = blob
+        .as_ref()
+        .map(|blob| blob.metadata.mime_type.clone())
+        .filter(|mime_type| !mime_type.trim().is_empty())
+        .unwrap_or(attachment.mime_type);
+    let filename = blob
+        .as_ref()
+        .map(|blob| blob.metadata.filename.clone())
+        .filter(|filename| !filename.trim().is_empty())
+        .unwrap_or(attachment.name);
+    ChatMediaAttachment {
+        attachment_id,
+        url,
+        mime_type,
+        filename,
+        kind: match attachment.kind {
+            HermesAttachmentKindV1::Image => ChatMediaKind::Image,
+            HermesAttachmentKindV1::Video => ChatMediaKind::Video,
+            HermesAttachmentKindV1::Audio => ChatMediaKind::VoiceNote,
+            HermesAttachmentKindV1::File => ChatMediaKind::File,
+        },
+        width: dimensions.map(|dimensions| dimensions.width),
+        height: dimensions.map(|dimensions| dimensions.height),
+        local_path: attachment.path,
+        upload_progress_per_mille: None,
+    }
+}
+
+fn sender_display_name(sender: &DeviceRef, payload_name: Option<&str>, is_mine: bool) -> String {
+    if is_mine {
+        return "You".to_owned();
+    }
+    if let Some(name) = payload_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_owned();
+    }
+    format!(
+        "{} / {}",
+        short_account_label(&sender.account_id),
+        sender.device_id
+    )
+}
+
+fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> ChatMessage {
+    project_chat_message(
+        message.room_id,
+        message.seq,
+        message.message_id,
+        message.sender,
+        message.plaintext,
+        owner,
+    )
 }
 
 fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
@@ -1352,6 +1597,18 @@ fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
             device_id: message.sender_device_id.clone(),
         },
         plaintext: message.payload.clone(),
+    }
+}
+
+fn app_room_metadata(room_id: &str, display_name: Option<&str>) -> StoredAppRoom {
+    let display_name = display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(room_id)
+        .to_owned();
+    StoredAppRoom {
+        room_id: room_id.to_owned(),
+        display_name,
     }
 }
 
@@ -1626,6 +1883,96 @@ mod tests {
     }
 
     #[test]
+    fn chat_projection_maps_hermes_reply_sender_and_media() {
+        use finitechat_proto::{
+            AttachmentBlobEncryptionV1, AttachmentBlobMetadataV1, AttachmentBlobReferenceV1,
+            AttachmentDimensionsV1,
+        };
+
+        let sender = DeviceRef {
+            account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            device_id: "phone".to_owned(),
+        };
+        let owner = DeviceRef {
+            account_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+            device_id: "ios".to_owned(),
+        };
+        let payload = HermesMessagePayloadV1 {
+            payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: Some("topic-main".to_owned()),
+            text: "photo from Hermes".to_owned(),
+            kind: finitechat_hermes::HermesSendKindV1::Media,
+            status: finitechat_hermes::HermesMessageStatusV1::Complete,
+            edit_of: None,
+            attachments: vec![HermesAttachmentV1 {
+                kind: HermesAttachmentKindV1::Image,
+                name: "ignored.jpg".to_owned(),
+                mime_type: "application/octet-stream".to_owned(),
+                path: Some("/tmp/local-preview.jpg".to_owned()),
+                url: Some("https://cdn.invalid/fallback".to_owned()),
+                blob: Some(AttachmentBlobReferenceV1 {
+                    scheme: "finitechat.attachment.v1".to_owned(),
+                    url: "https://blob.invalid/sha256".to_owned(),
+                    ciphertext_sha256: "c".repeat(64),
+                    plaintext_sha256: "p".repeat(64),
+                    plaintext_size: 12,
+                    ciphertext_size: 28,
+                    encryption: AttachmentBlobEncryptionV1 {
+                        algorithm: "AES-256-GCM".to_owned(),
+                        key_hex: "00".repeat(32),
+                        nonce_hex: "11".repeat(12),
+                    },
+                    metadata: AttachmentBlobMetadataV1 {
+                        mime_type: "image/jpeg".to_owned(),
+                        filename: "photo.jpg".to_owned(),
+                        dimensions: Some(AttachmentDimensionsV1 {
+                            width: 640,
+                            height: 480,
+                        }),
+                    },
+                }),
+            }],
+            reply_to_message_id: Some("message-parent".to_owned()),
+            sender_name: Some("Hermes User".to_owned()),
+            metadata: BTreeMap::new(),
+        }
+        .encode()
+        .unwrap();
+
+        let message = project_chat_message(
+            "room-main".to_owned(),
+            7,
+            "message-7".to_owned(),
+            sender,
+            payload,
+            &owner,
+        );
+
+        assert_eq!(message.conversation_id.as_deref(), Some("topic-main"));
+        assert_eq!(message.text, "photo from Hermes");
+        assert_eq!(message.display_content, "photo from Hermes");
+        assert_eq!(
+            message.reply_to_message_id.as_deref(),
+            Some("message-parent")
+        );
+        assert_eq!(message.sender_display_name, "Hermes User");
+        assert!(!message.is_mine);
+        assert!(message.reactions.is_empty());
+        assert!(message.read_receipt.is_none());
+        assert_eq!(message.media.len(), 1);
+        let media = &message.media[0];
+        assert_eq!(media.kind, ChatMediaKind::Image);
+        assert_eq!(media.url.as_deref(), Some("https://blob.invalid/sha256"));
+        assert_eq!(media.mime_type, "image/jpeg");
+        assert_eq!(media.filename, "photo.jpg");
+        assert_eq!(media.width, Some(640));
+        assert_eq!(media.height, Some(480));
+        assert_eq!(media.local_path.as_deref(), Some("/tmp/local-preview.jpg"));
+    }
+
+    #[test]
     fn app_create_room_requires_durable_server_success() {
         let dir = tempfile::tempdir().unwrap();
         let app = FiniteChatRuntime::open(OpenOptions {
@@ -1649,6 +1996,27 @@ mod tests {
         let state = app.state().unwrap();
         assert!(state.rooms.is_empty());
         assert_eq!(state.status, "ready");
+    }
+
+    #[test]
+    fn app_create_room_rejects_oversized_display_name_before_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let error = app
+            .dispatch(AppAction::CreateRoom {
+                display_name: "x".repeat(MAX_INVITE_DISPLAY_NAME_BYTES as usize + 1),
+            })
+            .expect_err("oversized room labels fail before network or storage side effects");
+        assert!(matches!(error, FiniteChatCoreError::Client { .. }));
+        assert!(app.state().unwrap().rooms.is_empty());
     }
 
     #[test]
@@ -1846,6 +2214,72 @@ mod tests {
             app_room(&reopened_state, &room_id).last_message_preview,
             "hello from app actor"
         );
+    }
+
+    #[test]
+    fn app_start_runtime_returns_durable_chat_when_delivery_is_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Local First".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        alice
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "saved before force close".to_owned(),
+            })
+            .unwrap();
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let local_snapshot = reopened.state().unwrap();
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).display_name,
+            "Local First"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "saved before force close"),
+            "force-close reopen must render the durable local transcript before sync"
+        );
+
+        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(started.status, "offline");
+        assert_eq!(
+            started.toast.as_deref(),
+            Some("Showing saved chats. Connection will retry.")
+        );
+        assert!(
+            started
+                .messages
+                .iter()
+                .any(|message| message.text == "saved before force close"),
+            "startup sync failure must not hide the durable local transcript"
+        );
+        assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
     }
 
     #[test]
@@ -2097,6 +2531,13 @@ mod tests {
         let server_url = format!("http://{addr}");
         wait_for_live_http_server(&server_url);
         server_url
+    }
+
+    fn unavailable_http_server_url() -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
     }
 
     fn wait_for_live_http_server(server_url: &str) {

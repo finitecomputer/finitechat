@@ -25,6 +25,7 @@ rollback.
 `finitechat-client` has the first local client SQLite store:
 
 - `client_device_states`
+- `client_app_rooms`
 - `client_app_messages`
 
 `client_device_states` stores one encrypted binary snapshot per
@@ -33,6 +34,16 @@ profile metadata needed to reload, the Finite Chat room id to MLS group id
 mapping, the per-room applied server cursor, pending claimed Welcome payloads,
 durable link-fanout plans and prepared Commit replay values, and OpenMLS
 storage records for signer, group, and message-secret state.
+
+`client_app_rooms` stores encrypted local application-room metadata that is not
+MLS state but is required to render the chat list after restart. Rows are
+scoped to the owning account/device and keyed by `room_id`; the first metadata
+payload stores the room display name. The row payload is sealed with the same
+client-store key as the device snapshot, and the AEAD AAD binds owner and room
+id so copied or tampered rows fail closed on load. Room creation persists the
+device state and app-room metadata in one SQLite transaction; invite
+finalization stores the invite display name after Welcome activation so joined
+rooms can reopen with the human label from the invite.
 
 `client_app_messages` stores the bounded local application-message projection
 that powers chat lists and room views. It is not an authoritative server log
@@ -63,10 +74,12 @@ matches that pending Commit.
 
 Received application messages are inserted in the same SQLite transaction that
 persists the device cursor that consumed them. Own sends are inserted by
-`CoreState::send_text` after the server append is accepted; Swift and the app
+`CoreState::send_text` after the server append is accepted. Swift and the app
 runtime render the Rust state and do not own persistence. Startup reads the
-bounded SQLite projection. Full room-history sync remains a repair/recovery
-path, not the ordinary way the UI gets messages after launch.
+bounded SQLite room/message projection before network sync; delivery failure
+during startup must return the saved chat list and transcript as offline local
+state, not an empty UI. Full room-history sync remains a repair/recovery path,
+not the ordinary way the UI gets messages after launch.
 
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an
