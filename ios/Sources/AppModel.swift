@@ -79,16 +79,15 @@ struct RuntimeConfig: Codable, Equatable {
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
             || (hasLaunchAutomation && !persistLaunchOverride)
+            || (hasLaunchOverride && !persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
             usesTransientStore: transientOverride
         )
-        // Runtime identity is product state. A phone launched from Xcode with
-        // only a LAN server/device id should reopen the same SQLite store after
-        // manual force-close. Auto-create/join/send probes are test automation:
-        // they use an isolated transient store unless the launch explicitly opts
-        // into persistence.
+        // Runtime identity is product state. Launch-provided server/device
+        // values are one-shot unless explicitly persisted, so diagnostics and
+        // automation cannot strand a home-screen relaunch on the wrong store.
         if !transientOverride
             && (
                 persisted.serverURL != config.serverURL
