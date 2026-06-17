@@ -535,6 +535,24 @@ final class StagedComposerAttachmentTests: XCTestCase {
         }
     }
 
+    func testPastedImageStagesAsOutboundAttachment() throws {
+        let bytes = Data([0x47, 0x49, 0x46, 0x38])
+
+        let staged = try StagedComposerAttachment(
+            pastedData: bytes,
+            mimeType: "image/gif"
+        )
+        let outbound = staged.outboundAttachment
+
+        XCTAssertTrue(staged.filename.hasPrefix("pasted-"))
+        XCTAssertTrue(staged.filename.hasSuffix(".gif"))
+        XCTAssertEqual(staged.mimeType, "image/gif")
+        XCTAssertEqual(staged.kind, .image)
+        XCTAssertEqual(outbound.mimeType, "image/gif")
+        XCTAssertEqual(outbound.kind, .image)
+        XCTAssertEqual(outbound.bytes, bytes)
+    }
+
     private func temporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
