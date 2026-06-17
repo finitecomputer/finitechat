@@ -719,7 +719,9 @@ impl AppRuntimeState {
         sort_app_rooms(&mut rooms);
         apply_room_message_projection(&mut rooms, &all_messages, &local_read_seq);
         let stored_app_state = core.store.load_app_state(&owner).map_err(store_error)?;
-        let selected_room_id = selected_room_id_from_stored(&rooms, stored_app_state);
+        let selected_room_id = selected_room_id_from_stored(&rooms, &stored_app_state);
+        let should_persist_selected_room_repair =
+            selected_room_id.is_some() && stored_app_state.selected_room_id != selected_room_id;
         let mut loaded_message_counts = BTreeMap::new();
         if let Some(room_id) = selected_room_id.clone() {
             loaded_message_counts.insert(room_id, DEFAULT_TRANSCRIPT_WINDOW);
@@ -752,6 +754,9 @@ impl AppRuntimeState {
             revoked_devices: BTreeSet::new(),
         };
         state.sync_selected_room_messages();
+        if should_persist_selected_room_repair {
+            state.persist_app_state()?;
+        }
         state.load_profile_cache()?;
         Ok(state)
     }
@@ -4396,13 +4401,14 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
 
 fn selected_room_id_from_stored(
     rooms: &[AppRoomSummary],
-    stored: StoredAppState,
+    stored: &StoredAppState,
 ) -> Option<String> {
-    let selected = stored.selected_room_id?;
-    rooms
-        .iter()
-        .any(|room| room.room_id == selected)
-        .then_some(selected)
+    if let Some(selected) = stored.selected_room_id.as_ref()
+        && rooms.iter().any(|room| room.room_id == *selected)
+    {
+        return Some(selected.clone());
+    }
+    rooms.first().map(|room| room.room_id.clone())
 }
 
 fn stored_room_from_app(
@@ -5661,6 +5667,79 @@ mod tests {
             "startup sync failure must not hide the durable local transcript"
         );
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
+    }
+
+    #[test]
+    fn app_runtime_reopens_core_created_chat_without_saved_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let room_id = "room_core_cold_launch";
+        let core = FiniteChatCore::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        core.bootstrap_room(room_id.to_owned(), Some("Core Created".to_owned()))
+            .unwrap();
+        core.send_text(
+            room_id.to_owned(),
+            "core message before app launch".to_owned(),
+        )
+        .unwrap();
+        drop(core);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+        assert_eq!(local_snapshot.selected_room_id.as_deref(), Some(room_id));
+        assert_eq!(
+            app_room(&local_snapshot, room_id).display_name,
+            "Core Created"
+        );
+        assert_eq!(
+            app_room(&local_snapshot, room_id).last_message_preview,
+            "core message before app launch"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "core message before app launch"),
+            "app cold launch must project a durable core-created transcript without a saved selection row"
+        );
+        drop(reopened);
+
+        let repaired = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap()
+        .state()
+        .unwrap();
+        assert_eq!(repaired.selected_room_id.as_deref(), Some(room_id));
+        assert!(
+            repaired
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "core message before app launch"),
+            "selection repair must be persisted for later force-close relaunches"
+        );
     }
 
     #[test]
