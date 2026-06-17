@@ -16,7 +16,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(persisted.deviceID, "ios")
     }
 
-    func testLaunchOverridesStayTransientWhenStableConfigExists() throws {
+    func testLaunchOverridesUseStableStoreWithoutRewritingStableConfig() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://persisted.example",
@@ -37,7 +37,8 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://args.example")
         XCTAssertEqual(loaded.deviceID, "transient-device")
-        XCTAssertTrue(loaded.usesTransientStore)
+        XCTAssertFalse(loaded.usesTransientStore)
+        XCTAssertFalse(loaded.persistsRuntimeIdentityUpdates)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
@@ -125,7 +126,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertFalse(persisted.usesTransientStore)
     }
 
-    func testLaunchAutomationUsesTransientStoreAndDoesNotRewritePersistedConfigByDefault() throws {
+    func testLaunchAutomationUsesStableStoreAndDoesNotRewritePersistedConfigByDefault() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://persisted.example",
@@ -150,7 +151,8 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
         XCTAssertEqual(loaded.deviceID, "codex-persist-check")
-        XCTAssertTrue(loaded.usesTransientStore)
+        XCTAssertFalse(loaded.usesTransientStore)
+        XCTAssertFalse(loaded.persistsRuntimeIdentityUpdates)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
@@ -246,7 +248,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertFalse(persisted.usesTransientStore)
     }
 
-    func testFirstLaunchAutomationWithoutPersistDoesNotSeedStableConfig() throws {
+    func testFirstLaunchAutomationSeedsStableConfigForManualRelaunch() throws {
         let url = try temporaryConfigURL()
 
         let loaded = RuntimeConfig.load(
@@ -265,8 +267,19 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
         XCTAssertEqual(loaded.deviceID, "codex-persist-check")
-        XCTAssertTrue(loaded.usesTransientStore)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertFalse(loaded.usesTransientStore)
+        XCTAssertTrue(loaded.persistsRuntimeIdentityUpdates)
+        XCTAssertEqual(try persistedConfig(at: url), loaded)
+
+        let relaunched = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(relaunched.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(relaunched.deviceID, "codex-persist-check")
+        XCTAssertFalse(relaunched.usesTransientStore)
     }
 
     func testPersistedServerOnlyConfigCombinesWithDefaultDevice() throws {
@@ -748,6 +761,70 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.outboundText, "typed draft")
     }
 
+    func testDownloadAttachmentDispatchesRustBeginBeforeBlockingDownload() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var savedState = savedChatState()
+        let attachment = ChatMediaAttachment(
+            attachmentId: "attachment-1",
+            url: "http://blob.example/sha256",
+            mimeType: "image/jpeg",
+            filename: "photo.jpg",
+            kind: .image,
+            width: nil,
+            height: nil,
+            localPath: nil,
+            uploadProgressPerMille: nil,
+            downloadProgressPerMille: nil
+        )
+        var message = savedState.messages[0]
+        message.media = [attachment]
+        savedState.messages = [message]
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedState,
+            startRuntimeState: savedState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+        model.start()
+
+        model.downloadAttachment(roomID: "room-main", message: message, attachment: attachment)
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 3
+        }
+
+        guard case .beginDownloadAttachment(
+            let beginRoomID,
+            let beginMessageID,
+            let beginAttachmentID
+        ) = runtime.dispatchedActions[1] else {
+            return XCTFail("expected beginDownloadAttachment before blocking download")
+        }
+        XCTAssertEqual(beginRoomID, "room-main")
+        XCTAssertEqual(beginMessageID, "message-1")
+        XCTAssertEqual(beginAttachmentID, "attachment-1")
+
+        guard case .downloadAttachment(
+            let downloadRoomID,
+            let downloadMessageID,
+            let downloadAttachmentID
+        ) = runtime.dispatchedActions[2] else {
+            return XCTFail("expected downloadAttachment after beginDownloadAttachment")
+        }
+        XCTAssertEqual(downloadRoomID, "room-main")
+        XCTAssertEqual(downloadMessageID, "message-1")
+        XCTAssertEqual(downloadAttachmentID, "attachment-1")
+    }
+
     func testOfflineNoticeIsSuppressedWhenThereAreNoSavedChats() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -857,7 +934,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
     }
 
-    func testDiagnosticLaunchOverrideDoesNotReplaceStableChatRelaunchIdentity() throws {
+    func testDiagnosticLaunchOverrideUsesStableStoreButDoesNotReplaceStableChatRelaunchIdentity() throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")
         try RuntimeConfig(
@@ -879,8 +956,8 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         var openedOptions: [OpenOptions] = []
         let diagnosticRuntime = FakeFiniteChatRuntime(
-            initialState: emptyChatState(deviceID: "diagnostics-visual"),
-            startRuntimeState: emptyChatState(deviceID: "diagnostics-visual")
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
         )
         let diagnosticLaunch = AppModel(
             config: diagnosticConfig,
@@ -899,14 +976,12 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(openedOptions[0].serverUrl, "http://127.0.0.1:1")
         XCTAssertEqual(openedOptions[0].deviceId, "diagnostics-visual")
         let diagnosticStore = URL(fileURLWithPath: openedOptions[0].dataDir)
-        XCTAssertEqual(diagnosticStore.lastPathComponent, "diagnostics-visual")
-        XCTAssertEqual(
-            diagnosticStore.deletingLastPathComponent().lastPathComponent,
-            "FiniteChatTransient"
-        )
+        XCTAssertEqual(diagnosticStore.lastPathComponent, "FiniteChatStore")
+        XCTAssertEqual(diagnosticLaunch.deviceID, "qt433")
         let persistedAfterDiagnostic = try persistedConfig(at: configURL)
         XCTAssertEqual(persistedAfterDiagnostic.serverURL, "http://persisted.example")
         XCTAssertEqual(persistedAfterDiagnostic.deviceID, "qt433")
+        XCTAssertEqual(diagnosticLaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
 
         let relaunchConfig = RuntimeConfig.load(
             environment: [:],

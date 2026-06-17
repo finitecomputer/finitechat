@@ -6,6 +6,7 @@ struct RuntimeConfig: Codable, Equatable {
     let serverURL: String
     let deviceID: String
     let usesTransientStore: Bool
+    let persistsRuntimeIdentityUpdates: Bool
 
     private static let defaultServerURL = "http://127.0.0.1:8787"
     private static let defaultDeviceID = "ios"
@@ -13,21 +14,22 @@ struct RuntimeConfig: Codable, Equatable {
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
     private static let persistLaunchConfigArgument = "--finitechat-persist-launch-config"
     private static let persistLaunchConfigEnvironmentKey = "FINITECHAT_PERSIST_LAUNCH_CONFIG"
-    private static let launchAutomationArguments = [
-        "--finitechat-auto-join",
-        "--finitechat-auto-create-room",
-        "--finitechat-auto-send",
-    ]
 
     enum CodingKeys: String, CodingKey {
         case serverURL = "server_url"
         case deviceID = "device_id"
     }
 
-    init(serverURL: String, deviceID: String, usesTransientStore: Bool = false) {
+    init(
+        serverURL: String,
+        deviceID: String,
+        usesTransientStore: Bool = false,
+        persistsRuntimeIdentityUpdates: Bool = true
+    ) {
         self.serverURL = serverURL
         self.deviceID = deviceID
         self.usesTransientStore = usesTransientStore
+        self.persistsRuntimeIdentityUpdates = persistsRuntimeIdentityUpdates
     }
 
     init(from decoder: Decoder) throws {
@@ -35,6 +37,7 @@ struct RuntimeConfig: Codable, Equatable {
         serverURL = try container.decode(String.self, forKey: .serverURL)
         deviceID = try container.decode(String.self, forKey: .deviceID)
         usesTransientStore = false
+        persistsRuntimeIdentityUpdates = true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -76,29 +79,27 @@ struct RuntimeConfig: Codable, Equatable {
             || persisted.deviceID != nil
             || persistedDeviceIsRecoverable
             || recoveredDeviceID != nil
-        let hasLaunchAutomation = launchAutomationArguments.contains {
-            argumentValue($0, in: args) != nil
-        }
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
-            || (hasLaunchAutomation && !persistLaunchOverride)
-            || (hasLaunchOverride && hasPersistentLaunchState && !persistLaunchOverride)
+        let shouldPersistFirstLaunchOverride = hasLaunchOverride
+            && !hasPersistentLaunchState
+        let shouldPersistResolvedIdentity = !transientOverride
+            && (!hasLaunchOverride || shouldPersistFirstLaunchOverride || persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
-            usesTransientStore: transientOverride
+            usesTransientStore: transientOverride,
+            persistsRuntimeIdentityUpdates: shouldPersistResolvedIdentity
         )
-        let shouldPersistFirstLaunchOverride = hasLaunchOverride
-            && !hasPersistentLaunchState
         let shouldPersistFallbackRepair = !hasLaunchOverride
             && (
                 persisted.serverURL != config.serverURL
                     || persisted.deviceID != config.deviceID
             )
         // Runtime identity is product state. First-run launch values can seed a
-        // stable client store, but existing saved identities win over one-off
-        // launch overrides. Those stay transient unless explicitly persisted.
+        // stable client store. Existing saved identities are not rewritten by
+        // one-off launch overrides unless the caller explicitly persists them.
         if !transientOverride
             && (
                 shouldPersistFallbackRepair
@@ -425,6 +426,7 @@ final class AppModel: ObservableObject {
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
     private let usesTransientStore: Bool
+    private let persistsRuntimeIdentityUpdates: Bool
     private let applicationSupportURL: URL?
     private let configStorageURL: URL?
     private let args: [String]
@@ -455,6 +457,7 @@ final class AppModel: ObservableObject {
         serverURL = config.serverURL
         deviceID = config.deviceID
         usesTransientStore = config.usesTransientStore
+        persistsRuntimeIdentityUpdates = config.persistsRuntimeIdentityUpdates
         self.applicationSupportURL = applicationSupportURL
         self.configStorageURL = configStorageURL
         self.args = args
@@ -752,14 +755,30 @@ final class AppModel: ObservableObject {
         guard !attachmentDownloadsInFlight.contains(key) else { return }
         attachmentDownloadsInFlight.insert(key)
 
+        let runtime: any FiniteChatRuntimeProtocol
+        let runtimeKey: String
+        do {
+            runtime = try currentRuntime()
+            runtimeKey = openKey
+            state = try runtime.dispatch(action: .beginDownloadAttachment(
+                roomId: roomID,
+                messageId: message.messageId,
+                attachmentId: attachment.attachmentId
+            ))
+            errorText = nil
+            restartUpdateLoopIfEnabled()
+        } catch {
+            attachmentDownloadsInFlight.remove(key)
+            errorText = String(describing: error)
+            return
+        }
+
         Task { [weak self] in
             guard let self else { return }
             defer {
                 attachmentDownloadsInFlight.remove(key)
             }
             do {
-                let runtime = try currentRuntime()
-                let runtimeKey = openKey
                 let action = AppAction.downloadAttachment(
                     roomId: roomID,
                     messageId: message.messageId,
@@ -882,7 +901,7 @@ final class AppModel: ObservableObject {
         let openedState = try opened.state()
         if openedState.identity.deviceId != deviceID {
             deviceID = openedState.identity.deviceId
-            if !usesTransientStore {
+            if !usesTransientStore && persistsRuntimeIdentityUpdates {
                 try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
                     storageURL: configStorageURL
                 )

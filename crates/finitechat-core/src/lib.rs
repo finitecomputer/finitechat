@@ -191,6 +191,10 @@ pub struct ChatMediaAttachment {
     /// Integer progress in 0..=1000. Kept integral so the FFI-visible
     /// projection stays Eq/Hash-friendly and deterministic across platforms.
     pub upload_progress_per_mille: Option<u32>,
+    /// Integer progress in 0..=1000 for Rust-owned attachment download state.
+    /// `Some(0)` means the verified download is in flight but no byte-level
+    /// progress is available from the current blocking HTTP boundary yet.
+    pub download_progress_per_mille: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -388,6 +392,11 @@ pub enum AppAction {
         message_id: String,
         attachment_id: String,
     },
+    BeginDownloadAttachment {
+        room_id: String,
+        message_id: String,
+        attachment_id: String,
+    },
     LoadOlderMessages {
         room_id: String,
         before_message_id: String,
@@ -451,6 +460,7 @@ struct AppRuntimeState {
     local_read_seq: BTreeMap<String, u64>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
     revoked_devices: BTreeSet<String>,
+    downloading_attachments: BTreeSet<(String, String, String)>,
 }
 
 struct SendAttachmentInput {
@@ -755,6 +765,7 @@ impl AppRuntimeState {
             local_read_seq,
             profile_cache: BTreeMap::new(),
             revoked_devices: BTreeSet::new(),
+            downloading_attachments: BTreeSet::new(),
         };
         state.sync_selected_room_messages();
         if should_persist_selected_room_repair {
@@ -828,6 +839,11 @@ impl AppRuntimeState {
                 message_id,
                 attachment_id,
             } => self.download_attachment(room_id, message_id, attachment_id)?,
+            AppAction::BeginDownloadAttachment {
+                room_id,
+                message_id,
+                attachment_id,
+            } => self.begin_download_attachment(room_id, message_id, attachment_id)?,
             AppAction::LoadOlderMessages {
                 room_id,
                 before_message_id,
@@ -1351,13 +1367,64 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn begin_download_attachment(
+        &mut self,
+        room_id: String,
+        message_id: String,
+        attachment_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        self.download_attachment_reference(&room_id, &message_id, &attachment_id)?;
+        let key = attachment_download_key(&room_id, &message_id, &attachment_id);
+        self.downloading_attachments.insert(key);
+        self.sync_selected_room_messages();
+        self.app.status = "downloading attachment".to_owned();
+        Ok(())
+    }
+
     fn download_attachment(
         &mut self,
         room_id: String,
         message_id: String,
         attachment_id: String,
     ) -> Result<(), FiniteChatCoreError> {
-        if !self.room_is_connected(&room_id) {
+        let reference =
+            self.download_attachment_reference(&room_id, &message_id, &attachment_id)?;
+        let key = attachment_download_key(&room_id, &message_id, &attachment_id);
+        self.downloading_attachments.insert(key.clone());
+        self.sync_selected_room_messages();
+        let downloaded = self.core.download_attachment_blob(&reference);
+        self.downloading_attachments.remove(&key);
+        let path = match downloaded {
+            Ok(path) => path,
+            Err(error) => {
+                self.sync_selected_room_messages();
+                self.app.status = "download failed".to_owned();
+                self.app.toast = Some(format!(
+                    "Attachment download failed: {}",
+                    compact_error_reason(&error)
+                ));
+                return Ok(());
+            }
+        };
+        self.sync_chat_projection();
+        let filename = reference.metadata.filename.trim();
+        let display_name = if filename.is_empty() {
+            "attachment"
+        } else {
+            filename
+        };
+        self.app.status = format!("downloaded {display_name}");
+        debug_assert!(path.is_file());
+        Ok(())
+    }
+
+    fn download_attachment_reference(
+        &self,
+        room_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<AttachmentBlobReferenceV1, FiniteChatCoreError> {
+        if !self.room_is_connected(room_id) {
             return Err(FiniteChatCoreError::Client {
                 reason: format!("room '{room_id}' is not ready to download attachments"),
             });
@@ -1372,24 +1439,13 @@ impl AppRuntimeState {
                 reason: format!("message '{message_id}' is not available in room '{room_id}'"),
             });
         };
-        let reference = attachment_reference_for_id(message, &attachment_id).ok_or_else(|| {
+        attachment_reference_for_id(message, attachment_id).ok_or_else(|| {
             FiniteChatCoreError::Client {
                 reason: format!(
                     "attachment '{attachment_id}' is not available on message '{message_id}'"
                 ),
             }
-        })?;
-        let path = self.core.download_attachment_blob(&reference)?;
-        self.sync_chat_projection();
-        let filename = reference.metadata.filename.trim();
-        let display_name = if filename.is_empty() {
-            "attachment"
-        } else {
-            filename
-        };
-        self.app.status = format!("downloaded {display_name}");
-        debug_assert!(path.is_file());
-        Ok(())
+        })
     }
 
     fn load_older_messages(
@@ -1915,8 +1971,26 @@ impl AppRuntimeState {
             .chat_projection
             .messages_for_room_window(&room_id, count);
         self.core.apply_attachment_cache_paths(&mut messages);
+        self.apply_attachment_download_progress(&mut messages);
         self.app.messages = messages;
         self.sync_transcript_load_state();
+    }
+
+    fn apply_attachment_download_progress(&self, messages: &mut [ChatMessage]) {
+        for message in messages {
+            for attachment in &mut message.media {
+                let key = attachment_download_key(
+                    &message.room_id,
+                    &message.message_id,
+                    &attachment.attachment_id,
+                );
+                if self.downloading_attachments.contains(&key) && attachment.local_path.is_none() {
+                    attachment.download_progress_per_mille = Some(0);
+                } else {
+                    attachment.download_progress_per_mille = None;
+                }
+            }
+        }
     }
 
     fn sync_transcript_load_state(&mut self) {
@@ -3809,7 +3883,20 @@ fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMe
         height: dimensions.map(|dimensions| dimensions.height),
         local_path: attachment.path,
         upload_progress_per_mille: local_pending_upload.then_some(0),
+        download_progress_per_mille: None,
     }
+}
+
+fn attachment_download_key(
+    room_id: &str,
+    message_id: &str,
+    attachment_id: &str,
+) -> (String, String, String) {
+    (
+        room_id.to_owned(),
+        message_id.to_owned(),
+        attachment_id.to_owned(),
+    )
 }
 
 fn attachment_references_by_id(
@@ -5337,6 +5424,61 @@ mod tests {
         assert_eq!(reopened_state.messages.first().unwrap().text, "message-025");
         assert_eq!(reopened_state.messages.last().unwrap().text, "message-074");
         assert!(app_room(&reopened_state, &room_id).can_load_older);
+    }
+
+    #[test]
+    fn app_runtime_cold_relaunch_restores_saved_chat_before_offline_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let created = app
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Persisted Chat".to_owned(),
+            })
+            .unwrap();
+        let room_id = created.rooms.first().unwrap().room_id.clone();
+        app.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "survives force close".to_owned(),
+        })
+        .unwrap();
+        drop(app);
+
+        let relaunched = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let cached = relaunched.state().unwrap();
+        assert_eq!(cached.rooms.len(), 1);
+        assert_eq!(cached.rooms[0].room_id, room_id);
+        assert_eq!(cached.selected_room_id.as_deref(), Some(room_id.as_str()));
+        assert_eq!(cached.messages.len(), 1);
+        assert_eq!(cached.messages[0].text, "survives force close");
+
+        let offline = relaunched.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(offline.status, "offline");
+        assert_eq!(
+            offline.toast.as_deref(),
+            Some("Showing saved chats. Connection will retry.")
+        );
+        assert_eq!(offline.rooms.len(), 1);
+        assert_eq!(offline.rooms[0].room_id, room_id);
+        assert_eq!(offline.selected_room_id.as_deref(), Some(room_id.as_str()));
+        assert_eq!(offline.messages.len(), 1);
+        assert_eq!(offline.messages[0].text, "survives force close");
     }
 
     #[test]
@@ -6971,12 +7113,33 @@ mod tests {
         let attachment = message.media.first().unwrap();
         assert_eq!(attachment.filename, "remote photo.jpg");
         assert_eq!(attachment.local_path, None);
+        assert_eq!(attachment.download_progress_per_mille, None);
+        let message_id = message.message_id.clone();
+        let attachment_id = attachment.attachment_id.clone();
+
+        let downloading_state = bob
+            .dispatch(AppAction::BeginDownloadAttachment {
+                room_id: room_id.clone(),
+                message_id: message_id.clone(),
+                attachment_id: attachment_id.clone(),
+            })
+            .unwrap();
+        let downloading_message = downloading_state
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("beginning a download keeps the attachment projected");
+        assert_eq!(
+            downloading_message.media[0].download_progress_per_mille,
+            Some(0)
+        );
+        assert_eq!(downloading_message.media[0].local_path, None);
 
         let bob_state = bob
             .dispatch(AppAction::DownloadAttachment {
                 room_id: room_id.clone(),
-                message_id: message.message_id.clone(),
-                attachment_id: attachment.attachment_id.clone(),
+                message_id,
+                attachment_id,
             })
             .unwrap();
         let downloaded = bob_state
@@ -6988,6 +7151,7 @@ mod tests {
             .local_path
             .as_ref()
             .expect("downloaded attachment projects verified local path");
+        assert_eq!(downloaded.media[0].download_progress_per_mille, None);
         assert!(local_path.ends_with("remote_photo.jpg"));
         assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
 

@@ -767,7 +767,7 @@ private struct MediaTile: View {
                 mediaPlaceholder
             }
 
-            if attachment.kind == .video {
+            if attachment.kind == .video, localPath != nil {
                 Image(systemName: "play.fill")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.white)
@@ -776,7 +776,15 @@ private struct MediaTile: View {
             }
 
             if let uploadProgress {
-                AttachmentProgressOverlay(progress: uploadProgress, isMine: isMine)
+                AttachmentProgressOverlay(
+                    progress: uploadProgress,
+                    accessibilityLabel: "Uploading attachment"
+                )
+            } else if isDownloading {
+                AttachmentProgressOverlay(
+                    progress: downloadProgress,
+                    accessibilityLabel: "Downloading attachment"
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -808,7 +816,8 @@ private struct MediaTile: View {
     }
 
     private var canDownload: Bool {
-        guard localPath == nil,
+        guard !isDownloading,
+              localPath == nil,
               let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
         else {
             return false
@@ -818,6 +827,18 @@ private struct MediaTile: View {
 
     private var uploadProgress: Double? {
         guard let progress = attachment.uploadProgressPerMille else { return nil }
+        return Double(min(progress, 1_000)) / 1_000
+    }
+
+    private var isDownloading: Bool {
+        attachment.downloadProgressPerMille != nil
+    }
+
+    private var downloadProgress: Double? {
+        guard let progress = attachment.downloadProgressPerMille else { return nil }
+        if progress == 0 {
+            return nil
+        }
         return Double(min(progress, 1_000)) / 1_000
     }
 
@@ -917,6 +938,9 @@ private struct FileAttachmentRow: View {
                     if let uploadProgress {
                         ProgressView(value: uploadProgress)
                             .tint(isMine ? .white : .accentColor)
+                    } else if isDownloading {
+                        ProgressView()
+                            .tint(isMine ? .white : .accentColor)
                     }
                 }
 
@@ -944,9 +968,16 @@ private struct FileAttachmentRow: View {
         return Double(min(progress, 1_000)) / 1_000
     }
 
+    private var isDownloading: Bool {
+        attachment.downloadProgressPerMille != nil
+    }
+
     private var detailText: String {
         if let uploadProgress {
             return "Uploading \(Int(uploadProgress * 100))%"
+        }
+        if isDownloading {
+            return "Downloading..."
         }
         if hasLocalPath {
             return "Tap to open"
@@ -961,6 +992,9 @@ private struct FileAttachmentRow: View {
         if uploadProgress != nil {
             return "arrow.up.circle"
         }
+        if isDownloading {
+            return "arrow.down.circle"
+        }
         if hasLocalPath {
             return "eye"
         }
@@ -972,18 +1006,25 @@ private struct FileAttachmentRow: View {
 }
 
 private struct AttachmentProgressOverlay: View {
-    let progress: Double
-    let isMine: Bool
+    let progress: Double?
+    let accessibilityLabel: String
 
     var body: some View {
         ZStack {
             Color.black.opacity(0.36)
-            ProgressView(value: progress)
-                .progressViewStyle(.circular)
-                .tint(.white)
-                .scaleEffect(1.25)
+            if let progress {
+                ProgressView(value: progress)
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.25)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.25)
+            }
         }
-        .accessibilityLabel(isMine ? "Uploading attachment" : "Loading attachment")
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 

@@ -419,6 +419,7 @@ func attachmentLocalURL(_ attachment: ChatMediaAttachment) -> URL? {
 
 func attachmentCanDownload(_ attachment: ChatMediaAttachment) -> Bool {
     guard attachmentLocalURL(attachment) == nil,
+          attachment.downloadProgressPerMille == nil,
           let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
     else {
         return false

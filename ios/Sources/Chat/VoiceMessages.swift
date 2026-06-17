@@ -487,7 +487,11 @@ struct VoiceAttachmentRow: View {
     }
 
     private var downloadRow: some View {
-        Button(action: onDownload) {
+        Button {
+            if !isDownloading {
+                onDownload()
+            }
+        } label: {
             HStack(spacing: 10) {
                 Image(systemName: "waveform")
                     .font(.body.weight(.semibold))
@@ -499,20 +503,26 @@ struct VoiceAttachmentRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Voice message")
                         .font(.subheadline.weight(.medium))
-                    Text(attachment.mimeType.isEmpty ? VoiceRecordingAttachment.mimeType : attachment.mimeType)
+                    Text(detailText)
                         .font(.caption)
                         .foregroundStyle(isMine ? .white.opacity(0.72) : .secondary)
                 }
 
                 Spacer(minLength: 4)
 
-                Image(systemName: "arrow.down.circle")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(isMine ? .white.opacity(0.82) : .accentColor)
+                if isDownloading {
+                    ProgressView()
+                        .tint(isMine ? .white : .accentColor)
+                } else {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(isMine ? .white.opacity(0.82) : .accentColor)
+                }
             }
             .foregroundStyle(isMine ? .white : .primary)
         }
         .buttonStyle(.plain)
+        .disabled(isDownloading)
         .task(id: attachment.attachmentId) {
             if attachmentCanDownload(attachment) {
                 onDownload()
@@ -522,6 +532,17 @@ struct VoiceAttachmentRow: View {
 
     private var localPath: String? {
         attachmentLocalURL(attachment)?.path
+    }
+
+    private var isDownloading: Bool {
+        attachment.downloadProgressPerMille != nil
+    }
+
+    private var detailText: String {
+        if isDownloading {
+            return "Downloading..."
+        }
+        return attachment.mimeType.isEmpty ? VoiceRecordingAttachment.mimeType : attachment.mimeType
     }
 }
 
