@@ -214,6 +214,7 @@ private struct RoomThreadView: View {
     @State private var imagePreviewSelection: ChatImagePreviewSelection?
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
     @State private var documentPreviewItem: ChatAttachmentPreviewItem?
+    @State private var showMediaGallery = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
@@ -299,7 +300,15 @@ private struct RoomThreadView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if let room, room.state == .connected {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showMediaGallery = true
+                    } label: {
+                        Image(systemName: "photo.on.rectangle.angled")
+                    }
+                    .accessibilityLabel("Photos and Videos")
+                    .accessibilityIdentifier("MediaGalleryButton")
+
                     Button {
                         if model.createInvite(for: room) {
                             showInvite()
@@ -311,6 +320,15 @@ private struct RoomThreadView: View {
                     .accessibilityIdentifier("InviteButton")
                 }
             }
+        }
+        .navigationDestination(isPresented: $showMediaGallery) {
+            ChatMediaGalleryView(
+                roomTitle: room?.displayName ?? "this chat",
+                items: ChatMediaGalleryProjection.items(messages: projection.messages),
+                onDownloadAttachment: { message, attachment in
+                    model.downloadAttachment(roomID: roomID, message: message, attachment: attachment)
+                }
+            )
         }
         .onAppear {
             if let room {

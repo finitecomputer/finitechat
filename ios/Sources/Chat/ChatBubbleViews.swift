@@ -958,7 +958,7 @@ private struct MediaTile: View {
     }
 }
 
-private struct VerifiedLocalImageView<Placeholder: View>: View {
+struct VerifiedLocalImageView<Placeholder: View>: View {
     let path: String
     let placeholder: () -> Placeholder
 
@@ -1289,7 +1289,7 @@ private struct ChatAvatar: View {
     }
 }
 
-private func mediaLabel(for kind: ChatMediaKind) -> String {
+func mediaLabel(for kind: ChatMediaKind) -> String {
     switch kind {
     case .image:
         return "Image"
@@ -1302,7 +1302,7 @@ private func mediaLabel(for kind: ChatMediaKind) -> String {
     }
 }
 
-private func iconName(for kind: ChatMediaKind) -> String {
+func iconName(for kind: ChatMediaKind) -> String {
     switch kind {
     case .image:
         return "photo"
