@@ -365,6 +365,7 @@ struct AppRuntimeState {
     owned_invites: BTreeMap<String, String>,
     invite_watch_marks: BTreeMap<String, InviteWatchMark>,
     loaded_message_counts: BTreeMap<String, usize>,
+    local_read_seq: BTreeMap<String, u64>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
     revoked_devices: BTreeSet<String>,
 }
@@ -593,11 +594,13 @@ impl AppRuntimeState {
         let mut persisted_room_ids = BTreeSet::new();
         let mut pending_invites = BTreeMap::new();
         let mut owned_invites = BTreeMap::new();
+        let mut local_read_seq = BTreeMap::new();
         let mut rooms = Vec::new();
         for stored_room in stored_rooms {
             let room_id = stored_room.room_id.clone();
             let has_mls_room = known_room_ids.contains(&room_id);
             persisted_room_ids.insert(room_id.clone());
+            local_read_seq.insert(room_id.clone(), stored_room.local_read_seq);
             if stored_room.state != StoredAppRoomState::Connected
                 && let Some(invite_url) = stored_room.pending_invite_url.clone()
             {
@@ -610,11 +613,12 @@ impl AppRuntimeState {
         }
         for room_id in known_room_ids {
             if !persisted_room_ids.contains(&room_id) {
+                local_read_seq.entry(room_id.clone()).or_default();
                 rooms.push(connected_app_room(&room_id, &room_id));
             }
         }
         sort_app_rooms(&mut rooms);
-        apply_message_previews(&mut rooms, &all_messages);
+        apply_room_message_projection(&mut rooms, &all_messages, &local_read_seq);
         let selected_room_id = rooms.first().map(|room| room.room_id.clone());
         let mut loaded_message_counts = BTreeMap::new();
         if let Some(room_id) = selected_room_id.clone() {
@@ -640,6 +644,7 @@ impl AppRuntimeState {
             owned_invites,
             invite_watch_marks: BTreeMap::new(),
             loaded_message_counts,
+            local_read_seq,
             profile_cache: BTreeMap::new(),
             revoked_devices: BTreeSet::new(),
         };
@@ -1144,6 +1149,21 @@ impl AppRuntimeState {
     }
 
     fn mark_room_read(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
+        if self.room(&room_id).is_none() {
+            return Ok(());
+        }
+        if let Some((_, seq)) = self.chat_projection.latest_peer_message(&room_id) {
+            let current = self
+                .local_read_seq
+                .get(&room_id)
+                .copied()
+                .unwrap_or_default();
+            if seq > current {
+                self.local_read_seq.insert(room_id.clone(), seq);
+                self.persist_room_projection(&room_id)?;
+                self.sync_chat_projection();
+            }
+        }
         if !self.room_is_connected(&room_id) {
             return Ok(());
         }
@@ -1349,7 +1369,7 @@ impl AppRuntimeState {
 
     fn sync_chat_projection(&mut self) {
         let messages = self.chat_projection.messages();
-        apply_message_previews(&mut self.app.rooms, &messages);
+        apply_room_message_projection(&mut self.app.rooms, &messages, &self.local_read_seq);
         self.sync_selected_room_messages();
     }
 
@@ -1393,7 +1413,12 @@ impl AppRuntimeState {
         };
         let pending = self.pending_invites.get(room_id);
         let owned_invite_url = self.owned_invites.get(room_id);
-        let stored = stored_room_from_app(&room, pending, owned_invite_url);
+        let local_read_seq = self
+            .local_read_seq
+            .get(room_id)
+            .copied()
+            .unwrap_or_default();
+        let stored = stored_room_from_app(&room, local_read_seq, pending, owned_invite_url);
         let owner = self.core.device.device_ref().clone();
         self.core
             .store
@@ -2782,6 +2807,19 @@ impl ChatProjectionState {
             .map(|message| (message.message_id.clone(), message.seq))
     }
 
+    fn latest_peer_message(&self, room_id: &str) -> Option<(String, u64)> {
+        self.messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| !message.is_mine)
+            .max_by(|left, right| {
+                left.seq
+                    .cmp(&right.seq)
+                    .then_with(|| left.message_id.cmp(&right.message_id))
+            })
+            .map(|message| (message.message_id.clone(), message.seq))
+    }
+
     fn apply_reaction(
         &mut self,
         room_id: &str,
@@ -3000,6 +3038,7 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
 
 fn stored_room_from_app(
     room: &AppRoomSummary,
+    local_read_seq: u64,
     pending: Option<&PendingInvite>,
     owned_invite_url: Option<&String>,
 ) -> StoredAppRoom {
@@ -3008,6 +3047,7 @@ fn stored_room_from_app(
         display_name: room.display_name.clone(),
         state: stored_app_room_state(&room.state),
         status: room.status.clone(),
+        local_read_seq,
         pending_invite_url: pending.map(|pending| pending.invite_url.clone()),
         owned_invite_url: owned_invite_url.cloned(),
     }
@@ -3044,6 +3084,7 @@ fn app_room_metadata(room_id: &str, display_name: Option<&str>) -> StoredAppRoom
         display_name,
         state: StoredAppRoomState::Connected,
         status: "connected".to_owned(),
+        local_read_seq: 0,
         pending_invite_url: None,
         owned_invite_url: None,
     }
@@ -3097,14 +3138,30 @@ fn load_legacy_app_messages(data_dir: &Path) -> Result<Vec<ChatMessage>, FiniteC
     Ok(messages)
 }
 
-fn apply_message_previews(rooms: &mut [AppRoomSummary], messages: &[ChatMessage]) {
+fn apply_room_message_projection(
+    rooms: &mut [AppRoomSummary],
+    messages: &[ChatMessage],
+    local_read_seq: &BTreeMap<String, u64>,
+) {
+    let mut previews = BTreeMap::new();
+    let mut unread_counts = BTreeMap::<String, u32>::new();
     for message in messages {
-        if let Some(room) = rooms
-            .iter_mut()
-            .find(|room| room.room_id == message.room_id)
-        {
-            room.last_message_preview = message_preview(message);
+        previews.insert(message.room_id.clone(), message_preview(message));
+        let read_seq = local_read_seq
+            .get(&message.room_id)
+            .copied()
+            .unwrap_or_default();
+        if !message.is_mine && message.seq > read_seq {
+            unread_counts
+                .entry(message.room_id.clone())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
         }
+    }
+
+    for room in rooms {
+        room.last_message_preview = previews.remove(&room.room_id).unwrap_or_default();
+        room.unread_count = unread_counts.remove(&room.room_id).unwrap_or_default();
     }
 }
 
@@ -4880,6 +4937,118 @@ mod tests {
             1,
             1,
             "Read by 1",
+        );
+    }
+
+    #[test]
+    fn app_runtime_unread_counts_are_local_durable_and_offline_clearable() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Unread Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        bob.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "first unread".to_owned(),
+        })
+        .unwrap();
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(app_room(&alice_state, &room_id).unread_count, 1);
+
+        let alice_state = alice
+            .dispatch(AppAction::MarkRoomRead {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(app_room(&alice_state, &room_id).unread_count, 0);
+
+        bob.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "second unread".to_owned(),
+        })
+        .unwrap();
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(app_room(&alice_state, &room_id).unread_count, 1);
+        assert_eq!(
+            app_room(&alice_state, &room_id).last_message_preview,
+            "second unread"
+        );
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let offline_state = reopened.state().unwrap();
+        assert_eq!(app_room(&offline_state, &room_id).unread_count, 1);
+
+        let cleared = reopened
+            .dispatch(AppAction::MarkRoomRead {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+        assert_eq!(app_room(&cleared, &room_id).unread_count, 0);
+        drop(reopened);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert_eq!(
+            app_room(&reopened.state().unwrap(), &room_id).unread_count,
+            0
         );
     }
 

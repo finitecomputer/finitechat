@@ -350,6 +350,7 @@ pub struct StoredAppRoom {
     pub display_name: String,
     pub state: StoredAppRoomState,
     pub status: String,
+    pub local_read_seq: u64,
     pub pending_invite_url: Option<String>,
     pub owned_invite_url: Option<String>,
 }
@@ -387,6 +388,8 @@ struct StoredAppRoomMetadataV1 {
     state: StoredAppRoomState,
     #[serde(default = "default_app_room_status")]
     status: String,
+    #[serde(default)]
+    local_read_seq: u64,
     #[serde(default)]
     pending_invite_url: Option<String>,
     #[serde(default)]
@@ -3058,6 +3061,7 @@ impl SqliteClientStore {
                 display_name: metadata.display_name,
                 state: metadata.state,
                 status: metadata.status,
+                local_read_seq: metadata.local_read_seq,
                 pending_invite_url: metadata.pending_invite_url,
                 owned_invite_url: metadata.owned_invite_url,
             };
@@ -6343,6 +6347,7 @@ fn encrypt_app_room_metadata(
         display_name: room.display_name.clone(),
         state: room.state,
         status: room.status.clone(),
+        local_read_seq: room.local_read_seq,
         pending_invite_url: room.pending_invite_url.clone(),
         owned_invite_url: room.owned_invite_url.clone(),
     };
@@ -8029,6 +8034,7 @@ mod tests {
         let second = StoredAppRoom {
             state: StoredAppRoomState::WaitingForApproval,
             status: "waiting for room admission".to_owned(),
+            local_read_seq: 42,
             pending_invite_url: Some("finite://join?v=1&s=http%3A%2F%2Flocalhost&r=room-side&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3".to_owned()),
             ..app_room("room-side", "Side Room")
         };
@@ -8187,6 +8193,7 @@ mod tests {
             display_name: display_name.to_owned(),
             state: StoredAppRoomState::Connected,
             status: "connected".to_owned(),
+            local_read_seq: 0,
             pending_invite_url: None,
             owned_invite_url: None,
         }
