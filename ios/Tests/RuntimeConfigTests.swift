@@ -563,6 +563,23 @@ final class RuntimeConfigTests: XCTestCase {
     }
 }
 
+final class ChatTimelineTypingTests: XCTestCase {
+    func testTypingRowHasStableNonDurableIdentity() {
+        let row = ChatTimelineRow.typing([
+            AppTypingMember(
+                roomId: "room-main",
+                accountId: "alice-account",
+                deviceId: "alice-ios",
+                displayName: "Alice",
+                npub: nil
+            ),
+        ])
+
+        XCTAssertEqual(row.id, "typing-indicator")
+        XCTAssertNil(row.oldestMessageID)
+    }
+}
+
 @MainActor
 final class AppModelPersistenceTests: XCTestCase {
     func testForceCloseStyleRelaunchUsesSameStableStoreAndKeepsSavedProjection() throws {
@@ -839,7 +856,8 @@ final class AppModelPersistenceTests: XCTestCase {
             toast: toast,
             messages: [message],
             profiles: [],
-            devices: []
+            devices: [],
+            typingMembers: []
         )
     }
 
@@ -863,7 +881,8 @@ final class AppModelPersistenceTests: XCTestCase {
             toast: toast,
             messages: [],
             profiles: [],
-            devices: []
+            devices: [],
+            typingMembers: []
         )
     }
 

@@ -4,9 +4,10 @@ use finitechat_delivery::{
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
     BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GetNostrProfilesRequest,
-    GetNostrProfilesResponse, GroupSyncRequest, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
-    HttpInviteJoinState, HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
+    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GetEphemeralActivitiesRequest,
+    GetEphemeralActivitiesResponse, GetNostrProfilesRequest, GetNostrProfilesResponse,
+    GroupSyncRequest, HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState,
+    HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
     InviteJoinStatusResponse, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
     ListInviteJoinRequestsResponse, NostrProfileRecord, PublishKeyPackageResponse,
@@ -3993,6 +3994,13 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
         request: &AppendEphemeralActivityRequest,
     ) -> Result<EphemeralActivityAccepted, HttpRuntimeDeliveryError<T::Error>> {
         self.post_json("/activities", request)
+    }
+
+    pub fn get_ephemeral_activities(
+        &mut self,
+        request: &GetEphemeralActivitiesRequest,
+    ) -> Result<GetEphemeralActivitiesResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json("/activities/get", request)
     }
 
     pub fn put_nostr_profile(

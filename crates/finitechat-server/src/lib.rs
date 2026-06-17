@@ -26,8 +26,9 @@ pub use finitechat_http::{
     ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
     FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
-    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetLinkSessionRequest,
+    GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest, HealthResponse,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
     HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
     HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
     InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
@@ -125,8 +126,15 @@ pub struct HttpServerState {
 
 #[derive(Clone)]
 struct SyncStreamCursors {
-    rooms: Vec<finitechat_http::SyncWaitRoom>,
+    rooms: Vec<SyncStreamRoomCursor>,
     invites: Vec<SyncStreamInviteCursor>,
+}
+
+#[derive(Clone)]
+struct SyncStreamRoomCursor {
+    room_id: String,
+    after_seq: u64,
+    seen_activity_received_at_ms: u64,
 }
 
 #[derive(Clone)]
@@ -1312,6 +1320,17 @@ impl HttpServerState {
             }
         }
 
+        for watch in &mut cursors.rooms {
+            let highwater = self.activity_highwater_for_room(&watch.room_id);
+            if highwater > watch.seen_activity_received_at_ms {
+                watch.seen_activity_received_at_ms = highwater;
+                events.push(SyncHintEvent::ActivityChanged {
+                    room_id: watch.room_id.clone(),
+                    received_at_ms: highwater,
+                });
+            }
+        }
+
         let sessions = self
             .invite_sessions
             .lock()
@@ -1348,6 +1367,20 @@ impl HttpServerState {
         }
 
         events
+    }
+
+    fn activity_highwater_for_room(&self, room_id: &str) -> u64 {
+        let activity = self
+            .ephemeral_activity
+            .lock()
+            .expect("HTTP ephemeral activity mutex");
+        activity
+            .values()
+            .flat_map(|records| records.iter())
+            .filter(|record| record.room_id == room_id)
+            .map(|record| record.received_at_ms)
+            .max()
+            .unwrap_or_default()
     }
 
     fn save_account_room(
@@ -2295,6 +2328,66 @@ impl HttpServerState {
         })
     }
 
+    fn get_ephemeral_activities(
+        &self,
+        request: GetEphemeralActivitiesRequest,
+    ) -> Result<GetEphemeralActivitiesResponse, ServerHttpError> {
+        validate_get_ephemeral_activities_request(&request)?;
+        self.ensure_device_not_revoked(&request.requester)?;
+        {
+            let rooms = self
+                .room_memberships
+                .lock()
+                .expect("HTTP room-membership mutex");
+            let projection = rooms.get(&request.room_id).ok_or_else(|| {
+                ServerHttpError::RoomMembershipConflict {
+                    room_id: request.room_id.clone(),
+                    reason: "ephemeral activity read requires a room-membership projection"
+                        .to_owned(),
+                }
+            })?;
+            if projection.status != RoomStatus::Open {
+                return Err(ServerHttpError::RoomNotOpen {
+                    room_id: request.room_id.clone(),
+                    status: projection.status,
+                });
+            }
+            let tracks_requester = projection.tracks_device(&request.requester);
+            if (tracks_requester || projection.membership_complete)
+                && !projection.device_active_at_head(&request.requester)
+            {
+                return Err(ServerHttpError::SenderNotActive {
+                    sender: request.requester.clone(),
+                });
+            }
+        }
+
+        let mut activity = self
+            .ephemeral_activity
+            .lock()
+            .expect("HTTP ephemeral activity mutex");
+        let mut records = Vec::new();
+        for route_records in activity.values_mut() {
+            route_records.retain(|record| record.expires_at_ms > request.now_ms);
+            records.extend(
+                route_records
+                    .iter()
+                    .filter(|record| {
+                        record.room_id == request.room_id
+                            && record.conversation_id == request.conversation_id
+                    })
+                    .cloned(),
+            );
+        }
+        records.sort_by(|left, right| {
+            left.received_at_ms
+                .cmp(&right.received_at_ms)
+                .then_with(|| left.sender.account_id.cmp(&right.sender.account_id))
+                .then_with(|| left.sender.device_id.cmp(&right.sender.device_id))
+        });
+        Ok(GetEphemeralActivitiesResponse { records })
+    }
+
     fn claim_welcomes(
         &self,
         request: ClaimWelcomesRequest,
@@ -2817,6 +2910,7 @@ pub fn http_router(state: HttpServerState) -> Router {
             post(get_application_effect_counts),
         )
         .route("/activities", post(append_ephemeral_activity))
+        .route("/activities/get", post(get_ephemeral_activities))
         .route("/upload", put(upload_blob_object))
         .route("/blobs/{sha256}", get(download_blob_object))
         .route("/commits", post(submit_commit))
@@ -2896,7 +2990,16 @@ async fn append_ephemeral_activity(
     State(state): State<HttpServerState>,
     Json(request): Json<AppendEphemeralActivityRequest>,
 ) -> Result<Json<EphemeralActivityAccepted>, ServerHttpError> {
-    Ok(Json(state.append_ephemeral_activity(request)?))
+    let response = state.append_ephemeral_activity(request)?;
+    state.wake.notify_waiters();
+    Ok(Json(response))
+}
+
+async fn get_ephemeral_activities(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetEphemeralActivitiesRequest>,
+) -> Result<Json<GetEphemeralActivitiesResponse>, ServerHttpError> {
+    Ok(Json(state.get_ephemeral_activities(request)?))
 }
 
 async fn upload_blob_object(
@@ -2957,7 +3060,15 @@ async fn sync_stream(
             MAX_SYNC_STREAM_HEARTBEAT_MILLIS,
         );
     let cursors = SyncStreamCursors {
-        rooms: request.rooms,
+        rooms: request
+            .rooms
+            .into_iter()
+            .map(|room| SyncStreamRoomCursor {
+                room_id: room.room_id,
+                after_seq: room.after_seq,
+                seen_activity_received_at_ms: 0,
+            })
+            .collect(),
         invites: request
             .invites
             .into_iter()
@@ -3007,6 +3118,7 @@ async fn sync_stream(
 fn sync_sse_event(event: SyncHintEvent) -> Event {
     let name = match &event {
         SyncHintEvent::RoomAdvanced { .. } => "room_advanced",
+        SyncHintEvent::ActivityChanged { .. } => "activity_changed",
         SyncHintEvent::InviteChanged { .. } => "invite_changed",
         SyncHintEvent::Heartbeat => "heartbeat",
     };
@@ -5252,6 +5364,37 @@ fn validate_append_ephemeral_activity_request(
             reason: error.to_string(),
         }
     })
+}
+
+fn validate_get_ephemeral_activities_request(
+    request: &GetEphemeralActivitiesRequest,
+) -> Result<(), ServerHttpError> {
+    validate_string_bytes("activity.room_id", &request.room_id, MAX_OBJECT_ID_BYTES).map_err(
+        |error| ServerHttpError::InvalidActivityRequest {
+            reason: error.to_string(),
+        },
+    )?;
+    if let Some(conversation_id) = &request.conversation_id {
+        validate_bytes_non_empty("activity.conversation_id", conversation_id.len()).map_err(
+            |error| ServerHttpError::InvalidActivityRequest {
+                reason: error.to_string(),
+            },
+        )?;
+        validate_string_bytes(
+            "activity.conversation_id",
+            conversation_id,
+            MAX_OBJECT_ID_BYTES,
+        )
+        .map_err(|error| ServerHttpError::InvalidActivityRequest {
+            reason: error.to_string(),
+        })?;
+    }
+    request
+        .requester
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidActivityRequest {
+            reason: error.to_string(),
+        })
 }
 
 fn validate_device_liveness_request(

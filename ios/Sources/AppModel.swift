@@ -423,6 +423,7 @@ final class AppModel: ObservableObject {
     private var launchAutomationTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
+    private var lastTypingIntentByRoom: [String: Bool] = [:]
     private var didRunLaunchAutomation = false
 
     deinit {
@@ -782,6 +783,12 @@ final class AppModel: ObservableObject {
         dispatch(.markRoomRead(roomId: room.roomId))
     }
 
+    func setTyping(roomID: String, isTyping: Bool) {
+        guard lastTypingIntentByRoom[roomID] != isTyping else { return }
+        lastTypingIntentByRoom[roomID] = isTyping
+        dispatch(.setTyping(roomId: roomID, isTyping: isTyping))
+    }
+
     func applyDevSettings() {
         do {
             try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
@@ -878,6 +885,7 @@ final class AppModel: ObservableObject {
         launchAutomationTask = nil
         attachmentDownloadsInFlight.removeAll()
         messageRetriesInFlight.removeAll()
+        lastTypingIntentByRoom.removeAll()
         runtime = nil
         openKey = ""
         state = nil

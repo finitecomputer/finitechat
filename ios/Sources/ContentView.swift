@@ -231,6 +231,12 @@ private struct RoomThreadView: View {
         projection.messages.last?.messageId
     }
 
+    private var transcriptRows: [ChatTimelineRow] {
+        let members = typingMembers(for: roomID)
+        guard !members.isEmpty else { return projection.rows }
+        return projection.rows + [.typing(members)]
+    }
+
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
@@ -332,11 +338,15 @@ private struct RoomThreadView: View {
             }
         }
         .onDisappear {
+            model.setTyping(roomID: roomID, isTyping: false)
             dismissFocusedMessage(animated: false)
             voiceRecorder.cancelRecording()
         }
         .onChange(of: selectedPhotoItems) { _, items in
             stagePhotoItems(items)
+        }
+        .onChange(of: model.outboundText) { _, text in
+            updateTypingIntent(text)
         }
     }
 
@@ -346,7 +356,7 @@ private struct RoomThreadView: View {
         case .connected:
             ChatTranscriptView(
                 roomID: room.roomId,
-                rows: projection.rows,
+                rows: transcriptRows,
                 messagesById: projection.messagesById,
                 onReact: { message, emoji in
                     model.react(to: message, emoji: emoji)
@@ -505,9 +515,20 @@ private struct RoomThreadView: View {
         return projection.messagesById[replyToMessageId]
     }
 
+    private func typingMembers(for roomID: String) -> [AppTypingMember] {
+        model.state?.typingMembers.filter { $0.roomId == roomID } ?? []
+    }
+
+    private func updateTypingIntent(_ text: String) {
+        guard room?.state == .connected else { return }
+        let isTyping = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        model.setTyping(roomID: roomID, isTyping: isTyping)
+    }
+
     private func sendComposerDraft() {
         if stagedAttachments.isEmpty {
             if model.send(replyTo: replyDraftMessage) {
+                model.setTyping(roomID: roomID, isTyping: false)
                 replyDraftMessage = nil
             }
             return
@@ -515,6 +536,7 @@ private struct RoomThreadView: View {
 
         let outbound = stagedAttachments.map(\.outboundAttachment)
         model.sendAttachments(roomID: roomID, attachments: outbound, replyTo: replyDraftMessage) {
+            model.setTyping(roomID: roomID, isTyping: false)
             stagedAttachments = []
             selectedPhotoItems = []
             replyDraftMessage = nil

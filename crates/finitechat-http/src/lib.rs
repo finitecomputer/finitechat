@@ -2,7 +2,8 @@ use finitechat_delivery::{
     HttpClaimedKeyPackage, HttpKeyPackageId, HttpPublishTarget, HttpSequence,
 };
 use finitechat_proto::{
-    ApplicationDeliveryPolicy, DeviceRef, MembershipDeltaV1, RoomLogEntry, RoomProtocol,
+    ApplicationDeliveryPolicy, DeviceRef, EphemeralActivityRecord, MembershipDeltaV1, RoomLogEntry,
+    RoomProtocol,
 };
 use finitechat_transport::transport::TransportMessage;
 use finitechat_transport::{GroupId, MemberId, MessageId};
@@ -113,6 +114,10 @@ pub enum SyncHintEvent {
         room_id: String,
         seq: HttpSequence,
     },
+    ActivityChanged {
+        room_id: String,
+        received_at_ms: u64,
+    },
     InviteChanged {
         invite_id: String,
         requests: u32,
@@ -164,6 +169,21 @@ pub struct GetDeviceLivenessResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<DeviceLivenessRecord>,
     pub live: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetEphemeralActivitiesRequest {
+    pub room_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    pub requester: DeviceRef,
+    pub now_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetEphemeralActivitiesResponse {
+    #[serde(default)]
+    pub records: Vec<EphemeralActivityRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

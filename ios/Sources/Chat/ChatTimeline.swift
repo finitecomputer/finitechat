@@ -31,11 +31,14 @@ struct ChatRoomProjection: Equatable {
 
 enum ChatTimelineRow: Identifiable, Equatable {
     case messageGroup(ChatTimelineMessageGroup)
+    case typing([AppTypingMember])
 
     var id: String {
         switch self {
         case .messageGroup(let group):
             "group-\(group.id)"
+        case .typing:
+            "typing-indicator"
         }
     }
 
@@ -43,6 +46,8 @@ enum ChatTimelineRow: Identifiable, Equatable {
         switch self {
         case .messageGroup(let group):
             group.messages.first?.messageId
+        case .typing:
+            nil
         }
     }
 }

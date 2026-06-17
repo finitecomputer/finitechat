@@ -20,15 +20,20 @@ use finitechat_client::{
     run_runtime_sync_tick, submit_invite_join_request,
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
-use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
+use finitechat_http::{
+    GetEphemeralActivitiesRequest, SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom,
+};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    ApplicationDeliveryPolicy, AttachmentBlobMetadataV1, AttachmentBlobReferenceV1, ChatReactionV1,
-    ChatReceiptStateV1, ChatReceiptV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef,
-    DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest, MAX_ATTACHMENT_PLAINTEXT_BYTES,
-    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, RoomProtocol, invite_current_pin,
-    npub_decode, npub_encode, validate_bytes_len, validate_bytes_non_empty, validate_item_count,
-    validate_string_bytes,
+    AppendEphemeralActivityRequest, ApplicationDeliveryPolicy, AttachmentBlobMetadataV1,
+    AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1,
+    CreateRoomRequest, DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DeviceRef,
+    DurableAppEventKind, EphemeralActivityActionV1, EphemeralActivityIngressContext,
+    EphemeralActivityProjection, EphemeralActivityProjectionEntry, FINITECHAT_ACTIVITY_KIND_TYPING,
+    GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest, MAX_ATTACHMENT_PLAINTEXT_BYTES,
+    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, RoomProtocol, RuntimeActivityClearV1,
+    invite_current_pin, npub_decode, npub_encode, validate_bytes_len, validate_bytes_non_empty,
+    validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -58,6 +63,7 @@ const MIN_POLL_OPTIONS: usize = 2;
 const MAX_POLL_OPTIONS: u32 = 10;
 const MAX_POLL_QUESTION_BYTES: u32 = 512;
 const MAX_POLL_OPTION_BYTES: u32 = 160;
+const TYPING_REFRESH_MIN_MILLIS: u64 = 10_000;
 
 const _: () = {
     assert!(MAX_APP_MESSAGES > 0);
@@ -296,6 +302,15 @@ pub struct AppDeviceSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppTypingMember {
+    pub room_id: String,
+    pub account_id: String,
+    pub device_id: String,
+    pub display_name: String,
+    pub npub: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct AppState {
     pub rev: u64,
     pub identity: Identity,
@@ -308,6 +323,7 @@ pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub profiles: Vec<AppProfileSummary>,
     pub devices: Vec<AppDeviceSummary>,
+    pub typing_members: Vec<AppTypingMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -389,6 +405,10 @@ pub enum AppAction {
         room_id: String,
         message_id: String,
     },
+    SetTyping {
+        room_id: String,
+        is_typing: bool,
+    },
     RefreshDevices,
     RevokeDevice {
         account_id: String,
@@ -422,6 +442,8 @@ struct AppRuntimeState {
     pending_invites: BTreeMap<String, PendingInvite>,
     owned_invites: BTreeMap<String, String>,
     invite_watch_marks: BTreeMap<String, InviteWatchMark>,
+    activity_projection: EphemeralActivityProjection,
+    local_typing_leases: BTreeMap<String, u64>,
     loaded_message_counts: BTreeMap<String, usize>,
     local_read_seq: BTreeMap<String, u64>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
@@ -716,11 +738,14 @@ impl AppRuntimeState {
                 messages: Vec::new(),
                 profiles: Vec::new(),
                 devices: Vec::new(),
+                typing_members: Vec::new(),
             },
             chat_projection,
             pending_invites,
             owned_invites,
             invite_watch_marks: BTreeMap::new(),
+            activity_projection: EphemeralActivityProjection::default(),
+            local_typing_leases: BTreeMap::new(),
             loaded_message_counts,
             local_read_seq,
             profile_cache: BTreeMap::new(),
@@ -811,6 +836,7 @@ impl AppRuntimeState {
                 room_id,
                 message_id,
             } => self.retry_message(room_id, message_id)?,
+            AppAction::SetTyping { room_id, is_typing } => self.set_typing(room_id, is_typing)?,
             AppAction::RefreshDevices => self.refresh_devices()?,
             AppAction::RevokeDevice {
                 account_id,
@@ -904,6 +930,8 @@ impl AppRuntimeState {
                 self.app.toast = Some(format!("{} device(s) joined", accepted.accepted.len()));
             }
         }
+        self.try_finalize_pending_rooms()?;
+        self.refresh_ephemeral_activity_for_connected_rooms()?;
         let synced = self.core.sync_with_projection()?;
         self.apply_projection_events(synced.events);
         self.append_messages(synced.result.messages);
@@ -1474,6 +1502,46 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn set_typing(&mut self, room_id: String, is_typing: bool) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Ok(());
+        }
+        let now_ms = self.core.now_millis()?;
+        let refresh_floor = now_ms.saturating_add(TYPING_REFRESH_MIN_MILLIS);
+
+        if is_typing {
+            if self
+                .local_typing_leases
+                .get(&room_id)
+                .copied()
+                .is_some_and(|expires_at_ms| expires_at_ms > refresh_floor)
+            {
+                return Ok(());
+            }
+            match self.core.send_typing_activity(&room_id, true, now_ms) {
+                Ok(()) => {
+                    self.local_typing_leases.insert(
+                        room_id,
+                        now_ms.saturating_add(
+                            GenericActivityKindV1::Typing.recommended_expiry_millis(),
+                        ),
+                    );
+                }
+                Err(FiniteChatCoreError::Delivery { .. }) => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
+
+        if self.local_typing_leases.remove(&room_id).is_none() {
+            return Ok(());
+        }
+        match self.core.send_typing_activity(&room_id, false, now_ms) {
+            Ok(()) | Err(FiniteChatCoreError::Delivery { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn retry_room(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
         if self.pending_invites.contains_key(&room_id) {
             self.try_finalize_room(&room_id)?;
@@ -1770,6 +1838,15 @@ impl AppRuntimeState {
                 .filter(|message| message.room_id == *room_id)
                 .count()
         });
+        for message in &messages {
+            self.clear_default_typing_for_sender(
+                &message.room_id,
+                &DeviceRef {
+                    account_id: message.sender_account_id.clone(),
+                    device_id: message.sender_device_id.clone(),
+                },
+            );
+        }
         self.chat_projection.append_messages(messages, &owner);
         if let Some(room_id) = selected_room_id
             && selected_message_count > 0
@@ -1783,6 +1860,7 @@ impl AppRuntimeState {
             }
         }
         self.sync_chat_projection();
+        self.sync_typing_members();
     }
 
     fn apply_projection_events(&mut self, events: Vec<StoredAppEvent>) {
@@ -1791,9 +1869,21 @@ impl AppRuntimeState {
         }
         let owner = self.core.device.device_ref().clone();
         for event in events {
+            if let Ok(app_event) =
+                serde_json::from_slice::<DecryptedApplicationEventV1>(&event.plaintext)
+            {
+                let _ = self
+                    .activity_projection
+                    .clear_from_durable_application_event(
+                        &event.room_id,
+                        &event.sender,
+                        &app_event,
+                    );
+            }
             self.chat_projection.apply_event(event, &owner);
         }
         self.sync_chat_projection();
+        self.sync_typing_members();
     }
 
     fn sync_chat_projection(&mut self) {
@@ -1826,6 +1916,96 @@ impl AppRuntimeState {
             room.can_load_older = selected_room_id.as_deref() == Some(room.room_id.as_str())
                 && selected_can_load_older;
         }
+    }
+
+    fn refresh_ephemeral_activity_for_connected_rooms(
+        &mut self,
+    ) -> Result<(), FiniteChatCoreError> {
+        let now_ms = self.core.now_millis()?;
+        self.activity_projection
+            .expire_at(now_ms)
+            .map_err(client_error)?;
+        self.local_typing_leases
+            .retain(|_, expires_at_ms| *expires_at_ms > now_ms);
+        let room_ids = self
+            .app
+            .rooms
+            .iter()
+            .filter(|room| room.state == AppRoomState::Connected)
+            .filter(|room| self.core.has_room(&room.room_id))
+            .map(|room| room.room_id.clone())
+            .collect::<Vec<_>>();
+        for room_id in room_ids {
+            let records = self.core.get_ephemeral_activities(&room_id, now_ms)?;
+            for record in records {
+                let Ok(plaintext) = self
+                    .core
+                    .device
+                    .decrypt_activity_payload(&record.room_id, &record.payload)
+                else {
+                    continue;
+                };
+                let Ok(activity) =
+                    serde_json::from_slice::<DecryptedEphemeralActivityV1>(&plaintext)
+                else {
+                    continue;
+                };
+                let context = EphemeralActivityIngressContext {
+                    room_id: &record.room_id,
+                    conversation_id: record.conversation_id.as_deref(),
+                    sender: &record.sender,
+                    received_at_ms: record.received_at_ms,
+                    expires_at_ms: record.expires_at_ms,
+                };
+                let _ = self.activity_projection.apply(context, &activity);
+            }
+        }
+        self.sync_typing_members();
+        Ok(())
+    }
+
+    fn clear_default_typing_for_sender(&mut self, room_id: &str, sender: &DeviceRef) {
+        let clear = RuntimeActivityClearV1 {
+            activity_kind: FINITECHAT_ACTIVITY_KIND_TYPING.to_owned(),
+            activity_id: None,
+            conversation_id: None,
+        };
+        let _ = self
+            .activity_projection
+            .clear_from_durable_terminal(room_id, None, sender, &clear);
+    }
+
+    fn sync_typing_members(&mut self) {
+        let owner = self.core.device.device_ref();
+        let connected_rooms = self
+            .app
+            .rooms
+            .iter()
+            .filter(|room| room.state == AppRoomState::Connected)
+            .map(|room| room.room_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut members = self
+            .activity_projection
+            .entries()
+            .filter(|entry| connected_rooms.contains(entry.room_id.as_str()))
+            .filter(|entry| entry.conversation_id.is_none())
+            .filter(|entry| entry.activity_kind == FINITECHAT_ACTIVITY_KIND_TYPING)
+            .filter(|entry| entry.sender != *owner)
+            .map(|entry| typing_member_from_activity(entry, &self.profile_cache))
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| {
+            left.room_id
+                .cmp(&right.room_id)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+                .then_with(|| left.account_id.cmp(&right.account_id))
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+        members.dedup_by(|left, right| {
+            left.room_id == right.room_id
+                && left.account_id == right.account_id
+                && left.device_id == right.device_id
+        });
+        self.app.typing_members = members;
     }
 
     fn loaded_message_count(&self, room_id: &str) -> usize {
@@ -2678,6 +2858,70 @@ impl CoreState {
             .room_server_url(room_id)
             .map(str::to_owned)
             .unwrap_or_else(|| self.server_url.clone())
+    }
+
+    fn send_typing_activity(
+        &mut self,
+        room_id: &str,
+        is_typing: bool,
+        now_ms: u64,
+    ) -> Result<(), FiniteChatCoreError> {
+        let activity = DecryptedEphemeralActivityV1 {
+            activity_kind: FINITECHAT_ACTIVITY_KIND_TYPING.to_owned(),
+            activity_id: None,
+            action: if is_typing {
+                EphemeralActivityActionV1::Set
+            } else {
+                EphemeralActivityActionV1::Clear
+            },
+            payload: if is_typing {
+                br#"{}"#.to_vec()
+            } else {
+                Vec::new()
+            },
+        };
+        activity.validate_limits().map_err(client_error)?;
+        let plaintext = serde_json::to_vec(&activity).map_err(client_error)?;
+        let request = AppendEphemeralActivityRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: self
+                .device
+                .room_mls_group_id(room_id)
+                .map_err(client_error)?,
+            epoch: self.device.group_epoch(room_id).map_err(client_error)?,
+            sender: self.device.device_ref().clone(),
+            conversation_id: None,
+            payload: self
+                .device
+                .encrypt_activity_payload(room_id, &plaintext)
+                .map_err(client_error)?,
+            received_at_ms: now_ms,
+            expires_at_ms: now_ms
+                .saturating_add(GenericActivityKindV1::Typing.recommended_expiry_millis()),
+        };
+        let room_server_url = self.room_server_url(room_id);
+        let mut delivery = delivery_for(&room_server_url);
+        delivery.append_activity(&request).map_err(delivery_error)?;
+        Ok(())
+    }
+
+    fn get_ephemeral_activities(
+        &self,
+        room_id: &str,
+        now_ms: u64,
+    ) -> Result<Vec<finitechat_proto::EphemeralActivityRecord>, FiniteChatCoreError> {
+        let request = GetEphemeralActivitiesRequest {
+            room_id: room_id.to_owned(),
+            conversation_id: None,
+            requester: self.device.device_ref().clone(),
+            now_ms,
+        };
+        let room_server_url = self.room_server_url(room_id);
+        let mut delivery = delivery_for(&room_server_url);
+        delivery
+            .get_ephemeral_activities(&request)
+            .map(|response| response.records)
+            .map_err(delivery_error)
     }
 
     fn send_reaction(
@@ -3575,6 +3819,24 @@ fn sender_display_name(sender: &DeviceRef, payload_name: Option<&str>, is_mine: 
         short_account_label(&sender.account_id),
         sender.device_id
     )
+}
+
+fn typing_member_from_activity(
+    entry: &EphemeralActivityProjectionEntry,
+    profile_cache: &BTreeMap<String, AppProfileSummary>,
+) -> AppTypingMember {
+    let npub = npub_encode(&entry.sender.account_id).ok();
+    let profile_name = profile_cache
+        .get(&entry.sender.account_id)
+        .map(|profile| profile.display_name.trim())
+        .filter(|display_name| !display_name.is_empty());
+    AppTypingMember {
+        room_id: entry.room_id.clone(),
+        account_id: entry.sender.account_id.clone(),
+        device_id: entry.sender.device_id.clone(),
+        display_name: sender_display_name(&entry.sender, profile_name, false),
+        npub,
+    }
 }
 
 fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Option<ChatMessage> {
@@ -5231,6 +5493,107 @@ mod tests {
         assert_eq!(
             app_room(&reopened_state, &room_id).last_message_preview,
             "hello from app actor"
+        );
+    }
+
+    #[test]
+    fn app_runtime_projects_typing_as_live_only_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Typing Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        bob.dispatch(AppAction::SetTyping {
+            room_id: room_id.clone(),
+            is_typing: true,
+        })
+        .unwrap();
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(alice_state.typing_members.len(), 1);
+        assert_eq!(alice_state.typing_members[0].room_id, room_id);
+        assert_eq!(alice_state.typing_members[0].device_id, "bob-ios");
+
+        drop(alice);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert!(
+            reopened.state().unwrap().typing_members.is_empty(),
+            "ephemeral typing must not be stored in the durable client transcript"
+        );
+        drop(reopened);
+
+        bob.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "done typing".to_owned(),
+        })
+        .unwrap();
+        let alice_online = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let alice_state = alice_online.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            alice_state.typing_members.is_empty(),
+            "durable chat messages clear stale typing from the same sender"
+        );
+        assert!(
+            alice_state
+                .messages
+                .iter()
+                .any(|message| message.text == "done typing")
         );
     }
 

@@ -2116,6 +2116,10 @@ impl EphemeralActivityProjection {
         })
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = &EphemeralActivityProjectionEntry> {
+        self.entries.values()
+    }
+
     pub fn get(
         &self,
         room_id: &str,

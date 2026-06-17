@@ -36,6 +36,10 @@ struct ChatTimelineRowView: View {
             )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
+        case .typing(let members):
+            ChatTypingIndicatorRow(members: members)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
         }
     }
 }
@@ -1034,6 +1038,81 @@ private struct MessageStatusLine: View {
             return true
         }
         return false
+    }
+}
+
+private struct ChatTypingIndicatorRow: View {
+    let members: [AppTypingMember]
+
+    private let avatarSize: CGFloat = 28
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            ChatAvatar(
+                title: primaryName,
+                subtitle: primaryMember?.npub ?? primaryMember?.accountId ?? "typing",
+                size: avatarSize
+            )
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                TypingDotsBubble()
+
+                Text(label)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 44)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+    }
+
+    private var primaryMember: AppTypingMember? {
+        members.first
+    }
+
+    private var primaryName: String {
+        let trimmed = primaryMember?.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            return trimmed
+        }
+        return primaryMember?.deviceId ?? "Someone"
+    }
+
+    private var label: String {
+        if members.count <= 1 {
+            return "\(primaryName) is typing"
+        }
+        return "\(primaryName) and \(members.count - 1) others are typing"
+    }
+}
+
+private struct TypingDotsBubble: View {
+    var body: some View {
+        TimelineView(.animation) { context in
+            HStack(spacing: 4) {
+                ForEach(0..<3, id: \.self) { index in
+                    Circle()
+                        .fill(Color.secondary)
+                        .frame(width: 5, height: 5)
+                        .opacity(dotOpacity(index: index, date: context.date))
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+        }
+    }
+
+    private func dotOpacity(index: Int, date: Date) -> Double {
+        let beat = (date.timeIntervalSinceReferenceDate * 2.4 + Double(index) * 0.42)
+            .truncatingRemainder(dividingBy: 1)
+        return beat < 0.5 ? 1 : 0.34
     }
 }
 
