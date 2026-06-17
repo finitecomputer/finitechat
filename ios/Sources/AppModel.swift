@@ -669,10 +669,12 @@ final class AppModel: ObservableObject {
         roomID: String,
         attachments: [OutboundAttachment],
         replyTo message: ChatMessage? = nil,
+        captionOverride: String? = nil,
         onSuccess: (@MainActor () -> Void)? = nil
     ) {
         guard !attachments.isEmpty else { return }
-        let caption = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let caption = (captionOverride ?? outboundText)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -689,7 +691,9 @@ final class AppModel: ObservableObject {
                 }.value
                 guard openKey == runtimeKey else { return }
                 state = nextState
-                outboundText = ""
+                if captionOverride == nil {
+                    outboundText = ""
+                }
                 errorText = nil
                 onSuccess?()
                 restartUpdateLoopIfEnabled()

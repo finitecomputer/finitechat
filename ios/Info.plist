@@ -27,6 +27,8 @@
 	<string>FiniteChat connects to your development server on the local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>FiniteChat uses the microphone to record voice messages you choose to send.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>FiniteChat uses speech recognition to transcribe voice messages you choose to send.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

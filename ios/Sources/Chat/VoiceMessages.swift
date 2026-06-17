@@ -1,5 +1,6 @@
 import Accelerate
 import AVFoundation
+import Speech
 import SwiftUI
 
 enum VoiceRecordingPhase: Equatable {
@@ -11,6 +12,11 @@ struct VoiceRecordingState: Equatable {
     var phase: VoiceRecordingPhase
     var durationSecs: TimeInterval
     var levels: [Float]
+    var transcript: String = ""
+}
+
+func voiceRecordingCaption(_ recording: VoiceRecordingState?) -> String {
+    recording?.transcript.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
 enum VoiceRecordingAttachment {
@@ -71,6 +77,10 @@ final class VoiceRecorder: ObservableObject {
     private var startedAt: Date?
     private var pausedAt: Date?
     private var accumulatedPausedDuration: TimeInterval = 0
+    private var speechRecognizer: SFSpeechRecognizer?
+    private nonisolated(unsafe) var speechRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var speechTask: SFSpeechRecognitionTask?
+    private var lastTranscript = ""
 
     private nonisolated(unsafe) var latestPower: Float = 0
 
@@ -109,9 +119,11 @@ final class VoiceRecorder: ObservableObject {
             throw VoiceRecordingError.cannotCreateFile
         }
 
+        startSpeechRecognition()
         inputNode.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) {
             [weak self, file] buffer, _ in
             try? file.write(from: buffer)
+            self?.speechRequest?.append(buffer)
             guard let channelData = buffer.floatChannelData?[0] else { return }
             let frames = buffer.frameLength
             guard frames > 0 else { return }
@@ -135,6 +147,7 @@ final class VoiceRecorder: ObservableObject {
         startedAt = Date()
         pausedAt = nil
         accumulatedPausedDuration = 0
+        lastTranscript = ""
         latestPower = 0
         state = VoiceRecordingState(phase: .recording, durationSecs: 0, levels: [])
         startTimer()
@@ -235,6 +248,7 @@ final class VoiceRecorder: ObservableObject {
     private func stopEngine() {
         timer?.invalidate()
         timer = nil
+        stopSpeechRecognition()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
@@ -248,7 +262,44 @@ final class VoiceRecorder: ObservableObject {
         startedAt = nil
         pausedAt = nil
         accumulatedPausedDuration = 0
+        lastTranscript = ""
         latestPower = 0
+    }
+
+    private func startSpeechRecognition() {
+        let status = SFSpeechRecognizer.authorizationStatus()
+        guard status == .authorized || status == .notDetermined else { return }
+        guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.addsPunctuation = true
+
+        speechRecognizer = recognizer
+        speechRequest = request
+        speechTask = recognizer.recognitionTask(with: request) { [weak self] result, _ in
+            guard let transcript = result?.bestTranscription.formattedString else { return }
+            Task { @MainActor [weak self] in
+                self?.recordTranscript(transcript)
+            }
+        }
+    }
+
+    private func recordTranscript(_ transcript: String) {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != lastTranscript else { return }
+        lastTranscript = trimmed
+        guard var next = state else { return }
+        next.transcript = trimmed
+        state = next
+    }
+
+    private func stopSpeechRecognition() {
+        speechRequest?.endAudio()
+        speechTask?.cancel()
+        speechRequest = nil
+        speechTask = nil
+        speechRecognizer = nil
     }
 
     private func requestMicrophoneAccess() async -> Bool {
@@ -308,6 +359,14 @@ struct VoiceRecordingComposerView: View {
 
                 LiveVoiceWaveformView(levels: recording.levels.map(CGFloat.init))
                     .frame(height: 28)
+            }
+
+            if !voiceRecordingCaption(recording).isEmpty {
+                Text(voiceRecordingCaption(recording))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack {

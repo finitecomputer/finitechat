@@ -697,6 +697,57 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+        model.start()
+        model.outboundText = "typed draft"
+
+        let attachment = OutboundAttachment(
+            filename: "voice_1725000123.m4a",
+            mimeType: VoiceRecordingAttachment.mimeType,
+            kind: .voiceNote,
+            bytes: Data([0x00, 0x01])
+        )
+        model.sendAttachments(
+            roomID: "room-main",
+            attachments: [attachment],
+            captionOverride: "  hello from transcript  "
+        )
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 2
+        }
+
+        guard case .sendAttachments(
+            let roomID,
+            let attachments,
+            let caption,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendAttachments action")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(attachments, [attachment])
+        XCTAssertEqual(caption, "hello from transcript")
+        XCTAssertNil(replyToMessageID)
+        XCTAssertEqual(model.outboundText, "typed draft")
+    }
+
     func testOfflineNoticeIsSuppressedWhenThereAreNoSavedChats() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1105,4 +1156,40 @@ final class VoiceMessageTests: XCTestCase {
         XCTAssertEqual(formattedDuration(65.9), "1:05")
         XCTAssertEqual(formattedDuration(3_605), "60:05")
     }
+
+    func testVoiceRecordingCaptionTrimsTranscript() {
+        XCTAssertEqual(
+            voiceRecordingCaption(VoiceRecordingState(
+                phase: .recording,
+                durationSecs: 1,
+                levels: [],
+                transcript: "  Hello from speech  \n"
+            )),
+            "Hello from speech"
+        )
+        XCTAssertEqual(
+            voiceRecordingCaption(VoiceRecordingState(
+                phase: .paused,
+                durationSecs: 1,
+                levels: [],
+                transcript: " \n "
+            )),
+            ""
+        )
+        XCTAssertEqual(voiceRecordingCaption(nil), "")
+    }
+}
+
+private func waitUntil(
+    timeout: TimeInterval = 2,
+    condition: @escaping @MainActor () -> Bool
+) async throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() {
+            return
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTFail("timed out waiting for condition")
 }

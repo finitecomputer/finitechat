@@ -557,6 +557,7 @@ private struct RoomThreadView: View {
 
     private func sendVoiceRecording() {
         guard voiceRecorder.state != nil, !voiceSendInFlight else { return }
+        let caption = voiceRecordingCaption(voiceRecorder.state)
         voiceSendInFlight = true
         Task {
             do {
@@ -572,7 +573,8 @@ private struct RoomThreadView: View {
                 model.sendAttachments(
                     roomID: roomID,
                     attachments: [attachment],
-                    replyTo: replyDraftMessage
+                    replyTo: replyDraftMessage,
+                    captionOverride: caption
                 ) {
                     replyDraftMessage = nil
                 }
