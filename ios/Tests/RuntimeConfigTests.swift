@@ -73,10 +73,12 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://args.example")
         XCTAssertEqual(loaded.deviceID, "transient-device")
+        XCTAssertTrue(loaded.usesTransientStore)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
         XCTAssertEqual(persisted.deviceID, "persisted-device")
+        XCTAssertFalse(persisted.usesTransientStore)
     }
 
     func testLaunchAutomationOverridesDoNotRewritePersistedConfig() throws {
@@ -102,10 +104,31 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
         XCTAssertEqual(loaded.deviceID, "codex-persist-check")
+        XCTAssertTrue(loaded.usesTransientStore)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
         XCTAssertEqual(persisted.deviceID, "persisted-device")
+        XCTAssertFalse(persisted.usesTransientStore)
+    }
+
+    func testPersistedServerOnlyConfigCombinesWithDefaultDevice() throws {
+        let url = try temporaryConfigURL()
+        try Data(#"{"server_url":"http://192.168.1.226:8789"}"#.utf8).write(to: url)
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://192.168.1.226:8789")
+        XCTAssertEqual(loaded.deviceID, "ios")
+        XCTAssertFalse(loaded.usesTransientStore)
+
+        let persisted = try persistedConfig(at: url)
+        XCTAssertEqual(persisted.serverURL, "http://192.168.1.226:8789")
+        XCTAssertEqual(persisted.deviceID, "ios")
     }
 
     func testFirstLaunchOverridesSeedPersistedConfigForRelaunch() throws {
@@ -298,6 +321,32 @@ final class RuntimeConfigTests: XCTestCase {
         let selectedURL = URL(fileURLWithPath: dataDir)
 
         XCTAssertEqual(selectedURL, stableStoreURL)
+        XCTAssertEqual(
+            try Data(contentsOf: stableStoreURL.appendingPathComponent("account-secret.hex")),
+            Data("stable".utf8)
+        )
+    }
+
+    func testRuntimeDataStoreUsesIsolatedTransientStore() throws {
+        let supportURL = try temporarySupportURL()
+        let stableStoreURL = supportURL.appendingPathComponent("FiniteChatStore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stableStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data("stable".utf8)
+            .write(to: stableStoreURL.appendingPathComponent("account-secret.hex"))
+
+        let dataDir = try RuntimeDataStore.dataDir(
+            deviceID: "codex/persist-check",
+            applicationSupportURL: supportURL,
+            transient: true
+        )
+        let transientURL = URL(fileURLWithPath: dataDir)
+
+        XCTAssertEqual(transientURL.lastPathComponent, "codex-persist-check")
+        XCTAssertEqual(transientURL.deletingLastPathComponent().lastPathComponent, "FiniteChatTransient")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: transientURL.path))
         XCTAssertEqual(
             try Data(contentsOf: stableStoreURL.appendingPathComponent("account-secret.hex")),
             Data("stable".utf8)

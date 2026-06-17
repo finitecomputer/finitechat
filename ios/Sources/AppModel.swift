@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct RuntimeConfig: Codable, Equatable {
     let serverURL: String
     let deviceID: String
+    let usesTransientStore: Bool
 
     private static let defaultServerURL = "http://127.0.0.1:8787"
     private static let defaultDeviceID = "ios"
@@ -14,6 +15,25 @@ struct RuntimeConfig: Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case serverURL = "server_url"
         case deviceID = "device_id"
+    }
+
+    init(serverURL: String, deviceID: String, usesTransientStore: Bool = false) {
+        self.serverURL = serverURL
+        self.deviceID = deviceID
+        self.usesTransientStore = usesTransientStore
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serverURL = try container.decode(String.self, forKey: .serverURL)
+        deviceID = try container.decode(String.self, forKey: .deviceID)
+        usesTransientStore = false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(serverURL, forKey: .serverURL)
+        try container.encode(deviceID, forKey: .deviceID)
     }
 
     static func load(
@@ -27,30 +47,19 @@ struct RuntimeConfig: Codable, Equatable {
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
         let persisted = loadPersisted(storageURL: storageURL)
         let recoveredDeviceID = existingSingleRecoverableDeviceStoreID(storageURL: storageURL)
-        let persistedStoreIsRecoverable = persisted
-            .map { recoverableDeviceStoreExists($0.deviceID, storageURL: storageURL) } ?? false
-        let persistedConfig: RuntimeConfig?
-        if let persisted {
-            if persistedStoreIsRecoverable || recoveredDeviceID == nil {
-                persistedConfig = persisted
-            } else if let recoveredDeviceID {
-                persistedConfig = RuntimeConfig(
-                    serverURL: persisted.serverURL,
-                    deviceID: recoveredDeviceID
-                )
-            } else {
-                persistedConfig = nil
-            }
+        let persistedDeviceIsRecoverable = persisted.deviceID
+            .map { recoverableDeviceStoreExists($0, storageURL: storageURL) } ?? false
+        let fallbackDeviceID: String
+        if let persistedDeviceID = persisted.deviceID,
+           persistedDeviceIsRecoverable || recoveredDeviceID == nil
+        {
+            fallbackDeviceID = persistedDeviceID
         } else {
-            persistedConfig = nil
+            fallbackDeviceID = recoveredDeviceID ?? defaultDeviceID
         }
-        let fallback = persistedConfig ?? RuntimeConfig(
-            serverURL: defaultServerURL,
-            deviceID: recoveredDeviceID ?? defaultDeviceID
-        )
-        let config = RuntimeConfig(
-            serverURL: serverURL ?? fallback.serverURL,
-            deviceID: deviceID ?? fallback.deviceID
+        let fallback = RuntimeConfig(
+            serverURL: persisted.serverURL ?? defaultServerURL,
+            deviceID: fallbackDeviceID
         )
         let hasLaunchOverride = serverURL != nil || deviceID != nil
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
@@ -61,11 +70,22 @@ struct RuntimeConfig: Codable, Equatable {
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
             || launchAutomation
+        let config = RuntimeConfig(
+            serverURL: serverURL ?? fallback.serverURL,
+            deviceID: deviceID ?? fallback.deviceID,
+            usesTransientStore: transientOverride
+        )
         // Runtime identity is product state. A phone launched from Xcode with a
         // LAN server or device id must reopen that same SQLite store after a
         // manual force-close. Tests and launch automations stay process-local
         // so they cannot poison normal app relaunches.
-        if !transientOverride && (persisted != config || hasLaunchOverride) {
+        if !transientOverride
+            && (
+                persisted.serverURL != config.serverURL
+                    || persisted.deviceID != config.deviceID
+                    || hasLaunchOverride
+            )
+        {
             try? config.save(storageURL: storageURL)
         }
         return config
@@ -84,17 +104,14 @@ struct RuntimeConfig: Codable, Equatable {
         try data.write(to: url, options: .atomic)
     }
 
-    private static func loadPersisted(storageURL: URL?) -> RuntimeConfig? {
+    private static func loadPersisted(storageURL: URL?) -> PersistedRuntimeConfig {
         guard let url = storageURL ?? (try? configURL()),
               let data = try? Data(contentsOf: url),
-              let config = try? JSONDecoder().decode(RuntimeConfig.self, from: data)
+              let config = try? JSONDecoder().decode(PersistedRuntimeConfig.self, from: data)
         else {
-            return nil
+            return PersistedRuntimeConfig()
         }
-        let serverURL = config.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let deviceID = config.deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !serverURL.isEmpty, !deviceID.isEmpty else { return nil }
-        return RuntimeConfig(serverURL: serverURL, deviceID: deviceID)
+        return config.normalized()
     }
 
     private static func configURL() throws -> URL {
@@ -181,21 +198,61 @@ struct RuntimeConfig: Codable, Equatable {
     }
 }
 
+private struct PersistedRuntimeConfig: Codable, Equatable {
+    var serverURL: String?
+    var deviceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case serverURL = "server_url"
+        case deviceID = "device_id"
+    }
+
+    init(serverURL: String? = nil, deviceID: String? = nil) {
+        self.serverURL = serverURL
+        self.deviceID = deviceID
+    }
+
+    func normalized() -> PersistedRuntimeConfig {
+        PersistedRuntimeConfig(
+            serverURL: normalizedNonEmpty(serverURL),
+            deviceID: normalizedNonEmpty(deviceID)
+        )
+    }
+
+    private func normalizedNonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+}
+
 struct RuntimeDataStore {
     private static let legacyDataRootDirectoryName = "FiniteChat"
     private static let currentDataDirectoryName = "FiniteChatStore"
+    private static let transientDataRootDirectoryName = "FiniteChatTransient"
     private static let clientStoreFileName = "client.sqlite3"
     private static let accountSecretFileName = "account-secret.hex"
 
     static func dataDir(
         deviceID: String,
-        applicationSupportURL: URL? = nil
+        applicationSupportURL: URL? = nil,
+        transient: Bool = false
     ) throws -> String {
         let supportURL: URL
         if let applicationSupportURL {
             supportURL = applicationSupportURL
         } else {
             supportURL = try defaultApplicationSupportURL(create: true)
+        }
+        if transient {
+            let transientStoreURL = supportURL
+                .appendingPathComponent(transientDataRootDirectoryName, isDirectory: true)
+                .appendingPathComponent(safeDeviceDirectoryName(deviceID), isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: transientStoreURL,
+                withIntermediateDirectories: true
+            )
+            return transientStoreURL.path
         }
         let currentStoreURL = supportURL.appendingPathComponent(
             currentDataDirectoryName,
@@ -346,6 +403,7 @@ final class AppModel: ObservableObject {
 
     private var runtime: FiniteChatRuntime?
     private var openKey = ""
+    private let usesTransientStore = AppModel.initialConfig.usesTransientStore
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
@@ -627,7 +685,10 @@ final class AppModel: ObservableObject {
         if let runtime, openKey == key {
             return runtime
         }
-        let dataDir = try RuntimeDataStore.dataDir(deviceID: deviceID)
+        let dataDir = try RuntimeDataStore.dataDir(
+            deviceID: deviceID,
+            transient: usesTransientStore
+        )
         let opened = try FiniteChatRuntime.open(
             options: OpenOptions(
                 dataDir: dataDir,
@@ -640,7 +701,9 @@ final class AppModel: ObservableObject {
         let openedState = try opened.state()
         if openedState.identity.deviceId != deviceID {
             deviceID = openedState.identity.deviceId
-            try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+            if !usesTransientStore {
+                try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+            }
         }
         runtime = opened
         openKey = "\(serverURL)|\(deviceID)"

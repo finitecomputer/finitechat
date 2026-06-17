@@ -12,6 +12,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     var canLoadOlder = false
     var onLoadOlderMessages: ((String) -> Void)?
@@ -75,6 +76,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
                     messageFrameRegistry: coordinator.messageFrameRegistry,
                     onReact: coordinator.parent.onReact,
                     onDownloadAttachment: coordinator.parent.onDownloadAttachment,
+                    onOpenAttachment: coordinator.parent.onOpenAttachment,
                     onLongPressMessage: coordinator.parent.onLongPressMessage
                 )
             }

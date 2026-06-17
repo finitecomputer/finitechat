@@ -15,6 +15,7 @@ struct ChatTimelineRowView: View {
     let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     var body: some View {
@@ -26,6 +27,7 @@ struct ChatTimelineRowView: View {
                 messageFrameRegistry: messageFrameRegistry,
                 onReact: onReact,
                 onDownloadAttachment: onDownloadAttachment,
+                onOpenAttachment: onOpenAttachment,
                 onLongPressMessage: onLongPressMessage
             )
                 .padding(.horizontal, 12)
@@ -46,6 +48,7 @@ struct FocusedChatMessageCard: View {
             messageFrameRegistry: nil,
             onReact: { _, _ in },
             onDownloadAttachment: { _, _ in },
+            onOpenAttachment: { _, _ in },
             onLongPressMessage: nil
         )
         .allowsHitTesting(false)
@@ -58,6 +61,7 @@ private struct ChatMessageGroupRow: View {
     let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     private let avatarSize: CGFloat = 28
@@ -95,6 +99,7 @@ private struct ChatMessageGroupRow: View {
                     messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
+                    onOpenAttachment: onOpenAttachment,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .leading
                 )
@@ -116,6 +121,7 @@ private struct ChatMessageGroupRow: View {
                     messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
+                    onOpenAttachment: onOpenAttachment,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
@@ -146,6 +152,7 @@ private struct ChatBubbleStack: View {
     let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let alignment: HorizontalAlignment
 
@@ -159,6 +166,7 @@ private struct ChatBubbleStack: View {
                     messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
+                    onOpenAttachment: onOpenAttachment,
                     onLongPressMessage: onLongPressMessage
                 )
             }
@@ -185,6 +193,7 @@ private struct ChatMessageBubble: View {
     let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onLongPressMessage: ((ChatMessage, CGRect) -> Void)?
 
     @State private var isPressed = false
@@ -225,6 +234,9 @@ private struct ChatMessageBubble: View {
                         isMine: message.isMine,
                         onDownloadAttachment: { attachment in
                             onDownloadAttachment(message, attachment)
+                        },
+                        onOpenAttachment: { attachment in
+                            onOpenAttachment(message, attachment)
                         }
                     )
                         .padding(.top, message.replyToMessageId == nil ? 0 : 6)
@@ -446,6 +458,7 @@ private struct ChatMediaGrid: View {
     let attachments: [ChatMediaAttachment]
     let isMine: Bool
     let onDownloadAttachment: (ChatMediaAttachment) -> Void
+    let onOpenAttachment: (ChatMediaAttachment) -> Void
 
     var body: some View {
         let visual = attachments.filter { $0.kind == .image || $0.kind == .video }
@@ -464,6 +477,9 @@ private struct ChatMediaGrid: View {
                     isMine: isMine,
                     onDownload: {
                         onDownloadAttachment(attachment)
+                    },
+                    onOpen: {
+                        onOpenAttachment(attachment)
                     }
                 )
                     .padding(.horizontal, 8)
@@ -538,6 +554,9 @@ private struct ChatMediaGrid: View {
             isMine: isMine,
             onDownload: {
                 onDownloadAttachment(attachment)
+            },
+            onOpen: {
+                onOpenAttachment(attachment)
             }
         )
     }
@@ -558,11 +577,16 @@ private struct MediaTile: View {
     let attachment: ChatMediaAttachment
     let isMine: Bool
     let onDownload: () -> Void
+    let onOpen: () -> Void
 
     var body: some View {
         ZStack {
             if attachment.kind == .image, let path = localPath {
                 VerifiedLocalImageView(path: path) {
+                    mediaPlaceholder
+                }
+            } else if attachment.kind == .video, let path = localPath {
+                LocalVideoThumbnailView(path: path) {
                     mediaPlaceholder
                 }
             } else {
@@ -576,9 +600,21 @@ private struct MediaTile: View {
                     .padding(12)
                     .background(.black.opacity(0.42), in: Circle())
             }
+
+            if let uploadProgress {
+                AttachmentProgressOverlay(progress: uploadProgress, isMine: isMine)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if localPath != nil {
+                onOpen()
+            } else if canDownload {
+                onDownload()
+            }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(mediaLabel(for: attachment.kind))
         .task(id: attachment.attachmentId) {
@@ -604,6 +640,11 @@ private struct MediaTile: View {
             return false
         }
         return !url.isEmpty
+    }
+
+    private var uploadProgress: Double? {
+        guard let progress = attachment.uploadProgressPerMille else { return nil }
+        return Double(min(progress, 1_000)) / 1_000
     }
 
     private var mediaPlaceholder: some View {
@@ -672,10 +713,13 @@ private struct FileAttachmentRow: View {
     let attachment: ChatMediaAttachment
     let isMine: Bool
     let onDownload: () -> Void
+    let onOpen: () -> Void
 
     var body: some View {
         Button {
-            if canDownload {
+            if hasLocalPath {
+                onOpen()
+            } else if canDownload {
                 onDownload()
             }
         } label: {
@@ -696,33 +740,76 @@ private struct FileAttachmentRow: View {
                         .font(.caption)
                         .foregroundStyle(isMine ? .white.opacity(0.72) : .secondary)
                         .lineLimit(1)
+                    if let uploadProgress {
+                        ProgressView(value: uploadProgress)
+                            .tint(isMine ? .white : .accentColor)
+                    }
                 }
+
+                Spacer(minLength: 4)
+
+                Image(systemName: accessoryIconName)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(isMine ? .white.opacity(0.82) : .accentColor)
             }
             .foregroundStyle(isMine ? .white : .primary)
         }
         .buttonStyle(.plain)
     }
 
+    private var hasLocalPath: Bool {
+        attachmentLocalURL(attachment) != nil
+    }
+
     private var canDownload: Bool {
-        let hasLocalPath = !(attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        guard !hasLocalPath,
-              let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
-        else {
-            return false
-        }
-        return !url.isEmpty
+        attachmentCanDownload(attachment)
+    }
+
+    private var uploadProgress: Double? {
+        guard let progress = attachment.uploadProgressPerMille else { return nil }
+        return Double(min(progress, 1_000)) / 1_000
     }
 
     private var detailText: String {
-        if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !localPath.isEmpty
-        {
-            return "Downloaded"
+        if let uploadProgress {
+            return "Uploading \(Int(uploadProgress * 100))%"
+        }
+        if hasLocalPath {
+            return "Tap to open"
         }
         if canDownload {
             return "Tap to download"
         }
         return attachment.mimeType.isEmpty ? mediaLabel(for: attachment.kind) : attachment.mimeType
+    }
+
+    private var accessoryIconName: String {
+        if uploadProgress != nil {
+            return "arrow.up.circle"
+        }
+        if hasLocalPath {
+            return "eye"
+        }
+        if canDownload {
+            return "arrow.down.circle"
+        }
+        return "info.circle"
+    }
+}
+
+private struct AttachmentProgressOverlay: View {
+    let progress: Double
+    let isMine: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.36)
+            ProgressView(value: progress)
+                .progressViewStyle(.circular)
+                .tint(.white)
+                .scaleEffect(1.25)
+        }
+        .accessibilityLabel(isMine ? "Uploading attachment" : "Loading attachment")
     }
 }
 

@@ -191,6 +191,9 @@ private struct RoomThreadView: View {
     @State private var focusedMessage: ChatMessage?
     @State private var focusedMessageFrame: CGRect = .zero
     @State private var focusedActionsVisible = false
+    @State private var imagePreviewSelection: ChatImagePreviewSelection?
+    @State private var videoPreviewItem: ChatAttachmentPreviewItem?
+    @State private var documentPreviewItem: ChatAttachmentPreviewItem?
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -276,6 +279,21 @@ private struct RoomThreadView: View {
         ) { result in
             handleImportedAttachment(result)
         }
+        .fullScreenCover(item: $imagePreviewSelection) { selection in
+            ChatImagePreviewView(selection: selection) {
+                imagePreviewSelection = nil
+            }
+        }
+        .fullScreenCover(item: $videoPreviewItem) { item in
+            ChatVideoPreviewView(item: item) {
+                videoPreviewItem = nil
+            }
+        }
+        .fullScreenCover(item: $documentPreviewItem) { item in
+            ChatDocumentPreviewView(item: item) {
+                documentPreviewItem = nil
+            }
+        }
         .onDisappear {
             dismissFocusedMessage(animated: false)
         }
@@ -294,6 +312,9 @@ private struct RoomThreadView: View {
                 },
                 onDownloadAttachment: { message, attachment in
                     model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
+                },
+                onOpenAttachment: { message, attachment in
+                    handleAttachmentOpen(message: message, attachment: attachment)
                 },
                 onLongPressMessage: { message, frame in
                     presentFocusedMessage(message, frame: frame)
@@ -342,6 +363,30 @@ private struct RoomThreadView: View {
             }
         case .failure(let error):
             model.errorText = String(describing: error)
+        }
+    }
+
+    private func handleAttachmentOpen(message: ChatMessage, attachment: ChatMediaAttachment) {
+        guard let localURL = attachmentLocalURL(attachment) else {
+            if attachmentCanDownload(attachment) {
+                model.downloadAttachment(roomID: roomID, message: message, attachment: attachment)
+            }
+            return
+        }
+
+        switch attachment.kind {
+        case .image:
+            let imageAttachments = message.media.filter { media in
+                media.kind == .image && attachmentLocalURL(media) != nil
+            }
+            imagePreviewSelection = ChatImagePreviewSelection(
+                attachments: imageAttachments,
+                selected: attachment
+            )
+        case .video:
+            videoPreviewItem = ChatAttachmentPreviewItem(attachment: attachment, url: localURL)
+        case .voiceNote, .file:
+            documentPreviewItem = ChatAttachmentPreviewItem(attachment: attachment, url: localURL)
         }
     }
 
