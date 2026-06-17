@@ -71,6 +71,7 @@ const CLIENT_STORE_KEY_DERIVATION_DOMAIN: &[u8] = b"finitechat.client-store-key.
 const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1";
 const CLIENT_APP_MESSAGE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-message.v1";
 const CLIENT_APP_EVENT_AAD_DOMAIN: &[u8] = b"finitechat.client-app-event.v1";
+const CLIENT_APP_OUTBOX_AAD_DOMAIN: &[u8] = b"finitechat.client-app-outbox.v1";
 const CLIENT_APP_ROOM_AAD_DOMAIN: &[u8] = b"finitechat.client-app-room.v1";
 const CLIENT_APP_STATE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-state.v1";
 const CLIENT_APP_PROFILE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-profile.v1";
@@ -101,6 +102,9 @@ const MAX_APP_MESSAGE_CIPHERTEXT_BYTES: u32 =
     MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_EVENT_CIPHERTEXT_BYTES: u32 =
     MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
+const MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES: u32 = MAX_ENVELOPE_PAYLOAD_BYTES + 8 * 1024;
+const MAX_APP_OUTBOX_METADATA_CIPHERTEXT_BYTES: u32 =
+    MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_ROOM_DISPLAY_NAME_BYTES: u32 = 256;
 const MAX_APP_ROOM_STATUS_BYTES: u32 = 512;
 const MAX_APP_ROOM_INVITE_URL_BYTES: u32 = 4096;
@@ -117,6 +121,7 @@ const MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES: u32 = 8192;
 const MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_STORED_APP_MESSAGES: u32 = 5_000;
+const MAX_STORED_APP_OUTBOX_MESSAGES: u32 = 512;
 const MAX_STORED_APP_PROFILES: u32 = 4_096;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
@@ -356,6 +361,67 @@ impl StoredAppEvent {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOutboundMessage {
+    pub room_id: RoomId,
+    pub message_id: MessageId,
+    pub sender: DeviceRef,
+    pub plaintext: Vec<u8>,
+    pub delivery_state: StoredOutboundDeliveryState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredOutboundDeliveryState {
+    #[default]
+    Pending,
+    Failed {
+        reason: String,
+    },
+}
+
+impl StoredOutboundDeliveryState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        match self {
+            Self::Pending => Ok(()),
+            Self::Failed { reason } => {
+                validate_string_bytes(
+                    "app_outbox.failure_reason",
+                    reason,
+                    MAX_APP_ROOM_STATUS_BYTES,
+                )?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl StoredOutboundMessage {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_room_id(&self.room_id)?;
+        validate_string_bytes(
+            "app_outbox.message_id",
+            &self.message_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        self.sender.validate_limits().map_err(ClientError::from)?;
+        validate_bytes_len(
+            "app_outbox.plaintext",
+            self.plaintext.len(),
+            MAX_ENVELOPE_PAYLOAD_BYTES,
+        )?;
+        self.delivery_state.validate_limits()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredOutboundMessageMetadataV1 {
+    sender: DeviceRef,
+    plaintext: Vec<u8>,
+    #[serde(default)]
+    delivery_state: StoredOutboundDeliveryState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3077,6 +3143,87 @@ impl SqliteClientStore {
         })
     }
 
+    pub fn load_app_outbox(
+        &self,
+        owner: &DeviceRef,
+    ) -> Result<Vec<StoredOutboundMessage>, ClientStoreError> {
+        validate_app_message_owner(owner)?;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT room_id, message_id, nonce, ciphertext
+            FROM client_app_outbox
+            WHERE account_id = ?1 AND device_id = ?2
+            ORDER BY rowid ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![&owner.account_id, &owner.device_id], |row| {
+            Ok((
+                row.get::<_, RoomId>(0)?,
+                row.get::<_, MessageId>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let (room_id, message_id, nonce, ciphertext) = row?;
+            let metadata = decrypt_app_outbox_metadata(
+                &self.options.encryption_key,
+                AppOutboxIdentity {
+                    owner,
+                    room_id: &room_id,
+                    message_id: &message_id,
+                },
+                &nonce,
+                &ciphertext,
+            )?;
+            let message = StoredOutboundMessage {
+                room_id,
+                message_id,
+                sender: metadata.sender,
+                plaintext: metadata.plaintext,
+                delivery_state: metadata.delivery_state,
+            };
+            message.validate_limits()?;
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    pub fn save_app_outbox(
+        &mut self,
+        owner: &DeviceRef,
+        messages: &[StoredOutboundMessage],
+    ) -> Result<(), ClientStoreError> {
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_app_outbox_tx(tx, &encryption_key, owner, messages)?;
+            prune_app_outbox_tx(tx, owner, MAX_STORED_APP_OUTBOX_MESSAGES)
+        })
+    }
+
+    pub fn delete_app_outbox_message(
+        &mut self,
+        owner: &DeviceRef,
+        room_id: &str,
+        message_id: &str,
+    ) -> Result<(), ClientStoreError> {
+        validate_app_message_owner(owner)?;
+        validate_room_id(room_id).map_err(ClientError::from)?;
+        validate_string_bytes("app_outbox.message_id", message_id, MAX_OBJECT_ID_BYTES)
+            .map_err(ClientError::from)?;
+        self.with_transaction(|tx| {
+            tx.execute(
+                r#"
+                DELETE FROM client_app_outbox
+                WHERE account_id = ?1 AND device_id = ?2 AND room_id = ?3 AND message_id = ?4
+                "#,
+                params![&owner.account_id, &owner.device_id, room_id, message_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn load_app_rooms(
         &self,
         owner: &DeviceRef,
@@ -5097,6 +5244,18 @@ pub enum ClientStoreError {
     NegativeStoredAppEventSeq { seq: i64 },
     #[error("stored app event count cannot be represented in sqlite")]
     StoredAppEventCountOverflow,
+    #[error("encrypted app outbox nonce has {actual_bytes} bytes")]
+    InvalidAppOutboxNonceLength { actual_bytes: usize },
+    #[error("failed to encrypt app outbox metadata")]
+    EncryptAppOutbox,
+    #[error("failed to decrypt app outbox metadata")]
+    DecryptAppOutbox,
+    #[error("failed to encode app outbox metadata")]
+    EncodeAppOutboxMetadata,
+    #[error("failed to decode app outbox metadata")]
+    DecodeAppOutboxMetadata,
+    #[error("stored app outbox count cannot be represented in sqlite")]
+    StoredAppOutboxCountOverflow,
     #[error("failed to encrypt stored app event")]
     EncryptAppEvent,
     #[error("failed to decrypt stored app event")]
@@ -5757,7 +5916,6 @@ fn migrate_client_store(
     reject_or_remove_legacy_client_store_tables(conn)?;
     if client_app_messages_has_column(conn, "plaintext")? {
         migrate_plaintext_app_messages(conn, encryption_key)?;
-        return Ok(());
     }
     create_current_client_store_schema(conn)?;
     Ok(())
@@ -5817,6 +5975,22 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
 
         CREATE INDEX IF NOT EXISTS client_app_events_owner_idx
           ON client_app_events(account_id, device_id);
+
+        CREATE TABLE IF NOT EXISTS client_app_outbox (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          room_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          nonce BLOB NOT NULL,
+          ciphertext BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id, room_id, message_id),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_device_states(account_id, device_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS client_app_outbox_owner_idx
+          ON client_app_outbox(account_id, device_id);
 
         CREATE TABLE IF NOT EXISTS client_app_rooms (
           account_id TEXT NOT NULL,
@@ -6284,6 +6458,43 @@ fn save_app_events_tx(
     Ok(())
 }
 
+fn save_app_outbox_tx(
+    tx: &Transaction<'_>,
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    messages: &[StoredOutboundMessage],
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO client_app_outbox (
+          account_id,
+          device_id,
+          room_id,
+          message_id,
+          nonce,
+          ciphertext
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(account_id, device_id, room_id, message_id) DO UPDATE SET
+          nonce = excluded.nonce,
+          ciphertext = excluded.ciphertext
+        "#,
+    )?;
+    for message in messages {
+        message.validate_limits()?;
+        let sealed = encrypt_app_outbox_metadata(encryption_key, owner, message)?;
+        stmt.execute(params![
+            &owner.account_id,
+            &owner.device_id,
+            &message.room_id,
+            &message.message_id,
+            &sealed.nonce,
+            &sealed.ciphertext,
+        ])?;
+    }
+    Ok(())
+}
+
 fn save_app_rooms_tx(
     tx: &Transaction<'_>,
     encryption_key: &ClientStoreEncryptionKey,
@@ -6462,6 +6673,43 @@ fn prune_app_events_tx(
     Ok(())
 }
 
+fn prune_app_outbox_tx(
+    tx: &Transaction<'_>,
+    owner: &DeviceRef,
+    max_messages: u32,
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    let count = tx.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM client_app_outbox
+        WHERE account_id = ?1 AND device_id = ?2
+        "#,
+        params![&owner.account_id, &owner.device_id],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let excess = count.saturating_sub(u64::from(max_messages));
+    if excess == 0 {
+        return Ok(());
+    }
+    let limit =
+        i64::try_from(excess).map_err(|_| ClientStoreError::StoredAppOutboxCountOverflow)?;
+    tx.execute(
+        r#"
+        DELETE FROM client_app_outbox
+        WHERE rowid IN (
+          SELECT rowid
+          FROM client_app_outbox
+          WHERE account_id = ?1 AND device_id = ?2
+          ORDER BY rowid ASC
+          LIMIT ?3
+        )
+        "#,
+        params![&owner.account_id, &owner.device_id, limit],
+    )?;
+    Ok(())
+}
+
 fn prune_app_profiles_tx(
     tx: &Transaction<'_>,
     owner: &DeviceRef,
@@ -6551,6 +6799,12 @@ struct SealedAppEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedAppOutbox {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SealedAppRoom {
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
@@ -6575,6 +6829,13 @@ struct AppMessageIdentity<'a> {
     seq: u64,
     message_id: &'a str,
     sender: &'a DeviceRef,
+}
+
+#[derive(Clone, Copy)]
+struct AppOutboxIdentity<'a> {
+    owner: &'a DeviceRef,
+    room_id: &'a str,
+    message_id: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -6709,6 +6970,58 @@ fn encrypt_app_event_plaintext(
     )
     .map_err(ClientError::from)?;
     Ok(SealedAppEvent {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
+fn encrypt_app_outbox_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    message: &StoredOutboundMessage,
+) -> Result<SealedAppOutbox, ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    message.validate_limits()?;
+    let metadata = StoredOutboundMessageMetadataV1 {
+        sender: message.sender.clone(),
+        plaintext: message.plaintext.clone(),
+        delivery_state: message.delivery_state.clone(),
+    };
+    let plaintext =
+        serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppOutboxMetadata)?;
+    validate_bytes_len(
+        "app_outbox.metadata",
+        plaintext.len(),
+        MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_outbox_aad(AppOutboxIdentity {
+        owner,
+        room_id: &message.room_id,
+        message_id: &message.message_id,
+    })?;
+    let provider = OpenMlsRustCrypto::default();
+    let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider
+        .rand()
+        .random_array()
+        .map_err(|_| ClientStoreError::Randomness)?;
+    let ciphertext = provider
+        .crypto()
+        .aead_encrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            &plaintext,
+            &nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::EncryptAppOutbox)?;
+    validate_bytes_len(
+        "app_outbox.ciphertext",
+        ciphertext.len(),
+        MAX_APP_OUTBOX_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(SealedAppOutbox {
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -6979,6 +7292,59 @@ fn decrypt_app_event_plaintext(
     Ok(plaintext)
 }
 
+fn decrypt_app_outbox_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    identity: AppOutboxIdentity<'_>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<StoredOutboundMessageMetadataV1, ClientStoreError> {
+    if nonce.len() != CLIENT_STORE_NONCE_BYTES {
+        return Err(ClientStoreError::InvalidAppOutboxNonceLength {
+            actual_bytes: nonce.len(),
+        });
+    }
+    validate_bytes_non_empty("app_outbox.ciphertext", ciphertext.len())
+        .map_err(ClientError::from)?;
+    validate_bytes_len(
+        "app_outbox.ciphertext",
+        ciphertext.len(),
+        MAX_APP_OUTBOX_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_outbox_aad(identity)?;
+    let provider = OpenMlsRustCrypto::default();
+    let plaintext = provider
+        .crypto()
+        .aead_decrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            ciphertext,
+            nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::DecryptAppOutbox)?;
+    validate_bytes_len(
+        "app_outbox.metadata",
+        plaintext.len(),
+        MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let metadata = serde_json::from_slice::<StoredOutboundMessageMetadataV1>(&plaintext)
+        .map_err(|_| ClientStoreError::DecodeAppOutboxMetadata)?;
+    metadata
+        .sender
+        .validate_limits()
+        .map_err(ClientError::from)?;
+    validate_bytes_len(
+        "app_outbox.plaintext",
+        metadata.plaintext.len(),
+        MAX_ENVELOPE_PAYLOAD_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    metadata.delivery_state.validate_limits()?;
+    Ok(metadata)
+}
+
 fn decrypt_app_room_metadata(
     encryption_key: &ClientStoreEncryptionKey,
     identity: AppRoomIdentity<'_>,
@@ -7201,6 +7567,34 @@ fn app_event_or_message_aad(
     append_raw_len_prefixed(&mut aad, identity.message_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.sender.account_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.sender.device_id.as_bytes())?;
+    Ok(aad)
+}
+
+fn app_outbox_aad(identity: AppOutboxIdentity<'_>) -> Result<Vec<u8>, ClientStoreError> {
+    validate_app_message_owner(identity.owner)?;
+    validate_room_id(identity.room_id).map_err(ClientError::from)?;
+    validate_string_bytes(
+        "app_outbox.message_id",
+        identity.message_id,
+        MAX_OBJECT_ID_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let mut aad = Vec::with_capacity(
+        CLIENT_APP_OUTBOX_AAD_DOMAIN.len()
+            + U32_BYTES
+            + identity.owner.account_id.len()
+            + U32_BYTES
+            + identity.owner.device_id.len()
+            + U32_BYTES
+            + identity.room_id.len()
+            + U32_BYTES
+            + identity.message_id.len(),
+    );
+    aad.extend_from_slice(CLIENT_APP_OUTBOX_AAD_DOMAIN);
+    append_raw_len_prefixed(&mut aad, identity.owner.account_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.owner.device_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.room_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.message_id.as_bytes())?;
     Ok(aad)
 }
 
@@ -8611,6 +9005,58 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_client_store_persists_app_outbox_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([11; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: secret.clone(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(60),
+        };
+        let device = FiniteChatDevice::new(config).unwrap();
+        let owner = device.device_ref().clone();
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+
+        let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+        store.save_device_state(&device).unwrap();
+        let pending = outbound_message(&owner, "local-1", "pending body");
+        store
+            .save_app_outbox(&owner, std::slice::from_ref(&pending))
+            .unwrap();
+        assert_eq!(
+            store.load_app_outbox(&owner).unwrap(),
+            vec![pending.clone()]
+        );
+        drop(store);
+
+        let mut reopened = SqliteClientStore::open(&db_path, options).unwrap();
+        assert_eq!(
+            reopened.load_app_outbox(&owner).unwrap(),
+            vec![pending.clone()]
+        );
+
+        let failed = StoredOutboundMessage {
+            delivery_state: StoredOutboundDeliveryState::Failed {
+                reason: "network unavailable".to_owned(),
+            },
+            ..pending.clone()
+        };
+        reopened
+            .save_app_outbox(&owner, std::slice::from_ref(&failed))
+            .unwrap();
+        assert_eq!(reopened.load_app_outbox(&owner).unwrap(), vec![failed]);
+
+        reopened
+            .delete_app_outbox_message(&owner, "room-store", "local-1")
+            .unwrap();
+        assert!(reopened.load_app_outbox(&owner).unwrap().is_empty());
+    }
+
+    #[test]
     fn sqlite_client_store_persists_app_rooms_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let secret = NostrSecretKey::from_bytes([8; NOSTR_SECRET_KEY_BYTES]).unwrap();
@@ -8881,6 +9327,20 @@ mod tests {
             message_id: message_id.to_owned(),
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
+        }
+    }
+
+    fn outbound_message(
+        sender: &DeviceRef,
+        message_id: &str,
+        plaintext: &str,
+    ) -> StoredOutboundMessage {
+        StoredOutboundMessage {
+            room_id: "room-store".to_owned(),
+            message_id: message_id.to_owned(),
+            sender: sender.clone(),
+            plaintext: plaintext.as_bytes().to_vec(),
+            delivery_state: StoredOutboundDeliveryState::Pending,
         }
     }
 

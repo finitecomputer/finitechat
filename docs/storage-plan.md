@@ -28,6 +28,7 @@ rollback.
 - `client_app_rooms`
 - `client_app_state`
 - `client_app_messages`
+- `client_app_outbox`
 - `client_app_profiles`
 
 `client_device_states` stores one encrypted binary snapshot per
@@ -69,6 +70,17 @@ message id, and authenticated sender so copied or tampered rows fail closed
 on load. The table has owner and owner/room/seq indexes so startup can load a
 bounded recent projection without replaying room history.
 
+`client_app_outbox` stores encrypted local pending/failed chat sends that have
+not become accepted server log entries. Outbox rows are scoped to the owning
+account/device and keyed by `(room_id, message_id)`, where `message_id` is a
+local client id. The encrypted payload carries the sender, decrypted application
+plaintext, and delivery state (`pending` or `failed` with a bounded reason).
+Runtime startup merges these rows into the Rust-owned chat projection after
+accepted messages/events, so a force-close after a failed send reopens with the
+visible failed bubble instead of an empty transcript. When a send is accepted by
+the room server, the runtime writes the accepted app message/event projection
+and deletes the matching outbox row.
+
 The wrapping key is derived from the user's Nostr secret and device id using
 HKDF with Finite Chat domain separation. SQLite metadata, row counts, WAL
 behavior, and account/device lookup ids remain visible to the local machine;
@@ -86,14 +98,15 @@ creating local pending MLS state and still submit the exact server request that
 matches that pending Commit.
 
 Received application messages are inserted in the same SQLite transaction that
-persists the device cursor that consumed them. Own sends are inserted by
-`CoreState::send_text` after the server append is accepted. Swift and the app
-runtime render the Rust state and do not own persistence. Startup reads the
-bounded SQLite app-state, room, message, and profile projections before network
-sync; delivery failure during startup must return the saved chat list and
-selected transcript as offline local state, not an empty UI. Full room-history
-sync remains a repair/recovery path, not the ordinary way the UI gets messages
-after launch.
+persists the device cursor that consumed them. Own sends are first inserted into
+`client_app_outbox` before network delivery, then promoted by deleting the
+outbox row after the server append is accepted and the accepted app
+message/event projection is saved. Swift and the app runtime render the Rust
+state and do not own persistence. Startup reads the bounded SQLite app-state,
+room, message, outbox, and profile projections before network sync; delivery
+failure during startup must return the saved chat list and selected transcript
+as offline local state, not an empty UI. Full room-history sync remains a
+repair/recovery path, not the ordinary way the UI gets messages after launch.
 
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an
