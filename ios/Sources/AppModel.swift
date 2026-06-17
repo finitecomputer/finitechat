@@ -455,6 +455,31 @@ final class AppModel: ObservableObject {
         return projection(for: roomId).messages
     }
 
+    var roomListEmptyDescription: String {
+        if developerErrorText != nil {
+            return "Open Settings to check connection."
+        }
+        if state == nil {
+            return "Opening chats..."
+        }
+        return "No chats yet"
+    }
+
+    var userNoticeText: String? {
+        if rooms.isEmpty {
+            return nil
+        }
+        return state?.toast?.nonEmptyTrimmed
+    }
+
+    var developerErrorText: String? {
+        errorText?.nonEmptyTrimmed
+    }
+
+    var developerRuntimeStatus: String? {
+        state?.status.nonEmptyTrimmed
+    }
+
     var activeProfile: AppProfileSummary? {
         guard let state, let activeProfileId = state.activeProfileId else { return nil }
         return state.profiles.first { $0.accountId == activeProfileId }
@@ -931,6 +956,13 @@ final class AppModel: ObservableObject {
             return .voiceNote
         }
         return .file
+    }
+}
+
+private extension String {
+    var nonEmptyTrimmed: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

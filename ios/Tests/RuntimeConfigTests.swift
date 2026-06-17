@@ -462,6 +462,8 @@ final class AppModelPersistenceTests: XCTestCase {
             "saved before force close",
         ])
         XCTAssertEqual(firstLaunch.state?.status, "offline")
+        XCTAssertEqual(firstLaunch.userNoticeText, "Showing saved chats. Connection will retry.")
+        XCTAssertEqual(firstLaunch.developerRuntimeStatus, "offline")
         XCTAssertEqual(firstRuntime.dispatchedActions, [.startRuntime])
 
         let relaunchConfig = RuntimeConfig.load(
@@ -501,8 +503,65 @@ final class AppModelPersistenceTests: XCTestCase {
             relaunch.state?.toast,
             "Showing saved chats. Connection will retry."
         )
+        XCTAssertEqual(relaunch.userNoticeText, "Showing saved chats. Connection will retry.")
+        XCTAssertEqual(relaunch.developerRuntimeStatus, "offline")
         XCTAssertNil(relaunch.errorText)
         XCTAssertEqual(secondRuntime.dispatchedActions, [.startRuntime])
+    }
+
+    func testRawRuntimeDiagnosticsStayOutOfNormalChatSurfaces() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            throw RawDiagnosticError(
+                description: "HTTP runtime transport failed: server returned 404 Not Found"
+            )
+        }
+
+        model.start()
+
+        XCTAssertNil(model.userNoticeText)
+        XCTAssertEqual(model.roomListEmptyDescription, "Open Settings to check connection.")
+        XCTAssertEqual(
+            model.developerErrorText,
+            "HTTP runtime transport failed: server returned 404 Not Found"
+        )
+    }
+
+    func testOfflineNoticeIsSuppressedWhenThereAreNoSavedChats() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let offlineEmpty = emptyChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: offlineEmpty,
+            startRuntimeState: offlineEmpty
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        XCTAssertNil(model.userNoticeText)
+        XCTAssertEqual(model.roomListEmptyDescription, "No chats yet")
+        XCTAssertEqual(model.developerRuntimeStatus, "offline")
     }
 
     private func savedChatState(
@@ -559,6 +618,29 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    private func emptyChatState(
+        status: String = "ready",
+        toast: String? = nil
+    ) -> AppState {
+        AppState(
+            rev: 1,
+            identity: Identity(
+                accountId: "alice-account",
+                deviceId: "qt433",
+                accountSecretHex: String(repeating: "0", count: 64)
+            ),
+            rooms: [],
+            selectedRoomId: nil,
+            activeInvite: nil,
+            activeProfileId: nil,
+            status: status,
+            toast: toast,
+            messages: [],
+            profiles: [],
+            devices: []
+        )
+    }
+
     private func temporarySupportURL() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -568,6 +650,10 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         return directory
     }
+}
+
+private struct RawDiagnosticError: Error, CustomStringConvertible {
+    let description: String
 }
 
 private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked Sendable {

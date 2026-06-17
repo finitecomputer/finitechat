@@ -92,7 +92,7 @@ private struct RoomListView: View {
                 ContentUnavailableView {
                     Label("FiniteChat", systemImage: "bubble.left.and.bubble.right")
                 } description: {
-                    Text(model.errorText ?? model.state?.status ?? "Ready")
+                    Text(model.roomListEmptyDescription)
                 } actions: {
                     HStack {
                         Button {
@@ -150,7 +150,7 @@ private struct RoomListView: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            StatusBar(text: model.errorText ?? model.state?.toast ?? model.state?.status)
+            NoticeBar(text: model.userNoticeText)
         }
     }
 }
@@ -194,7 +194,7 @@ private struct RoomRow: View {
         if !room.lastMessagePreview.isEmpty {
             return room.lastMessagePreview
         }
-        return room.status
+        return room.userStatusText
     }
 }
 
@@ -370,7 +370,7 @@ private struct RoomThreadView: View {
         case .waitingForApproval:
             PendingRoomView(room: room, model: model)
         case .joining:
-            ProgressView(room.status)
+            ProgressView(room.userStatusText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .needsAttention, .offline:
             NeedsAttentionView(room: room) {
@@ -745,7 +745,7 @@ private struct PendingRoomView: View {
             Image(systemName: "lock.open")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
-            Text(room.status)
+            Text(room.userStatusText)
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -778,7 +778,7 @@ private struct NeedsAttentionView: View {
             Image(systemName: "exclamationmark.triangle")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
-            Text(room.status)
+            Text(room.userStatusText)
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -941,14 +941,6 @@ private struct SettingsSheet: View {
                     }
                 }
 
-                if let errorText = model.errorText {
-                    Section("Last Error") {
-                        Text(errorText)
-                            .font(.caption)
-                            .textSelection(.enabled)
-                    }
-                }
-
                 DisclosureGroup("Developer") {
                     TextField("Server", text: $model.serverURL)
                         .textInputAutocapitalization(.never)
@@ -962,6 +954,22 @@ private struct SettingsSheet: View {
                         LabeledContent("Account", value: state.identity.accountId)
                         LabeledContent("Runtime Device", value: state.identity.deviceId)
                         LabeledContent("Revision", value: "\(state.rev)")
+                    }
+                    if let status = model.developerRuntimeStatus {
+                        LabeledContent("Runtime Status", value: status)
+                    }
+                    if let notice = model.userNoticeText {
+                        LabeledContent("Last Notice", value: notice)
+                    }
+                    if let errorText = model.developerErrorText {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Last Error")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(errorText)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
@@ -1141,7 +1149,7 @@ private struct QRCodeView: View {
     }
 }
 
-private struct StatusBar: View {
+private struct NoticeBar: View {
     let text: String?
 
     var body: some View {
@@ -1169,6 +1177,26 @@ private extension AppRoomState {
             .red
         case .offline:
             .gray
+        }
+    }
+}
+
+private extension AppRoomSummary {
+    var userStatusText: String {
+        switch state {
+        case .connected:
+            return "Connected"
+        case .waitingForApproval:
+            if status.localizedCaseInsensitiveContains("PIN") {
+                return "Enter the invite PIN"
+            }
+            return "Waiting for approval"
+        case .joining:
+            return "Joining"
+        case .needsAttention:
+            return "Needs attention"
+        case .offline:
+            return "Offline"
         }
     }
 }
