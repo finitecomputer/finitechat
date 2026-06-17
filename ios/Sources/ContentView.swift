@@ -207,6 +207,7 @@ private struct RoomThreadView: View {
     @State private var focusedMessage: ChatMessage?
     @State private var focusedMessageFrame: CGRect = .zero
     @State private var focusedActionsVisible = false
+    @State private var composerFocused = false
     @State private var imagePreviewSelection: ChatImagePreviewSelection?
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
     @State private var documentPreviewItem: ChatAttachmentPreviewItem?
@@ -248,6 +249,7 @@ private struct RoomThreadView: View {
                     },
                     onReply: {
                         replyDraftMessage = focusedMessage
+                        composerFocused = true
                         dismissFocusedMessage()
                     },
                     onCopy: {
@@ -335,6 +337,22 @@ private struct RoomThreadView: View {
                 onLongPressMessage: { message, frame in
                     presentFocusedMessage(message, frame: frame)
                 },
+                accessoryContent: Composer(
+                    model: model,
+                    replyTarget: replyDraftMessage,
+                    isInputFocused: $composerFocused,
+                    onCancelReply: {
+                        replyDraftMessage = nil
+                    },
+                    onSend: {
+                        if model.send(replyTo: replyDraftMessage) {
+                            replyDraftMessage = nil
+                        }
+                    }
+                ) {
+                    importingAttachment = true
+                },
+                isInputFocused: composerFocused,
                 canLoadOlder: room.canLoadOlder,
                 onLoadOlderMessages: { beforeMessageID in
                     model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
@@ -344,20 +362,6 @@ private struct RoomThreadView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGroupedBackground))
             .accessibilityLabel("Messages")
-            Composer(
-                model: model,
-                replyTarget: replyDraftMessage,
-                onCancelReply: {
-                    replyDraftMessage = nil
-                },
-                onSend: {
-                    if model.send(replyTo: replyDraftMessage) {
-                        replyDraftMessage = nil
-                    }
-                }
-            ) {
-                importingAttachment = true
-            }
         case .waitingForApproval:
             PendingRoomView(room: room, model: model)
         case .joining:
@@ -407,6 +411,7 @@ private struct RoomThreadView: View {
     }
 
     private func presentFocusedMessage(_ message: ChatMessage, frame: CGRect) {
+        composerFocused = false
         focusedMessageFrame = frame
         withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
             focusedMessage = message
@@ -567,9 +572,11 @@ private func messageClipboardText(_ message: ChatMessage) -> String {
 private struct Composer: View {
     @ObservedObject var model: AppModel
     let replyTarget: ChatMessage?
+    @Binding var isInputFocused: Bool
     let onCancelReply: () -> Void
     let onSend: () -> Void
     let onAttach: () -> Void
+    @FocusState private var textFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -593,6 +600,7 @@ private struct Composer: View {
                 TextField("Message", text: $model.outboundText, axis: .vertical)
                     .lineLimit(1...4)
                     .textFieldStyle(.roundedBorder)
+                    .focused($textFieldFocused)
                     .accessibilityLabel("Message")
 
                 Button {
@@ -608,6 +616,13 @@ private struct Composer: View {
             .padding()
         }
         .background(.bar)
+        .onChange(of: textFieldFocused) { _, focused in
+            isInputFocused = focused
+        }
+        .onChange(of: isInputFocused) { _, focused in
+            guard textFieldFocused != focused else { return }
+            textFieldFocused = focused
+        }
     }
 }
 

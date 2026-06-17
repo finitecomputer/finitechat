@@ -7,6 +7,7 @@ enum MessageCollectionUpdateKind: Equatable {
 }
 
 enum MessageCollectionLayout {
+    static let jumpButtonSpacing: CGFloat = 12
     static let bottomContentSpacing: CGFloat = 12
 
     static func effectiveContentInset(
