@@ -258,6 +258,10 @@ private struct RoomThreadView: View {
                 onDownloadAttachment: { message, attachment in
                     model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
                 },
+                canLoadOlder: room.canLoadOlder,
+                onLoadOlderMessages: { beforeMessageID in
+                    model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
+                },
                 followsBottom: $followsBottom
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)

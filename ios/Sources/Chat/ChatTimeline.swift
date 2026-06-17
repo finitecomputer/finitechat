@@ -38,6 +38,13 @@ enum ChatTimelineRow: Identifiable, Equatable {
             "group-\(group.id)"
         }
     }
+
+    var oldestMessageID: String? {
+        switch self {
+        case .messageGroup(let group):
+            group.messages.first?.messageId
+        }
+    }
 }
 
 enum ChatTimeline {

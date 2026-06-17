@@ -38,6 +38,8 @@ const ATTACHMENT_CACHE_DIR: &str = "attachments";
 const LEGACY_APP_MESSAGES_FILE: &str = "app-messages.json";
 const MAX_APP_MESSAGES: usize = 5_000;
 const MAX_APP_MESSAGES_U32: u32 = 5_000;
+const DEFAULT_TRANSCRIPT_WINDOW: usize = 50;
+const MAX_TRANSCRIPT_PAGE_SIZE: u32 = 100;
 const DEFAULT_KEY_PACKAGE_TARGET_AVAILABLE: u32 = 2;
 const DEFAULT_MAX_SYNC_PAGES_PER_ROOM: u32 = 16;
 const DEFAULT_CREDENTIAL_VALIDITY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
@@ -46,6 +48,14 @@ const DEFAULT_INVITE_MAX_JOINS: u32 = 32;
 const DEFAULT_APP_UPDATE_WAIT_MILLIS: u64 = 30_000;
 const MIN_APP_UPDATE_WAIT_MILLIS: u64 = 1_000;
 const MAX_APP_UPDATE_WAIT_MILLIS: u64 = 60_000;
+
+const _: () = {
+    assert!(MAX_APP_MESSAGES > 0);
+    assert!(MAX_APP_MESSAGES_U32 as usize == MAX_APP_MESSAGES);
+    assert!(DEFAULT_TRANSCRIPT_WINDOW > 0);
+    assert!(DEFAULT_TRANSCRIPT_WINDOW <= MAX_APP_MESSAGES);
+    assert!(MAX_TRANSCRIPT_PAGE_SIZE > 0);
+};
 
 uniffi::setup_scaffolding!();
 
@@ -217,6 +227,7 @@ pub struct AppRoomSummary {
     pub status: String,
     pub last_message_preview: String,
     pub unread_count: u32,
+    pub can_load_older: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -298,6 +309,11 @@ pub enum AppAction {
         message_id: String,
         attachment_id: String,
     },
+    LoadOlderMessages {
+        room_id: String,
+        before_message_id: String,
+        limit: u32,
+    },
     ReactToMessage {
         room_id: String,
         message_id: String,
@@ -342,6 +358,7 @@ struct AppRuntimeState {
     pending_invites: BTreeMap<String, PendingInvite>,
     owned_invites: BTreeMap<String, String>,
     invite_watch_marks: BTreeMap<String, InviteWatchMark>,
+    loaded_message_counts: BTreeMap<String, usize>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
     revoked_devices: BTreeSet<String>,
 }
@@ -546,8 +563,7 @@ impl AppRuntimeState {
             .map_err(store_error)?;
         let chat_projection =
             ChatProjectionState::from_stored(stored_messages, stored_events, &owner);
-        let mut messages = chat_projection.messages();
-        core.apply_attachment_cache_paths(&mut messages);
+        let all_messages = chat_projection.messages();
         let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
         let known_room_ids = core.known_room_ids().into_iter().collect::<BTreeSet<_>>();
         let mut persisted_room_ids = BTreeSet::new();
@@ -574,19 +590,24 @@ impl AppRuntimeState {
             }
         }
         sort_app_rooms(&mut rooms);
-        apply_message_previews(&mut rooms, &messages);
-        Ok(Self {
+        apply_message_previews(&mut rooms, &all_messages);
+        let selected_room_id = rooms.first().map(|room| room.room_id.clone());
+        let mut loaded_message_counts = BTreeMap::new();
+        if let Some(room_id) = selected_room_id.clone() {
+            loaded_message_counts.insert(room_id, DEFAULT_TRANSCRIPT_WINDOW);
+        }
+        let mut state = Self {
             core,
             app: AppState {
                 rev: 0,
                 identity,
-                selected_room_id: rooms.first().map(|room| room.room_id.clone()),
+                selected_room_id,
                 rooms,
                 active_invite: None,
                 active_profile_id: None,
                 status: "ready".to_owned(),
                 toast: None,
-                messages,
+                messages: Vec::new(),
                 profiles: Vec::new(),
                 devices: Vec::new(),
             },
@@ -594,9 +615,12 @@ impl AppRuntimeState {
             pending_invites,
             owned_invites,
             invite_watch_marks: BTreeMap::new(),
+            loaded_message_counts,
             profile_cache: BTreeMap::new(),
             revoked_devices: BTreeSet::new(),
-        })
+        };
+        state.sync_selected_room_messages();
+        Ok(state)
     }
 
     fn dispatch(&mut self, action: AppAction) -> Result<(), FiniteChatCoreError> {
@@ -626,6 +650,11 @@ impl AppRuntimeState {
                 message_id,
                 attachment_id,
             } => self.download_attachment(room_id, message_id, attachment_id)?,
+            AppAction::LoadOlderMessages {
+                room_id,
+                before_message_id,
+                limit,
+            } => self.load_older_messages(room_id, before_message_id, limit)?,
             AppAction::ReactToMessage {
                 room_id,
                 message_id,
@@ -736,6 +765,9 @@ impl AppRuntimeState {
 
     fn open_room(&mut self, room_id: String) {
         self.app.selected_room_id = Some(room_id.clone());
+        self.loaded_message_counts
+            .entry(room_id.clone())
+            .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
         if self.room_mut(&room_id).is_none() {
             self.upsert_room(
                 &room_id,
@@ -744,6 +776,7 @@ impl AppRuntimeState {
                 "room is not available on this device",
             );
         }
+        self.sync_selected_room_messages();
     }
 
     fn create_room(&mut self, display_name: String) -> Result<(), FiniteChatCoreError> {
@@ -771,6 +804,7 @@ impl AppRuntimeState {
         );
         self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
+        self.sync_selected_room_messages();
         self.app.status = "room created".to_owned();
         Ok(())
     }
@@ -968,6 +1002,50 @@ impl AppRuntimeState {
         };
         self.app.status = format!("downloaded {display_name}");
         debug_assert!(path.is_file());
+        Ok(())
+    }
+
+    fn load_older_messages(
+        &mut self,
+        room_id: String,
+        before_message_id: String,
+        limit: u32,
+    ) -> Result<(), FiniteChatCoreError> {
+        if self.room(&room_id).is_none() {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not available"),
+            });
+        }
+
+        if self.app.selected_room_id.as_deref() != Some(room_id.as_str()) {
+            self.app.selected_room_id = Some(room_id.clone());
+            self.loaded_message_counts
+                .entry(room_id.clone())
+                .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
+            self.sync_selected_room_messages();
+            return Ok(());
+        }
+
+        if let Some(oldest) = self.app.messages.first()
+            && oldest.message_id != before_message_id
+        {
+            self.sync_selected_room_messages();
+            return Ok(());
+        }
+
+        let page_size = normalized_transcript_page_size(limit);
+        let current_count = self.loaded_message_count(&room_id);
+        let total_count = self.chat_projection.room_message_count(&room_id);
+        let next_count = current_count
+            .saturating_add(page_size)
+            .min(total_count)
+            .min(MAX_APP_MESSAGES);
+        self.loaded_message_counts.insert(
+            room_id.clone(),
+            next_count.max(DEFAULT_TRANSCRIPT_WINDOW.min(total_count)),
+        );
+        self.sync_selected_room_messages();
+        self.app.status = "loaded older messages".to_owned();
         Ok(())
     }
 
@@ -1181,7 +1259,25 @@ impl AppRuntimeState {
         if messages.is_empty() {
             return;
         }
+        let selected_room_id = self.app.selected_room_id.clone();
+        let selected_message_count = selected_room_id.as_ref().map_or(0, |room_id| {
+            messages
+                .iter()
+                .filter(|message| message.room_id == *room_id)
+                .count()
+        });
         self.chat_projection.append_messages(messages);
+        if let Some(room_id) = selected_room_id
+            && selected_message_count > 0
+        {
+            let current_count = self.loaded_message_count(&room_id);
+            if current_count > DEFAULT_TRANSCRIPT_WINDOW {
+                let next_count = current_count
+                    .saturating_add(selected_message_count)
+                    .min(MAX_APP_MESSAGES);
+                self.loaded_message_counts.insert(room_id, next_count);
+            }
+        }
         self.sync_chat_projection();
     }
 
@@ -1197,10 +1293,43 @@ impl AppRuntimeState {
     }
 
     fn sync_chat_projection(&mut self) {
-        let mut messages = self.chat_projection.messages();
+        let messages = self.chat_projection.messages();
+        apply_message_previews(&mut self.app.rooms, &messages);
+        self.sync_selected_room_messages();
+    }
+
+    fn sync_selected_room_messages(&mut self) {
+        let Some(room_id) = self.app.selected_room_id.clone() else {
+            self.app.messages.clear();
+            self.sync_transcript_load_state();
+            return;
+        };
+        let count = self.loaded_message_count(&room_id);
+        let mut messages = self
+            .chat_projection
+            .messages_for_room_window(&room_id, count);
         self.core.apply_attachment_cache_paths(&mut messages);
         self.app.messages = messages;
-        apply_message_previews(&mut self.app.rooms, &self.app.messages);
+        self.sync_transcript_load_state();
+    }
+
+    fn sync_transcript_load_state(&mut self) {
+        let selected_room_id = self.app.selected_room_id.clone();
+        let selected_can_load_older = selected_room_id.as_ref().is_some_and(|room_id| {
+            self.chat_projection.room_message_count(room_id) > self.loaded_message_count(room_id)
+        });
+        for room in &mut self.app.rooms {
+            room.can_load_older = selected_room_id.as_deref() == Some(room.room_id.as_str())
+                && selected_can_load_older;
+        }
+    }
+
+    fn loaded_message_count(&self, room_id: &str) -> usize {
+        self.loaded_message_counts
+            .get(room_id)
+            .copied()
+            .unwrap_or(DEFAULT_TRANSCRIPT_WINDOW)
+            .min(MAX_APP_MESSAGES)
     }
 
     fn persist_room_projection(&mut self, room_id: &str) -> Result<(), FiniteChatCoreError> {
@@ -1243,6 +1372,7 @@ impl AppRuntimeState {
             status: status.to_owned(),
             last_message_preview: String::new(),
             unread_count: 0,
+            can_load_older: false,
         });
         sort_app_rooms(&mut self.app.rooms);
     }
@@ -1314,6 +1444,15 @@ fn normalize_app_update_wait_millis(timeout_millis: u64) -> u64 {
         return DEFAULT_APP_UPDATE_WAIT_MILLIS;
     }
     timeout_millis.clamp(MIN_APP_UPDATE_WAIT_MILLIS, MAX_APP_UPDATE_WAIT_MILLIS)
+}
+
+fn normalized_transcript_page_size(limit: u32) -> usize {
+    let limit = if limit == 0 {
+        MAX_TRANSCRIPT_PAGE_SIZE
+    } else {
+        limit.min(MAX_TRANSCRIPT_PAGE_SIZE)
+    };
+    usize::try_from(limit).expect("u32 transcript page limit fits usize")
 }
 
 impl CoreState {
@@ -2433,6 +2572,27 @@ impl ChatProjectionState {
         messages
     }
 
+    fn messages_for_room_window(&self, room_id: &str, limit: usize) -> Vec<ChatMessage> {
+        let mut messages = self
+            .messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by(message_sort);
+        if messages.len() > limit {
+            messages.drain(0..messages.len() - limit);
+        }
+        messages
+    }
+
+    fn room_message_count(&self, room_id: &str) -> usize {
+        self.messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .count()
+    }
+
     fn insert_message(&mut self, mut message: ChatMessage) {
         message.read_receipt =
             receipt_summary_for_message(&message, &self.delivered_through, &self.read_through);
@@ -2663,6 +2823,7 @@ fn app_room_from_stored(room: StoredAppRoom, has_mls_room: bool) -> AppRoomSumma
         status,
         last_message_preview: String::new(),
         unread_count: 0,
+        can_load_older: false,
     }
 }
 
@@ -2674,6 +2835,7 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
         status: "connected".to_owned(),
         last_message_preview: String::new(),
         unread_count: 0,
+        can_load_older: false,
     }
 }
 
@@ -3308,6 +3470,82 @@ mod tests {
             .expect_err("oversized room labels fail before network or storage side effects");
         assert!(matches!(error, FiniteChatCoreError::Client { .. }));
         assert!(app.state().unwrap().rooms.is_empty());
+    }
+
+    #[test]
+    fn app_runtime_windows_selected_room_transcript_and_loads_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let created = app
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Windowed Chat".to_owned(),
+            })
+            .unwrap();
+        let room_id = created.rooms.first().unwrap().room_id.clone();
+        let total_messages = DEFAULT_TRANSCRIPT_WINDOW + 25;
+        let mut state = created;
+        for index in 0..total_messages {
+            state = app
+                .dispatch(AppAction::SendMessage {
+                    room_id: room_id.clone(),
+                    text: format!("message-{index:03}"),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(state.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
+        assert_eq!(state.messages.first().unwrap().text, "message-025");
+        assert_eq!(state.messages.last().unwrap().text, "message-074");
+        assert!(app_room(&state, &room_id).can_load_older);
+
+        let stale = app
+            .dispatch(AppAction::LoadOlderMessages {
+                room_id: room_id.clone(),
+                before_message_id: "not-the-current-oldest".to_owned(),
+                limit: 25,
+            })
+            .unwrap();
+        assert_eq!(stale.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
+        assert_eq!(stale.messages.first().unwrap().text, "message-025");
+        assert!(app_room(&stale, &room_id).can_load_older);
+
+        let before_message_id = stale.messages.first().unwrap().message_id.clone();
+        let loaded = app
+            .dispatch(AppAction::LoadOlderMessages {
+                room_id: room_id.clone(),
+                before_message_id,
+                limit: 25,
+            })
+            .unwrap();
+        assert_eq!(loaded.messages.len(), total_messages);
+        assert_eq!(loaded.messages.first().unwrap().text, "message-000");
+        assert_eq!(loaded.messages.last().unwrap().text, "message-074");
+        assert!(!app_room(&loaded, &room_id).can_load_older);
+
+        drop(app);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert_eq!(reopened_state.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
+        assert_eq!(reopened_state.messages.first().unwrap().text, "message-025");
+        assert_eq!(reopened_state.messages.last().unwrap().text, "message-074");
+        assert!(app_room(&reopened_state, &room_id).can_load_older);
     }
 
     #[test]

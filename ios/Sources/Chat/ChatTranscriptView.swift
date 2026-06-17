@@ -13,7 +13,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     var canLoadOlder = false
-    var onLoadOlderMessages: (() -> Void)?
+    var onLoadOlderMessages: ((String) -> Void)?
     @Binding var followsBottom: Bool
 
     private var contentState: ContentState {
@@ -350,10 +350,10 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
             guard indexPath.item <= 2 else { return }
             guard parent.canLoadOlder else { return }
 
-            let oldestMessageId = parent.rows.first?.id
+            let oldestMessageId = parent.rows.first?.oldestMessageID
             guard let oldestMessageId, oldestMessageId != requestedOldestId else { return }
             requestedOldestId = oldestMessageId
-            parent.onLoadOlderMessages?()
+            parent.onLoadOlderMessages?(oldestMessageId)
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -451,7 +451,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
 
         private func syncRequestedOldestId() {
             guard let requestedOldestId else { return }
-            let currentOldestId = parent.rows.first?.id
+            let currentOldestId = parent.rows.first?.oldestMessageID
             if currentOldestId != requestedOldestId || !parent.canLoadOlder {
                 self.requestedOldestId = nil
             }

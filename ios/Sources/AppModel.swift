@@ -300,6 +300,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func loadOlderMessages(roomID: String, beforeMessageID: String) {
+        dispatch(.loadOlderMessages(
+            roomId: roomID,
+            beforeMessageId: beforeMessageID,
+            limit: 50
+        ))
+    }
+
     func react(to message: ChatMessage, emoji: String) {
         dispatch(.reactToMessage(
             roomId: message.roomId,
