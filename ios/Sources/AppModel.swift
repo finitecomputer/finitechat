@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-struct RuntimeConfig: Decodable {
+struct RuntimeConfig: Codable {
     let serverURL: String
     let deviceID: String
 
@@ -17,30 +17,54 @@ struct RuntimeConfig: Decodable {
             ?? environmentValue("FINITECHAT_SERVER_URL", in: environment)
         let deviceID = argumentValue("--finitechat-device", in: args)
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
-        let fallback = RuntimeConfig(
-            serverURL: serverURL ?? "http://127.0.0.1:8787",
-            deviceID: deviceID ?? "ios"
+        let persisted = loadPersisted()
+        let config = RuntimeConfig(
+            serverURL: serverURL ?? persisted?.serverURL ?? "http://127.0.0.1:8787",
+            deviceID: deviceID ?? persisted?.deviceID ?? "ios"
         )
-        guard let support = try? FileManager.default.url(
+        if serverURL != nil || deviceID != nil {
+            try? config.save()
+        }
+        return config
+    }
+
+    func save() throws {
+        let config = RuntimeConfig(
+            serverURL: serverURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            deviceID: deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard !config.serverURL.isEmpty, !config.deviceID.isEmpty else {
+            throw ConfigError.emptyValue
+        }
+        let data = try JSONEncoder().encode(config)
+        try data.write(to: Self.configURL(), options: .atomic)
+    }
+
+    private static func loadPersisted() -> RuntimeConfig? {
+        guard let url = try? configURL(),
+              let data = try? Data(contentsOf: url),
+              let config = try? JSONDecoder().decode(RuntimeConfig.self, from: data)
+        else {
+            return nil
+        }
+        let serverURL = config.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let deviceID = config.deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serverURL.isEmpty, !deviceID.isEmpty else { return nil }
+        return RuntimeConfig(serverURL: serverURL, deviceID: deviceID)
+    }
+
+    private static func configURL() throws -> URL {
+        let support = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true
-        ) else {
-            return fallback
-        }
-        let url = support.appendingPathComponent("finitechat_config.json")
-        guard let data = try? Data(contentsOf: url),
-              let config = try? JSONDecoder().decode(RuntimeConfig.self, from: data),
-              !config.serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              !config.deviceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            return fallback
-        }
-        return RuntimeConfig(
-            serverURL: serverURL ?? config.serverURL,
-            deviceID: deviceID ?? config.deviceID
         )
+        return support.appendingPathComponent("finitechat_config.json")
+    }
+
+    enum ConfigError: Error {
+        case emptyValue
     }
 
     private static func environmentValue(
@@ -182,6 +206,12 @@ final class AppModel: ObservableObject {
     }
 
     func applyDevSettings() {
+        do {
+            try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+        } catch {
+            errorText = String(describing: error)
+            return
+        }
         closeRuntime()
         start()
     }
