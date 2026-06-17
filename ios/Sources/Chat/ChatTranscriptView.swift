@@ -12,6 +12,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onReply: (ChatMessage) -> Void
     var canLoadOlder = false
     var onLoadOlderMessages: ((String) -> Void)?
     @Binding var followsBottom: Bool
@@ -65,7 +66,8 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
                     row: row,
                     messagesById: coordinator.parent.messagesById,
                     onReact: coordinator.parent.onReact,
-                    onDownloadAttachment: coordinator.parent.onDownloadAttachment
+                    onDownloadAttachment: coordinator.parent.onDownloadAttachment,
+                    onReply: coordinator.parent.onReply
                 )
             }
             .minSize(width: 0, height: 0)

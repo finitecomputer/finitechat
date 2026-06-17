@@ -1,5 +1,6 @@
 import ImageIO
 import SwiftUI
+import UIKit
 
 enum ChatBubblePosition {
     case single
@@ -13,6 +14,7 @@ struct ChatTimelineRowView: View {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onReply: (ChatMessage) -> Void
 
     var body: some View {
         switch row {
@@ -21,7 +23,8 @@ struct ChatTimelineRowView: View {
                 group: group,
                 messagesById: messagesById,
                 onReact: onReact,
-                onDownloadAttachment: onDownloadAttachment
+                onDownloadAttachment: onDownloadAttachment,
+                onReply: onReply
             )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
@@ -34,6 +37,7 @@ private struct ChatMessageGroupRow: View {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onReply: (ChatMessage) -> Void
 
     private let avatarSize: CGFloat = 28
 
@@ -69,6 +73,7 @@ private struct ChatMessageGroupRow: View {
                     messagesById: messagesById,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
+                    onReply: onReply,
                     alignment: .leading
                 )
             }
@@ -88,6 +93,7 @@ private struct ChatMessageGroupRow: View {
                     messagesById: messagesById,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
+                    onReply: onReply,
                     alignment: .trailing
                 )
 
@@ -116,6 +122,7 @@ private struct ChatBubbleStack: View {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onReply: (ChatMessage) -> Void
     let alignment: HorizontalAlignment
 
     var body: some View {
@@ -126,7 +133,8 @@ private struct ChatBubbleStack: View {
                     replyTarget: replyTarget(for: message),
                     position: bubblePosition(at: index, count: messages.count),
                     onReact: onReact,
-                    onDownloadAttachment: onDownloadAttachment
+                    onDownloadAttachment: onDownloadAttachment,
+                    onReply: onReply
                 )
             }
         }
@@ -151,6 +159,7 @@ private struct ChatMessageBubble: View {
     let position: ChatBubblePosition
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onReply: (ChatMessage) -> Void
 
     @State private var isPressed = false
 
@@ -238,6 +247,22 @@ private struct ChatMessageBubble: View {
         }
         .accessibilityElement(children: .combine)
         .contextMenu {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                onReply(message)
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            }
+
+            Button {
+                UIPasteboard.general.string = bodyText
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+            .disabled(bodyText.isEmpty)
+
+            Divider()
+
             ForEach(quickReactionEmojis, id: \.self) { emoji in
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()

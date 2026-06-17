@@ -296,6 +296,11 @@ pub enum AppAction {
         room_id: String,
         text: String,
     },
+    SendReply {
+        room_id: String,
+        text: String,
+        reply_to_message_id: String,
+    },
     SendAttachment {
         room_id: String,
         filename: String,
@@ -303,6 +308,7 @@ pub enum AppAction {
         kind: ChatMediaKind,
         bytes: Vec<u8>,
         caption: String,
+        reply_to_message_id: Option<String>,
     },
     DownloadAttachment {
         room_id: String,
@@ -361,6 +367,16 @@ struct AppRuntimeState {
     loaded_message_counts: BTreeMap<String, usize>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
     revoked_devices: BTreeSet<String>,
+}
+
+struct SendAttachmentInput {
+    room_id: String,
+    filename: String,
+    mime_type: String,
+    kind: ChatMediaKind,
+    bytes: Vec<u8>,
+    caption: String,
+    reply_to_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -478,7 +494,15 @@ impl FiniteChatCore {
         caption: String,
     ) -> Result<SyncResult, FiniteChatCoreError> {
         let mut state = self.lock()?;
-        state.send_attachment(&room_id, filename, mime_type, kind, bytes, caption)
+        state.send_attachment(SendAttachmentInput {
+            room_id,
+            filename,
+            mime_type,
+            kind,
+            bytes,
+            caption,
+            reply_to_message_id: None,
+        })
     }
 
     pub fn sync(&self) -> Result<SyncResult, FiniteChatCoreError> {
@@ -637,6 +661,11 @@ impl AppRuntimeState {
                 pin,
             } => self.submit_invite_pin(pending_room_id, pin)?,
             AppAction::SendMessage { room_id, text } => self.send_message(room_id, text)?,
+            AppAction::SendReply {
+                room_id,
+                text,
+                reply_to_message_id,
+            } => self.send_reply(room_id, text, reply_to_message_id)?,
             AppAction::SendAttachment {
                 room_id,
                 filename,
@@ -644,7 +673,16 @@ impl AppRuntimeState {
                 kind,
                 bytes,
                 caption,
-            } => self.send_attachment(room_id, filename, mime_type, kind, bytes, caption)?,
+                reply_to_message_id,
+            } => self.send_attachment(SendAttachmentInput {
+                room_id,
+                filename,
+                mime_type,
+                kind,
+                bytes,
+                caption,
+                reply_to_message_id,
+            })?,
             AppAction::DownloadAttachment {
                 room_id,
                 message_id,
@@ -924,6 +962,26 @@ impl AppRuntimeState {
     }
 
     fn send_message(&mut self, room_id: String, text: String) -> Result<(), FiniteChatCoreError> {
+        self.send_message_with_reply(room_id, text, None)
+    }
+
+    fn send_reply(
+        &mut self,
+        room_id: String,
+        text: String,
+        reply_to_message_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let target_id = reply_to_message_id.trim();
+        self.validate_reply_target(&room_id, target_id)?;
+        self.send_message_with_reply(room_id, text, Some(target_id.to_owned()))
+    }
+
+    fn send_message_with_reply(
+        &mut self,
+        room_id: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -933,7 +991,9 @@ impl AppRuntimeState {
                 reason: format!("room '{room_id}' is not ready to send"),
             });
         }
-        let result = self.core.send_text(&room_id, trimmed)?;
+        let result =
+            self.core
+                .send_text_with_reply(&room_id, trimmed, reply_to_message_id.as_deref())?;
         self.append_messages(result.messages);
         if let Some(room) = self.room_mut(&room_id) {
             room.last_message_preview = trimmed.to_owned();
@@ -944,21 +1004,16 @@ impl AppRuntimeState {
 
     fn send_attachment(
         &mut self,
-        room_id: String,
-        filename: String,
-        mime_type: String,
-        kind: ChatMediaKind,
-        bytes: Vec<u8>,
-        caption: String,
+        mut input: SendAttachmentInput,
     ) -> Result<(), FiniteChatCoreError> {
-        if !self.room_is_connected(&room_id) {
+        if !self.room_is_connected(&input.room_id) {
             return Err(FiniteChatCoreError::Client {
-                reason: format!("room '{room_id}' is not ready to send"),
+                reason: format!("room '{}' is not ready to send", input.room_id),
             });
         }
-        let result = self
-            .core
-            .send_attachment(&room_id, filename, mime_type, kind, bytes, caption)?;
+        input.reply_to_message_id =
+            self.normalize_reply_target(&input.room_id, input.reply_to_message_id)?;
+        let result = self.core.send_attachment(input)?;
         self.append_messages(result.messages);
         self.app.status = "sent".to_owned();
         Ok(())
@@ -1394,6 +1449,37 @@ impl AppRuntimeState {
             .find(|room| room.room_id == room_id)
     }
 
+    fn normalize_reply_target(
+        &self,
+        room_id: &str,
+        reply_to_message_id: Option<String>,
+    ) -> Result<Option<String>, FiniteChatCoreError> {
+        let Some(reply_to_message_id) = reply_to_message_id else {
+            return Ok(None);
+        };
+        let target_id = reply_to_message_id.trim();
+        self.validate_reply_target(room_id, target_id)?;
+        Ok(Some(target_id.to_owned()))
+    }
+
+    fn validate_reply_target(
+        &self,
+        room_id: &str,
+        target_id: &str,
+    ) -> Result<(), FiniteChatCoreError> {
+        if target_id.is_empty() {
+            return Err(FiniteChatCoreError::Client {
+                reason: "reply target message id cannot be empty".to_owned(),
+            });
+        }
+        if !self.chat_projection.message_exists(room_id, target_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("reply target '{target_id}' is not available in room '{room_id}'"),
+            });
+        }
+        Ok(())
+    }
+
     fn bump_rev(&mut self) {
         self.app.rev = self.app.rev.saturating_add(1);
     }
@@ -1695,38 +1781,44 @@ impl CoreState {
     }
 
     fn send_text(&mut self, room_id: &str, text: &str) -> Result<SyncResult, FiniteChatCoreError> {
-        let chat_payload = encode_text_message_payload(text)?;
+        self.send_text_with_reply(room_id, text, None)
+    }
+
+    fn send_text_with_reply(
+        &mut self,
+        room_id: &str,
+        text: &str,
+        reply_to_message_id: Option<&str>,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
+        let chat_payload = encode_text_message_payload(text, reply_to_message_id)?;
         self.send_chat_payload(room_id, chat_payload)
     }
 
     fn send_attachment(
         &mut self,
-        room_id: &str,
-        filename: String,
-        mime_type: String,
-        kind: ChatMediaKind,
-        bytes: Vec<u8>,
-        caption: String,
+        input: SendAttachmentInput,
     ) -> Result<SyncResult, FiniteChatCoreError> {
-        let filename = filename.trim().to_owned();
-        let mime_type = mime_type.trim().to_owned();
+        let room_id = input.room_id;
+        let filename = input.filename.trim().to_owned();
+        let mime_type = input.mime_type.trim().to_owned();
         let metadata = AttachmentBlobMetadataV1 {
             mime_type: mime_type.clone(),
             filename: filename.clone(),
             dimensions: None,
         };
         metadata.validate_limits().map_err(client_error)?;
-        let room_server_url = self.room_server_url(room_id);
-        let reference = self.upload_attachment_blob(&room_server_url, &bytes, metadata)?;
-        self.cache_attachment_plaintext(&reference, &bytes)?;
+        let room_server_url = self.room_server_url(&room_id);
+        let reference = self.upload_attachment_blob(&room_server_url, &input.bytes, metadata)?;
+        self.cache_attachment_plaintext(&reference, &input.bytes)?;
         let chat_payload = encode_attachment_message_payload(
-            caption.trim(),
+            input.caption.trim(),
             &filename,
             &mime_type,
-            kind,
+            input.kind,
             reference,
+            input.reply_to_message_id.as_deref(),
         )?;
-        let mut result = self.send_chat_payload(room_id, chat_payload)?;
+        let mut result = self.send_chat_payload(&room_id, chat_payload)?;
         self.apply_attachment_cache_paths(&mut result.messages);
         Ok(result)
     }
@@ -2308,7 +2400,10 @@ fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> Decode
     }
 }
 
-fn encode_text_message_payload(text: &str) -> Result<Vec<u8>, FiniteChatCoreError> {
+fn encode_text_message_payload(
+    text: &str,
+    reply_to_message_id: Option<&str>,
+) -> Result<Vec<u8>, FiniteChatCoreError> {
     HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
         conversation_id: None,
@@ -2317,7 +2412,7 @@ fn encode_text_message_payload(text: &str) -> Result<Vec<u8>, FiniteChatCoreErro
         status: finitechat_hermes::HermesMessageStatusV1::Complete,
         edit_of: None,
         attachments: Vec::new(),
-        reply_to_message_id: None,
+        reply_to_message_id: reply_to_message_id.map(ToOwned::to_owned),
         sender_name: None,
         metadata: BTreeMap::new(),
     }
@@ -2331,6 +2426,7 @@ fn encode_attachment_message_payload(
     mime_type: &str,
     kind: ChatMediaKind,
     reference: AttachmentBlobReferenceV1,
+    reply_to_message_id: Option<&str>,
 ) -> Result<Vec<u8>, FiniteChatCoreError> {
     HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
@@ -2347,7 +2443,7 @@ fn encode_attachment_message_payload(
             url: Some(reference.url.clone()),
             blob: Some(reference),
         }],
-        reply_to_message_id: None,
+        reply_to_message_id: reply_to_message_id.map(ToOwned::to_owned),
         sender_name: None,
         metadata: BTreeMap::new(),
     }
@@ -2591,6 +2687,11 @@ impl ChatProjectionState {
             .values()
             .filter(|message| message.room_id == room_id)
             .count()
+    }
+
+    fn message_exists(&self, room_id: &str, message_id: &str) -> bool {
+        self.messages
+            .contains_key(&(room_id.to_owned(), message_id.to_owned()))
     }
 
     fn insert_message(&mut self, mut message: ChatMessage) {
@@ -3240,7 +3341,7 @@ mod tests {
                 .to_owned(),
             device_id: "tablet".to_owned(),
         };
-        let chat_payload = encode_text_message_payload("event sourced hello").unwrap();
+        let chat_payload = encode_text_message_payload("event sourced hello", None).unwrap();
         let chat_event =
             encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)
                 .unwrap();
@@ -3913,6 +4014,145 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_sends_reply_message_with_durable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let created = app
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Replies".to_owned(),
+            })
+            .unwrap();
+        let room_id = created.rooms.first().unwrap().room_id.clone();
+        let parent_state = app
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "parent".to_owned(),
+            })
+            .unwrap();
+        let parent_id = parent_state
+            .messages
+            .iter()
+            .find(|message| message.text == "parent")
+            .expect("parent message projects")
+            .message_id
+            .clone();
+
+        let missing = app
+            .dispatch(AppAction::SendReply {
+                room_id: room_id.clone(),
+                text: "nope".to_owned(),
+                reply_to_message_id: "missing-message".to_owned(),
+            })
+            .expect_err("unknown reply targets are rejected by Rust policy");
+        assert!(
+            missing.to_string().contains("reply target"),
+            "unexpected missing-target error: {missing}"
+        );
+
+        let replied = app
+            .dispatch(AppAction::SendReply {
+                room_id: room_id.clone(),
+                text: "child".to_owned(),
+                reply_to_message_id: parent_id.clone(),
+            })
+            .unwrap();
+        let reply = replied
+            .messages
+            .iter()
+            .find(|message| message.text == "child")
+            .expect("reply message projects");
+        assert_eq!(
+            reply.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        let DecodedAppEvent::ChatMessage { payload, .. } = decode_application_event(&reply.payload)
+        else {
+            panic!("reply row must carry a chat message application event");
+        };
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("reply row must carry Hermes message payload");
+        assert_eq!(
+            hermes.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        let media_replied = app
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "reply-photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: b"reply image bytes".to_vec(),
+                caption: "media child".to_owned(),
+                reply_to_message_id: Some(parent_id.clone()),
+            })
+            .unwrap();
+        let media_reply = media_replied
+            .messages
+            .iter()
+            .find(|message| message.text == "media child" && !message.media.is_empty())
+            .expect("media reply message projects");
+        assert_eq!(
+            media_reply.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        let DecodedAppEvent::ChatMessage { payload, .. } =
+            decode_application_event(&media_reply.payload)
+        else {
+            panic!("media reply row must carry a chat message application event");
+        };
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("media reply row must carry Hermes message payload");
+        assert_eq!(
+            hermes.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        drop(app);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        let reopened_reply = reopened_state
+            .messages
+            .iter()
+            .find(|message| message.text == "child")
+            .expect("reply projection survives reopen");
+        assert_eq!(
+            reopened_reply.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        let reopened_media_reply = reopened_state
+            .messages
+            .iter()
+            .find(|message| message.text == "media child" && !message.media.is_empty())
+            .expect("media reply projection survives reopen");
+        assert_eq!(
+            reopened_media_reply.reply_to_message_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+    }
+
+    #[test]
     fn app_runtime_sends_encrypted_attachment_blob_and_reopens_projection() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -3941,6 +4181,7 @@ mod tests {
                 kind: ChatMediaKind::Image,
                 bytes: plaintext.clone(),
                 caption: String::new(),
+                reply_to_message_id: None,
             })
             .unwrap();
         let message = sent
@@ -4063,6 +4304,7 @@ mod tests {
                 kind: ChatMediaKind::Image,
                 bytes: plaintext.clone(),
                 caption: "from alice".to_owned(),
+                reply_to_message_id: None,
             })
             .unwrap();
 

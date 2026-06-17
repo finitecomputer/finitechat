@@ -270,15 +270,34 @@ final class AppModel: ObservableObject {
         dispatch(.revokeDevice(accountId: device.accountId, deviceId: device.deviceId))
     }
 
-    func send() {
-        guard let room = selectedRoom else { return }
+    @discardableResult
+    func send(replyTo message: ChatMessage? = nil) -> Bool {
+        guard let room = selectedRoom else { return false }
         let text = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        outboundText = ""
-        dispatch(.sendMessage(roomId: room.roomId, text: text))
+        guard !text.isEmpty else { return false }
+        let action: AppAction
+        if let message {
+            action = .sendReply(
+                roomId: room.roomId,
+                text: text,
+                replyToMessageId: message.messageId
+            )
+        } else {
+            action = .sendMessage(roomId: room.roomId, text: text)
+        }
+        let sent = dispatch(action)
+        if sent {
+            outboundText = ""
+        }
+        return sent
     }
 
-    func sendAttachment(roomID: String, fileURL: URL) {
+    func sendAttachment(
+        roomID: String,
+        fileURL: URL,
+        replyTo message: ChatMessage? = nil,
+        onSuccess: (@MainActor () -> Void)? = nil
+    ) {
         let caption = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
         outboundText = ""
         Task { [weak self] in
@@ -295,7 +314,8 @@ final class AppModel: ObservableObject {
                     mimeType: attachment.mimeType,
                     kind: attachment.kind,
                     bytes: attachment.data,
-                    caption: caption
+                    caption: caption,
+                    replyToMessageId: message?.messageId
                 )
                 let nextState = try await Task.detached(priority: .userInitiated) {
                     try runtime.dispatch(action: action)
@@ -303,6 +323,7 @@ final class AppModel: ObservableObject {
                 guard openKey == runtimeKey else { return }
                 state = nextState
                 errorText = nil
+                onSuccess?()
                 startUpdateLoop()
             } catch {
                 errorText = String(describing: error)
@@ -407,12 +428,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func dispatch(_ action: AppAction) {
+    @discardableResult
+    private func dispatch(_ action: AppAction) -> Bool {
+        var succeeded = false
         run {
             let runtime = try currentRuntime()
             self.state = try runtime.dispatch(action: action)
+            succeeded = true
         }
         startUpdateLoop()
+        return succeeded
     }
 
     private func currentRuntime() throws -> FiniteChatRuntime {

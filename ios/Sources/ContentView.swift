@@ -186,6 +186,7 @@ private struct RoomThreadView: View {
     let showInvite: () -> Void
     @State private var followsBottom = true
     @State private var importingAttachment = false
+    @State private var replyDraftMessage: ChatMessage?
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -258,6 +259,9 @@ private struct RoomThreadView: View {
                 onDownloadAttachment: { message, attachment in
                     model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
                 },
+                onReply: { message in
+                    replyDraftMessage = message
+                },
                 canLoadOlder: room.canLoadOlder,
                 onLoadOlderMessages: { beforeMessageID in
                     model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
@@ -267,7 +271,18 @@ private struct RoomThreadView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGroupedBackground))
             .accessibilityLabel("Messages")
-            Composer(model: model) {
+            Composer(
+                model: model,
+                replyTarget: replyDraftMessage,
+                onCancelReply: {
+                    replyDraftMessage = nil
+                },
+                onSend: {
+                    if model.send(replyTo: replyDraftMessage) {
+                        replyDraftMessage = nil
+                    }
+                }
+            ) {
                 importingAttachment = true
             }
         case .waitingForApproval:
@@ -286,7 +301,9 @@ private struct RoomThreadView: View {
         switch result {
         case .success(let urls):
             guard let url = urls.first else { return }
-            model.sendAttachment(roomID: roomID, fileURL: url)
+            model.sendAttachment(roomID: roomID, fileURL: url, replyTo: replyDraftMessage) {
+                replyDraftMessage = nil
+            }
         case .failure(let error):
             model.errorText = String(describing: error)
         }
@@ -295,36 +312,121 @@ private struct RoomThreadView: View {
 
 private struct Composer: View {
     @ObservedObject var model: AppModel
+    let replyTarget: ChatMessage?
+    let onCancelReply: () -> Void
+    let onSend: () -> Void
     let onAttach: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button {
-                onAttach()
-            } label: {
-                Image(systemName: "paperclip")
-                    .font(.title3)
+        VStack(spacing: 0) {
+            if let replyTarget {
+                ComposerReplyPreview(
+                    message: replyTarget,
+                    onCancel: onCancelReply
+                )
             }
-            .accessibilityLabel("Attach")
-            .accessibilityIdentifier("AttachButton")
 
-            TextField("Message", text: $model.outboundText, axis: .vertical)
-                .lineLimit(1...4)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("Message")
+            HStack(spacing: 10) {
+                Button {
+                    onAttach()
+                } label: {
+                    Image(systemName: "paperclip")
+                        .font(.title3)
+                }
+                .accessibilityLabel("Attach")
+                .accessibilityIdentifier("AttachButton")
 
-            Button {
-                model.send()
-            } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                TextField("Message", text: $model.outboundText, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Message")
+
+                Button {
+                    onSend()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
+                }
+                .disabled(!model.canSend)
+                .accessibilityLabel("Send")
+                .accessibilityIdentifier("SendButton")
             }
-            .disabled(!model.canSend)
-            .accessibilityLabel("Send")
-            .accessibilityIdentifier("SendButton")
+            .padding()
         }
-        .padding()
         .background(.bar)
+    }
+}
+
+private struct ComposerReplyPreview: View {
+    let message: ChatMessage
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 3)
+                .clipShape(Capsule())
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Replying to \(senderLabel)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(snippet)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                onCancel()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cancel reply")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.thinMaterial)
+    }
+
+    private var senderLabel: String {
+        if message.isMine {
+            return "You"
+        }
+        let name = message.senderDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? message.senderDeviceId : name
+    }
+
+    private var snippet: String {
+        let text = message.displayContent.isEmpty ? message.text : message.displayContent
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
+        }
+        if let media = message.media.first {
+            return media.filename.isEmpty ? composerMediaLabel(for: media.kind) : media.filename
+        }
+        return "Message"
+    }
+}
+
+private func composerMediaLabel(for kind: ChatMediaKind) -> String {
+    switch kind {
+    case .image:
+        return "Image"
+    case .voiceNote:
+        return "Voice note"
+    case .video:
+        return "Video"
+    case .file:
+        return "File"
     }
 }
 
