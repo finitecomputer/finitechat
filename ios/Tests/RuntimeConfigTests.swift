@@ -82,7 +82,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertFalse(persisted.usesTransientStore)
     }
 
-    func testLaunchAutomationOverridesPersistForManualRelaunch() throws {
+    func testLaunchAutomationUsesTransientStoreAndDoesNotRewritePersistedConfigByDefault() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://persisted.example",
@@ -101,6 +101,50 @@ final class RuntimeConfigTests: XCTestCase {
                 "finite://join?v=1&s=http%3A%2F%2F127.0.0.1%3A1&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
                 "--finitechat-auto-send",
                 "probe",
+            ],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(loaded.deviceID, "codex-persist-check")
+        XCTAssertTrue(loaded.usesTransientStore)
+
+        let persisted = try persistedConfig(at: url)
+        XCTAssertEqual(persisted.serverURL, "http://persisted.example")
+        XCTAssertEqual(persisted.deviceID, "persisted-device")
+        XCTAssertFalse(persisted.usesTransientStore)
+
+        let relaunched = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(relaunched.serverURL, "http://persisted.example")
+        XCTAssertEqual(relaunched.deviceID, "persisted-device")
+        XCTAssertFalse(relaunched.usesTransientStore)
+    }
+
+    func testExplicitPersistentLaunchAutomationOverridesPersistForManualRelaunch() throws {
+        let url = try temporaryConfigURL()
+        try RuntimeConfig(
+            serverURL: "http://persisted.example",
+            deviceID: "persisted-device"
+        ).save(storageURL: url)
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: [
+                "FiniteChat",
+                "--finitechat-server",
+                "http://127.0.0.1:1",
+                "--finitechat-device",
+                "codex-persist-check",
+                "--finitechat-auto-create-room",
+                "Probe",
+                "--finitechat-auto-send",
+                "probe",
+                "--finitechat-persist-launch-config",
             ],
             storageURL: url
         )
@@ -157,6 +201,29 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
         XCTAssertEqual(persisted.deviceID, "persisted-device")
         XCTAssertFalse(persisted.usesTransientStore)
+    }
+
+    func testFirstLaunchAutomationWithoutPersistDoesNotSeedStableConfig() throws {
+        let url = try temporaryConfigURL()
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: [
+                "FiniteChat",
+                "--finitechat-server",
+                "http://127.0.0.1:1",
+                "--finitechat-device",
+                "codex-persist-check",
+                "--finitechat-auto-create-room",
+                "Probe",
+            ],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(loaded.deviceID, "codex-persist-check")
+        XCTAssertTrue(loaded.usesTransientStore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testPersistedServerOnlyConfigCombinesWithDefaultDevice() throws {

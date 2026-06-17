@@ -11,6 +11,13 @@ struct RuntimeConfig: Codable, Equatable {
     private static let defaultDeviceID = "ios"
     private static let transientConfigArgument = "--finitechat-transient-config"
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
+    private static let persistLaunchConfigArgument = "--finitechat-persist-launch-config"
+    private static let persistLaunchConfigEnvironmentKey = "FINITECHAT_PERSIST_LAUNCH_CONFIG"
+    private static let launchAutomationArguments = [
+        "--finitechat-auto-join",
+        "--finitechat-auto-create-room",
+        "--finitechat-auto-send",
+    ]
 
     enum CodingKeys: String, CodingKey {
         case serverURL = "server_url"
@@ -63,24 +70,31 @@ struct RuntimeConfig: Codable, Equatable {
         )
         let hasLaunchOverride = serverURL != nil || deviceID != nil
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
+        let persistLaunchOverride = argumentFlag(persistLaunchConfigArgument, in: args)
+            || truthyEnvironmentValue(persistLaunchConfigEnvironmentKey, in: environment)
+        let hasLaunchAutomation = launchAutomationArguments.contains {
+            argumentValue($0, in: args) != nil
+        }
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
+            || (hasLaunchAutomation && !persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
             usesTransientStore: transientOverride
         )
-        // Runtime identity is product state. A phone launched from Xcode with a
-        // LAN server or device id must reopen that same SQLite store after a
-        // manual force-close. Tests opt into transient state explicitly, or via
-        // the hosted XCTest environment, so product automation does not make a
-        // real chat vanish on the next manual relaunch.
+        // Runtime identity is product state. A phone launched from Xcode with
+        // only a LAN server/device id should reopen the same SQLite store after
+        // manual force-close. Auto-create/join/send probes are test automation:
+        // they use an isolated transient store unless the launch explicitly opts
+        // into persistence.
         if !transientOverride
             && (
                 persisted.serverURL != config.serverURL
                     || persisted.deviceID != config.deviceID
                     || hasLaunchOverride
+                    || persistLaunchOverride
             )
         {
             try? config.save(storageURL: storageURL)
