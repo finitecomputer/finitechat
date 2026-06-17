@@ -31,7 +31,11 @@ struct ContentView: View {
             RoomListView(
                 model: model,
                 present: { destination in
-                sheet = destination
+                    sheet = destination
+                },
+                open: { room in
+                    model.openRoom(room)
+                    path = [room.roomId]
                 }
             )
             .navigationDestination(for: String.self) { roomID in
@@ -61,6 +65,7 @@ struct ContentView: View {
 private struct RoomListView: View {
     @ObservedObject var model: AppModel
     let present: (AppSheet) -> Void
+    let open: (AppRoomSummary) -> Void
 
     var body: some View {
         Group {
@@ -86,12 +91,12 @@ private struct RoomListView: View {
                 }
             } else {
                 List(model.rooms, id: \.roomId) { room in
-                    NavigationLink(value: room.roomId) {
+                    Button {
+                        open(room)
+                    } label: {
                         RoomRow(room: room)
                     }
-                    .simultaneousGesture(TapGesture().onEnded {
-                        model.openRoom(room)
-                    })
+                    .buttonStyle(.plain)
                     .accessibilityIdentifier("RoomRow-\(room.roomId)")
                 }
                 .listStyle(.plain)
