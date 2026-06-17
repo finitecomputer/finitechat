@@ -228,6 +228,9 @@ private struct RoomThreadView: View {
                 roomID: room.roomId,
                 rows: projection.rows,
                 messagesById: projection.messagesById,
+                onReact: { message, emoji in
+                    model.react(to: message, emoji: emoji)
+                },
                 followsBottom: $followsBottom
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)

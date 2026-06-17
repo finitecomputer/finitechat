@@ -275,6 +275,11 @@ pub enum AppAction {
         room_id: String,
         text: String,
     },
+    ReactToMessage {
+        room_id: String,
+        message_id: String,
+        emoji: String,
+    },
     RetryRoom {
         room_id: String,
     },
@@ -307,6 +312,7 @@ pub struct FiniteChatRuntime {
 struct AppRuntimeState {
     core: CoreState,
     app: AppState,
+    chat_projection: ChatProjectionState,
     pending_invites: BTreeMap<String, PendingInvite>,
     owned_invites: BTreeMap<String, String>,
     invite_watch_marks: BTreeMap<String, InviteWatchMark>,
@@ -329,6 +335,18 @@ struct InviteWatchMark {
 struct AppRuntimeWaitPlan {
     server_url: String,
     request: SyncStreamRequest,
+}
+
+#[derive(Debug, Default)]
+struct CoreSyncProjection {
+    result: SyncResult,
+    events: Vec<StoredAppEvent>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ChatProjectionState {
+    messages: BTreeMap<(String, String), ChatMessage>,
+    reaction_senders: BTreeSet<(String, String, String, String)>,
 }
 
 #[uniffi::export]
@@ -485,7 +503,9 @@ impl AppRuntimeState {
             .store
             .load_app_events(&owner, MAX_APP_MESSAGES_U32)
             .map_err(store_error)?;
-        let messages = chat_messages_from_stored(stored_messages, stored_events, &owner);
+        let chat_projection =
+            ChatProjectionState::from_stored(stored_messages, stored_events, &owner);
+        let messages = chat_projection.messages();
         let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
         let known_room_ids = core.known_room_ids().into_iter().collect::<BTreeSet<_>>();
         let mut persisted_room_ids = BTreeSet::new();
@@ -528,6 +548,7 @@ impl AppRuntimeState {
                 profiles: Vec::new(),
                 devices: Vec::new(),
             },
+            chat_projection,
             pending_invites,
             owned_invites,
             invite_watch_marks: BTreeMap::new(),
@@ -550,6 +571,11 @@ impl AppRuntimeState {
                 pin,
             } => self.submit_invite_pin(pending_room_id, pin)?,
             AppAction::SendMessage { room_id, text } => self.send_message(room_id, text)?,
+            AppAction::ReactToMessage {
+                room_id,
+                message_id,
+                emoji,
+            } => self.react_to_message(room_id, message_id, emoji)?,
             AppAction::RetryRoom { room_id } => self.retry_room(room_id)?,
             AppAction::RefreshDevices => self.refresh_devices()?,
             AppAction::RevokeDevice {
@@ -644,8 +670,9 @@ impl AppRuntimeState {
                 self.app.toast = Some(format!("{} device(s) joined", accepted.accepted.len()));
             }
         }
-        let synced = self.core.sync()?;
-        self.append_messages(synced.messages)?;
+        let synced = self.core.sync_with_projection()?;
+        self.apply_projection_events(synced.events);
+        self.append_messages(synced.result.messages);
         self.try_finalize_pending_rooms()?;
         self.app.status = "ready".to_owned();
         Ok(())
@@ -817,11 +844,50 @@ impl AppRuntimeState {
             });
         }
         let result = self.core.send_text(&room_id, trimmed)?;
-        self.append_messages(result.messages)?;
+        self.append_messages(result.messages);
         if let Some(room) = self.room_mut(&room_id) {
             room.last_message_preview = trimmed.to_owned();
         }
         self.app.status = "sent".to_owned();
+        Ok(())
+    }
+
+    fn react_to_message(
+        &mut self,
+        room_id: String,
+        message_id: String,
+        emoji: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let emoji = emoji.trim().to_owned();
+        if emoji.is_empty() {
+            return Ok(());
+        }
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to react"),
+            });
+        }
+        let Some(message) = self
+            .app
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && message.message_id == message_id)
+        else {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("message '{message_id}' is not available in room '{room_id}'"),
+            });
+        };
+        if message
+            .reactions
+            .iter()
+            .any(|reaction| reaction.emoji == emoji && reaction.reacted_by_me)
+        {
+            return Ok(());
+        }
+
+        let event = self.core.send_reaction(&room_id, &message_id, &emoji)?;
+        self.apply_projection_events(vec![event]);
+        self.app.status = "reacted".to_owned();
         Ok(())
     }
 
@@ -969,30 +1035,28 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn append_messages(&mut self, messages: Vec<ChatMessage>) -> Result<(), FiniteChatCoreError> {
-        let mut existing = self
-            .app
-            .messages
-            .iter()
-            .map(message_key)
-            .collect::<BTreeSet<_>>();
-        let mut changed = false;
-        for message in messages {
-            if existing.contains(&message_key(&message)) {
-                continue;
-            }
-            existing.insert(message_key(&message));
-            if let Some(room) = self.room_mut(&message.room_id) {
-                room.last_message_preview = message.text.clone();
-            }
-            self.app.messages.push(message);
-            changed = true;
+    fn append_messages(&mut self, messages: Vec<ChatMessage>) {
+        if messages.is_empty() {
+            return;
         }
-        if changed && self.app.messages.len() > MAX_APP_MESSAGES {
-            let drop_count = self.app.messages.len() - MAX_APP_MESSAGES;
-            self.app.messages.drain(0..drop_count);
+        self.chat_projection.append_messages(messages);
+        self.sync_chat_projection();
+    }
+
+    fn apply_projection_events(&mut self, events: Vec<StoredAppEvent>) {
+        if events.is_empty() {
+            return;
         }
-        Ok(())
+        let owner = self.core.device.device_ref().clone();
+        for event in events {
+            self.chat_projection.apply_event(event, &owner);
+        }
+        self.sync_chat_projection();
+    }
+
+    fn sync_chat_projection(&mut self) {
+        self.app.messages = self.chat_projection.messages();
+        apply_message_previews(&mut self.app.rooms, &self.app.messages);
     }
 
     fn persist_room_projection(&mut self, room_id: &str) -> Result<(), FiniteChatCoreError> {
@@ -1391,12 +1455,72 @@ impl CoreState {
         Ok(result)
     }
 
+    fn send_reaction(
+        &mut self,
+        room_id: &str,
+        target_message_id: &str,
+        emoji: &str,
+    ) -> Result<StoredAppEvent, FiniteChatCoreError> {
+        let reaction = ChatReactionV1 {
+            target_message_id: target_message_id.to_owned(),
+            emoji: emoji.trim().to_owned(),
+        };
+        reaction.validate_limits().map_err(client_error)?;
+        let reaction_payload = serde_json::to_vec(&reaction).map_err(client_error)?;
+        let app_event_plaintext =
+            encode_application_event(DurableAppEventKind::ChatReaction, None, &reaction_payload)?;
+        let idempotency_key = self
+            .device
+            .generate_object_id("reaction")
+            .map_err(client_error)?;
+        let request = self
+            .device
+            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .map_err(|error| send_error(room_id, error))?;
+        let sender = request.sender.clone();
+        self.store
+            .save_device_state(&self.device)
+            .map_err(store_error)?;
+
+        let room_server_url = self
+            .device
+            .room_server_url(room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.server_url.clone());
+        let mut delivery = delivery_for(&room_server_url);
+        let accepted = delivery
+            .append_event(
+                &request,
+                DurableAppEventKind::ChatReaction.delivery_policy(),
+            )
+            .map_err(delivery_error)?;
+        let event = StoredAppEvent {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+            message_id: accepted.message_id,
+            sender,
+            plaintext: app_event_plaintext,
+        };
+        self.store
+            .save_app_events(
+                self.device.device_ref(),
+                std::slice::from_ref(&event),
+                MAX_APP_MESSAGES_U32,
+            )
+            .map_err(store_error)?;
+        Ok(event)
+    }
+
     fn sync(&mut self) -> Result<SyncResult, FiniteChatCoreError> {
+        Ok(self.sync_with_projection()?.result)
+    }
+
+    fn sync_with_projection(&mut self) -> Result<CoreSyncProjection, FiniteChatCoreError> {
         let options = RuntimeSyncOptions {
             key_package_target_available: DEFAULT_KEY_PACKAGE_TARGET_AVAILABLE,
             max_sync_pages_per_room: DEFAULT_MAX_SYNC_PAGES_PER_ROOM,
         };
-        let mut result = SyncResult::default();
+        let mut projection = CoreSyncProjection::default();
 
         let mut home_delivery = self.home_delivery();
         let home_report = run_runtime_sync_tick(
@@ -1407,7 +1531,7 @@ impl CoreState {
         )
         .map_err(runtime_error)?;
         let owner = self.device.device_ref().clone();
-        result.merge_report(home_report, &owner);
+        projection.merge_report(home_report, &owner);
 
         let room_servers = self
             .device
@@ -1425,10 +1549,10 @@ impl CoreState {
                 &server_url,
             )
             .map_err(runtime_error)?;
-            result.merge_report(report, &owner);
+            projection.merge_report(report, &owner);
         }
 
-        Ok(result)
+        Ok(projection)
     }
 
     fn persist_chat_messages_and_events(
@@ -1458,35 +1582,45 @@ impl CoreState {
     }
 }
 
-impl SyncResult {
+impl CoreSyncProjection {
     fn merge_report(&mut self, report: finitechat_client::RuntimeSyncReport, owner: &DeviceRef) {
-        self.uploaded_key_packages = self
+        self.result.uploaded_key_packages = self
+            .result
             .uploaded_key_packages
             .saturating_add(report.uploaded_key_packages);
-        self.claimed_welcomes = self
+        self.result.claimed_welcomes = self
+            .result
             .claimed_welcomes
             .saturating_add(report.claimed_welcomes);
-        self.activated_welcome_acks_sent = self
+        self.result.activated_welcome_acks_sent = self
+            .result
             .activated_welcome_acks_sent
             .saturating_add(report.activated_welcome_acks_sent);
-        self.sync_pages = self.sync_pages.saturating_add(report.sync_pages);
-        self.messages
-            .extend(
-                report
-                    .applied_entries
-                    .into_iter()
-                    .filter_map(|entry| match entry.entry {
-                        AppliedLogEntry::Application { plaintext, sender } => project_chat_message(
-                            entry.room_id,
-                            entry.seq,
-                            entry.message_id,
-                            sender,
-                            plaintext,
-                            owner,
-                        ),
-                        AppliedLogEntry::Commit { .. } => None,
-                    }),
-            );
+        self.result.sync_pages = self.result.sync_pages.saturating_add(report.sync_pages);
+        for entry in report.applied_entries {
+            match entry.entry {
+                AppliedLogEntry::Application { plaintext, sender } => {
+                    if let Some(message) = project_chat_message(
+                        entry.room_id.clone(),
+                        entry.seq,
+                        entry.message_id.clone(),
+                        sender.clone(),
+                        plaintext.clone(),
+                        owner,
+                    ) {
+                        self.result.messages.push(message);
+                    }
+                    self.events.push(StoredAppEvent {
+                        room_id: entry.room_id,
+                        seq: entry.seq,
+                        message_id: entry.message_id,
+                        sender,
+                        plaintext,
+                    });
+                }
+                AppliedLogEntry::Commit { .. } => {}
+            }
+        }
     }
 }
 
@@ -1739,81 +1873,134 @@ fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Opt
     )
 }
 
+#[cfg(test)]
 fn chat_messages_from_stored(
     stored_messages: Vec<StoredAppMessage>,
     stored_events: Vec<StoredAppEvent>,
     owner: &DeviceRef,
 ) -> Vec<ChatMessage> {
-    let mut by_key = BTreeMap::<(String, String), ChatMessage>::new();
-    for message in stored_messages {
-        if let Some(projected) = chat_message_from_stored(message, owner) {
-            by_key.insert(message_key(&projected), projected);
-        }
-    }
-    for event in stored_events {
-        apply_stored_app_event(&mut by_key, event, owner);
-    }
-    let mut messages = by_key.into_values().collect::<Vec<_>>();
-    messages.sort_by(|left, right| {
-        left.seq
-            .cmp(&right.seq)
-            .then_with(|| left.room_id.cmp(&right.room_id))
-            .then_with(|| left.message_id.cmp(&right.message_id))
-    });
-    messages
+    ChatProjectionState::from_stored(stored_messages, stored_events, owner).messages()
 }
 
-fn apply_stored_app_event(
-    messages: &mut BTreeMap<(String, String), ChatMessage>,
-    event: StoredAppEvent,
-    owner: &DeviceRef,
-) {
-    match decode_application_event(&event.plaintext) {
-        DecodedAppEvent::ChatMessage { .. } => {
-            if let Some(message) = project_chat_message(
-                event.room_id,
-                event.seq,
-                event.message_id,
-                event.sender,
-                event.plaintext,
-                owner,
-            ) {
-                messages.insert(message_key(&message), message);
+impl ChatProjectionState {
+    fn from_stored(
+        stored_messages: Vec<StoredAppMessage>,
+        stored_events: Vec<StoredAppEvent>,
+        owner: &DeviceRef,
+    ) -> Self {
+        let mut projection = Self::default();
+        for message in stored_messages {
+            if let Some(projected) = chat_message_from_stored(message, owner) {
+                projection.insert_message(projected);
             }
         }
-        DecodedAppEvent::ChatReaction(reaction) => {
-            apply_chat_reaction(messages, &event.room_id, &event.sender, owner, reaction);
+        for event in stored_events {
+            projection.apply_event(event, owner);
         }
-        DecodedAppEvent::Ignored => {}
+        projection.trim_to_limit();
+        projection
     }
-}
 
-fn apply_chat_reaction(
-    messages: &mut BTreeMap<(String, String), ChatMessage>,
-    room_id: &str,
-    sender: &DeviceRef,
-    owner: &DeviceRef,
-    reaction: ChatReactionV1,
-) {
-    let key = (room_id.to_owned(), reaction.target_message_id);
-    let Some(message) = messages.get_mut(&key) else {
-        return;
-    };
-    let emoji = reaction.emoji.trim().to_owned();
-    let Some(summary) = message
-        .reactions
-        .iter_mut()
-        .find(|summary| summary.emoji == emoji)
-    else {
-        message.reactions.push(ChatReactionSummary {
-            emoji,
-            count: 1,
-            reacted_by_me: sender == owner,
+    fn append_messages(&mut self, messages: Vec<ChatMessage>) {
+        for message in messages {
+            self.insert_message(message);
+        }
+        self.trim_to_limit();
+    }
+
+    fn apply_event(&mut self, event: StoredAppEvent, owner: &DeviceRef) {
+        match decode_application_event(&event.plaintext) {
+            DecodedAppEvent::ChatMessage { .. } => {
+                if let Some(message) = project_chat_message(
+                    event.room_id,
+                    event.seq,
+                    event.message_id,
+                    event.sender,
+                    event.plaintext,
+                    owner,
+                ) {
+                    self.insert_message(message);
+                }
+            }
+            DecodedAppEvent::ChatReaction(reaction) => {
+                self.apply_reaction(&event.room_id, &event.sender, owner, reaction);
+            }
+            DecodedAppEvent::Ignored => {}
+        }
+        self.trim_to_limit();
+    }
+
+    fn messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self.messages.values().cloned().collect::<Vec<_>>();
+        messages.sort_by(message_sort);
+        messages
+    }
+
+    fn insert_message(&mut self, message: ChatMessage) {
+        self.messages.insert(message_key(&message), message);
+    }
+
+    fn apply_reaction(
+        &mut self,
+        room_id: &str,
+        sender: &DeviceRef,
+        owner: &DeviceRef,
+        reaction: ChatReactionV1,
+    ) {
+        let key = (room_id.to_owned(), reaction.target_message_id);
+        let emoji = reaction.emoji.trim().to_owned();
+        let sender_key = device_label(sender);
+        if !self
+            .reaction_senders
+            .insert((key.0.clone(), key.1.clone(), emoji.clone(), sender_key))
+        {
+            return;
+        }
+
+        let Some(message) = self.messages.get_mut(&key) else {
+            return;
+        };
+        let Some(summary) = message
+            .reactions
+            .iter_mut()
+            .find(|summary| summary.emoji == emoji)
+        else {
+            message.reactions.push(ChatReactionSummary {
+                emoji,
+                count: 1,
+                reacted_by_me: sender == owner,
+            });
+            return;
+        };
+        summary.count = summary.count.saturating_add(1);
+        summary.reacted_by_me |= sender == owner;
+    }
+
+    fn trim_to_limit(&mut self) {
+        if self.messages.len() <= MAX_APP_MESSAGES {
+            return;
+        }
+        let mut keyed_messages = self
+            .messages
+            .values()
+            .map(|message| {
+                (
+                    message.seq,
+                    message.room_id.clone(),
+                    message.message_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        keyed_messages.sort();
+        let drop_count = keyed_messages.len() - MAX_APP_MESSAGES;
+        for (_, room_id, message_id) in keyed_messages.into_iter().take(drop_count) {
+            self.messages.remove(&(room_id, message_id));
+        }
+        let message_keys = self.messages.keys().cloned().collect::<BTreeSet<_>>();
+        self.reaction_senders.retain(|(room_id, message_id, _, _)| {
+            message_keys.contains(&(room_id.clone(), message_id.clone()))
         });
-        return;
-    };
-    summary.count = summary.count.saturating_add(1);
-    summary.reacted_by_me |= sender == owner;
+    }
 }
 
 fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
@@ -1986,6 +2173,13 @@ fn sort_app_rooms(rooms: &mut [AppRoomSummary]) {
             .cmp(&right.display_name)
             .then_with(|| left.room_id.cmp(&right.room_id))
     });
+}
+
+fn message_sort(left: &ChatMessage, right: &ChatMessage) -> std::cmp::Ordering {
+    left.seq
+        .cmp(&right.seq)
+        .then_with(|| left.room_id.cmp(&right.room_id))
+        .then_with(|| left.message_id.cmp(&right.message_id))
 }
 
 fn message_key(message: &ChatMessage) -> (String, String) {
@@ -2272,8 +2466,32 @@ mod tests {
                     room_id: "room-main".to_owned(),
                     seq: 2,
                     message_id: "reaction-1".to_owned(),
-                    sender: peer,
+                    sender: peer.clone(),
                     plaintext: reaction_event,
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 3,
+                    message_id: "reaction-duplicate".to_owned(),
+                    sender: peer,
+                    plaintext: encode_application_event(
+                        DurableAppEventKind::ChatReaction,
+                        None,
+                        &reaction_payload,
+                    )
+                    .unwrap(),
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 4,
+                    message_id: "reaction-owner".to_owned(),
+                    sender: owner.clone(),
+                    plaintext: encode_application_event(
+                        DurableAppEventKind::ChatReaction,
+                        None,
+                        &reaction_payload,
+                    )
+                    .unwrap(),
                 },
             ],
             &owner,
@@ -2285,8 +2503,8 @@ mod tests {
             messages[0].reactions,
             vec![ChatReactionSummary {
                 emoji: "+1".to_owned(),
-                count: 1,
-                reacted_by_me: false,
+                count: 2,
+                reacted_by_me: true,
             }]
         );
     }
@@ -2897,6 +3115,110 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_reactions_are_durable_and_live_projected() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Reaction Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let bob_state = bob
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "tap a reaction on this".to_owned(),
+            })
+            .unwrap();
+        let target_message_id = bob_state
+            .messages
+            .iter()
+            .find(|message| message.text == "tap a reaction on this")
+            .expect("sent message projects")
+            .message_id
+            .clone();
+
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice
+            .dispatch(AppAction::ReactToMessage {
+                room_id: room_id.clone(),
+                message_id: target_message_id.clone(),
+                emoji: "👍".to_owned(),
+            })
+            .unwrap();
+        assert_reaction(&alice_state, &target_message_id, "👍", 1, true);
+
+        let alice_state = alice
+            .dispatch(AppAction::ReactToMessage {
+                room_id: room_id.clone(),
+                message_id: target_message_id.clone(),
+                emoji: "👍".to_owned(),
+            })
+            .unwrap();
+        assert_reaction(&alice_state, &target_message_id, "👍", 1, true);
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert_reaction(&bob_state, &target_message_id, "👍", 1, false);
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert_reaction(
+            &reopened.state().unwrap(),
+            &target_message_id,
+            "👍",
+            1,
+            true,
+        );
+    }
+
+    #[test]
     fn app_runtime_lists_and_revokes_same_account_devices() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -3045,6 +3367,27 @@ mod tests {
         assert_eq!(device.current_device, current_device);
         assert_eq!(device.revoked, revoked);
         assert_eq!(device.room_count, 1);
+    }
+
+    fn assert_reaction(
+        state: &AppState,
+        message_id: &str,
+        emoji: &str,
+        count: u32,
+        reacted_by_me: bool,
+    ) {
+        let message = state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .unwrap_or_else(|| panic!("missing message {message_id}"));
+        let reaction = message
+            .reactions
+            .iter()
+            .find(|reaction| reaction.emoji == emoji)
+            .unwrap_or_else(|| panic!("missing reaction {emoji} on {message_id}"));
+        assert_eq!(reaction.count, count);
+        assert_eq!(reaction.reacted_by_me, reacted_by_me);
     }
 
     fn put_profile(server_url: &str, profile: NostrProfileRecord) {

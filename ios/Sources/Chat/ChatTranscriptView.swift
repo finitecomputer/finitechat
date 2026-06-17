@@ -9,6 +9,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
     let roomID: String
     let rows: [ChatTimelineRow]
     let messagesById: [String: ChatMessage]
+    let onReact: (ChatMessage, String) -> Void
     var canLoadOlder = false
     var onLoadOlderMessages: (() -> Void)?
     @Binding var followsBottom: Bool
@@ -60,7 +61,8 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
             cell.contentConfiguration = UIHostingConfiguration {
                 ChatTimelineRowView(
                     row: row,
-                    messagesById: coordinator.parent.messagesById
+                    messagesById: coordinator.parent.messagesById,
+                    onReact: coordinator.parent.onReact
                 )
             }
             .minSize(width: 0, height: 0)

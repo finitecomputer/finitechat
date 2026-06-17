@@ -222,6 +222,14 @@ final class AppModel: ObservableObject {
         dispatch(.sendMessage(roomId: room.roomId, text: text))
     }
 
+    func react(to message: ChatMessage, emoji: String) {
+        dispatch(.reactToMessage(
+            roomId: message.roomId,
+            messageId: message.messageId,
+            emoji: emoji
+        ))
+    }
+
     func applyDevSettings() {
         do {
             try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()

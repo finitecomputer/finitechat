@@ -10,11 +10,16 @@ enum ChatBubblePosition {
 struct ChatTimelineRowView: View {
     let row: ChatTimelineRow
     let messagesById: [String: ChatMessage]
+    let onReact: (ChatMessage, String) -> Void
 
     var body: some View {
         switch row {
         case .messageGroup(let group):
-            ChatMessageGroupRow(group: group, messagesById: messagesById)
+            ChatMessageGroupRow(
+                group: group,
+                messagesById: messagesById,
+                onReact: onReact
+            )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
         }
@@ -24,6 +29,7 @@ struct ChatTimelineRowView: View {
 private struct ChatMessageGroupRow: View {
     let group: ChatTimelineMessageGroup
     let messagesById: [String: ChatMessage]
+    let onReact: (ChatMessage, String) -> Void
 
     private let avatarSize: CGFloat = 28
 
@@ -57,6 +63,7 @@ private struct ChatMessageGroupRow: View {
                 ChatBubbleStack(
                     messages: group.messages,
                     messagesById: messagesById,
+                    onReact: onReact,
                     alignment: .leading
                 )
             }
@@ -74,6 +81,7 @@ private struct ChatMessageGroupRow: View {
                 ChatBubbleStack(
                     messages: group.messages,
                     messagesById: messagesById,
+                    onReact: onReact,
                     alignment: .trailing
                 )
 
@@ -100,6 +108,7 @@ private struct ChatMessageGroupRow: View {
 private struct ChatBubbleStack: View {
     let messages: [ChatMessage]
     let messagesById: [String: ChatMessage]
+    let onReact: (ChatMessage, String) -> Void
     let alignment: HorizontalAlignment
 
     var body: some View {
@@ -108,7 +117,8 @@ private struct ChatBubbleStack: View {
                 ChatMessageBubble(
                     message: message,
                     replyTarget: replyTarget(for: message),
-                    position: bubblePosition(at: index, count: messages.count)
+                    position: bubblePosition(at: index, count: messages.count),
+                    onReact: onReact
                 )
             }
         }
@@ -131,6 +141,7 @@ private struct ChatMessageBubble: View {
     let message: ChatMessage
     let replyTarget: ChatMessage?
     let position: ChatBubblePosition
+    let onReact: (ChatMessage, String) -> Void
 
     @State private var isPressed = false
 
@@ -200,13 +211,28 @@ private struct ChatMessageBubble: View {
             }
 
             if !message.reactions.isEmpty {
-                ReactionChips(reactions: message.reactions)
+                ReactionChips(
+                    message: message,
+                    reactions: message.reactions,
+                    onReact: onReact
+                )
                     .offset(y: -7)
                     .padding(.horizontal, 5)
                     .padding(.bottom, -2)
             }
         }
         .accessibilityElement(children: .combine)
+        .contextMenu {
+            ForEach(quickReactionEmojis, id: \.self) { emoji in
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onReact(message, emoji)
+                } label: {
+                    Text(reactionMenuTitle(for: emoji))
+                }
+                .disabled(message.reactions.contains { $0.emoji == emoji && $0.reactedByMe })
+            }
+        }
     }
 
     private var statusText: String? {
@@ -229,20 +255,29 @@ private struct ChatMessageBubble: View {
 }
 
 private struct ReactionChips: View {
+    let message: ChatMessage
     let reactions: [ChatReactionSummary]
+    let onReact: (ChatMessage, String) -> Void
 
     var body: some View {
         HStack(spacing: 4) {
             ForEach(reactions, id: \.emoji) { reaction in
-                HStack(spacing: 3) {
-                    Text(reaction.emoji)
-                        .font(.system(size: 13))
-                    if reaction.count > 1 {
-                        Text("\(reaction.count)")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(reaction.reactedByMe ? .white : .secondary)
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onReact(message, reaction.emoji)
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(reaction.emoji)
+                            .font(.system(size: 13))
+                        if reaction.count > 1 {
+                            Text("\(reaction.count)")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(reaction.reactedByMe ? .white : .secondary)
+                        }
                     }
                 }
+                .buttonStyle(.plain)
+                .disabled(reaction.reactedByMe)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(
@@ -256,6 +291,12 @@ private struct ReactionChips: View {
             }
         }
     }
+}
+
+private let quickReactionEmojis = ["❤️", "👍", "😂", "😮", "😢", "🙏"]
+
+private func reactionMenuTitle(for emoji: String) -> String {
+    "React \(emoji)"
 }
 
 private struct ReplyPreview: View {
