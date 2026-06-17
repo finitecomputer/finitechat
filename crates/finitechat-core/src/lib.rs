@@ -7381,6 +7381,111 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_persists_remote_synced_message_for_force_close_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Remote Persistence".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        bob.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "remote sync survives force close".to_owned(),
+        })
+        .unwrap();
+        let alice_synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            alice_synced
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "remote sync survives force close"),
+            "receiver must render the synced remote message before relaunch"
+        );
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+        assert_eq!(
+            local_snapshot.selected_room_id.as_deref(),
+            Some(room_id.as_str())
+        );
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).last_message_preview,
+            "remote sync survives force close"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "remote sync survives force close"),
+            "force-close reopen must restore remote synced messages from local SQLite before sync"
+        );
+
+        let offline = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(offline.status, "offline");
+        assert!(
+            offline
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "remote sync survives force close"),
+            "offline startup must not hide locally persisted synced messages"
+        );
+    }
+
+    #[test]
     fn app_runtime_polls_are_durable_and_votes_are_non_notifying() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));

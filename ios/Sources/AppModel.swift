@@ -508,6 +508,14 @@ final class AppModel: ObservableObject {
         state?.status.nonEmptyTrimmed
     }
 
+    var developerPersistenceSummary: String {
+        let roomCount = rooms.count
+        let selectedRoomID = state?.selectedRoomId?.nonEmptyTrimmed ?? "none"
+        let selectedMessages = selectedRoomMessages.count
+        let projectedMessages = state?.messages.count ?? 0
+        return "\(roomCount) room(s), selected \(selectedRoomID), \(selectedMessages) selected message(s), \(projectedMessages) projected message(s)"
+    }
+
     var activeProfile: AppProfileSummary? {
         guard let state, let activeProfileId = state.activeProfileId else { return nil }
         return state.profiles.first { $0.accountId == activeProfileId }

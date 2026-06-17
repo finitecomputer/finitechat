@@ -128,7 +128,9 @@ app-state, room, message, outbox, and profile projections before network sync;
 delivery failure during startup must return the saved chat list and selected
 transcript as offline local state, not an empty UI. Full room-history sync
 remains a repair/recovery path, not the ordinary way the UI gets messages after
-launch.
+launch. Regression coverage must include a remote-synced message that survives
+force-close and offline relaunch, because that is the user-visible chat
+contract, not an implementation detail.
 
 On iOS, stable launch overrides for server URL or device id are treated as
 product configuration once the Rust runtime opens successfully. The app writes

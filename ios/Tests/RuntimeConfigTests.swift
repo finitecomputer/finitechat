@@ -723,6 +723,10 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(relaunch.userNoticeText, "Showing saved chats. Connection will retry.")
         XCTAssertEqual(relaunch.developerRuntimeStatus, "offline")
+        XCTAssertEqual(
+            relaunch.developerPersistenceSummary,
+            "1 room(s), selected room-main, 1 selected message(s), 1 projected message(s)"
+        )
         XCTAssertNil(relaunch.errorText)
         XCTAssertEqual(secondRuntime.dispatchedActions, [.startRuntime])
     }

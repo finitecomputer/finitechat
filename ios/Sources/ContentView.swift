@@ -1420,6 +1420,7 @@ private struct SettingsSheet: View {
                         LabeledContent("Account", value: state.identity.accountId)
                         LabeledContent("Runtime Device", value: state.identity.deviceId)
                         LabeledContent("Revision", value: "\(state.rev)")
+                        LabeledContent("Persistence", value: model.developerPersistenceSummary)
                     }
                     if let status = model.developerRuntimeStatus {
                         LabeledContent("Runtime Status", value: status)
