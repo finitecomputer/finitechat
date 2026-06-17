@@ -29,9 +29,27 @@ struct RuntimeConfig: Codable, Equatable {
         let deviceID = argumentValue("--finitechat-device", in: args)
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
         let persisted = loadPersisted(storageURL: storageURL)
-        let fallback = persisted ?? RuntimeConfig(
+        let recoveredDeviceID = existingSingleRecoverableDeviceStoreID(storageURL: storageURL)
+        let persistedStoreIsRecoverable = persisted
+            .map { recoverableDeviceStoreExists($0.deviceID, storageURL: storageURL) } ?? false
+        let persistedConfig: RuntimeConfig?
+        if let persisted {
+            if persistedStoreIsRecoverable || recoveredDeviceID == nil {
+                persistedConfig = persisted
+            } else if let recoveredDeviceID {
+                persistedConfig = RuntimeConfig(
+                    serverURL: persisted.serverURL,
+                    deviceID: recoveredDeviceID
+                )
+            } else {
+                persistedConfig = nil
+            }
+        } else {
+            persistedConfig = nil
+        }
+        let fallback = persistedConfig ?? RuntimeConfig(
             serverURL: defaultServerURL,
-            deviceID: existingSingleDeviceStoreID(storageURL: storageURL) ?? defaultDeviceID
+            deviceID: recoveredDeviceID ?? defaultDeviceID
         )
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
@@ -44,7 +62,7 @@ struct RuntimeConfig: Codable, Equatable {
         // LAN server or device id must reopen that same SQLite store after a
         // manual force-close. Tests/debug harnesses can still opt into a
         // process-local override with the transient flag.
-        if persisted == nil || (hasLaunchOverride && !transientOverride) {
+        if !transientOverride && (persisted != config || hasLaunchOverride) {
             try? config.save(storageURL: storageURL)
         }
         return config
@@ -86,7 +104,20 @@ struct RuntimeConfig: Codable, Equatable {
         return support.appendingPathComponent("finitechat_config.json")
     }
 
-    private static func existingSingleDeviceStoreID(storageURL: URL?) -> String? {
+    private static func existingSingleRecoverableDeviceStoreID(storageURL: URL?) -> String? {
+        let candidates = recoverableDeviceStores(storageURL: storageURL)
+        guard candidates.count == 1 else { return nil }
+        return candidates[0]
+    }
+
+    private static func recoverableDeviceStoreExists(
+        _ deviceID: String,
+        storageURL: URL?
+    ) -> Bool {
+        recoverableDeviceStores(storageURL: storageURL).contains(deviceID)
+    }
+
+    private static func recoverableDeviceStores(storageURL: URL?) -> [String] {
         let supportURL: URL
         if let storageURL {
             supportURL = storageURL.deletingLastPathComponent()
@@ -98,7 +129,7 @@ struct RuntimeConfig: Codable, Equatable {
         ) {
             supportURL = applicationSupport
         } else {
-            return nil
+            return []
         }
 
         let dataRoot = supportURL.appendingPathComponent(dataRootDirectoryName, isDirectory: true)
@@ -107,21 +138,30 @@ struct RuntimeConfig: Codable, Equatable {
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
-            return nil
+            return []
         }
 
-        let candidates = entries.filter { entry in
+        return entries.compactMap { entry in
             let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            guard isDirectory else { return false }
-            return FileManager.default.fileExists(
-                atPath: entry.appendingPathComponent(clientStoreFileName).path
-            ) || FileManager.default.fileExists(
-                atPath: entry.appendingPathComponent(accountSecretFileName).path
-            )
+            guard isDirectory else { return nil }
+            guard deviceStoreIsRecoverable(entry) else { return nil }
+            let deviceID = entry.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+            return deviceID.isEmpty ? nil : deviceID
         }
-        guard candidates.count == 1 else { return nil }
-        let deviceID = candidates[0].lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
-        return deviceID.isEmpty ? nil : deviceID
+    }
+
+    private static func deviceStoreIsRecoverable(_ url: URL) -> Bool {
+        let accountSecret = url.appendingPathComponent(accountSecretFileName)
+        if FileManager.default.fileExists(atPath: accountSecret.path) {
+            return true
+        }
+
+        let clientStore = url.appendingPathComponent(clientStoreFileName)
+        guard FileManager.default.fileExists(atPath: clientStore.path) else {
+            return false
+        }
+        let size = (try? clientStore.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return size > 0
     }
 
     enum ConfigError: Error {

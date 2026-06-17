@@ -118,7 +118,7 @@ final class RuntimeConfigTests: XCTestCase {
             at: deviceStoreURL,
             withIntermediateDirectories: true
         )
-        try Data().write(to: deviceStoreURL.appendingPathComponent("client.sqlite3"))
+        try Data("secret".utf8).write(to: deviceStoreURL.appendingPathComponent("account-secret.hex"))
 
         let loaded = RuntimeConfig.load(
             environment: [:],
@@ -128,6 +128,87 @@ final class RuntimeConfigTests: XCTestCase {
 
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
         XCTAssertEqual(loaded.deviceID, "qt433")
+        XCTAssertEqual(try persistedConfig(at: url), loaded)
+    }
+
+    func testMissingConfigDoesNotAdoptEmptyPlaceholderStore() throws {
+        let url = try temporaryConfigURL()
+        let supportURL = url.deletingLastPathComponent()
+        let deviceStoreURL = supportURL
+            .appendingPathComponent("FiniteChat", isDirectory: true)
+            .appendingPathComponent("qt433", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: deviceStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: deviceStoreURL.appendingPathComponent("client.sqlite3"))
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
+        XCTAssertEqual(loaded.deviceID, "ios")
+        XCTAssertEqual(try persistedConfig(at: url), loaded)
+    }
+
+    func testPersistedEmptyDeviceRecoversUniqueInitializedStore() throws {
+        let url = try temporaryConfigURL()
+        try RuntimeConfig(
+            serverURL: "http://192.168.1.226:8789",
+            deviceID: "ios"
+        ).save(storageURL: url)
+
+        let supportURL = url.deletingLastPathComponent()
+        let dataRoot = supportURL.appendingPathComponent("FiniteChat", isDirectory: true)
+        let emptyStoreURL = dataRoot.appendingPathComponent("ios", isDirectory: true)
+        let initializedStoreURL = dataRoot.appendingPathComponent("qt433", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: emptyStoreURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: initializedStoreURL,
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: emptyStoreURL.appendingPathComponent("client.sqlite3"))
+        try Data("secret".utf8)
+            .write(to: initializedStoreURL.appendingPathComponent("account-secret.hex"))
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://192.168.1.226:8789")
+        XCTAssertEqual(loaded.deviceID, "qt433")
+        XCTAssertEqual(try persistedConfig(at: url), loaded)
+    }
+
+    func testMissingConfigDoesNotGuessAmongMultipleInitializedStores() throws {
+        let url = try temporaryConfigURL()
+        let supportURL = url.deletingLastPathComponent()
+        let dataRoot = supportURL.appendingPathComponent("FiniteChat", isDirectory: true)
+        for deviceID in ["alice", "bob"] {
+            let storeURL = dataRoot.appendingPathComponent(deviceID, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: storeURL,
+                withIntermediateDirectories: true
+            )
+            try Data("secret".utf8).write(to: storeURL.appendingPathComponent("account-secret.hex"))
+        }
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
+        XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
