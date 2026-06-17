@@ -8,9 +8,9 @@ use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
     RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppMessage,
-    StoredAppRoom, accept_pending_invite_joins, create_room_invite, finalize_invited_room,
-    generate_account_secret, run_room_server_sync_tick, run_runtime_sync_tick,
-    submit_invite_join_request,
+    StoredAppRoom, StoredAppRoomState, accept_pending_invite_joins, create_room_invite,
+    finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
+    run_runtime_sync_tick, submit_invite_join_request,
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
@@ -483,28 +483,32 @@ impl AppRuntimeState {
             .into_iter()
             .map(|message| chat_message_from_stored(message, &owner))
             .collect::<Vec<_>>();
-        let room_metadata = core
-            .store
-            .load_app_rooms(&owner)
-            .map_err(store_error)?
-            .into_iter()
-            .map(|room| (room.room_id, room.display_name))
-            .collect::<BTreeMap<_, _>>();
-        let mut rooms = core
-            .known_room_ids()
-            .into_iter()
-            .map(|room_id| AppRoomSummary {
-                display_name: room_metadata
-                    .get(&room_id)
-                    .cloned()
-                    .unwrap_or_else(|| room_id.clone()),
-                room_id,
-                state: AppRoomState::Connected,
-                status: "connected".to_owned(),
-                last_message_preview: String::new(),
-                unread_count: 0,
-            })
-            .collect::<Vec<_>>();
+        let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
+        let known_room_ids = core.known_room_ids().into_iter().collect::<BTreeSet<_>>();
+        let mut persisted_room_ids = BTreeSet::new();
+        let mut pending_invites = BTreeMap::new();
+        let mut owned_invites = BTreeMap::new();
+        let mut rooms = Vec::new();
+        for stored_room in stored_rooms {
+            let room_id = stored_room.room_id.clone();
+            let has_mls_room = known_room_ids.contains(&room_id);
+            persisted_room_ids.insert(room_id.clone());
+            if stored_room.state != StoredAppRoomState::Connected
+                && let Some(invite_url) = stored_room.pending_invite_url.clone()
+            {
+                pending_invites.insert(room_id.clone(), PendingInvite { invite_url });
+            }
+            if let Some(invite_url) = stored_room.owned_invite_url.clone() {
+                owned_invites.insert(room_id.clone(), invite_url);
+            }
+            rooms.push(app_room_from_stored(stored_room, has_mls_room));
+        }
+        for room_id in known_room_ids {
+            if !persisted_room_ids.contains(&room_id) {
+                rooms.push(connected_app_room(&room_id, &room_id));
+            }
+        }
+        sort_app_rooms(&mut rooms);
         apply_message_previews(&mut rooms, &messages);
         Ok(Self {
             core,
@@ -521,8 +525,8 @@ impl AppRuntimeState {
                 profiles: Vec::new(),
                 devices: Vec::new(),
             },
-            pending_invites: BTreeMap::new(),
-            owned_invites: BTreeMap::new(),
+            pending_invites,
+            owned_invites,
             invite_watch_marks: BTreeMap::new(),
             profile_cache: BTreeMap::new(),
             revoked_devices: BTreeSet::new(),
@@ -639,7 +643,7 @@ impl AppRuntimeState {
         }
         let synced = self.core.sync()?;
         self.append_messages(synced.messages)?;
-        self.try_finalize_pending_rooms();
+        self.try_finalize_pending_rooms()?;
         self.app.status = "ready".to_owned();
         Ok(())
     }
@@ -679,6 +683,7 @@ impl AppRuntimeState {
             AppRoomState::Connected,
             "connected",
         );
+        self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
         self.app.status = "room created".to_owned();
         Ok(())
@@ -702,6 +707,7 @@ impl AppRuntimeState {
                     AppRoomState::NeedsAttention,
                     &error.to_string(),
                 );
+                self.persist_room_projection(&room_id)?;
                 self.app.status = "room needs attention".to_owned();
                 self.app.toast = Some("Invite could not be created".to_owned());
                 return Ok(());
@@ -710,10 +716,11 @@ impl AppRuntimeState {
         self.owned_invites
             .insert(room_id.clone(), invite.invite_url.clone());
         self.app.active_invite = Some(AppInviteState {
-            room_id,
+            room_id: room_id.clone(),
             invite_url: invite.invite_url,
             pin: invite.pin,
         });
+        self.persist_room_projection(&room_id)?;
         self.app.status = "invite ready".to_owned();
         Ok(())
     }
@@ -757,6 +764,7 @@ impl AppRuntimeState {
             AppRoomState::WaitingForApproval,
             "enter PIN to request admission",
         );
+        self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
         self.app.status = "invite scanned".to_owned();
         Ok(())
@@ -779,12 +787,17 @@ impl AppRuntimeState {
             pin.trim(),
             Some(self.app.identity.device_id.clone()),
         )?;
+        let display_name = self
+            .room(&pending_room_id)
+            .map(|room| room.display_name.clone())
+            .unwrap_or_else(|| pending_room_id.clone());
         self.upsert_room(
             &pending_room_id,
-            &pending_room_id,
+            &display_name,
             AppRoomState::WaitingForApproval,
             "waiting for room admission",
         );
+        self.persist_room_projection(&pending_room_id)?;
         self.app.selected_room_id = Some(pending_room_id);
         self.app.status = "join requested".to_owned();
         Ok(())
@@ -818,15 +831,20 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn try_finalize_pending_rooms(&mut self) {
+    fn try_finalize_pending_rooms(&mut self) -> Result<(), FiniteChatCoreError> {
         for room_id in self.pending_invites.keys().cloned().collect::<Vec<_>>() {
-            if let Err(error) = self.try_finalize_room(&room_id)
-                && let Some(room) = self.room_mut(&room_id)
-            {
-                room.state = AppRoomState::WaitingForApproval;
-                room.status = error.to_string();
+            match self.try_finalize_room(&room_id) {
+                Ok(()) => {}
+                Err(error) => {
+                    if let Some(room) = self.room_mut(&room_id) {
+                        room.state = AppRoomState::WaitingForApproval;
+                        room.status = error.to_string();
+                        self.persist_room_projection(&room_id)?;
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     fn try_finalize_room(&mut self, room_id: &str) -> Result<(), FiniteChatCoreError> {
@@ -842,10 +860,12 @@ impl AppRuntimeState {
             room.state = AppRoomState::Joining;
             room.status = "joining".to_owned();
         }
+        self.persist_room_projection(room_id)?;
         self.core.sync()?;
         self.core.finalize_invite(&pending.invite_url)?;
         self.pending_invites.remove(room_id);
         self.upsert_room(room_id, &display_name, AppRoomState::Connected, "connected");
+        self.persist_room_projection(room_id)?;
         self.app.status = "joined".to_owned();
         Ok(())
     }
@@ -972,6 +992,20 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn persist_room_projection(&mut self, room_id: &str) -> Result<(), FiniteChatCoreError> {
+        let Some(room) = self.room(room_id).cloned() else {
+            return Ok(());
+        };
+        let pending = self.pending_invites.get(room_id);
+        let owned_invite_url = self.owned_invites.get(room_id);
+        let stored = stored_room_from_app(&room, pending, owned_invite_url);
+        let owner = self.core.device.device_ref().clone();
+        self.core
+            .store
+            .save_app_rooms(&owner, std::slice::from_ref(&stored))
+            .map_err(store_error)
+    }
+
     fn upsert_room(
         &mut self,
         room_id: &str,
@@ -979,10 +1013,16 @@ impl AppRuntimeState {
         state: AppRoomState,
         status: &str,
     ) {
-        if let Some(room) = self.room_mut(room_id) {
-            room.display_name = display_name.to_owned();
-            room.state = state;
-            room.status = status.to_owned();
+        if let Some(index) = self
+            .app
+            .rooms
+            .iter()
+            .position(|room| room.room_id == room_id)
+        {
+            self.app.rooms[index].display_name = display_name.to_owned();
+            self.app.rooms[index].state = state;
+            self.app.rooms[index].status = status.to_owned();
+            sort_app_rooms(&mut self.app.rooms);
             return;
         }
         self.app.rooms.push(AppRoomSummary {
@@ -993,11 +1033,7 @@ impl AppRuntimeState {
             last_message_preview: String::new(),
             unread_count: 0,
         });
-        self.app.rooms.sort_by(|left, right| {
-            left.display_name
-                .cmp(&right.display_name)
-                .then_with(|| left.room_id.cmp(&right.room_id))
-        });
+        sort_app_rooms(&mut self.app.rooms);
     }
 
     fn room_is_connected(&self, room_id: &str) -> bool {
@@ -1600,6 +1636,69 @@ fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
     }
 }
 
+fn app_room_from_stored(room: StoredAppRoom, has_mls_room: bool) -> AppRoomSummary {
+    let mut state = app_room_state_from_stored(room.state);
+    let mut status = room.status;
+    if state == AppRoomState::Connected && !has_mls_room {
+        state = AppRoomState::NeedsAttention;
+        status = "room is not available on this device".to_owned();
+    }
+    AppRoomSummary {
+        room_id: room.room_id,
+        display_name: room.display_name,
+        state,
+        status,
+        last_message_preview: String::new(),
+        unread_count: 0,
+    }
+}
+
+fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
+    AppRoomSummary {
+        room_id: room_id.to_owned(),
+        display_name: display_name.to_owned(),
+        state: AppRoomState::Connected,
+        status: "connected".to_owned(),
+        last_message_preview: String::new(),
+        unread_count: 0,
+    }
+}
+
+fn stored_room_from_app(
+    room: &AppRoomSummary,
+    pending: Option<&PendingInvite>,
+    owned_invite_url: Option<&String>,
+) -> StoredAppRoom {
+    StoredAppRoom {
+        room_id: room.room_id.clone(),
+        display_name: room.display_name.clone(),
+        state: stored_app_room_state(&room.state),
+        status: room.status.clone(),
+        pending_invite_url: pending.map(|pending| pending.invite_url.clone()),
+        owned_invite_url: owned_invite_url.cloned(),
+    }
+}
+
+fn app_room_state_from_stored(state: StoredAppRoomState) -> AppRoomState {
+    match state {
+        StoredAppRoomState::Connected => AppRoomState::Connected,
+        StoredAppRoomState::WaitingForApproval => AppRoomState::WaitingForApproval,
+        StoredAppRoomState::Joining => AppRoomState::Joining,
+        StoredAppRoomState::NeedsAttention => AppRoomState::NeedsAttention,
+        StoredAppRoomState::Offline => AppRoomState::Offline,
+    }
+}
+
+fn stored_app_room_state(state: &AppRoomState) -> StoredAppRoomState {
+    match state {
+        AppRoomState::Connected => StoredAppRoomState::Connected,
+        AppRoomState::WaitingForApproval => StoredAppRoomState::WaitingForApproval,
+        AppRoomState::Joining => StoredAppRoomState::Joining,
+        AppRoomState::NeedsAttention => StoredAppRoomState::NeedsAttention,
+        AppRoomState::Offline => StoredAppRoomState::Offline,
+    }
+}
+
 fn app_room_metadata(room_id: &str, display_name: Option<&str>) -> StoredAppRoom {
     let display_name = display_name
         .map(str::trim)
@@ -1609,6 +1708,10 @@ fn app_room_metadata(room_id: &str, display_name: Option<&str>) -> StoredAppRoom
     StoredAppRoom {
         room_id: room_id.to_owned(),
         display_name,
+        state: StoredAppRoomState::Connected,
+        status: "connected".to_owned(),
+        pending_invite_url: None,
+        owned_invite_url: None,
     }
 }
 
@@ -1669,6 +1772,14 @@ fn apply_message_previews(rooms: &mut [AppRoomSummary], messages: &[ChatMessage]
             room.last_message_preview = message.text.clone();
         }
     }
+}
+
+fn sort_app_rooms(rooms: &mut [AppRoomSummary]) {
+    rooms.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.room_id.cmp(&right.room_id))
+    });
 }
 
 fn message_key(message: &ChatMessage) -> (String, String) {
@@ -2280,6 +2391,136 @@ mod tests {
             "startup sync failure must not hide the durable local transcript"
         );
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
+    }
+
+    #[test]
+    fn app_runtime_recovers_invite_join_projection_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Recovered Join".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        drop(alice);
+
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert_eq!(
+            app_room(&alice.state().unwrap(), &room_id).state,
+            AppRoomState::Connected
+        );
+
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let scanned = bob
+            .dispatch(AppAction::ScanTarget {
+                value: invite.invite_url.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            app_room(&scanned, &room_id).state,
+            AppRoomState::WaitingForApproval
+        );
+        assert_eq!(
+            app_room(&scanned, &room_id).status,
+            "enter PIN to request admission"
+        );
+        drop(bob);
+
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let recovered = bob.state().unwrap();
+        assert_eq!(
+            app_room(&recovered, &room_id).state,
+            AppRoomState::WaitingForApproval
+        );
+        assert_eq!(
+            app_room(&recovered, &room_id).status,
+            "enter PIN to request admission"
+        );
+        let requested = bob
+            .dispatch(AppAction::SubmitInvitePin {
+                pending_room_id: room_id.clone(),
+                pin: invite.pin,
+            })
+            .unwrap();
+        assert_eq!(
+            app_room(&requested, &room_id).status,
+            "waiting for room admission"
+        );
+        assert_eq!(
+            app_room(&requested, &room_id).display_name,
+            "Recovered Join"
+        );
+        drop(bob);
+
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let waiting = bob.state().unwrap();
+        assert_eq!(
+            app_room(&waiting, &room_id).state,
+            AppRoomState::WaitingForApproval
+        );
+        assert_eq!(
+            app_room(&waiting, &room_id).status,
+            "waiting for room admission"
+        );
+        assert_eq!(app_room(&waiting, &room_id).display_name, "Recovered Join");
+
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            alice_state.toast.as_deref(),
+            Some("1 device(s) joined"),
+            "creator invite watch must survive relaunch and admit the joiner"
+        );
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&bob_state, &room_id).state,
+            AppRoomState::Connected
+        );
     }
 
     #[test]

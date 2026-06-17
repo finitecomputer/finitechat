@@ -97,7 +97,9 @@ const MAX_CLIENT_STATE_CIPHERTEXT_BYTES: u32 =
 const MAX_APP_MESSAGE_CIPHERTEXT_BYTES: u32 =
     MAX_ENVELOPE_PAYLOAD_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_ROOM_DISPLAY_NAME_BYTES: u32 = 256;
-const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 1024;
+const MAX_APP_ROOM_STATUS_BYTES: u32 = 512;
+const MAX_APP_ROOM_INVITE_URL_BYTES: u32 = 4096;
+const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 8192;
 const MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_STORED_APP_MESSAGES: u32 = 5_000;
@@ -130,6 +132,7 @@ const _: () = {
     assert!(MAX_CLIENT_STATE_CIPHERTEXT_BYTES > MAX_CLIENT_STATE_PLAINTEXT_BYTES);
     assert!(MAX_APP_MESSAGE_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES > MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES);
+    assert!(MAX_APP_ROOM_INVITE_URL_BYTES >= MAX_ROOM_SERVER_URL_BYTES);
     assert!(MAX_STORED_APP_MESSAGES > 0);
 };
 
@@ -314,6 +317,20 @@ impl StoredAppMessage {
 pub struct StoredAppRoom {
     pub room_id: RoomId,
     pub display_name: String,
+    pub state: StoredAppRoomState,
+    pub status: String,
+    pub pending_invite_url: Option<String>,
+    pub owned_invite_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredAppRoomState {
+    #[default]
+    Connected,
+    WaitingForApproval,
+    Joining,
+    NeedsAttention,
+    Offline,
 }
 
 impl StoredAppRoom {
@@ -325,6 +342,9 @@ impl StoredAppRoom {
             MAX_APP_ROOM_DISPLAY_NAME_BYTES,
         )?;
         validate_bytes_non_empty("app_room.display_name", self.display_name.len())?;
+        validate_string_bytes("app_room.status", &self.status, MAX_APP_ROOM_STATUS_BYTES)?;
+        validate_optional_app_room_url("app_room.pending_invite_url", &self.pending_invite_url)?;
+        validate_optional_app_room_url("app_room.owned_invite_url", &self.owned_invite_url)?;
         Ok(())
     }
 }
@@ -332,6 +352,18 @@ impl StoredAppRoom {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAppRoomMetadataV1 {
     display_name: String,
+    #[serde(default)]
+    state: StoredAppRoomState,
+    #[serde(default = "default_app_room_status")]
+    status: String,
+    #[serde(default)]
+    pending_invite_url: Option<String>,
+    #[serde(default)]
+    owned_invite_url: Option<String>,
+}
+
+fn default_app_room_status() -> String {
+    "connected".to_owned()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2860,6 +2892,10 @@ impl SqliteClientStore {
             let room = StoredAppRoom {
                 room_id,
                 display_name: metadata.display_name,
+                state: metadata.state,
+                status: metadata.status,
+                pending_invite_url: metadata.pending_invite_url,
+                owned_invite_url: metadata.owned_invite_url,
             };
             room.validate_limits()?;
             rooms.push(room);
@@ -5596,6 +5632,18 @@ fn validate_app_message_limit(limit: u32) -> Result<(), ClientStoreError> {
     })
 }
 
+fn validate_optional_app_room_url(
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<(), ClientError> {
+    let Some(value) = value.as_deref() else {
+        return Ok(());
+    };
+    validate_bytes_non_empty(field, value.len())?;
+    validate_string_bytes(field, value, MAX_APP_ROOM_INVITE_URL_BYTES)?;
+    Ok(())
+}
+
 fn sqlite_seq_from_u64(seq: u64) -> Result<i64, ClientStoreError> {
     i64::try_from(seq).map_err(|_| ClientStoreError::StoredAppMessageSeqOutOfRange { seq })
 }
@@ -5876,6 +5924,10 @@ fn encrypt_app_room_metadata(
     room.validate_limits()?;
     let metadata = StoredAppRoomMetadataV1 {
         display_name: room.display_name.clone(),
+        state: room.state,
+        status: room.status.clone(),
+        pending_invite_url: room.pending_invite_url.clone(),
+        owned_invite_url: room.owned_invite_url.clone(),
     };
     let plaintext =
         serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppRoomMetadata)?;
@@ -6037,6 +6089,14 @@ fn decrypt_app_room_metadata(
     .map_err(ClientError::from)?;
     validate_bytes_non_empty("app_room.display_name", metadata.display_name.len())
         .map_err(ClientError::from)?;
+    validate_string_bytes(
+        "app_room.status",
+        &metadata.status,
+        MAX_APP_ROOM_STATUS_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    validate_optional_app_room_url("app_room.pending_invite_url", &metadata.pending_invite_url)?;
+    validate_optional_app_room_url("app_room.owned_invite_url", &metadata.owned_invite_url)?;
     Ok(metadata)
 }
 
@@ -7428,13 +7488,12 @@ mod tests {
 
         let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
         store.save_device_state(&device).unwrap();
-        let first = StoredAppRoom {
-            room_id: "room-main".to_owned(),
-            display_name: "Main Room".to_owned(),
-        };
+        let first = app_room("room-main", "Main Room");
         let second = StoredAppRoom {
-            room_id: "room-side".to_owned(),
-            display_name: "Side Room".to_owned(),
+            state: StoredAppRoomState::WaitingForApproval,
+            status: "waiting for room admission".to_owned(),
+            pending_invite_url: Some("finite://join?v=1&s=http%3A%2F%2Flocalhost&r=room-side&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3".to_owned()),
+            ..app_room("room-side", "Side Room")
         };
         store
             .save_app_rooms(&owner, &[second.clone(), first.clone()])
@@ -7566,6 +7625,17 @@ mod tests {
             message_id: message_id.to_owned(),
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
+        }
+    }
+
+    fn app_room(room_id: &str, display_name: &str) -> StoredAppRoom {
+        StoredAppRoom {
+            room_id: room_id.to_owned(),
+            display_name: display_name.to_owned(),
+            state: StoredAppRoomState::Connected,
+            status: "connected".to_owned(),
+            pending_invite_url: None,
+            owned_invite_url: None,
         }
     }
 }
