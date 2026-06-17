@@ -38,7 +38,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(loaded.serverURL, "http://args.example")
         XCTAssertEqual(loaded.deviceID, "transient-device")
         XCTAssertFalse(loaded.usesTransientStore)
-        XCTAssertFalse(loaded.persistsRuntimeIdentityUpdates)
+        XCTAssertTrue(loaded.persistsRuntimeIdentityUpdates)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
@@ -152,7 +152,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
         XCTAssertEqual(loaded.deviceID, "codex-persist-check")
         XCTAssertFalse(loaded.usesTransientStore)
-        XCTAssertFalse(loaded.persistsRuntimeIdentityUpdates)
+        XCTAssertTrue(loaded.persistsRuntimeIdentityUpdates)
 
         let persisted = try persistedConfig(at: url)
         XCTAssertEqual(persisted.serverURL, "http://persisted.example")
@@ -977,54 +977,57 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
     }
 
-    func testDiagnosticLaunchOverrideUsesStableStoreButDoesNotReplaceStableChatRelaunchIdentity() throws {
+    func testStableLaunchOverridePersistsResolvedChatIdentityForManualRelaunch() throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")
         try RuntimeConfig(
             serverURL: "http://persisted.example",
-            deviceID: "qt433"
+            deviceID: "ios"
         ).save(storageURL: configURL)
 
-        let diagnosticArgs = [
+        let launchArgs = [
             "FiniteChat",
             "--finitechat-server",
-            "http://127.0.0.1:1",
+            "http://192.168.1.226:8789",
             "--finitechat-device",
-            "diagnostics-visual",
+            "qt433",
         ]
-        let diagnosticConfig = RuntimeConfig.load(
+        let launchConfig = RuntimeConfig.load(
             environment: [:],
-            args: diagnosticArgs,
+            args: launchArgs,
             storageURL: configURL
         )
         var openedOptions: [OpenOptions] = []
-        let diagnosticRuntime = FakeFiniteChatRuntime(
+        let launchRuntime = FakeFiniteChatRuntime(
             initialState: savedChatState(),
             startRuntimeState: savedChatState()
         )
-        let diagnosticLaunch = AppModel(
-            config: diagnosticConfig,
+        let firstLaunch = AppModel(
+            config: launchConfig,
             applicationSupportURL: supportURL,
             configStorageURL: configURL,
-            args: diagnosticArgs,
+            args: launchArgs,
             startsUpdateLoop: false
         ) { options in
             openedOptions.append(options)
-            return diagnosticRuntime
+            return launchRuntime
         }
 
-        diagnosticLaunch.start()
+        firstLaunch.start()
 
         XCTAssertEqual(openedOptions.count, 1)
-        XCTAssertEqual(openedOptions[0].serverUrl, "http://127.0.0.1:1")
-        XCTAssertEqual(openedOptions[0].deviceId, "diagnostics-visual")
-        let diagnosticStore = URL(fileURLWithPath: openedOptions[0].dataDir)
-        XCTAssertEqual(diagnosticStore.lastPathComponent, "FiniteChatStore")
-        XCTAssertEqual(diagnosticLaunch.deviceID, "qt433")
-        let persistedAfterDiagnostic = try persistedConfig(at: configURL)
-        XCTAssertEqual(persistedAfterDiagnostic.serverURL, "http://persisted.example")
-        XCTAssertEqual(persistedAfterDiagnostic.deviceID, "qt433")
-        XCTAssertEqual(diagnosticLaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
+        XCTAssertEqual(openedOptions[0].serverUrl, "http://192.168.1.226:8789")
+        XCTAssertEqual(openedOptions[0].deviceId, "qt433")
+        XCTAssertEqual(
+            URL(fileURLWithPath: openedOptions[0].dataDir).lastPathComponent,
+            "FiniteChatStore"
+        )
+        XCTAssertEqual(firstLaunch.deviceID, "qt433")
+        XCTAssertEqual(firstLaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
+
+        let persistedAfterLaunch = try persistedConfig(at: configURL)
+        XCTAssertEqual(persistedAfterLaunch.serverURL, "http://192.168.1.226:8789")
+        XCTAssertEqual(persistedAfterLaunch.deviceID, "qt433")
 
         let relaunchConfig = RuntimeConfig.load(
             environment: [:],
@@ -1049,7 +1052,7 @@ final class AppModelPersistenceTests: XCTestCase {
         relaunch.start()
 
         XCTAssertEqual(openedOptions.count, 2)
-        XCTAssertEqual(openedOptions[1].serverUrl, "http://persisted.example")
+        XCTAssertEqual(openedOptions[1].serverUrl, "http://192.168.1.226:8789")
         XCTAssertEqual(openedOptions[1].deviceId, "qt433")
         XCTAssertEqual(
             URL(fileURLWithPath: openedOptions[1].dataDir).lastPathComponent,
@@ -1152,6 +1155,42 @@ final class AppModelPersistenceTests: XCTestCase {
     private func persistedConfig(at url: URL) throws -> RuntimeConfig {
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(RuntimeConfig.self, from: data)
+    }
+}
+
+final class ReactionEmojiCatalogTests: XCTestCase {
+    func testEmptySearchShowsRecentSectionFirst() {
+        let sections = ReactionEmojiCatalog.filteredSections(searchText: "")
+
+        XCTAssertEqual(sections.first?.title, "Recent")
+        XCTAssertEqual(
+            Array(sections.first?.emojis.map(\.emoji).prefix(6) ?? []),
+            ["❤️", "👍", "👎", "😂", "😮", "😢"]
+        )
+    }
+
+    func testSearchMatchesEmojiNameAndKeywordWithoutDuplicates() {
+        let rocketMatches = ReactionEmojiCatalog.filteredSections(searchText: "rocket")
+        XCTAssertEqual(rocketMatches.map(\.title), ["Results"])
+        XCTAssertEqual(rocketMatches.first?.emojis.map(\.emoji), ["🚀"])
+
+        let agreeMatches = ReactionEmojiCatalog.filteredSections(searchText: "agree")
+            .flatMap(\.emojis)
+            .map(\.emoji)
+        XCTAssertEqual(agreeMatches.count, Set(agreeMatches).count)
+        XCTAssertTrue(agreeMatches.contains("👍"))
+        XCTAssertTrue(agreeMatches.contains("🤝"))
+    }
+
+    func testWhitespaceOnlySearchUsesDefaultSections() {
+        XCTAssertEqual(
+            ReactionEmojiCatalog.filteredSections(searchText: "   "),
+            ReactionEmojiCatalog.sections
+        )
+    }
+
+    func testUnknownSearchReturnsNoSections() {
+        XCTAssertTrue(ReactionEmojiCatalog.filteredSections(searchText: "not-an-emoji").isEmpty)
     }
 }
 

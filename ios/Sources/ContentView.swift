@@ -208,6 +208,7 @@ private struct RoomThreadView: View {
     @State private var focusedMessage: ChatMessage?
     @State private var focusedMessageFrame: CGRect = .zero
     @State private var focusedActionsVisible = false
+    @State private var reactionPickerContext: ReactionPickerContext?
     @State private var composerFocused = false
     @State private var imagePreviewSelection: ChatImagePreviewSelection?
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
@@ -258,6 +259,10 @@ private struct RoomThreadView: View {
                     },
                     onReact: { emoji in
                         model.react(to: focusedMessage, emoji: emoji)
+                        dismissFocusedMessage()
+                    },
+                    onMoreReaction: {
+                        reactionPickerContext = ReactionPickerContext(message: focusedMessage)
                         dismissFocusedMessage()
                     },
                     onReply: {
@@ -336,6 +341,12 @@ private struct RoomThreadView: View {
             PollComposerView { question, options in
                 model.sendPoll(roomID: draft.roomID, question: question, options: options)
             }
+        }
+        .sheet(item: $reactionPickerContext) { context in
+            ReactionEmojiPickerSheet { emoji in
+                model.react(to: context.message, emoji: emoji)
+            }
+            .presentationDetents([.medium, .large])
         }
         .onDisappear {
             model.setTyping(roomID: roomID, isTyping: false)
@@ -660,6 +671,7 @@ private struct FocusedMessageOverlay: View {
     let actionsVisible: Bool
     let onDismiss: () -> Void
     let onReact: (String) -> Void
+    let onMoreReaction: () -> Void
     let onReply: () -> Void
     let onRetry: () -> Void
     let onCopy: () -> Void
@@ -678,7 +690,7 @@ private struct FocusedMessageOverlay: View {
 
                 VStack(alignment: message.isMine ? .trailing : .leading, spacing: 10) {
                     if canReact {
-                        FocusedReactionBar(onReact: onReact)
+                        FocusedReactionBar(onReact: onReact, onMore: onMoreReaction)
                     }
 
                     FocusedChatMessageCard(
@@ -723,9 +735,10 @@ private struct FocusedMessageOverlay: View {
 
 private struct FocusedReactionBar: View {
     let onReact: (String) -> Void
+    let onMore: () -> Void
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 4) {
             ForEach(focusedReactionEmojis, id: \.self) { emoji in
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -738,6 +751,19 @@ private struct FocusedReactionBar: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("React \(emoji)")
             }
+
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                onMore()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .background(Color(uiColor: .tertiarySystemGroupedBackground), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More reactions")
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
@@ -803,7 +829,252 @@ private struct FocusedMessageActionCard: View {
     }
 }
 
-private let focusedReactionEmojis = ["❤️", "👍", "😂", "😮", "😢", "🙏"]
+private let focusedReactionEmojis = ["❤️", "👍", "👎", "😂", "😮", "😢"]
+
+private struct ReactionPickerContext: Identifiable {
+    let message: ChatMessage
+
+    var id: String {
+        message.messageId
+    }
+}
+
+struct ReactionEmojiSection: Equatable, Identifiable {
+    let title: String
+    let emojis: [ReactionEmojiChoice]
+
+    var id: String {
+        title
+    }
+}
+
+struct ReactionEmojiChoice: Equatable, Identifiable {
+    let emoji: String
+    let name: String
+    let keywords: [String]
+
+    var id: String {
+        emoji
+    }
+
+    func matches(_ query: String) -> Bool {
+        let normalized = query
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return true }
+        if name.lowercased().contains(normalized) {
+            return true
+        }
+        return keywords.contains { keyword in
+            keyword.lowercased().contains(normalized)
+        }
+    }
+}
+
+enum ReactionEmojiCatalog {
+    static let recent = [
+        choice("❤️", "Red heart", "love", "heart"),
+        choice("👍", "Thumbs up", "yes", "agree", "like"),
+        choice("👎", "Thumbs down", "no", "disagree"),
+        choice("😂", "Face with tears of joy", "laugh", "funny"),
+        choice("😮", "Surprised face", "wow", "shock"),
+        choice("😢", "Crying face", "sad"),
+        choice("🔥", "Fire", "hot", "lit"),
+        choice("🎉", "Party popper", "celebrate", "party"),
+        choice("👀", "Eyes", "looking", "watching"),
+        choice("🙏", "Folded hands", "thanks", "please"),
+        choice("💯", "Hundred points", "perfect", "agree"),
+        choice("🤔", "Thinking face", "think", "hmm"),
+    ]
+
+    static let sections = [
+        ReactionEmojiSection(title: "Recent", emojis: recent),
+        ReactionEmojiSection(title: "Smileys", emojis: [
+            choice("😀", "Grinning face", "smile"),
+            choice("😃", "Smiling face", "happy"),
+            choice("😄", "Smiling eyes", "happy"),
+            choice("😁", "Beaming face", "grin"),
+            choice("😆", "Squinting face", "laugh"),
+            choice("😅", "Grinning sweat", "relief"),
+            choice("🤣", "Rolling on the floor laughing", "laugh", "funny"),
+            choice("😂", "Face with tears of joy", "laugh", "funny"),
+            choice("🙂", "Slightly smiling face", "smile"),
+            choice("🙃", "Upside-down face", "silly"),
+            choice("😉", "Winking face", "wink"),
+            choice("😊", "Smiling face with smiling eyes", "warm"),
+            choice("😇", "Smiling face with halo", "angel"),
+            choice("😍", "Heart eyes", "love"),
+            choice("😘", "Face blowing a kiss", "kiss"),
+            choice("😋", "Yum face", "tasty"),
+            choice("😜", "Winking tongue", "joke"),
+            choice("🤔", "Thinking face", "think", "hmm"),
+            choice("🤨", "Raised eyebrow", "skeptical"),
+            choice("😐", "Neutral face", "neutral"),
+            choice("😑", "Expressionless face", "blank"),
+            choice("😶", "Face without mouth", "quiet"),
+            choice("😏", "Smirking face", "smirk"),
+            choice("😒", "Unamused face", "unimpressed"),
+            choice("🙄", "Face with rolling eyes", "eyeroll"),
+            choice("😬", "Grimacing face", "grimace"),
+            choice("😮", "Surprised face", "wow", "shock"),
+            choice("😯", "Hushed face", "surprised"),
+            choice("😲", "Astonished face", "amazed"),
+            choice("😴", "Sleeping face", "sleep"),
+            choice("🤤", "Drooling face", "want"),
+            choice("😪", "Sleepy face", "tired"),
+            choice("😵", "Dizzy face", "dizzy"),
+            choice("🤯", "Exploding head", "mind blown"),
+            choice("🥳", "Partying face", "party", "celebrate"),
+            choice("🥺", "Pleading face", "please"),
+            choice("😭", "Loudly crying face", "cry"),
+            choice("😤", "Face with steam", "frustrated"),
+            choice("😡", "Pouting face", "angry"),
+        ]),
+        ReactionEmojiSection(title: "Gestures", emojis: [
+            choice("👋", "Waving hand", "hello", "bye"),
+            choice("👌", "OK hand", "ok"),
+            choice("✌️", "Victory hand", "peace"),
+            choice("🤞", "Crossed fingers", "hope"),
+            choice("🤟", "Love-you gesture", "love"),
+            choice("🤘", "Sign of the horns", "rock"),
+            choice("👍", "Thumbs up", "yes", "agree", "like"),
+            choice("👎", "Thumbs down", "no", "disagree"),
+            choice("👏", "Clapping hands", "applause"),
+            choice("🙌", "Raising hands", "celebrate"),
+            choice("🙏", "Folded hands", "thanks", "please"),
+            choice("🤝", "Handshake", "deal", "agree"),
+            choice("💪", "Flexed biceps", "strong"),
+            choice("🫡", "Saluting face", "salute"),
+        ]),
+        ReactionEmojiSection(title: "Hearts", emojis: [
+            choice("❤️", "Red heart", "love", "heart"),
+            choice("🧡", "Orange heart", "heart"),
+            choice("💛", "Yellow heart", "heart"),
+            choice("💚", "Green heart", "heart"),
+            choice("💙", "Blue heart", "heart"),
+            choice("💜", "Purple heart", "heart"),
+            choice("🖤", "Black heart", "heart"),
+            choice("🤍", "White heart", "heart"),
+            choice("💔", "Broken heart", "heartbreak"),
+            choice("💕", "Two hearts", "love"),
+            choice("💖", "Sparkling heart", "love"),
+            choice("💝", "Heart with ribbon", "gift"),
+        ]),
+        ReactionEmojiSection(title: "Symbols", emojis: [
+            choice("⭐️", "Star", "favorite"),
+            choice("✨", "Sparkles", "sparkle"),
+            choice("🔥", "Fire", "hot", "lit"),
+            choice("💯", "Hundred points", "perfect", "agree"),
+            choice("🎉", "Party popper", "celebrate", "party"),
+            choice("✅", "Check mark", "done", "yes"),
+            choice("❌", "Cross mark", "no", "cancel"),
+            choice("⚠️", "Warning", "caution"),
+            choice("🚀", "Rocket", "ship", "launch"),
+            choice("💡", "Light bulb", "idea"),
+            choice("👑", "Crown", "king", "queen"),
+        ]),
+    ]
+
+    static func filteredSections(searchText: String) -> [ReactionEmojiSection] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return sections }
+
+        var seen = Set<String>()
+        let matches = sections
+            .flatMap(\.emojis)
+            .filter { choice in
+                guard choice.matches(query), !seen.contains(choice.emoji) else { return false }
+                seen.insert(choice.emoji)
+                return true
+            }
+        return matches.isEmpty ? [] : [ReactionEmojiSection(title: "Results", emojis: matches)]
+    }
+
+    private static func choice(
+        _ emoji: String,
+        _ name: String,
+        _ keywords: String...
+    ) -> ReactionEmojiChoice {
+        ReactionEmojiChoice(emoji: emoji, name: name, keywords: keywords)
+    }
+}
+
+private struct ReactionEmojiPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
+    let onSelect: (String) -> Void
+
+    private var sections: [ReactionEmojiSection] {
+        ReactionEmojiCatalog.filteredSections(searchText: searchText)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    if sections.isEmpty {
+                        ContentUnavailableView("No matching emoji", systemImage: "magnifyingglass")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 44)
+                    } else {
+                        ForEach(sections) { section in
+                            ReactionEmojiSectionView(section: section) { emoji in
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                onSelect(emoji)
+                                dismiss()
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 16)
+            }
+            .navigationTitle("Reactions")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $searchText, prompt: "Search emoji")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ReactionEmojiSectionView: View {
+    let section: ReactionEmojiSection
+    let onSelect: (String) -> Void
+
+    private let columns = Array(
+        repeating: GridItem(.flexible(minimum: 40, maximum: 52), spacing: 8),
+        count: 6
+    )
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(section.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(section.emojis) { choice in
+                    Button {
+                        onSelect(choice.emoji)
+                    } label: {
+                        Text(choice.emoji)
+                            .font(.system(size: 30))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(choice.name)
+                }
+            }
+        }
+    }
+}
 
 private func messageClipboardText(_ message: ChatMessage) -> String {
     let display = message.displayContent.trimmingCharacters(in: .whitespacesAndNewlines)

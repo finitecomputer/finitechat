@@ -130,6 +130,13 @@ transcript as offline local state, not an empty UI. Full room-history sync
 remains a repair/recovery path, not the ordinary way the UI gets messages after
 launch.
 
+On iOS, stable launch overrides for server URL or device id are treated as
+product configuration once the Rust runtime opens successfully. The app writes
+the resolved runtime identity back to its config file so a force-close relaunch
+without Xcode launch arguments reopens the same local SQLite identity and
+projection. Throwaway diagnostics must use the explicit transient store flag;
+ordinary stable launches are not temporary.
+
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an
 already-unlocked finitecomputer runtime.

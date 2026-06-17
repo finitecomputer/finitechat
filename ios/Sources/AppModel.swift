@@ -85,7 +85,6 @@ struct RuntimeConfig: Codable, Equatable {
         let shouldPersistFirstLaunchOverride = hasLaunchOverride
             && !hasPersistentLaunchState
         let shouldPersistResolvedIdentity = !transientOverride
-            && (!hasLaunchOverride || shouldPersistFirstLaunchOverride || persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
@@ -899,13 +898,14 @@ final class AppModel: ObservableObject {
             )
         )
         let openedState = try opened.state()
-        if openedState.identity.deviceId != deviceID {
-            deviceID = openedState.identity.deviceId
-            if !usesTransientStore && persistsRuntimeIdentityUpdates {
-                try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
-                    storageURL: configStorageURL
-                )
-            }
+        let resolvedDeviceID = openedState.identity.deviceId
+        if resolvedDeviceID != deviceID {
+            deviceID = resolvedDeviceID
+        }
+        if !usesTransientStore && persistsRuntimeIdentityUpdates {
+            try? RuntimeConfig(serverURL: serverURL, deviceID: resolvedDeviceID).save(
+                storageURL: configStorageURL
+            )
         }
         runtime = opened
         openKey = "\(serverURL)|\(deviceID)"
