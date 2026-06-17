@@ -747,6 +747,10 @@ final class AppModel: ObservableObject {
     }
 
     func downloadAttachment(roomID: String, message: ChatMessage, attachment: ChatMediaAttachment) {
+        downloadAttachment(roomID: roomID, messageID: message.messageId, attachment: attachment)
+    }
+
+    func downloadAttachment(roomID: String, messageID: String, attachment: ChatMediaAttachment) {
         if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
            !localPath.isEmpty
         {
@@ -758,7 +762,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let key = "\(roomID)|\(message.messageId)|\(attachment.attachmentId)"
+        let key = "\(roomID)|\(messageID)|\(attachment.attachmentId)"
         guard !attachmentDownloadsInFlight.contains(key) else { return }
         attachmentDownloadsInFlight.insert(key)
 
@@ -769,7 +773,7 @@ final class AppModel: ObservableObject {
             runtimeKey = openKey
             state = try runtime.dispatch(action: .beginDownloadAttachment(
                 roomId: roomID,
-                messageId: message.messageId,
+                messageId: messageID,
                 attachmentId: attachment.attachmentId
             ))
             errorText = nil
@@ -788,7 +792,7 @@ final class AppModel: ObservableObject {
             do {
                 let action = AppAction.downloadAttachment(
                     roomId: roomID,
-                    messageId: message.messageId,
+                    messageId: messageID,
                     attachmentId: attachment.attachmentId
                 )
                 let nextState = try await Task.detached(priority: .utility) {

@@ -1115,6 +1115,7 @@ final class AppModelPersistenceTests: XCTestCase {
             status: status,
             toast: toast,
             messages: [message],
+            mediaGallery: nil,
             profiles: [],
             devices: [],
             typingMembers: []
@@ -1140,6 +1141,7 @@ final class AppModelPersistenceTests: XCTestCase {
             status: status,
             toast: toast,
             messages: [],
+            mediaGallery: nil,
             profiles: [],
             devices: [],
             typingMembers: []
@@ -1198,102 +1200,32 @@ final class ReactionEmojiCatalogTests: XCTestCase {
     }
 }
 
-final class ChatMediaGalleryProjectionTests: XCTestCase {
-    func testGalleryProjectionPreservesMessageAndAttachmentOrderForVisualMedia() {
-        let messages = [
-            chatMessage(
-                id: "message-1",
-                seq: 1,
-                media: [
-                    mediaAttachment(id: "image-1", kind: .image),
-                    mediaAttachment(id: "file-1", kind: .file),
-                    mediaAttachment(id: "video-1", kind: .video),
-                ]
-            ),
-            chatMessage(
-                id: "message-2",
-                seq: 2,
-                media: [
-                    mediaAttachment(id: "voice-1", kind: .voiceNote),
-                    mediaAttachment(id: "image-2", kind: .image),
-                ]
-            ),
-        ]
-
-        let items = ChatMediaGalleryProjection.items(messages: messages)
-
-        XCTAssertEqual(
-            items.map(\.id),
-            [
-                "message-1|image-1",
-                "message-1|video-1",
-                "message-2|image-2",
-            ]
-        )
-        XCTAssertEqual(items.map(\.message.messageId), ["message-1", "message-1", "message-2"])
-        XCTAssertEqual(items.map(\.attachment.kind), [.image, .video, .image])
-    }
-
-    func testGalleryProjectionIsEmptyWhenTranscriptHasNoPhotosOrVideos() {
-        let messages = [
-            chatMessage(
-                id: "message-1",
-                seq: 1,
-                media: [
-                    mediaAttachment(id: "voice-1", kind: .voiceNote),
-                    mediaAttachment(id: "file-1", kind: .file),
-                ]
-            ),
-        ]
-
-        XCTAssertTrue(ChatMediaGalleryProjection.items(messages: messages).isEmpty)
-    }
-
-    private func chatMessage(
-        id: String,
-        seq: UInt64,
-        media: [ChatMediaAttachment]
-    ) -> ChatMessage {
-        ChatMessage(
+final class ChatMediaGalleryItemIdentityTests: XCTestCase {
+    func testGeneratedGalleryItemUsesRustStableItemIdForSwiftIdentity() {
+        let item = ChatMediaGalleryItem(
+            itemId: "room-main|message-1|image-1",
             roomId: "room-main",
-            seq: seq,
-            messageId: id,
-            conversationId: nil,
-            senderAccountId: "alice-account",
-            senderDeviceId: "alice-ios",
+            messageId: "message-1",
+            attachmentId: "image-1",
+            attachment: ChatMediaAttachment(
+                attachmentId: "image-1",
+                url: "https://example.invalid/image-1",
+                mimeType: "image/jpeg",
+                filename: "image-1.jpg",
+                kind: .image,
+                width: nil,
+                height: nil,
+                localPath: nil,
+                uploadProgressPerMille: nil,
+                downloadProgressPerMille: nil
+            ),
             senderDisplayName: "Alice",
             senderNpub: nil,
-            text: "",
-            displayContent: "",
-            payload: Data(),
-            replyToMessageId: nil,
-            isMine: false,
-            delivery: .sent,
-            reactions: [],
-            media: media,
-            readReceipt: nil,
-            poll: nil,
-            timestampUnixSeconds: 1_700_000_000 + seq,
+            timestampUnixSeconds: 1_700_000_000,
             displayTimestamp: "now"
         )
-    }
 
-    private func mediaAttachment(
-        id: String,
-        kind: ChatMediaKind
-    ) -> ChatMediaAttachment {
-        ChatMediaAttachment(
-            attachmentId: id,
-            url: "https://example.invalid/\(id)",
-            mimeType: kind == .image ? "image/jpeg" : "application/octet-stream",
-            filename: "\(id).dat",
-            kind: kind,
-            width: nil,
-            height: nil,
-            localPath: nil,
-            uploadProgressPerMille: nil,
-            downloadProgressPerMille: nil
-        )
+        XCTAssertEqual(item.id, "room-main|message-1|image-1")
     }
 }
 

@@ -230,6 +230,15 @@ private struct RoomThreadView: View {
         model.projection(for: roomID)
     }
 
+    private var mediaGalleryItems: [ChatMediaGalleryItem] {
+        guard let gallery = model.state?.mediaGallery,
+              gallery.roomId == roomID
+        else {
+            return []
+        }
+        return gallery.items
+    }
+
     private var latestMessageID: String? {
         projection.messages.last?.messageId
     }
@@ -324,9 +333,13 @@ private struct RoomThreadView: View {
         .navigationDestination(isPresented: $showMediaGallery) {
             ChatMediaGalleryView(
                 roomTitle: room?.displayName ?? "this chat",
-                items: ChatMediaGalleryProjection.items(messages: projection.messages),
-                onDownloadAttachment: { message, attachment in
-                    model.downloadAttachment(roomID: roomID, message: message, attachment: attachment)
+                items: mediaGalleryItems,
+                onDownloadAttachment: { item in
+                    model.downloadAttachment(
+                        roomID: roomID,
+                        messageID: item.messageId,
+                        attachment: item.attachment
+                    )
                 }
             )
         }

@@ -198,6 +198,25 @@ pub struct ChatMediaAttachment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatMediaGalleryState {
+    pub room_id: String,
+    pub items: Vec<ChatMediaGalleryItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatMediaGalleryItem {
+    pub item_id: String,
+    pub room_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub attachment: ChatMediaAttachment,
+    pub sender_display_name: String,
+    pub sender_npub: Option<String>,
+    pub timestamp_unix_seconds: u64,
+    pub display_timestamp: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct OutboundAttachment {
     pub filename: String,
     pub mime_type: String,
@@ -328,6 +347,7 @@ pub struct AppState {
     pub status: String,
     pub toast: Option<String>,
     pub messages: Vec<ChatMessage>,
+    pub media_gallery: Option<ChatMediaGalleryState>,
     pub profiles: Vec<AppProfileSummary>,
     pub devices: Vec<AppDeviceSummary>,
     pub typing_members: Vec<AppTypingMember>,
@@ -751,6 +771,7 @@ impl AppRuntimeState {
                 status: "ready".to_owned(),
                 toast: None,
                 messages: Vec::new(),
+                media_gallery: None,
                 profiles: Vec::new(),
                 devices: Vec::new(),
                 typing_members: Vec::new(),
@@ -1429,12 +1450,7 @@ impl AppRuntimeState {
                 reason: format!("room '{room_id}' is not ready to download attachments"),
             });
         }
-        let Some(message) = self
-            .app
-            .messages
-            .iter()
-            .find(|message| message.room_id == room_id && message.message_id == message_id)
-        else {
+        let Some(message) = self.chat_projection.message(room_id, message_id) else {
             return Err(FiniteChatCoreError::Client {
                 reason: format!("message '{message_id}' is not available in room '{room_id}'"),
             });
@@ -1963,6 +1979,7 @@ impl AppRuntimeState {
     fn sync_selected_room_messages(&mut self) {
         let Some(room_id) = self.app.selected_room_id.clone() else {
             self.app.messages.clear();
+            self.app.media_gallery = None;
             self.sync_transcript_load_state();
             return;
         };
@@ -1973,7 +1990,17 @@ impl AppRuntimeState {
         self.core.apply_attachment_cache_paths(&mut messages);
         self.apply_attachment_download_progress(&mut messages);
         self.app.messages = messages;
+        self.sync_selected_room_media_gallery(&room_id);
         self.sync_transcript_load_state();
+    }
+
+    fn sync_selected_room_media_gallery(&mut self, room_id: &str) {
+        let mut messages = self.chat_projection.visual_media_messages_for_room(room_id);
+        self.core.apply_attachment_cache_paths(&mut messages);
+        self.apply_attachment_download_progress(&mut messages);
+        self.app.media_gallery = Some(ChatProjectionState::media_gallery_from_messages(
+            room_id, &messages,
+        ));
     }
 
     fn apply_attachment_download_progress(&self, messages: &mut [ChatMessage]) {
@@ -4129,6 +4156,52 @@ impl ChatProjectionState {
         messages
     }
 
+    fn visual_media_messages_for_room(&self, room_id: &str) -> Vec<ChatMessage> {
+        let mut messages = self
+            .messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| {
+                message.media.iter().any(|attachment| {
+                    matches!(attachment.kind, ChatMediaKind::Image | ChatMediaKind::Video)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by(message_sort);
+        messages
+    }
+
+    fn media_gallery_from_messages(
+        room_id: &str,
+        messages: &[ChatMessage],
+    ) -> ChatMediaGalleryState {
+        let mut items = Vec::new();
+        for message in messages {
+            debug_assert_eq!(message.room_id, room_id);
+            for attachment in &message.media {
+                if !matches!(attachment.kind, ChatMediaKind::Image | ChatMediaKind::Video) {
+                    continue;
+                }
+                items.push(ChatMediaGalleryItem {
+                    item_id: chat_media_gallery_item_id(message, attachment),
+                    room_id: message.room_id.clone(),
+                    message_id: message.message_id.clone(),
+                    attachment_id: attachment.attachment_id.clone(),
+                    attachment: attachment.clone(),
+                    sender_display_name: message.sender_display_name.clone(),
+                    sender_npub: message.sender_npub.clone(),
+                    timestamp_unix_seconds: message.timestamp_unix_seconds,
+                    display_timestamp: message.display_timestamp.clone(),
+                });
+            }
+        }
+        ChatMediaGalleryState {
+            room_id: room_id.to_owned(),
+            items,
+        }
+    }
+
     fn room_message_count(&self, room_id: &str) -> usize {
         self.messages
             .values()
@@ -4729,6 +4802,13 @@ fn message_sort(left: &ChatMessage, right: &ChatMessage) -> std::cmp::Ordering {
 
 fn message_key(message: &ChatMessage) -> (String, String) {
     (message.room_id.clone(), message.message_id.clone())
+}
+
+fn chat_media_gallery_item_id(message: &ChatMessage, attachment: &ChatMediaAttachment) -> String {
+    format!(
+        "{}|{}|{}",
+        message.room_id, message.message_id, attachment.attachment_id
+    )
 }
 
 fn load_or_create_account_secret(
@@ -7172,6 +7252,156 @@ mod tests {
             .expect("cached attachment projection survives offline reopen");
         assert_eq!(
             std::fs::read(reopened_message.media[0].local_path.as_ref().unwrap()).unwrap(),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn app_runtime_media_gallery_is_all_history_and_downloads_outside_transcript_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Gallery Window".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let plaintext = b"old image outside visible transcript".to_vec();
+        bob.dispatch(AppAction::SendAttachment {
+            room_id: room_id.clone(),
+            filename: "old-photo.jpg".to_owned(),
+            mime_type: "image/jpeg".to_owned(),
+            kind: ChatMediaKind::Image,
+            bytes: plaintext.clone(),
+            caption: "old media".to_owned(),
+            reply_to_message_id: None,
+        })
+        .unwrap();
+        for index in 0..55 {
+            bob.dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: format!("filler {index}"),
+            })
+            .unwrap();
+        }
+
+        let synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(synced.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
+        assert!(
+            synced
+                .messages
+                .iter()
+                .all(|message| message.media.is_empty()),
+            "the media message should be older than the selected transcript window"
+        );
+        let gallery = synced
+            .media_gallery
+            .as_ref()
+            .expect("selected room must project a media gallery");
+        assert_eq!(gallery.room_id, room_id);
+        assert_eq!(gallery.items.len(), 1);
+        let item = &gallery.items[0];
+        assert_eq!(item.attachment.filename, "old-photo.jpg");
+        assert_eq!(item.attachment.kind, ChatMediaKind::Image);
+        assert_eq!(item.attachment.local_path, None);
+        assert_eq!(
+            item.item_id,
+            format!("{}|{}|{}", room_id, item.message_id, item.attachment_id)
+        );
+
+        let downloaded = alice
+            .dispatch(AppAction::DownloadAttachment {
+                room_id: room_id.clone(),
+                message_id: item.message_id.clone(),
+                attachment_id: item.attachment_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            downloaded
+                .messages
+                .iter()
+                .all(|message| message.media.is_empty()),
+            "downloading old gallery media must not force-expand the transcript window"
+        );
+        let downloaded_item = downloaded
+            .media_gallery
+            .as_ref()
+            .and_then(|gallery| gallery.items.first())
+            .expect("gallery remains projected after download");
+        let local_path = downloaded_item
+            .attachment
+            .local_path
+            .as_ref()
+            .expect("downloaded gallery item projects verified local path");
+        assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
+
+        drop(alice);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert_eq!(reopened_state.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
+        assert!(
+            reopened_state
+                .messages
+                .iter()
+                .all(|message| message.media.is_empty())
+        );
+        let reopened_item = reopened_state
+            .media_gallery
+            .as_ref()
+            .and_then(|gallery| gallery.items.first())
+            .expect("gallery survives offline reopen from client SQLite projection");
+        assert_eq!(reopened_item.attachment.filename, "old-photo.jpg");
+        assert_eq!(
+            std::fs::read(reopened_item.attachment.local_path.as_ref().unwrap()).unwrap(),
             plaintext
         );
     }

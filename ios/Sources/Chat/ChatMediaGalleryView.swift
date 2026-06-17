@@ -1,32 +1,15 @@
 import SwiftUI
 
-struct ChatMediaGalleryItem: Equatable, Identifiable {
-    let message: ChatMessage
-    let attachment: ChatMediaAttachment
-
-    var id: String {
-        "\(message.messageId)|\(attachment.attachmentId)"
-    }
-}
-
-enum ChatMediaGalleryProjection {
-    static func items(messages: [ChatMessage]) -> [ChatMediaGalleryItem] {
-        messages.flatMap { message in
-            message.media
-                .filter { attachment in
-                    attachment.kind == .image || attachment.kind == .video
-                }
-                .map { attachment in
-                    ChatMediaGalleryItem(message: message, attachment: attachment)
-                }
-        }
+extension ChatMediaGalleryItem: Identifiable {
+    public var id: String {
+        itemId
     }
 }
 
 struct ChatMediaGalleryView: View {
     let roomTitle: String
     let items: [ChatMediaGalleryItem]
-    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onDownloadAttachment: (ChatMediaGalleryItem) -> Void
 
     @State private var imagePreviewSelection: ChatImagePreviewSelection?
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
@@ -100,7 +83,7 @@ struct ChatMediaGalleryView: View {
         }
 
         if attachmentCanDownload(attachment) {
-            onDownloadAttachment(item.message, attachment)
+            onDownloadAttachment(item)
         }
     }
 }
