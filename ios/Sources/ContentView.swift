@@ -30,15 +30,10 @@ struct ContentView: View {
         NavigationStack(path: $path) {
             RoomListView(
                 model: model,
-                openRoom: { room in
-                    model.openRoom(room)
-                    if path.last != room.roomId {
-                        path.append(room.roomId)
-                    }
-                }
-            ) { destination in
+                present: { destination in
                 sheet = destination
-            }
+                }
+            )
             .navigationDestination(for: String.self) { roomID in
                 RoomThreadView(model: model, roomID: roomID) {
                     sheet = .invite
@@ -65,7 +60,6 @@ struct ContentView: View {
 
 private struct RoomListView: View {
     @ObservedObject var model: AppModel
-    let openRoom: (AppRoomSummary) -> Void
     let present: (AppSheet) -> Void
 
     var body: some View {
@@ -92,12 +86,12 @@ private struct RoomListView: View {
                 }
             } else {
                 List(model.rooms, id: \.roomId) { room in
-                    Button {
-                        openRoom(room)
-                    } label: {
+                    NavigationLink(value: room.roomId) {
                         RoomRow(room: room)
                     }
-                    .buttonStyle(.plain)
+                    .simultaneousGesture(TapGesture().onEnded {
+                        model.openRoom(room)
+                    })
                     .accessibilityIdentifier("RoomRow-\(room.roomId)")
                 }
                 .listStyle(.plain)
@@ -184,6 +178,7 @@ private struct RoomThreadView: View {
     @ObservedObject var model: AppModel
     let roomID: String
     let showInvite: () -> Void
+    @State private var followsBottom = true
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -191,6 +186,14 @@ private struct RoomThreadView: View {
 
     private var messages: [ChatMessage] {
         model.state?.messages.filter { $0.roomId == roomID } ?? []
+    }
+
+    private var timelineRows: [ChatTimelineRow] {
+        ChatTimeline.rows(messages: messages)
+    }
+
+    private var messagesById: [String: ChatMessage] {
+        ChatTimeline.messagesById(messages)
     }
 
     var body: some View {
@@ -229,12 +232,15 @@ private struct RoomThreadView: View {
     private func messageSurface(room: AppRoomSummary) -> some View {
         switch room.state {
         case .connected:
-            ThreadActionBar(room: room) {
-                if model.createInvite(for: room) {
-                    showInvite()
-                }
-            }
-            MessageList(messages: messages)
+            ChatTranscriptView(
+                roomID: room.roomId,
+                rows: timelineRows,
+                messagesById: messagesById,
+                followsBottom: $followsBottom
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemGroupedBackground))
+            .accessibilityLabel("Messages")
             Composer(model: model)
         case .waitingForApproval:
             PendingRoomView(room: room, model: model)
@@ -246,69 +252,6 @@ private struct RoomThreadView: View {
                 model.retry(room)
             }
         }
-    }
-}
-
-private struct ThreadActionBar: View {
-    let room: AppRoomSummary
-    let invite: () -> Void
-
-    var body: some View {
-        HStack {
-            Text(room.status)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button {
-                invite()
-            } label: {
-                Label("Invite", systemImage: "qrcode")
-            }
-            .buttonStyle(.bordered)
-            .accessibilityIdentifier("ThreadInviteButton")
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.bar)
-    }
-}
-
-private struct MessageList: View {
-    let messages: [ChatMessage]
-
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                ForEach(messages, id: \.messageId) { message in
-                    MessageBubble(message: message)
-                }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 12)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.systemGroupedBackground))
-        .accessibilityLabel("Messages")
-    }
-}
-
-private struct MessageBubble: View {
-    let message: ChatMessage
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(message.senderDeviceId)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(message.text)
-                .font(.body)
-                .textSelection(.enabled)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color(.secondarySystemGroupedBackground)))
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
     }
 }
 
