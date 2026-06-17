@@ -26,7 +26,9 @@ rollback.
 
 - `client_device_states`
 - `client_app_rooms`
+- `client_app_state`
 - `client_app_messages`
+- `client_app_profiles`
 
 `client_device_states` stores one encrypted binary snapshot per
 account/device. The plaintext snapshot contains the Nostr-rooted device
@@ -48,6 +50,13 @@ transitions persist their visible room projection before returning to Swift.
 Startup reconstructs the chat list from the union of persisted app-room rows
 and MLS-known rooms, because a pending invite can be user-visible before the
 device has joined the MLS group.
+
+`client_app_state` stores encrypted single-row application navigation state
+owned by Rust. The first field is `selected_room_id`, which lets a phone
+force-close and reopen into the same selected transcript before any network
+sync. Swift mirrors this field into native navigation; it does not decide which
+room is selected or persist chat routing on its own. The AEAD AAD binds the row
+to the owning account/device so copied state fails closed.
 
 `client_app_messages` stores the bounded local application-message projection
 that powers chat lists and room views. It is not an authoritative server log
@@ -80,10 +89,11 @@ Received application messages are inserted in the same SQLite transaction that
 persists the device cursor that consumed them. Own sends are inserted by
 `CoreState::send_text` after the server append is accepted. Swift and the app
 runtime render the Rust state and do not own persistence. Startup reads the
-bounded SQLite room/message projection before network sync; delivery failure
-during startup must return the saved chat list and transcript as offline local
-state, not an empty UI. Full room-history sync remains a repair/recovery path,
-not the ordinary way the UI gets messages after launch.
+bounded SQLite app-state, room, message, and profile projections before network
+sync; delivery failure during startup must return the saved chat list and
+selected transcript as offline local state, not an empty UI. Full room-history
+sync remains a repair/recovery path, not the ordinary way the UI gets messages
+after launch.
 
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an

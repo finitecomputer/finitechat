@@ -14,7 +14,7 @@ use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
     RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent,
-    StoredAppMessage, StoredAppProfile, StoredAppRoom, StoredAppRoomState,
+    StoredAppMessage, StoredAppProfile, StoredAppRoom, StoredAppRoomState, StoredAppState,
     accept_pending_invite_joins, create_room_invite, finalize_invited_room,
     generate_account_secret, run_room_server_sync_tick, run_runtime_sync_tick,
     submit_invite_join_request,
@@ -620,7 +620,8 @@ impl AppRuntimeState {
         }
         sort_app_rooms(&mut rooms);
         apply_room_message_projection(&mut rooms, &all_messages, &local_read_seq);
-        let selected_room_id = rooms.first().map(|room| room.room_id.clone());
+        let stored_app_state = core.store.load_app_state(&owner).map_err(store_error)?;
+        let selected_room_id = selected_room_id_from_stored(&rooms, stored_app_state);
         let mut loaded_message_counts = BTreeMap::new();
         if let Some(room_id) = selected_room_id.clone() {
             loaded_message_counts.insert(room_id, DEFAULT_TRANSCRIPT_WINDOW);
@@ -659,7 +660,7 @@ impl AppRuntimeState {
         match action {
             AppAction::StartRuntime => self.start_runtime()?,
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
-            AppAction::OpenRoom { room_id } => self.open_room(room_id),
+            AppAction::OpenRoom { room_id } => self.open_room(room_id)?,
             AppAction::CreateRoom { display_name } => self.create_room(display_name)?,
             AppAction::CreateInvite { room_id } => self.create_invite(room_id)?,
             AppAction::ScanTarget { value } => self.scan_target(value)?,
@@ -808,7 +809,7 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn open_room(&mut self, room_id: String) {
+    fn open_room(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
         self.app.selected_room_id = Some(room_id.clone());
         self.loaded_message_counts
             .entry(room_id.clone())
@@ -821,7 +822,9 @@ impl AppRuntimeState {
                 "room is not available on this device",
             );
         }
+        self.persist_app_state()?;
         self.sync_selected_room_messages();
+        Ok(())
     }
 
     fn create_room(&mut self, display_name: String) -> Result<(), FiniteChatCoreError> {
@@ -849,6 +852,7 @@ impl AppRuntimeState {
         );
         self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
+        self.persist_app_state()?;
         self.sync_selected_room_messages();
         self.app.status = "room created".to_owned();
         Ok(())
@@ -932,6 +936,7 @@ impl AppRuntimeState {
         );
         self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
+        self.persist_app_state()?;
         self.app.status = "invite scanned".to_owned();
         Ok(())
     }
@@ -965,6 +970,7 @@ impl AppRuntimeState {
         );
         self.persist_room_projection(&pending_room_id)?;
         self.app.selected_room_id = Some(pending_room_id);
+        self.persist_app_state()?;
         self.app.status = "join requested".to_owned();
         Ok(())
     }
@@ -1085,6 +1091,7 @@ impl AppRuntimeState {
             self.loaded_message_counts
                 .entry(room_id.clone())
                 .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
+            self.persist_app_state()?;
             self.sync_selected_room_messages();
             return Ok(());
         }
@@ -1477,6 +1484,17 @@ impl AppRuntimeState {
         self.core
             .store
             .save_app_rooms(&owner, std::slice::from_ref(&stored))
+            .map_err(store_error)
+    }
+
+    fn persist_app_state(&mut self) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        let stored = StoredAppState {
+            selected_room_id: self.app.selected_room_id.clone(),
+        };
+        self.core
+            .store
+            .save_app_state(&owner, &stored)
             .map_err(store_error)
     }
 
@@ -3105,6 +3123,17 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
     }
 }
 
+fn selected_room_id_from_stored(
+    rooms: &[AppRoomSummary],
+    stored: StoredAppState,
+) -> Option<String> {
+    let selected = stored.selected_room_id?;
+    rooms
+        .iter()
+        .any(|room| room.room_id == selected)
+        .then_some(selected)
+}
+
 fn stored_room_from_app(
     room: &AppRoomSummary,
     local_read_seq: u64,
@@ -4136,6 +4165,73 @@ mod tests {
             "startup sync failure must not hide the durable local transcript"
         );
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
+    }
+
+    #[test]
+    fn app_reopens_last_selected_room_before_network_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alpha = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Alpha".to_owned(),
+            })
+            .unwrap()
+            .selected_room_id
+            .unwrap();
+        let zulu = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Zulu".to_owned(),
+            })
+            .unwrap()
+            .selected_room_id
+            .unwrap();
+        assert_ne!(alpha, zulu);
+        alice
+            .dispatch(AppAction::SendMessage {
+                room_id: zulu.clone(),
+                text: "selected room survives force close".to_owned(),
+            })
+            .unwrap();
+        alice
+            .dispatch(AppAction::OpenRoom {
+                room_id: zulu.clone(),
+            })
+            .unwrap();
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+
+        assert_eq!(
+            local_snapshot.selected_room_id.as_deref(),
+            Some(zulu.as_str())
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.room_id == zulu
+                    && message.text == "selected room survives force close"),
+            "force-close reopen must restore the last selected room transcript before sync"
+        );
+        assert_eq!(app_room(&local_snapshot, &alpha).display_name, "Alpha");
     }
 
     #[test]

@@ -27,6 +27,7 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var sheet: AppSheet?
     @State private var path: [String] = []
+    @State private var lastAppliedSelectedRoomID: String?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -38,6 +39,7 @@ struct ContentView: View {
                 open: { room in
                     model.openRoom(room)
                     path = [room.roomId]
+                    lastAppliedSelectedRoomID = room.roomId
                 }
             )
             .navigationDestination(for: String.self) { roomID in
@@ -60,7 +62,21 @@ struct ContentView: View {
         }
         .task {
             model.start()
+            routeSelectedRoomIfNeeded(model.state?.selectedRoomId)
         }
+        .onChange(of: model.state?.selectedRoomId) { _, selectedRoomID in
+            routeSelectedRoomIfNeeded(selectedRoomID)
+        }
+    }
+
+    private func routeSelectedRoomIfNeeded(_ selectedRoomID: String?) {
+        guard let selectedRoomID else {
+            lastAppliedSelectedRoomID = nil
+            return
+        }
+        guard selectedRoomID != lastAppliedSelectedRoomID else { return }
+        path = [selectedRoomID]
+        lastAppliedSelectedRoomID = selectedRoomID
     }
 }
 
