@@ -184,16 +184,8 @@ private struct RoomThreadView: View {
         model.state?.rooms.first(where: { $0.roomId == roomID })
     }
 
-    private var messages: [ChatMessage] {
-        model.state?.messages.filter { $0.roomId == roomID } ?? []
-    }
-
-    private var timelineRows: [ChatTimelineRow] {
-        ChatTimeline.rows(messages: messages)
-    }
-
-    private var messagesById: [String: ChatMessage] {
-        ChatTimeline.messagesById(messages)
+    private var projection: ChatRoomProjection {
+        model.projection(for: roomID)
     }
 
     var body: some View {
@@ -234,8 +226,8 @@ private struct RoomThreadView: View {
         case .connected:
             ChatTranscriptView(
                 roomID: room.roomId,
-                rows: timelineRows,
-                messagesById: messagesById,
+                rows: projection.rows,
+                messagesById: projection.messagesById,
                 followsBottom: $followsBottom
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)

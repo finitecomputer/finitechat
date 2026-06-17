@@ -1053,10 +1053,6 @@ settings:
     MARKETING_VERSION: 0.1.0
     CURRENT_PROJECT_VERSION: 1
     SWIFT_VERSION: 5.0
-  configs:
-    Debug:
-      PRODUCT_BUNDLE_IDENTIFIER: {bundle_id}.dev
-
 targets:
   App:
     type: application
@@ -1301,10 +1297,6 @@ android {{
     }}
 
     buildTypes {{
-        debug {{
-            applicationIdSuffix = ".dev"
-            versionNameSuffix = "-dev"
-        }}
         release {{
             isMinifyEnabled = false
             proguardFiles(

@@ -95,7 +95,12 @@ final class AppModel: ObservableObject {
 
     @Published var serverURL: String = AppModel.initialConfig.serverURL
     @Published var deviceID: String = AppModel.initialConfig.deviceID
-    @Published private(set) var state: AppState?
+    @Published private(set) var state: AppState? {
+        didSet {
+            rebuildChatProjections()
+        }
+    }
+    private(set) var chatProjections: [String: ChatRoomProjection] = [:]
     @Published var errorText: String?
     @Published var roomDraft: String = ""
     @Published var scanDraft: String = ""
@@ -129,7 +134,7 @@ final class AppModel: ObservableObject {
 
     var selectedRoomMessages: [ChatMessage] {
         guard let roomId = selectedRoom?.roomId else { return [] }
-        return state?.messages.filter { $0.roomId == roomId } ?? []
+        return projection(for: roomId).messages
     }
 
     var activeProfile: AppProfileSummary? {
@@ -162,6 +167,10 @@ final class AppModel: ObservableObject {
 
     func openRoom(_ room: AppRoomSummary) {
         dispatch(.openRoom(roomId: room.roomId))
+    }
+
+    func projection(for roomID: String) -> ChatRoomProjection {
+        chatProjections[roomID] ?? .empty(roomID: roomID)
     }
 
     func createRoom() {
@@ -284,6 +293,14 @@ final class AppModel: ObservableObject {
         runtime = nil
         openKey = ""
         state = nil
+    }
+
+    private func rebuildChatProjections() {
+        guard let state else {
+            chatProjections = [:]
+            return
+        }
+        chatProjections = ChatTimeline.roomProjections(messages: state.messages)
     }
 
     private func run(_ operation: () throws -> Void) {

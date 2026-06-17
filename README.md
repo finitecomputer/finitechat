@@ -72,6 +72,12 @@ Build and launch the iOS simulator app against that server:
 FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run ios
 ```
 
+The RMP runner and Xcode project intentionally use the same configured bundle
+identifier (`computer.finite.finitechat`). Do not add a debug-only suffix for
+ordinary app testing: on iOS that creates a different app container, which makes
+the local SQLite transcript look missing even though it is under the other
+bundle id.
+
 The normal app flow is intentionally chat-shaped:
 
 1. Tap **New Room**.

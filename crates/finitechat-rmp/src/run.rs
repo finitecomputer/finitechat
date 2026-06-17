@@ -98,7 +98,7 @@ fn run_ios(
         return Err(CliError::operational("xcodegen generate failed"));
     }
 
-    let bundle_id = format!("{}.dev", ios.bundle_id);
+    let bundle_id = ios.bundle_id;
     let xcode_name = read_xcode_project_name(root).unwrap_or_else(|| "App".to_string());
     let xcode_scheme = ios.scheme.clone().unwrap_or_else(|| xcode_name.clone());
     let xcode_config = if release { "Release" } else { "Debug" };
@@ -557,7 +557,7 @@ fn run_android(
         )));
     }
 
-    let pkg = format!("{app_id}.dev");
+    let pkg = app_id;
 
     // Install.
     human_log(verbose, format!("adb install (serial={serial})"));
