@@ -33,11 +33,29 @@ targets:
     dependencies:
       - framework: Frameworks/FinitechatCore.xcframework
         embed: false
+  FiniteChatTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: FiniteChat
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: computer.finite.finitechat.tests
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/FiniteChat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/FiniteChat"
+        BUNDLE_LOADER: "$(TEST_HOST)"
 
 schemes:
   FiniteChat:
     build:
       targets:
         FiniteChat: all
+        FiniteChatTests: [test]
+    test:
+      targets:
+        - FiniteChatTests
     run:
       config: Debug

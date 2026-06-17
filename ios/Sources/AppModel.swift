@@ -10,25 +10,26 @@ struct RuntimeConfig: Codable {
         case deviceID = "device_id"
     }
 
-    static func load() -> RuntimeConfig {
-        let environment = ProcessInfo.processInfo.environment
-        let args = CommandLine.arguments
+    static func load(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        args: [String] = CommandLine.arguments,
+        storageURL: URL? = nil
+    ) -> RuntimeConfig {
         let serverURL = argumentValue("--finitechat-server", in: args)
             ?? environmentValue("FINITECHAT_SERVER_URL", in: environment)
         let deviceID = argumentValue("--finitechat-device", in: args)
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
-        let persisted = loadPersisted()
+        let persisted = loadPersisted(storageURL: storageURL)
         let config = RuntimeConfig(
             serverURL: serverURL ?? persisted?.serverURL ?? "http://127.0.0.1:8787",
             deviceID: deviceID ?? persisted?.deviceID ?? "ios"
         )
-        if serverURL != nil || deviceID != nil {
-            try? config.save()
-        }
+        // Launch args and environment are process-local test/dev overrides.
+        // Persisting them can strand real chats under a different device store.
         return config
     }
 
-    func save() throws {
+    func save(storageURL: URL? = nil) throws {
         let config = RuntimeConfig(
             serverURL: serverURL.trimmingCharacters(in: .whitespacesAndNewlines),
             deviceID: deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -37,11 +38,12 @@ struct RuntimeConfig: Codable {
             throw ConfigError.emptyValue
         }
         let data = try JSONEncoder().encode(config)
-        try data.write(to: Self.configURL(), options: .atomic)
+        let url = try storageURL ?? Self.configURL()
+        try data.write(to: url, options: .atomic)
     }
 
-    private static func loadPersisted() -> RuntimeConfig? {
-        guard let url = try? configURL(),
+    private static func loadPersisted(storageURL: URL?) -> RuntimeConfig? {
+        guard let url = storageURL ?? (try? configURL()),
               let data = try? Data(contentsOf: url),
               let config = try? JSONDecoder().decode(RuntimeConfig.self, from: data)
         else {
