@@ -563,3 +563,37 @@ final class StagedComposerAttachmentTests: XCTestCase {
         return directory
     }
 }
+
+final class VoiceMessageTests: XCTestCase {
+    func testVoiceRecordingAttachmentUsesProtocolVoiceKind() throws {
+        let bytes = Data([0x00, 0x01, 0x02])
+        let now = Date(timeIntervalSince1970: 1_725_000_123)
+
+        let attachment = try VoiceRecordingAttachment.outboundAttachment(data: bytes, now: now)
+
+        XCTAssertEqual(attachment.filename, "voice_1725000123.m4a")
+        XCTAssertEqual(attachment.mimeType, "audio/mp4")
+        XCTAssertEqual(attachment.kind, .voiceNote)
+        XCTAssertEqual(attachment.bytes, bytes)
+    }
+
+    func testVoiceRecordingAttachmentRejectsOversizeBeforeDispatch() {
+        let now = Date(timeIntervalSince1970: 1_725_000_123)
+
+        XCTAssertThrowsError(try VoiceRecordingAttachment.outboundAttachment(
+            data: Data(count: maxComposerAttachmentBytes + 1),
+            now: now
+        )) { error in
+            guard case ComposerAttachmentError.tooLarge(let filename) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(filename, "voice_1725000123.m4a")
+        }
+    }
+
+    func testVoiceDurationFormattingUsesMonospacedClockShape() {
+        XCTAssertEqual(formattedDuration(0), "0:00")
+        XCTAssertEqual(formattedDuration(65.9), "1:05")
+        XCTAssertEqual(formattedDuration(3_605), "60:05")
+    }
+}

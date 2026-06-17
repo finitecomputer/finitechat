@@ -215,6 +215,8 @@ private struct RoomThreadView: View {
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
+    @StateObject private var voiceRecorder = VoiceRecorder()
+    @State private var voiceSendInFlight = false
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -318,6 +320,7 @@ private struct RoomThreadView: View {
         }
         .onDisappear {
             dismissFocusedMessage(animated: false)
+            voiceRecorder.cancelRecording()
         }
         .onChange(of: selectedPhotoItems) { _, items in
             stagePhotoItems(items)
@@ -344,22 +347,7 @@ private struct RoomThreadView: View {
                 onLongPressMessage: { message, frame in
                     presentFocusedMessage(message, frame: frame)
                 },
-                accessoryContent: Composer(
-                    model: model,
-                    replyTarget: replyDraftMessage,
-                    stagedAttachments: $stagedAttachments,
-                    isPhotoPickerPresented: $showPhotoPicker,
-                    selectedPhotoItems: $selectedPhotoItems,
-                    isInputFocused: $composerFocused,
-                    onCancelReply: {
-                        replyDraftMessage = nil
-                    },
-                    onSend: {
-                        sendComposerDraft()
-                    }
-                ) {
-                    importingAttachment = true
-                },
+                accessoryContent: composerAccessory,
                 isInputFocused: composerFocused,
                 canLoadOlder: room.canLoadOlder,
                 onLoadOlderMessages: { beforeMessageID in
@@ -388,6 +376,46 @@ private struct RoomThreadView: View {
             stageFileURLs(urls)
         case .failure(let error):
             model.errorText = String(describing: error)
+        }
+    }
+
+    @ViewBuilder
+    private var composerAccessory: some View {
+        if let recording = voiceRecorder.state {
+            VoiceRecordingComposerView(
+                recording: recording,
+                isSending: voiceSendInFlight,
+                onSend: {
+                    sendVoiceRecording()
+                },
+                onCancel: {
+                    cancelVoiceRecording()
+                },
+                onTogglePause: {
+                    toggleVoiceRecordingPause()
+                }
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        } else {
+            Composer(
+                model: model,
+                replyTarget: replyDraftMessage,
+                stagedAttachments: $stagedAttachments,
+                isPhotoPickerPresented: $showPhotoPicker,
+                selectedPhotoItems: $selectedPhotoItems,
+                isInputFocused: $composerFocused,
+                onCancelReply: {
+                    replyDraftMessage = nil
+                },
+                onSend: {
+                    sendComposerDraft()
+                },
+                onStartVoiceRecording: {
+                    startVoiceRecording()
+                }
+            ) {
+                importingAttachment = true
+            }
         }
     }
 
@@ -454,6 +482,66 @@ private struct RoomThreadView: View {
             stagedAttachments = []
             selectedPhotoItems = []
             replyDraftMessage = nil
+        }
+    }
+
+    private func startVoiceRecording() {
+        guard voiceRecorder.state == nil else { return }
+        composerFocused = false
+        Task {
+            do {
+                try await voiceRecorder.startRecording()
+            } catch {
+                model.errorText = String(describing: error)
+            }
+        }
+    }
+
+    private func sendVoiceRecording() {
+        guard voiceRecorder.state != nil, !voiceSendInFlight else { return }
+        voiceSendInFlight = true
+        Task {
+            do {
+                let url = try await voiceRecorder.stopRecording()
+                defer {
+                    try? FileManager.default.removeItem(at: url)
+                    voiceSendInFlight = false
+                }
+                let data = try await Task.detached(priority: .userInitiated) {
+                    try Data(contentsOf: url)
+                }.value
+                let attachment = try VoiceRecordingAttachment.outboundAttachment(data: data)
+                model.sendAttachments(
+                    roomID: roomID,
+                    attachments: [attachment],
+                    replyTo: replyDraftMessage
+                ) {
+                    replyDraftMessage = nil
+                }
+            } catch {
+                voiceRecorder.cancelRecording()
+                voiceSendInFlight = false
+                model.errorText = String(describing: error)
+            }
+        }
+    }
+
+    private func cancelVoiceRecording() {
+        voiceRecorder.cancelRecording()
+        voiceSendInFlight = false
+    }
+
+    private func toggleVoiceRecordingPause() {
+        guard let recording = voiceRecorder.state else { return }
+        do {
+            switch recording.phase {
+            case .recording:
+                voiceRecorder.pauseRecording()
+            case .paused:
+                try voiceRecorder.resumeRecording()
+            }
+        } catch {
+            model.errorText = String(describing: error)
         }
     }
 

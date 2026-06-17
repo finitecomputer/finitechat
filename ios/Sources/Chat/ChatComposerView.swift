@@ -13,6 +13,7 @@ struct Composer: View {
     @Binding var isInputFocused: Bool
     let onCancelReply: () -> Void
     let onSend: () -> Void
+    let onStartVoiceRecording: () -> Void
     let onAttach: () -> Void
 
     var body: some View {
@@ -90,24 +91,43 @@ struct Composer: View {
                     }
                     .accessibilityLabel("Message")
 
-                Button {
-                    onSend()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title2)
+                if showsVoiceButton {
+                    Button {
+                        onStartVoiceRecording()
+                    } label: {
+                        Image(systemName: "mic.fill")
+                            .font(.title2)
+                    }
+                    .accessibilityLabel("Record voice message")
+                    .accessibilityIdentifier("VoiceRecordButton")
+                    .transition(.scale.combined(with: .opacity))
+                } else {
+                    Button {
+                        onSend()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title2)
+                    }
+                    .disabled(sendDisabled)
+                    .accessibilityLabel("Send")
+                    .accessibilityIdentifier("SendButton")
+                    .transition(.scale.combined(with: .opacity))
                 }
-                .disabled(sendDisabled)
-                .accessibilityLabel("Send")
-                .accessibilityIdentifier("SendButton")
             }
             .padding()
         }
         .background(.bar)
         .animation(.easeInOut(duration: 0.16), value: stagedAttachments.isEmpty)
+        .animation(.easeInOut(duration: 0.15), value: showsVoiceButton)
     }
 
     private var sendDisabled: Bool {
         stagedAttachments.isEmpty && !model.canSend
+    }
+
+    private var showsVoiceButton: Bool {
+        stagedAttachments.isEmpty
+            && model.outboundText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var remainingPhotoSelectionCount: Int {

@@ -4984,6 +4984,85 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_sends_voice_note_as_durable_audio_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Voice Notes".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+
+        let voice_bytes = b"fake m4a voice note".to_vec();
+        let sent = alice
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "voice_1725000123.m4a".to_owned(),
+                mime_type: "audio/mp4".to_owned(),
+                kind: ChatMediaKind::VoiceNote,
+                bytes: voice_bytes,
+                caption: "voice caption".to_owned(),
+                reply_to_message_id: None,
+            })
+            .unwrap();
+        let message = sent
+            .messages
+            .iter()
+            .find(|message| message.text == "voice caption")
+            .expect("voice media message projects");
+        assert_eq!(message.media.len(), 1);
+        assert_eq!(message.media[0].filename, "voice_1725000123.m4a");
+        assert_eq!(message.media[0].mime_type, "audio/mp4");
+        assert_eq!(message.media[0].kind, ChatMediaKind::VoiceNote);
+        assert!(message.media[0].local_path.is_some());
+
+        let DecodedAppEvent::ChatMessage { payload, .. } =
+            decode_application_event(&message.payload)
+        else {
+            panic!("voice media row must carry a chat message application event");
+        };
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("voice media row must carry Hermes message payload");
+        assert_eq!(hermes.attachments.len(), 1);
+        assert_eq!(hermes.attachments[0].kind, HermesAttachmentKindV1::Audio);
+        let blob = hermes.attachments[0]
+            .blob
+            .as_ref()
+            .expect("voice media must use encrypted blob reference");
+        assert_eq!(blob.metadata.filename, "voice_1725000123.m4a");
+        assert_eq!(blob.metadata.mime_type, "audio/mp4");
+
+        drop(alice);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        let reopened_message = reopened_state
+            .messages
+            .iter()
+            .find(|message| message.text == "voice caption")
+            .expect("voice projection survives offline reopen");
+        assert_eq!(reopened_message.media[0].kind, ChatMediaKind::VoiceNote);
+        assert!(reopened_message.media[0].local_path.is_some());
+    }
+
+    #[test]
     fn app_runtime_downloads_attachment_blob_to_verified_local_cache() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));

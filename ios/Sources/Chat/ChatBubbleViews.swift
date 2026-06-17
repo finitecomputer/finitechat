@@ -472,18 +472,30 @@ private struct ChatMediaGrid: View {
             }
 
             ForEach(files, id: \.attachmentId) { attachment in
-                FileAttachmentRow(
-                    attachment: attachment,
-                    isMine: isMine,
-                    onDownload: {
-                        onDownloadAttachment(attachment)
-                    },
-                    onOpen: {
-                        onOpenAttachment(attachment)
-                    }
-                )
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                if attachment.kind == .voiceNote {
+                    VoiceAttachmentRow(
+                        attachment: attachment,
+                        isMine: isMine,
+                        onDownload: {
+                            onDownloadAttachment(attachment)
+                        }
+                    )
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                } else {
+                    FileAttachmentRow(
+                        attachment: attachment,
+                        isMine: isMine,
+                        onDownload: {
+                            onDownloadAttachment(attachment)
+                        },
+                        onOpen: {
+                            onOpenAttachment(attachment)
+                        }
+                    )
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                }
             }
         }
     }
