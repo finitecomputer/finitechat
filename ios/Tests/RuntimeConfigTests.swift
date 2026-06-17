@@ -1194,6 +1194,96 @@ final class ReactionEmojiCatalogTests: XCTestCase {
     }
 }
 
+final class SaveMediaActionTests: XCTestCase {
+    func testSaveableImageAttachmentURLsIncludesOnlyLocalImages() {
+        let message = chatMessage(media: [
+            mediaAttachment(id: "image-local", kind: .image, localPath: "/tmp/photo.jpg"),
+            mediaAttachment(id: "video-local", kind: .video, localPath: "/tmp/video.mov"),
+            mediaAttachment(id: "image-remote", kind: .image, localPath: nil),
+            mediaAttachment(id: "image-blank", kind: .image, localPath: "   "),
+            mediaAttachment(id: "file-local", kind: .file, localPath: "/tmp/file.pdf"),
+        ])
+
+        XCTAssertEqual(
+            saveableImageAttachmentURLs(in: message).map(\.path),
+            ["/tmp/photo.jpg"]
+        )
+    }
+
+    func testSaveableImageAttachmentURLsPreservesMultipleImagesInMessageOrder() {
+        let message = chatMessage(media: [
+            mediaAttachment(id: "first", kind: .image, localPath: "/tmp/first.jpg"),
+            mediaAttachment(id: "second", kind: .image, localPath: "/tmp/second.png"),
+        ])
+
+        XCTAssertEqual(
+            saveableImageAttachmentURLs(in: message).map(\.path),
+            ["/tmp/first.jpg", "/tmp/second.png"]
+        )
+    }
+
+    func testSaveMediaActionTitleMatchesImageCount() {
+        XCTAssertNil(saveMediaActionTitle(imageCount: 0))
+        XCTAssertEqual(saveMediaActionTitle(imageCount: 1), "Save Photo")
+        XCTAssertEqual(saveMediaActionTitle(imageCount: 2), "Save Photos")
+    }
+
+    func testPhotoLibraryAddUsageDescriptionIsPresent() {
+        let value = Bundle.main.object(
+            forInfoDictionaryKey: "NSPhotoLibraryAddUsageDescription"
+        ) as? String
+
+        XCTAssertEqual(
+            value,
+            "FiniteChat saves photos from chats to your photo library when you choose Save Photo."
+        )
+    }
+
+    private func chatMessage(media: [ChatMediaAttachment]) -> ChatMessage {
+        ChatMessage(
+            roomId: "room-main",
+            seq: 1,
+            messageId: "message-1",
+            conversationId: nil,
+            senderAccountId: "alice-account",
+            senderDeviceId: "alice-ios",
+            senderDisplayName: "Alice",
+            senderNpub: nil,
+            text: "photo",
+            displayContent: "photo",
+            payload: Data("photo".utf8),
+            replyToMessageId: nil,
+            isMine: false,
+            delivery: .sent,
+            reactions: [],
+            media: media,
+            readReceipt: nil,
+            poll: nil,
+            timestampUnixSeconds: 1_700_000_000,
+            displayTimestamp: "now"
+        )
+    }
+
+    private func mediaAttachment(
+        id: String,
+        kind: ChatMediaKind,
+        localPath: String?
+    ) -> ChatMediaAttachment {
+        ChatMediaAttachment(
+            attachmentId: id,
+            url: nil,
+            mimeType: kind == .image ? "image/jpeg" : "application/octet-stream",
+            filename: "\(id).dat",
+            kind: kind,
+            width: nil,
+            height: nil,
+            localPath: localPath,
+            uploadProgressPerMille: nil,
+            downloadProgressPerMille: nil
+        )
+    }
+}
+
 private struct RawDiagnosticError: Error, CustomStringConvertible {
     let description: String
 }

@@ -1,4 +1,5 @@
 import CoreImage.CIFilterBuiltins
+import Photos
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -278,6 +279,13 @@ private struct RoomThreadView: View {
                         UIPasteboard.general.string = messageClipboardText(focusedMessage)
                         dismissFocusedMessage()
                     },
+                    onSaveMedia: saveableImageAttachmentURLs(in: focusedMessage).isEmpty ? nil : {
+                        saveImagesFromFocusedMessage(focusedMessage)
+                        dismissFocusedMessage()
+                    },
+                    saveMediaTitle: saveMediaActionTitle(
+                        imageCount: saveableImageAttachmentURLs(in: focusedMessage).count
+                    ),
                     canReact: messageCanUseSentActions(focusedMessage),
                     canReply: messageCanUseSentActions(focusedMessage),
                     canRetry: messageCanRetry(focusedMessage),
@@ -500,6 +508,23 @@ private struct RoomThreadView: View {
         }
     }
 
+    private func saveImagesFromFocusedMessage(_ message: ChatMessage) {
+        let urls = saveableImageAttachmentURLs(in: message)
+        guard !urls.isEmpty else {
+            model.errorText = "No downloaded photos to save."
+            return
+        }
+
+        Task {
+            do {
+                _ = try await PhotoLibraryImageSaver.saveImageFiles(urls)
+                model.errorText = nil
+            } catch {
+                model.errorText = String(describing: error)
+            }
+        }
+    }
+
     private func presentFocusedMessage(_ message: ChatMessage, frame: CGRect) {
         composerFocused = false
         focusedMessageFrame = frame
@@ -675,6 +700,8 @@ private struct FocusedMessageOverlay: View {
     let onReply: () -> Void
     let onRetry: () -> Void
     let onCopy: () -> Void
+    let onSaveMedia: (() -> Void)?
+    let saveMediaTitle: String?
     let canReact: Bool
     let canReply: Bool
     let canRetry: Bool
@@ -706,7 +733,9 @@ private struct FocusedMessageOverlay: View {
                             canCopy: canCopy,
                             onReply: onReply,
                             onRetry: onRetry,
-                            onCopy: onCopy
+                            onCopy: onCopy,
+                            onSaveMedia: onSaveMedia,
+                            saveMediaTitle: saveMediaTitle
                         )
                         .transition(.opacity.combined(with: .move(edge: .top)))
                     }
@@ -779,6 +808,8 @@ private struct FocusedMessageActionCard: View {
     let onReply: () -> Void
     let onRetry: () -> Void
     let onCopy: () -> Void
+    let onSaveMedia: (() -> Void)?
+    let saveMediaTitle: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -821,6 +852,22 @@ private struct FocusedMessageActionCard: View {
             }
             .buttonStyle(.plain)
             .disabled(!canCopy)
+
+            if let onSaveMedia, let saveMediaTitle {
+                Divider()
+
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onSaveMedia()
+                } label: {
+                    Label(saveMediaTitle, systemImage: "square.and.arrow.down")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(saveMediaTitle)
+            }
         }
         .frame(width: 176)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1082,6 +1129,77 @@ private func messageClipboardText(_ message: ChatMessage) -> String {
         return display
     }
     return message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func saveableImageAttachmentURLs(in message: ChatMessage) -> [URL] {
+    message.media
+        .filter { $0.kind == .image }
+        .compactMap(attachmentLocalURL)
+}
+
+func saveMediaActionTitle(imageCount: Int) -> String? {
+    guard imageCount > 0 else { return nil }
+    return imageCount == 1 ? "Save Photo" : "Save Photos"
+}
+
+enum PhotoLibraryImageSaveError: Error, CustomStringConvertible {
+    case noImages
+    case notAuthorized(PHAuthorizationStatus)
+    case saveFailed
+
+    var description: String {
+        switch self {
+        case .noImages:
+            "No downloaded photos to save."
+        case .notAuthorized:
+            "Photo library access was not granted."
+        case .saveFailed:
+            "Photo library save did not complete."
+        }
+    }
+}
+
+enum PhotoLibraryImageSaver {
+    static func saveImageFiles(_ urls: [URL]) async throws -> Int {
+        let existingURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existingURLs.isEmpty else {
+            throw PhotoLibraryImageSaveError.noImages
+        }
+
+        let status = await requestAddOnlyAuthorization()
+        guard status == .authorized || status == .limited else {
+            throw PhotoLibraryImageSaveError.notAuthorized(status)
+        }
+
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges {
+                for url in existingURLs {
+                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
+                }
+            } completionHandler: { success, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: PhotoLibraryImageSaveError.saveFailed)
+                }
+            }
+        }
+
+        return existingURLs.count
+    }
+
+    private static func requestAddOnlyAuthorization() async -> PHAuthorizationStatus {
+        let current = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        guard current == .notDetermined else { return current }
+        return await withCheckedContinuation { continuation in
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                continuation.resume(returning: status)
+            }
+        }
+    }
 }
 
 private struct PendingRoomView: View {
