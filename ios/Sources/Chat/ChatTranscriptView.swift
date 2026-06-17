@@ -12,7 +12,7 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
-    let onReply: (ChatMessage) -> Void
+    let onLongPressMessage: (ChatMessage, CGRect) -> Void
     var canLoadOlder = false
     var onLoadOlderMessages: ((String) -> Void)?
     @Binding var followsBottom: Bool
@@ -41,6 +41,13 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
         collectionView.onContentSizeChange = { [weak coordinator = context.coordinator] _ in
             coordinator?.handleContentSizeChange()
         }
+        let longPressGesture = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleCollectionLongPress(_:))
+        )
+        longPressGesture.minimumPressDuration = 0.3
+        longPressGesture.cancelsTouchesInView = false
+        collectionView.addGestureRecognizer(longPressGesture)
         viewController.onViewportGeometryChange = { [weak coordinator = context.coordinator] in
             coordinator?.handleViewportGeometryChange()
         }
@@ -65,9 +72,10 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
                 ChatTimelineRowView(
                     row: row,
                     messagesById: coordinator.parent.messagesById,
+                    messageFrameRegistry: coordinator.messageFrameRegistry,
                     onReact: coordinator.parent.onReact,
                     onDownloadAttachment: coordinator.parent.onDownloadAttachment,
-                    onReply: coordinator.parent.onReply
+                    onLongPressMessage: coordinator.parent.onLongPressMessage
                 )
             }
             .minSize(width: 0, height: 0)
@@ -173,6 +181,8 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
         private var isHoldingInitialBottomPin = false
         var lastContentState: ContentState?
         var pendingViewportAnchor: ScrollAnchor?
+        let messageFrameRegistry = ChatMessageFrameRegistry()
+        private var lastLongPressFocus: (messageID: String, time: TimeInterval)?
 
         init(parent: ChatTranscriptView) {
             self.parent = parent
@@ -356,6 +366,44 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
             guard let oldestMessageId, oldestMessageId != requestedOldestId else { return }
             requestedOldestId = oldestMessageId
             parent.onLoadOlderMessages?(oldestMessageId)
+        }
+
+        @objc func handleCollectionLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began,
+                  let collectionView
+            else {
+                return
+            }
+
+            let windowLocation = recognizer.location(in: collectionView.window)
+            presentLongPressedMessage(at: windowLocation)
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            contextMenuConfigurationForItemAt indexPath: IndexPath,
+            point: CGPoint
+        ) -> UIContextMenuConfiguration? {
+            let windowLocation = collectionView.convert(point, to: collectionView.window)
+            presentLongPressedMessage(at: windowLocation)
+            return nil
+        }
+
+        private func presentLongPressedMessage(at windowLocation: CGPoint) {
+            guard let hit = messageFrameRegistry.hitMessage(at: windowLocation) else { return }
+            let message = hit.message
+
+            let now = CACurrentMediaTime()
+            if let lastLongPressFocus,
+               lastLongPressFocus.messageID == message.messageId,
+               now - lastLongPressFocus.time < 0.45
+            {
+                return
+            }
+            lastLongPressFocus = (message.messageId, now)
+
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            parent.onLongPressMessage(message, hit.frame)
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {

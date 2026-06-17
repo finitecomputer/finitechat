@@ -1,5 +1,6 @@
 import CoreImage.CIFilterBuiltins
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 private enum AppSheet: Identifiable {
@@ -187,6 +188,9 @@ private struct RoomThreadView: View {
     @State private var followsBottom = true
     @State private var importingAttachment = false
     @State private var replyDraftMessage: ChatMessage?
+    @State private var focusedMessage: ChatMessage?
+    @State private var focusedMessageFrame: CGRect = .zero
+    @State private var focusedActionsVisible = false
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -201,11 +205,40 @@ private struct RoomThreadView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let room {
-                messageSurface(room: room)
-            } else {
-                ContentUnavailableView("Room unavailable", systemImage: "exclamationmark.triangle")
+        ZStack {
+            VStack(spacing: 0) {
+                if let room {
+                    messageSurface(room: room)
+                } else {
+                    ContentUnavailableView("Room unavailable", systemImage: "exclamationmark.triangle")
+                }
+            }
+
+            if let focusedMessage {
+                FocusedMessageOverlay(
+                    message: focusedMessage,
+                    replyTarget: focusedReplyTarget(for: focusedMessage),
+                    anchorFrame: focusedMessageFrame,
+                    actionsVisible: focusedActionsVisible,
+                    onDismiss: {
+                        dismissFocusedMessage()
+                    },
+                    onReact: { emoji in
+                        model.react(to: focusedMessage, emoji: emoji)
+                        dismissFocusedMessage()
+                    },
+                    onReply: {
+                        replyDraftMessage = focusedMessage
+                        dismissFocusedMessage()
+                    },
+                    onCopy: {
+                        UIPasteboard.general.string = messageClipboardText(focusedMessage)
+                        dismissFocusedMessage()
+                    },
+                    canCopy: !messageClipboardText(focusedMessage).isEmpty
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(10)
             }
         }
         .navigationTitle(room?.displayName ?? "Chat")
@@ -243,6 +276,9 @@ private struct RoomThreadView: View {
         ) { result in
             handleImportedAttachment(result)
         }
+        .onDisappear {
+            dismissFocusedMessage(animated: false)
+        }
     }
 
     @ViewBuilder
@@ -259,8 +295,8 @@ private struct RoomThreadView: View {
                 onDownloadAttachment: { message, attachment in
                     model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
                 },
-                onReply: { message in
-                    replyDraftMessage = message
+                onLongPressMessage: { message, frame in
+                    presentFocusedMessage(message, frame: frame)
                 },
                 canLoadOlder: room.canLoadOlder,
                 onLoadOlderMessages: { beforeMessageID in
@@ -308,6 +344,163 @@ private struct RoomThreadView: View {
             model.errorText = String(describing: error)
         }
     }
+
+    private func presentFocusedMessage(_ message: ChatMessage, frame: CGRect) {
+        focusedMessageFrame = frame
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+            focusedMessage = message
+            focusedActionsVisible = true
+        }
+    }
+
+    private func dismissFocusedMessage(animated: Bool = true) {
+        let updates = {
+            focusedMessage = nil
+            focusedActionsVisible = false
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.16), updates)
+        } else {
+            updates()
+        }
+    }
+
+    private func focusedReplyTarget(for message: ChatMessage) -> ChatMessage? {
+        guard let replyToMessageId = message.replyToMessageId else { return nil }
+        return projection.messagesById[replyToMessageId]
+    }
+}
+
+private struct FocusedMessageOverlay: View {
+    let message: ChatMessage
+    let replyTarget: ChatMessage?
+    let anchorFrame: CGRect
+    let actionsVisible: Bool
+    let onDismiss: () -> Void
+    let onReact: (String) -> Void
+    let onReply: () -> Void
+    let onCopy: () -> Void
+    let canCopy: Bool
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Color.black.opacity(0.18)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onDismiss)
+
+                VStack(alignment: message.isMine ? .trailing : .leading, spacing: 10) {
+                    FocusedReactionBar(onReact: onReact)
+
+                    FocusedChatMessageCard(
+                        message: message,
+                        replyTarget: replyTarget
+                    )
+                    .frame(maxWidth: min(geometry.size.width * 0.82, 360))
+
+                    if actionsVisible {
+                        FocusedMessageActionCard(
+                            canCopy: canCopy,
+                            onReply: onReply,
+                            onCopy: onCopy
+                        )
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: message.isMine ? .topTrailing : .topLeading
+                )
+                .padding(.top, overlayTop(in: geometry))
+                .padding(.horizontal, 20)
+                .animation(.easeOut(duration: 0.16), value: actionsVisible)
+            }
+        }
+    }
+
+    private func overlayTop(in geometry: GeometryProxy) -> CGFloat {
+        let overlayOriginY = geometry.frame(in: .global).minY
+        let localAnchorY = anchorFrame.minY - overlayOriginY
+        let reactionBarSpace: CGFloat = 58
+        let idealTop = localAnchorY - reactionBarSpace
+        let maxTop = max(12, geometry.size.height * 0.58)
+        return min(max(idealTop, 12), maxTop)
+    }
+}
+
+private struct FocusedReactionBar: View {
+    let onReact: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(focusedReactionEmojis, id: \.self) { emoji in
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onReact(emoji)
+                } label: {
+                    Text(emoji)
+                        .font(.system(size: 24))
+                        .frame(width: 42, height: 42)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("React \(emoji)")
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.14), radius: 14, x: 0, y: 6)
+    }
+}
+
+private struct FocusedMessageActionCard: View {
+    let canCopy: Bool
+    let onReply: () -> Void
+    let onCopy: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                onReply()
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+
+            Divider()
+
+            Button {
+                onCopy()
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canCopy)
+        }
+        .frame(width: 176)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .shadow(color: .black.opacity(0.14), radius: 14, x: 0, y: 6)
+    }
+}
+
+private let focusedReactionEmojis = ["❤️", "👍", "😂", "😮", "😢", "🙏"]
+
+private func messageClipboardText(_ message: ChatMessage) -> String {
+    let display = message.displayContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !display.isEmpty {
+        return display
+    }
+    return message.text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 private struct Composer: View {
@@ -365,7 +558,7 @@ private struct ComposerReplyPreview: View {
         HStack(spacing: 10) {
             Rectangle()
                 .fill(Color.accentColor)
-                .frame(width: 3)
+                .frame(width: 3, height: 36)
                 .clipShape(Capsule())
 
             VStack(alignment: .leading, spacing: 2) {

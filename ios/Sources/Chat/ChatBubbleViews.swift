@@ -12,9 +12,10 @@ enum ChatBubblePosition {
 struct ChatTimelineRowView: View {
     let row: ChatTimelineRow
     let messagesById: [String: ChatMessage]
+    let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
-    let onReply: (ChatMessage) -> Void
+    let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     var body: some View {
         switch row {
@@ -22,9 +23,10 @@ struct ChatTimelineRowView: View {
             ChatMessageGroupRow(
                 group: group,
                 messagesById: messagesById,
+                messageFrameRegistry: messageFrameRegistry,
                 onReact: onReact,
                 onDownloadAttachment: onDownloadAttachment,
-                onReply: onReply
+                onLongPressMessage: onLongPressMessage
             )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
@@ -32,12 +34,31 @@ struct ChatTimelineRowView: View {
     }
 }
 
+struct FocusedChatMessageCard: View {
+    let message: ChatMessage
+    let replyTarget: ChatMessage?
+
+    var body: some View {
+        ChatMessageBubble(
+            message: message,
+            replyTarget: replyTarget,
+            position: .single,
+            messageFrameRegistry: nil,
+            onReact: { _, _ in },
+            onDownloadAttachment: { _, _ in },
+            onLongPressMessage: nil
+        )
+        .allowsHitTesting(false)
+    }
+}
+
 private struct ChatMessageGroupRow: View {
     let group: ChatTimelineMessageGroup
     let messagesById: [String: ChatMessage]
+    let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
-    let onReply: (ChatMessage) -> Void
+    let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     private let avatarSize: CGFloat = 28
 
@@ -71,9 +92,10 @@ private struct ChatMessageGroupRow: View {
                 ChatBubbleStack(
                     messages: group.messages,
                     messagesById: messagesById,
+                    messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
-                    onReply: onReply,
+                    onLongPressMessage: onLongPressMessage,
                     alignment: .leading
                 )
             }
@@ -91,9 +113,10 @@ private struct ChatMessageGroupRow: View {
                 ChatBubbleStack(
                     messages: group.messages,
                     messagesById: messagesById,
+                    messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
-                    onReply: onReply,
+                    onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
 
@@ -120,9 +143,10 @@ private struct ChatMessageGroupRow: View {
 private struct ChatBubbleStack: View {
     let messages: [ChatMessage]
     let messagesById: [String: ChatMessage]
+    let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
-    let onReply: (ChatMessage) -> Void
+    let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let alignment: HorizontalAlignment
 
     var body: some View {
@@ -132,9 +156,10 @@ private struct ChatBubbleStack: View {
                     message: message,
                     replyTarget: replyTarget(for: message),
                     position: bubblePosition(at: index, count: messages.count),
+                    messageFrameRegistry: messageFrameRegistry,
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
-                    onReply: onReply
+                    onLongPressMessage: onLongPressMessage
                 )
             }
         }
@@ -157,11 +182,13 @@ private struct ChatMessageBubble: View {
     let message: ChatMessage
     let replyTarget: ChatMessage?
     let position: ChatBubblePosition
+    let messageFrameRegistry: ChatMessageFrameRegistry?
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
-    let onReply: (ChatMessage) -> Void
+    let onLongPressMessage: ((ChatMessage, CGRect) -> Void)?
 
     @State private var isPressed = false
+    @State private var frameRef = BubbleFrameRef()
 
     private var bubbleColor: Color {
         message.isMine ? .accentColor : Color(uiColor: .secondarySystemGroupedBackground)
@@ -207,7 +234,6 @@ private struct ChatMessageBubble: View {
                     Text(bodyText)
                         .font(.body)
                         .foregroundStyle(foregroundColor)
-                        .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.horizontal, 12)
                         .padding(.top, message.media.isEmpty ? 8 : 7)
@@ -226,10 +252,24 @@ private struct ChatMessageBubble: View {
             .frame(maxWidth: 326, alignment: message.isMine ? .trailing : .leading)
             .background(bubbleColor)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .background(
+                GeometryReader { proxy in
+                    let frame = proxy.frame(in: .global)
+                    Color.clear
+                        .onAppear {
+                            updateFrame(frame)
+                        }
+                        .onChange(of: frame) { _, newFrame in
+                            updateFrame(newFrame)
+                        }
+                }
+            )
+            .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .scaleEffect(isPressed ? 0.97 : 1)
             .animation(.spring(response: 0.24, dampingFraction: 0.76), value: isPressed)
             .onLongPressGesture(minimumDuration: 0.3, maximumDistance: 44) {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                onLongPressMessage?(message, frameRef.frame)
             } onPressingChanged: { pressing in
                 isPressed = pressing
             }
@@ -246,33 +286,14 @@ private struct ChatMessageBubble: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .contextMenu {
-            Button {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                onReply(message)
-            } label: {
-                Label("Reply", systemImage: "arrowshape.turn.up.left")
-            }
-
-            Button {
-                UIPasteboard.general.string = bodyText
-            } label: {
-                Label("Copy", systemImage: "doc.on.doc")
-            }
-            .disabled(bodyText.isEmpty)
-
-            Divider()
-
-            ForEach(quickReactionEmojis, id: \.self) { emoji in
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    onReact(message, emoji)
-                } label: {
-                    Text(reactionMenuTitle(for: emoji))
-                }
-                .disabled(message.reactions.contains { $0.emoji == emoji && $0.reactedByMe })
-            }
+        .onDisappear {
+            messageFrameRegistry?.removeFrame(for: message.messageId)
         }
+    }
+
+    private func updateFrame(_ frame: CGRect) {
+        frameRef.frame = frame
+        messageFrameRegistry?.setFrame(frame, for: message)
     }
 
     private var statusText: String? {
@@ -291,6 +312,42 @@ private struct ChatMessageBubble: View {
         case .middle:
             return 12
         }
+    }
+}
+
+private final class BubbleFrameRef {
+    var frame: CGRect = .zero
+}
+
+final class ChatMessageFrameRegistry {
+    private struct Entry {
+        let message: ChatMessage
+        let frame: CGRect
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    func setFrame(_ frame: CGRect, for message: ChatMessage) {
+        guard frame.width > 0, frame.height > 0 else { return }
+        entries[message.messageId] = Entry(message: message, frame: frame)
+    }
+
+    func removeFrame(for messageID: String) {
+        entries.removeValue(forKey: messageID)
+    }
+
+    func hitMessage(at point: CGPoint) -> (message: ChatMessage, frame: CGRect)? {
+        var best: (message: ChatMessage, frame: CGRect, area: CGFloat)?
+        for entry in entries.values {
+            let frame = entry.frame
+            guard frame.contains(point) else { continue }
+            let area = frame.width * frame.height
+            if best == nil || area < best!.area {
+                best = (entry.message, frame, area)
+            }
+        }
+        guard let best else { return nil }
+        return (best.message, best.frame)
     }
 }
 
@@ -331,12 +388,6 @@ private struct ReactionChips: View {
             }
         }
     }
-}
-
-private let quickReactionEmojis = ["❤️", "👍", "😂", "😮", "😢", "🙏"]
-
-private func reactionMenuTitle(for emoji: String) -> String {
-    "React \(emoji)"
 }
 
 private struct ReplyPreview: View {
