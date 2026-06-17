@@ -11,6 +11,8 @@ struct RuntimeConfig: Codable, Equatable {
     private static let dataRootDirectoryName = "FiniteChat"
     private static let clientStoreFileName = "client.sqlite3"
     private static let accountSecretFileName = "account-secret.hex"
+    private static let transientConfigArgument = "--finitechat-transient-config"
+    private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
 
     enum CodingKeys: String, CodingKey {
         case serverURL = "server_url"
@@ -35,10 +37,14 @@ struct RuntimeConfig: Codable, Equatable {
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID
         )
-        // First-run launch args/env seed the durable device store identity so
-        // a force-close relaunch outside Xcode reopens the same local SQLite.
-        // Once a config exists, dev overrides remain process-local.
-        if persisted == nil {
+        let hasLaunchOverride = serverURL != nil || deviceID != nil
+        let transientOverride = argumentFlag(transientConfigArgument, in: args)
+            || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
+        // Runtime identity is product state. A phone launched from Xcode with a
+        // LAN server or device id must reopen that same SQLite store after a
+        // manual force-close. Tests/debug harnesses can still opt into a
+        // process-local override with the transient flag.
+        if persisted == nil || (hasLaunchOverride && !transientOverride) {
             try? config.save(storageURL: storageURL)
         }
         return config
@@ -141,6 +147,23 @@ struct RuntimeConfig: Codable, Equatable {
         }
         let value = args[valueIndex].trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+
+    private static func argumentFlag(_ name: String, in args: [String]) -> Bool {
+        args.contains(name)
+    }
+
+    private static func truthyEnvironmentValue(
+        _ key: String,
+        in environment: [String: String]
+    ) -> Bool {
+        guard let value = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !value.isEmpty
+        else {
+            return false
+        }
+        return !["0", "false", "no", "off"].contains(value)
     }
 }
 
