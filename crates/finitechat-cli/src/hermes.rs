@@ -26,8 +26,9 @@ use finitechat_hermes::{
 use finitechat_http::{HttpInviteJoinState, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    AppendEphemeralActivityRequest, CreateRoomRequest, DurableAppEventKind,
-    INVITE_PIN_WINDOW_SECONDS, InviteCodeV1, RoomProtocol, invite_current_pin, npub_encode,
+    AppendEphemeralActivityRequest, CreateRoomRequest, DecryptedApplicationEventV1,
+    DurableAppEventKind, INVITE_PIN_WINDOW_SECONDS, InviteCodeV1, RoomProtocol, invite_current_pin,
+    npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -491,35 +492,16 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
             if sender.account_id == own_account {
                 continue;
             }
-            let event = match HermesMessagePayloadV1::decode(plaintext)
-                .map_err(|error| CliError::Hermes(error.to_string()))?
-            {
-                Some(payload) => payload.into_poll_event(
-                    applied.room_id.clone(),
-                    applied.seq,
-                    applied.message_id.clone(),
-                    sender.account_id.clone(),
-                    sender.device_id.clone(),
-                ),
-                None => {
-                    let Ok(text) = std::str::from_utf8(plaintext) else {
-                        continue;
-                    };
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    HermesPollEventV1::finite_chat_text(
-                        applied.room_id.clone(),
-                        applied.seq,
-                        applied.message_id.clone(),
-                        sender.account_id.clone(),
-                        sender.device_id.clone(),
-                        text.to_owned(),
-                    )
-                    .map_err(|error| CliError::Hermes(error.to_string()))?
-                }
-            };
-            events.push(event);
+            if let Some(event) = hermes_poll_event_from_application_plaintext(
+                &applied.room_id,
+                applied.seq,
+                &applied.message_id,
+                &sender.account_id,
+                &sender.device_id,
+                plaintext,
+            )? {
+                events.push(event);
+            }
         }
 
         if !events.is_empty() || !joined.is_empty() || started.elapsed() >= timeout {
@@ -568,6 +550,106 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     }
 
     crate::write_pretty_json(output, &json!({ "events": events, "joined": joined }))
+}
+
+fn hermes_poll_event_from_application_plaintext(
+    room_id: &str,
+    seq: u64,
+    message_id: &str,
+    sender_account_id: &str,
+    sender_device_id: &str,
+    plaintext: &[u8],
+) -> Result<Option<HermesPollEventV1>, CliError> {
+    if let Ok(event) = serde_json::from_slice::<DecryptedApplicationEventV1>(plaintext) {
+        if event.validate_limits().is_err() {
+            return Ok(None);
+        }
+        return match event.kind {
+            DurableAppEventKind::ChatMessage => hermes_poll_event_from_chat_payload(
+                room_id,
+                seq,
+                message_id,
+                sender_account_id,
+                sender_device_id,
+                &event.payload,
+                true,
+            ),
+            DurableAppEventKind::ConversationCreate
+            | DurableAppEventKind::ConversationUpdate
+            | DurableAppEventKind::ConversationArchive
+            | DurableAppEventKind::ConversationSegmentStart
+            | DurableAppEventKind::ChatEdit
+            | DurableAppEventKind::ChatReaction
+            | DurableAppEventKind::ChatReceipt
+            | DurableAppEventKind::RuntimeStateSnapshot
+            | DurableAppEventKind::RuntimeCommandRequest
+            | DurableAppEventKind::RuntimeCommandResult
+            | DurableAppEventKind::RuntimeCommandCancel
+            | DurableAppEventKind::StreamStart
+            | DurableAppEventKind::StreamFinish
+            | DurableAppEventKind::Namespaced { .. } => Ok(None),
+        };
+    }
+
+    hermes_poll_event_from_chat_payload(
+        room_id,
+        seq,
+        message_id,
+        sender_account_id,
+        sender_device_id,
+        plaintext,
+        false,
+    )
+}
+
+fn hermes_poll_event_from_chat_payload(
+    room_id: &str,
+    seq: u64,
+    message_id: &str,
+    sender_account_id: &str,
+    sender_device_id: &str,
+    payload: &[u8],
+    typed_chat_message: bool,
+) -> Result<Option<HermesPollEventV1>, CliError> {
+    if let Some(payload) = HermesMessagePayloadV1::decode(payload)
+        .map_err(|error| CliError::Hermes(error.to_string()))?
+    {
+        return Ok(Some(payload.into_poll_event(
+            room_id.to_owned(),
+            seq,
+            message_id.to_owned(),
+            sender_account_id.to_owned(),
+            sender_device_id.to_owned(),
+        )));
+    }
+
+    if typed_chat_message && payload_is_typed_json(payload) {
+        return Ok(None);
+    }
+
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    HermesPollEventV1::finite_chat_text(
+        room_id.to_owned(),
+        seq,
+        message_id.to_owned(),
+        sender_account_id.to_owned(),
+        sender_device_id.to_owned(),
+        text.to_owned(),
+    )
+    .map(Some)
+    .map_err(|error| CliError::Hermes(error.to_string()))
+}
+
+fn payload_is_typed_json(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some()
 }
 
 fn cmd_send<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
@@ -829,4 +911,53 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 
 pub(crate) fn hermes_usage() -> String {
     "hermes commands:\n  finitechat hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--home DIR] pin [--invite-id ID]\n  finitechat hermes [--home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use finitechat_hermes::HermesMessageTypeV1;
+
+    #[test]
+    fn poll_decoder_unwraps_typed_chat_message_but_ignores_non_hermes_typed_payloads() {
+        let wrapped_poll = DecryptedApplicationEventV1 {
+            kind: DurableAppEventKind::ChatMessage,
+            conversation_id: None,
+            payload: br#"{"type":"finitechat.chat.poll.v1","question":"Lunch?","options":[]}"#
+                .to_vec(),
+        };
+        let plaintext = serde_json::to_vec(&wrapped_poll).unwrap();
+        let event = hermes_poll_event_from_application_plaintext(
+            "room-main",
+            1,
+            "message-1",
+            "alice",
+            "ios",
+            &plaintext,
+        )
+        .unwrap();
+        assert!(
+            event.is_none(),
+            "typed non-Hermes payloads must not leak to agents as JSON text"
+        );
+
+        let wrapped_text = DecryptedApplicationEventV1 {
+            kind: DurableAppEventKind::ChatMessage,
+            conversation_id: None,
+            payload: b"plain hello".to_vec(),
+        };
+        let plaintext = serde_json::to_vec(&wrapped_text).unwrap();
+        let event = hermes_poll_event_from_application_plaintext(
+            "room-main",
+            2,
+            "message-2",
+            "alice",
+            "ios",
+            &plaintext,
+        )
+        .unwrap()
+        .expect("typed plain-text chat is still bridge-visible");
+        assert_eq!(event.text, "plain hello");
+        assert_eq!(event.message_type, HermesMessageTypeV1::Text);
+    }
 }

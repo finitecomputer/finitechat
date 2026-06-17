@@ -8,6 +8,7 @@ use finitechat_client::{
     ReqwestHttpRuntimeTransport, RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions,
     finalize_invited_room, run_runtime_sync_tick, submit_invite_join_request,
 };
+use finitechat_core::{AppAction, AppRoomState, ChatMediaKind, FiniteChatRuntime, OpenOptions};
 use finitechat_hermes::{HermesMessagePayloadV1, HermesMessageStatusV1, HermesSendKindV1};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{DurableAppEventKind, InviteCodeV1, invite_current_pin};
@@ -338,6 +339,154 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         &activity_request.to_string(),
     ]);
     assert_eq!(activity["accepted"], true);
+}
+
+#[test]
+fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("server.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+    ]);
+    let invite = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "invite",
+        "--room-name",
+        "Hermes Media",
+        "--json",
+    ]);
+    let room_id = invite["room_id"].as_str().unwrap().to_owned();
+    let invite_url = invite["url"].as_str().unwrap().to_owned();
+    let pin = invite["pin"].as_str().unwrap().to_owned();
+
+    let user = FiniteChatRuntime::open(OpenOptions {
+        data_dir: dir.path().join("ios-user").to_string_lossy().into_owned(),
+        server_url: server_url.clone(),
+        device_id: "ios-media".to_owned(),
+        account_secret_hex: None,
+        now_unix_seconds: Some(now_ms() / 1000),
+    })
+    .unwrap();
+    user.dispatch(AppAction::ScanTarget { value: invite_url })
+        .unwrap();
+    user.dispatch(AppAction::SubmitInvitePin {
+        pending_room_id: room_id.clone(),
+        pin,
+    })
+    .unwrap();
+
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":0}"#,
+    ]);
+    assert_eq!(poll["joined"].as_array().unwrap().len(), 1);
+    let joined = user
+        .dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        joined
+            .rooms
+            .iter()
+            .find(|room| room.room_id == room_id)
+            .expect("joined room projects")
+            .state,
+        AppRoomState::Connected
+    );
+
+    let sent = user
+        .dispatch(AppAction::SendAttachment {
+            room_id: room_id.clone(),
+            filename: "diagram.png".to_owned(),
+            mime_type: "image/png".to_owned(),
+            kind: ChatMediaKind::Image,
+            bytes: b"finitechat encrypted media fixture".to_vec(),
+            caption: "see attached".to_owned(),
+            reply_to_message_id: None,
+        })
+        .unwrap();
+    let user_media = sent
+        .messages
+        .iter()
+        .find(|message| message.text == "see attached" && !message.media.is_empty())
+        .expect("app attachment projects");
+    let user_attachment = user_media.media.first().unwrap();
+    assert_eq!(user_attachment.kind, ChatMediaKind::Image);
+    assert_eq!(user_attachment.filename, "diagram.png");
+
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":5000}"#,
+    ]);
+    let events = poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["text"], "see attached");
+    assert_eq!(events[0]["message_type"], "photo");
+    let hermes_attachment = events[0]["attachments"][0].clone();
+    assert_eq!(hermes_attachment["kind"], "image");
+    assert_eq!(hermes_attachment["name"], "diagram.png");
+    assert_eq!(hermes_attachment["mime_type"], "image/png");
+    assert_eq!(
+        hermes_attachment["blob"]["plaintext_sha256"],
+        user_attachment.attachment_id
+    );
+    assert!(
+        hermes_attachment["blob"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/blobs/")
+    );
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "agent media",
+            "kind": "media",
+            "status": "complete",
+            "attachments": [hermes_attachment],
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
+    let received = user.dispatch(AppAction::StartRuntime).unwrap();
+    let agent_media = received
+        .messages
+        .iter()
+        .find(|message| message.text == "agent media" && !message.media.is_empty())
+        .expect("Hermes media projects into the app transcript");
+    let agent_attachment = agent_media.media.first().unwrap();
+    assert_eq!(agent_attachment.kind, ChatMediaKind::Image);
+    assert_eq!(agent_attachment.filename, "diagram.png");
+    assert_eq!(
+        agent_attachment.attachment_id,
+        user_attachment.attachment_id
+    );
 }
 
 #[test]

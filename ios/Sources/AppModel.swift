@@ -223,6 +223,8 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
     }
 }
 
+typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProtocol
+
 struct RuntimeDataStore {
     private static let legacyDataRootDirectoryName = "FiniteChat"
     private static let currentDataDirectoryName = "FiniteChatStore"
@@ -382,10 +384,8 @@ private struct LegacyDeviceStore {
 
 @MainActor
 final class AppModel: ObservableObject {
-    private static let initialConfig = RuntimeConfig.load()
-
-    @Published var serverURL: String = AppModel.initialConfig.serverURL
-    @Published var deviceID: String = AppModel.initialConfig.deviceID
+    @Published var serverURL: String
+    @Published var deviceID: String
     @Published private(set) var state: AppState? {
         didSet {
             rebuildChatProjections()
@@ -398,9 +398,14 @@ final class AppModel: ObservableObject {
     @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
 
-    private var runtime: FiniteChatRuntime?
+    private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
-    private let usesTransientStore = AppModel.initialConfig.usesTransientStore
+    private let usesTransientStore: Bool
+    private let applicationSupportURL: URL?
+    private let configStorageURL: URL?
+    private let args: [String]
+    private let runtimeFactory: AppRuntimeFactory
+    private let startsUpdateLoop: Bool
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
@@ -409,6 +414,26 @@ final class AppModel: ObservableObject {
     deinit {
         updateTask?.cancel()
         launchAutomationTask?.cancel()
+    }
+
+    init(
+        config: RuntimeConfig = RuntimeConfig.load(),
+        applicationSupportURL: URL? = nil,
+        configStorageURL: URL? = nil,
+        args: [String] = CommandLine.arguments,
+        startsUpdateLoop: Bool = true,
+        runtimeFactory: @escaping AppRuntimeFactory = { options in
+            try FiniteChatRuntime.open(options: options)
+        }
+    ) {
+        serverURL = config.serverURL
+        deviceID = config.deviceID
+        usesTransientStore = config.usesTransientStore
+        self.applicationSupportURL = applicationSupportURL
+        self.configStorageURL = configStorageURL
+        self.args = args
+        self.runtimeFactory = runtimeFactory
+        self.startsUpdateLoop = startsUpdateLoop
     }
 
     var rooms: [AppRoomSummary] {
@@ -454,7 +479,7 @@ final class AppModel: ObservableObject {
         } catch {
             errorText = String(describing: error)
         }
-        startUpdateLoop()
+        restartUpdateLoopIfEnabled()
         if runtime != nil {
             runLaunchAutomationIfRequested()
         }
@@ -563,7 +588,7 @@ final class AppModel: ObservableObject {
                 state = nextState
                 errorText = nil
                 onSuccess?()
-                startUpdateLoop()
+                restartUpdateLoopIfEnabled()
             } catch {
                 errorText = String(describing: error)
             }
@@ -597,7 +622,7 @@ final class AppModel: ObservableObject {
                 outboundText = ""
                 errorText = nil
                 onSuccess?()
-                startUpdateLoop()
+                restartUpdateLoopIfEnabled()
             } catch {
                 errorText = String(describing: error)
             }
@@ -661,7 +686,7 @@ final class AppModel: ObservableObject {
                 guard openKey == runtimeKey else { return }
                 state = nextState
                 errorText = nil
-                startUpdateLoop()
+                restartUpdateLoopIfEnabled()
             } catch {
                 errorText = String(describing: error)
             }
@@ -690,7 +715,9 @@ final class AppModel: ObservableObject {
 
     func applyDevSettings() {
         do {
-            try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+            try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
+                storageURL: configStorageURL
+            )
         } catch {
             errorText = String(describing: error)
             return
@@ -731,21 +758,28 @@ final class AppModel: ObservableObject {
             self.state = try runtime.dispatch(action: action)
             succeeded = true
         }
-        startUpdateLoop()
+        restartUpdateLoopIfEnabled()
         return succeeded
     }
 
-    private func currentRuntime() throws -> FiniteChatRuntime {
+    private func restartUpdateLoopIfEnabled() {
+        if startsUpdateLoop {
+            startUpdateLoop()
+        }
+    }
+
+    private func currentRuntime() throws -> any FiniteChatRuntimeProtocol {
         let key = "\(serverURL)|\(deviceID)"
         if let runtime, openKey == key {
             return runtime
         }
         let dataDir = try RuntimeDataStore.dataDir(
             deviceID: deviceID,
+            applicationSupportURL: applicationSupportURL,
             transient: usesTransientStore
         )
-        let opened = try FiniteChatRuntime.open(
-            options: OpenOptions(
+        let opened = try runtimeFactory(
+            OpenOptions(
                 dataDir: dataDir,
                 serverUrl: serverURL,
                 deviceId: deviceID,
@@ -757,7 +791,9 @@ final class AppModel: ObservableObject {
         if openedState.identity.deviceId != deviceID {
             deviceID = openedState.identity.deviceId
             if !usesTransientStore {
-                try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save()
+                try? RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
+                    storageURL: configStorageURL
+                )
             }
         }
         runtime = opened
@@ -795,25 +831,35 @@ final class AppModel: ObservableObject {
 
     private func runLaunchAutomationIfRequested() {
         guard !didRunLaunchAutomation else { return }
-        let args = CommandLine.arguments
-        guard let inviteURL = Self.argumentValue("--finitechat-auto-join", in: args) else {
+        let inviteURL = Self.argumentValue("--finitechat-auto-join", in: args)
+        let createRoomName = Self.argumentValue("--finitechat-auto-create-room", in: args)
+        let outbound = Self.argumentValue("--finitechat-auto-send", in: args)
+        guard inviteURL != nil || createRoomName != nil || outbound != nil else {
             return
         }
 
         didRunLaunchAutomation = true
-        scanDraft = inviteURL
         pinDraft = Self.argumentValue("--finitechat-pin", in: args) ?? pinDraft
         deviceID = Self.argumentValue("--finitechat-device", in: args) ?? deviceID
         serverURL = Self.argumentValue("--finitechat-server", in: args) ?? serverURL
         let requestedRoomID = Self.argumentValue("--finitechat-room", in: args)
-        let outbound = Self.argumentValue("--finitechat-auto-send", in: args)
 
         launchAutomationTask = Task {
-            self.scanTarget()
-            let roomID = requestedRoomID ?? self.state?.selectedRoomId
-            if let room = self.launchAutomationRoom(roomID: roomID) {
-                self.submitPin(for: room)
+            if let createRoomName,
+               !createRoomName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                self.roomDraft = createRoomName
+                self.createRoom()
             }
+            if let inviteURL {
+                self.scanDraft = inviteURL
+                self.scanTarget()
+                let roomID = requestedRoomID ?? self.state?.selectedRoomId
+                if let room = self.launchAutomationRoom(roomID: roomID) {
+                    self.submitPin(for: room)
+                }
+            }
+            let roomID = requestedRoomID ?? self.state?.selectedRoomId
             if let outbound, !outbound.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 await self.sendLaunchAutomationMessage(roomID: roomID, text: outbound)
             }

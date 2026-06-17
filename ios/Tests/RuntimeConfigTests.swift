@@ -420,6 +420,183 @@ final class RuntimeConfigTests: XCTestCase {
     }
 }
 
+@MainActor
+final class AppModelPersistenceTests: XCTestCase {
+    func testForceCloseStyleRelaunchUsesSameStableStoreAndKeepsSavedProjection() throws {
+        let supportURL = try temporarySupportURL()
+        let configURL = supportURL.appendingPathComponent("finitechat_config.json")
+        let config = RuntimeConfig(
+            serverURL: "http://192.168.1.226:8789",
+            deviceID: "qt433"
+        )
+        try config.save(storageURL: configURL)
+
+        let savedState = savedChatState()
+        let offlineState = savedChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        var openedOptions: [OpenOptions] = []
+
+        let firstRuntime = FakeFiniteChatRuntime(
+            initialState: savedState,
+            startRuntimeState: offlineState
+        )
+        let firstLaunch = AppModel(
+            config: config,
+            applicationSupportURL: supportURL,
+            configStorageURL: configURL,
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return firstRuntime
+        }
+
+        firstLaunch.start()
+
+        XCTAssertEqual(firstLaunch.rooms.map(\.roomId), ["room-main"])
+        XCTAssertEqual(firstLaunch.selectedRoom?.roomId, "room-main")
+        XCTAssertEqual(firstLaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
+        XCTAssertEqual(firstLaunch.chatProjections["room-main"]?.messages.map(\.text), [
+            "saved before force close",
+        ])
+        XCTAssertEqual(firstLaunch.state?.status, "offline")
+        XCTAssertEqual(firstRuntime.dispatchedActions, [.startRuntime])
+
+        let relaunchConfig = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: configURL
+        )
+        let secondRuntime = FakeFiniteChatRuntime(
+            initialState: savedState,
+            startRuntimeState: offlineState
+        )
+        let relaunch = AppModel(
+            config: relaunchConfig,
+            applicationSupportURL: supportURL,
+            configStorageURL: configURL,
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return secondRuntime
+        }
+
+        relaunch.start()
+
+        XCTAssertEqual(openedOptions.count, 2)
+        XCTAssertEqual(openedOptions[0].serverUrl, "http://192.168.1.226:8789")
+        XCTAssertEqual(openedOptions[0].deviceId, "qt433")
+        XCTAssertEqual(openedOptions[0].dataDir, openedOptions[1].dataDir)
+        XCTAssertEqual(
+            URL(fileURLWithPath: openedOptions[1].dataDir).lastPathComponent,
+            "FiniteChatStore"
+        )
+        XCTAssertEqual(relaunch.rooms.map(\.roomId), ["room-main"])
+        XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
+        XCTAssertEqual(relaunch.state?.status, "offline")
+        XCTAssertEqual(
+            relaunch.state?.toast,
+            "Showing saved chats. Connection will retry."
+        )
+        XCTAssertNil(relaunch.errorText)
+        XCTAssertEqual(secondRuntime.dispatchedActions, [.startRuntime])
+    }
+
+    private func savedChatState(
+        status: String = "ready",
+        toast: String? = nil
+    ) -> AppState {
+        let identity = Identity(
+            accountId: "alice-account",
+            deviceId: "qt433",
+            accountSecretHex: String(repeating: "0", count: 64)
+        )
+        let room = AppRoomSummary(
+            roomId: "room-main",
+            displayName: "Main Room",
+            state: .connected,
+            status: "connected",
+            lastMessagePreview: "saved before force close",
+            unreadCount: 0,
+            canLoadOlder: false
+        )
+        let message = ChatMessage(
+            roomId: "room-main",
+            seq: 1,
+            messageId: "message-1",
+            conversationId: nil,
+            senderAccountId: "alice-account",
+            senderDeviceId: "qt433",
+            senderDisplayName: "qt433",
+            senderNpub: nil,
+            text: "saved before force close",
+            displayContent: "saved before force close",
+            payload: Data("saved before force close".utf8),
+            replyToMessageId: nil,
+            isMine: true,
+            delivery: .sent,
+            reactions: [],
+            media: [],
+            readReceipt: nil,
+            poll: nil,
+            displayTimestamp: "now"
+        )
+        return AppState(
+            rev: 1,
+            identity: identity,
+            rooms: [room],
+            selectedRoomId: "room-main",
+            activeInvite: nil,
+            activeProfileId: nil,
+            status: status,
+            toast: toast,
+            messages: [message],
+            profiles: [],
+            devices: []
+        )
+    }
+
+    private func temporarySupportURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory
+    }
+}
+
+private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked Sendable {
+    private var currentState: AppState
+    private let startRuntimeState: AppState
+    private(set) var dispatchedActions: [AppAction] = []
+
+    init(initialState: AppState, startRuntimeState: AppState) {
+        currentState = initialState
+        self.startRuntimeState = startRuntimeState
+    }
+
+    func state() throws -> AppState {
+        currentState
+    }
+
+    func dispatch(action: AppAction) throws -> AppState {
+        dispatchedActions.append(action)
+        if action == .startRuntime {
+            currentState = startRuntimeState
+        }
+        return currentState
+    }
+
+    func waitForUpdate(timeoutMillis: UInt64) throws -> AppState {
+        currentState
+    }
+}
+
 final class MessageCollectionLayoutTests: XCTestCase {
     func testJumpButtonSpacingMatchesKeyboardChromeGap() {
         XCTAssertEqual(MessageCollectionLayout.jumpButtonSpacing, 12)
