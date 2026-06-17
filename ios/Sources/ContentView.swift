@@ -1,4 +1,5 @@
 import CoreImage.CIFilterBuiltins
+import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -211,6 +212,9 @@ private struct RoomThreadView: View {
     @State private var imagePreviewSelection: ChatImagePreviewSelection?
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
     @State private var documentPreviewItem: ChatAttachmentPreviewItem?
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var stagedAttachments: [StagedComposerAttachment] = []
+    @State private var showPhotoPicker = false
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -293,7 +297,7 @@ private struct RoomThreadView: View {
         .fileImporter(
             isPresented: $importingAttachment,
             allowedContentTypes: [.item],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             handleImportedAttachment(result)
         }
@@ -314,6 +318,9 @@ private struct RoomThreadView: View {
         }
         .onDisappear {
             dismissFocusedMessage(animated: false)
+        }
+        .onChange(of: selectedPhotoItems) { _, items in
+            stagePhotoItems(items)
         }
     }
 
@@ -340,14 +347,15 @@ private struct RoomThreadView: View {
                 accessoryContent: Composer(
                     model: model,
                     replyTarget: replyDraftMessage,
+                    stagedAttachments: $stagedAttachments,
+                    isPhotoPickerPresented: $showPhotoPicker,
+                    selectedPhotoItems: $selectedPhotoItems,
                     isInputFocused: $composerFocused,
                     onCancelReply: {
                         replyDraftMessage = nil
                     },
                     onSend: {
-                        if model.send(replyTo: replyDraftMessage) {
-                            replyDraftMessage = nil
-                        }
+                        sendComposerDraft()
                     }
                 ) {
                     importingAttachment = true
@@ -377,10 +385,7 @@ private struct RoomThreadView: View {
     private func handleImportedAttachment(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            guard let url = urls.first else { return }
-            model.sendAttachment(roomID: roomID, fileURL: url, replyTo: replyDraftMessage) {
-                replyDraftMessage = nil
-            }
+            stageFileURLs(urls)
         case .failure(let error):
             model.errorText = String(describing: error)
         }
@@ -434,6 +439,69 @@ private struct RoomThreadView: View {
     private func focusedReplyTarget(for message: ChatMessage) -> ChatMessage? {
         guard let replyToMessageId = message.replyToMessageId else { return nil }
         return projection.messagesById[replyToMessageId]
+    }
+
+    private func sendComposerDraft() {
+        if stagedAttachments.isEmpty {
+            if model.send(replyTo: replyDraftMessage) {
+                replyDraftMessage = nil
+            }
+            return
+        }
+
+        let outbound = stagedAttachments.map(\.outboundAttachment)
+        model.sendAttachments(roomID: roomID, attachments: outbound, replyTo: replyDraftMessage) {
+            stagedAttachments = []
+            selectedPhotoItems = []
+            replyDraftMessage = nil
+        }
+    }
+
+    private func stageFileURLs(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        Task {
+            do {
+                let staged = try await Task.detached(priority: .userInitiated) {
+                    try urls.map { try StagedComposerAttachment(fileURL: $0) }
+                }.value
+                appendStagedAttachments(staged)
+            } catch {
+                model.errorText = String(describing: error)
+            }
+        }
+    }
+
+    private func stagePhotoItems(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        Task {
+            do {
+                var staged: [StagedComposerAttachment] = []
+                staged.reserveCapacity(items.count)
+                for item in items {
+                    if let attachment = try await StagedComposerAttachment(photoItem: item) {
+                        staged.append(attachment)
+                    }
+                }
+                appendStagedAttachments(staged)
+            } catch {
+                model.errorText = String(describing: error)
+            }
+            selectedPhotoItems = []
+        }
+    }
+
+    private func appendStagedAttachments(_ attachments: [StagedComposerAttachment]) {
+        guard !attachments.isEmpty else { return }
+        let remainingSlots = max(0, maxStagedComposerAttachments - stagedAttachments.count)
+        guard remainingSlots > 0 else {
+            model.errorText = "Attachment limit is \(maxStagedComposerAttachments) files."
+            return
+        }
+        let accepted = Array(attachments.prefix(remainingSlots))
+        stagedAttachments.append(contentsOf: accepted)
+        if accepted.count < attachments.count {
+            model.errorText = "Attachment limit is \(maxStagedComposerAttachments) files."
+        }
     }
 }
 
@@ -567,136 +635,6 @@ private func messageClipboardText(_ message: ChatMessage) -> String {
         return display
     }
     return message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-}
-
-private struct Composer: View {
-    @ObservedObject var model: AppModel
-    let replyTarget: ChatMessage?
-    @Binding var isInputFocused: Bool
-    let onCancelReply: () -> Void
-    let onSend: () -> Void
-    let onAttach: () -> Void
-    @FocusState private var textFieldFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if let replyTarget {
-                ComposerReplyPreview(
-                    message: replyTarget,
-                    onCancel: onCancelReply
-                )
-            }
-
-            HStack(spacing: 10) {
-                Button {
-                    onAttach()
-                } label: {
-                    Image(systemName: "paperclip")
-                        .font(.title3)
-                }
-                .accessibilityLabel("Attach")
-                .accessibilityIdentifier("AttachButton")
-
-                TextField("Message", text: $model.outboundText, axis: .vertical)
-                    .lineLimit(1...4)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($textFieldFocused)
-                    .accessibilityLabel("Message")
-
-                Button {
-                    onSend()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title2)
-                }
-                .disabled(!model.canSend)
-                .accessibilityLabel("Send")
-                .accessibilityIdentifier("SendButton")
-            }
-            .padding()
-        }
-        .background(.bar)
-        .onChange(of: textFieldFocused) { _, focused in
-            isInputFocused = focused
-        }
-        .onChange(of: isInputFocused) { _, focused in
-            guard textFieldFocused != focused else { return }
-            textFieldFocused = focused
-        }
-    }
-}
-
-private struct ComposerReplyPreview: View {
-    let message: ChatMessage
-    let onCancel: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Rectangle()
-                .fill(Color.accentColor)
-                .frame(width: 3, height: 36)
-                .clipShape(Capsule())
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Replying to \(senderLabel)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Text(snippet)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer(minLength: 8)
-
-            Button {
-                onCancel()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.body)
-                    .foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Cancel reply")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.thinMaterial)
-    }
-
-    private var senderLabel: String {
-        if message.isMine {
-            return "You"
-        }
-        let name = message.senderDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? message.senderDeviceId : name
-    }
-
-    private var snippet: String {
-        let text = message.displayContent.isEmpty ? message.text : message.displayContent
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            return trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
-        }
-        if let media = message.media.first {
-            return media.filename.isEmpty ? composerMediaLabel(for: media.kind) : media.filename
-        }
-        return "Message"
-    }
-}
-
-private func composerMediaLabel(for kind: ChatMediaKind) -> String {
-    switch kind {
-    case .image:
-        return "Image"
-    case .voiceNote:
-        return "Voice note"
-    case .video:
-        return "Video"
-    case .file:
-        return "File"
-    }
 }
 
 private struct PendingRoomView: View {

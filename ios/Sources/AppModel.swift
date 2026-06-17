@@ -568,6 +568,40 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func sendAttachments(
+        roomID: String,
+        attachments: [OutboundAttachment],
+        replyTo message: ChatMessage? = nil,
+        onSuccess: (@MainActor () -> Void)? = nil
+    ) {
+        guard !attachments.isEmpty else { return }
+        let caption = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                let action = AppAction.sendAttachments(
+                    roomId: roomID,
+                    attachments: attachments,
+                    caption: caption,
+                    replyToMessageId: message?.messageId
+                )
+                let nextState = try await Task.detached(priority: .userInitiated) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard openKey == runtimeKey else { return }
+                state = nextState
+                outboundText = ""
+                errorText = nil
+                onSuccess?()
+                startUpdateLoop()
+            } catch {
+                errorText = String(describing: error)
+            }
+        }
+    }
+
     func downloadAttachment(roomID: String, message: ChatMessage, attachment: ChatMediaAttachment) {
         if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
            !localPath.isEmpty

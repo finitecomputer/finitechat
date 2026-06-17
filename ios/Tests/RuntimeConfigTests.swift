@@ -502,3 +502,46 @@ final class MessageCollectionLayoutTests: XCTestCase {
         )
     }
 }
+
+final class StagedComposerAttachmentTests: XCTestCase {
+    func testFileURLStagesOutboundAttachmentMetadataAndBytes() throws {
+        let directory = try temporaryDirectory()
+        let url = directory.appendingPathComponent("sample.png")
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47])
+        try bytes.write(to: url)
+
+        let staged = try StagedComposerAttachment(fileURL: url)
+        let outbound = staged.outboundAttachment
+
+        XCTAssertEqual(staged.filename, "sample.png")
+        XCTAssertEqual(staged.mimeType, "image/png")
+        XCTAssertEqual(staged.kind, .image)
+        XCTAssertEqual(outbound.filename, "sample.png")
+        XCTAssertEqual(outbound.mimeType, "image/png")
+        XCTAssertEqual(outbound.kind, .image)
+        XCTAssertEqual(outbound.bytes, bytes)
+    }
+
+    func testFileURLRejectsProtocolOversizedAttachment() throws {
+        let directory = try temporaryDirectory()
+        let url = directory.appendingPathComponent("too-large.bin")
+        try Data(count: maxComposerAttachmentBytes + 1).write(to: url)
+
+        XCTAssertThrowsError(try StagedComposerAttachment(fileURL: url)) { error in
+            guard case ComposerAttachmentError.tooLarge(let filename) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(filename, "too-large.bin")
+        }
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory
+    }
+}
