@@ -2,9 +2,15 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct RuntimeConfig: Codable {
+struct RuntimeConfig: Codable, Equatable {
     let serverURL: String
     let deviceID: String
+
+    private static let defaultServerURL = "http://127.0.0.1:8787"
+    private static let defaultDeviceID = "ios"
+    private static let dataRootDirectoryName = "FiniteChat"
+    private static let clientStoreFileName = "client.sqlite3"
+    private static let accountSecretFileName = "account-secret.hex"
 
     enum CodingKeys: String, CodingKey {
         case serverURL = "server_url"
@@ -21,12 +27,20 @@ struct RuntimeConfig: Codable {
         let deviceID = argumentValue("--finitechat-device", in: args)
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
         let persisted = loadPersisted(storageURL: storageURL)
-        let config = RuntimeConfig(
-            serverURL: serverURL ?? persisted?.serverURL ?? "http://127.0.0.1:8787",
-            deviceID: deviceID ?? persisted?.deviceID ?? "ios"
+        let fallback = persisted ?? RuntimeConfig(
+            serverURL: defaultServerURL,
+            deviceID: existingSingleDeviceStoreID(storageURL: storageURL) ?? defaultDeviceID
         )
-        // Launch args and environment are process-local test/dev overrides.
-        // Persisting them can strand real chats under a different device store.
+        let config = RuntimeConfig(
+            serverURL: serverURL ?? fallback.serverURL,
+            deviceID: deviceID ?? fallback.deviceID
+        )
+        // First-run launch args/env seed the durable device store identity so
+        // a force-close relaunch outside Xcode reopens the same local SQLite.
+        // Once a config exists, dev overrides remain process-local.
+        if persisted == nil {
+            try? config.save(storageURL: storageURL)
+        }
         return config
     }
 
@@ -64,6 +78,44 @@ struct RuntimeConfig: Codable {
             create: true
         )
         return support.appendingPathComponent("finitechat_config.json")
+    }
+
+    private static func existingSingleDeviceStoreID(storageURL: URL?) -> String? {
+        let supportURL: URL
+        if let storageURL {
+            supportURL = storageURL.deletingLastPathComponent()
+        } else if let applicationSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) {
+            supportURL = applicationSupport
+        } else {
+            return nil
+        }
+
+        let dataRoot = supportURL.appendingPathComponent(dataRootDirectoryName, isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: dataRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let candidates = entries.filter { entry in
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            guard isDirectory else { return false }
+            return FileManager.default.fileExists(
+                atPath: entry.appendingPathComponent(clientStoreFileName).path
+            ) || FileManager.default.fileExists(
+                atPath: entry.appendingPathComponent(accountSecretFileName).path
+            )
+        }
+        guard candidates.count == 1 else { return nil }
+        let deviceID = candidates[0].lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return deviceID.isEmpty ? nil : deviceID
     }
 
     enum ConfigError: Error {

@@ -3812,6 +3812,107 @@ mod tests {
     }
 
     #[test]
+    fn app_reopens_synced_peer_chat_offline_after_force_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Force Close".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        bob.dispatch(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "remote message before force close".to_owned(),
+        })
+        .unwrap();
+        let synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            synced
+                .messages
+                .iter()
+                .any(|message| message.text == "remote message before force close")
+        );
+        drop(alice);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).display_name,
+            "Force Close"
+        );
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).last_message_preview,
+            "remote message before force close"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.text == "remote message before force close"),
+            "force-close reopen must render synced peer messages from local SQLite before sync"
+        );
+
+        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(started.status, "offline");
+        assert!(
+            started
+                .messages
+                .iter()
+                .any(|message| message.text == "remote message before force close"),
+            "offline startup must not clear a synced peer transcript"
+        );
+    }
+
+    #[test]
     fn app_runtime_sends_encrypted_attachment_blob_and_reopens_projection() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
