@@ -255,6 +255,9 @@ private struct RoomThreadView: View {
                 onReact: { message, emoji in
                     model.react(to: message, emoji: emoji)
                 },
+                onDownloadAttachment: { message, attachment in
+                    model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
+                },
                 followsBottom: $followsBottom
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)

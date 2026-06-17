@@ -114,6 +114,7 @@ final class AppModel: ObservableObject {
     private var openKey = ""
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
+    private var attachmentDownloadsInFlight = Set<String>()
     private var didRunLaunchAutomation = false
 
     deinit {
@@ -257,6 +258,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func downloadAttachment(roomID: String, message: ChatMessage, attachment: ChatMediaAttachment) {
+        if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !localPath.isEmpty
+        {
+            return
+        }
+        guard let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !url.isEmpty
+        else {
+            return
+        }
+
+        let key = "\(roomID)|\(message.messageId)|\(attachment.attachmentId)"
+        guard !attachmentDownloadsInFlight.contains(key) else { return }
+        attachmentDownloadsInFlight.insert(key)
+
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                attachmentDownloadsInFlight.remove(key)
+            }
+            do {
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                let action = AppAction.downloadAttachment(
+                    roomId: roomID,
+                    messageId: message.messageId,
+                    attachmentId: attachment.attachmentId
+                )
+                let nextState = try await Task.detached(priority: .utility) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard openKey == runtimeKey else { return }
+                state = nextState
+                errorText = nil
+                startUpdateLoop()
+            } catch {
+                errorText = String(describing: error)
+            }
+        }
+    }
+
     func react(to message: ChatMessage, emoji: String) {
         dispatch(.reactToMessage(
             roomId: message.roomId,
@@ -337,6 +380,7 @@ final class AppModel: ObservableObject {
         launchAutomationTask?.cancel()
         updateTask = nil
         launchAutomationTask = nil
+        attachmentDownloadsInFlight.removeAll()
         runtime = nil
         openKey = ""
         state = nil

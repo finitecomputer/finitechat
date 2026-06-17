@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use finitechat_blob::{
-    BlobDescriptor, BlossomUploadHttpResponse, finish_blossom_upload_http_response,
-    prepare_attachment_upload, prepare_blossom_upload_http_request,
+    BlobDescriptor, BlossomDownloadHttpResponse, BlossomUploadHttpResponse,
+    finish_blossom_download_http_response, finish_blossom_upload_http_response,
+    prepare_attachment_upload, prepare_blossom_download_http_request,
+    prepare_blossom_upload_http_request,
 };
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
@@ -27,10 +29,12 @@ use finitechat_proto::{
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const ACCOUNT_SECRET_FILE: &str = "account-secret.hex";
 const CLIENT_STORE_FILE: &str = "client.sqlite3";
+const ATTACHMENT_CACHE_DIR: &str = "attachments";
 const LEGACY_APP_MESSAGES_FILE: &str = "app-messages.json";
 const MAX_APP_MESSAGES: usize = 5_000;
 const MAX_APP_MESSAGES_U32: u32 = 5_000;
@@ -289,6 +293,11 @@ pub enum AppAction {
         bytes: Vec<u8>,
         caption: String,
     },
+    DownloadAttachment {
+        room_id: String,
+        message_id: String,
+        attachment_id: String,
+    },
     ReactToMessage {
         room_id: String,
         message_id: String,
@@ -537,7 +546,8 @@ impl AppRuntimeState {
             .map_err(store_error)?;
         let chat_projection =
             ChatProjectionState::from_stored(stored_messages, stored_events, &owner);
-        let messages = chat_projection.messages();
+        let mut messages = chat_projection.messages();
+        core.apply_attachment_cache_paths(&mut messages);
         let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
         let known_room_ids = core.known_room_ids().into_iter().collect::<BTreeSet<_>>();
         let mut persisted_room_ids = BTreeSet::new();
@@ -611,6 +621,11 @@ impl AppRuntimeState {
                 bytes,
                 caption,
             } => self.send_attachment(room_id, filename, mime_type, kind, bytes, caption)?,
+            AppAction::DownloadAttachment {
+                room_id,
+                message_id,
+                attachment_id,
+            } => self.download_attachment(room_id, message_id, attachment_id)?,
             AppAction::ReactToMessage {
                 room_id,
                 message_id,
@@ -915,6 +930,47 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn download_attachment(
+        &mut self,
+        room_id: String,
+        message_id: String,
+        attachment_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to download attachments"),
+            });
+        }
+        let Some(message) = self
+            .app
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && message.message_id == message_id)
+        else {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("message '{message_id}' is not available in room '{room_id}'"),
+            });
+        };
+        let reference = attachment_reference_for_id(message, &attachment_id).ok_or_else(|| {
+            FiniteChatCoreError::Client {
+                reason: format!(
+                    "attachment '{attachment_id}' is not available on message '{message_id}'"
+                ),
+            }
+        })?;
+        let path = self.core.download_attachment_blob(&reference)?;
+        self.sync_chat_projection();
+        let filename = reference.metadata.filename.trim();
+        let display_name = if filename.is_empty() {
+            "attachment"
+        } else {
+            filename
+        };
+        self.app.status = format!("downloaded {display_name}");
+        debug_assert!(path.is_file());
+        Ok(())
+    }
+
     fn react_to_message(
         &mut self,
         room_id: String,
@@ -1141,7 +1197,9 @@ impl AppRuntimeState {
     }
 
     fn sync_chat_projection(&mut self) {
-        self.app.messages = self.chat_projection.messages();
+        let mut messages = self.chat_projection.messages();
+        self.core.apply_attachment_cache_paths(&mut messages);
+        self.app.messages = messages;
         apply_message_previews(&mut self.app.rooms, &self.app.messages);
     }
 
@@ -1521,6 +1579,7 @@ impl CoreState {
         metadata.validate_limits().map_err(client_error)?;
         let room_server_url = self.room_server_url(room_id);
         let reference = self.upload_attachment_blob(&room_server_url, &bytes, metadata)?;
+        self.cache_attachment_plaintext(&reference, &bytes)?;
         let chat_payload = encode_attachment_message_payload(
             caption.trim(),
             &filename,
@@ -1528,7 +1587,9 @@ impl CoreState {
             kind,
             reference,
         )?;
-        self.send_chat_payload(room_id, chat_payload)
+        let mut result = self.send_chat_payload(room_id, chat_payload)?;
+        self.apply_attachment_cache_paths(&mut result.messages);
+        Ok(result)
     }
 
     fn send_chat_payload(
@@ -1604,6 +1665,120 @@ impl CoreState {
             },
         )
         .map_err(client_error)
+    }
+
+    fn download_attachment_blob(
+        &self,
+        reference: &AttachmentBlobReferenceV1,
+    ) -> Result<PathBuf, FiniteChatCoreError> {
+        if let Some(path) = self.cached_attachment_path(reference)? {
+            return Ok(path);
+        }
+
+        let request = prepare_blossom_download_http_request(reference).map_err(client_error)?;
+        let response = reqwest::blocking::Client::new()
+            .get(request.url)
+            .send()
+            .map_err(delivery_error)?;
+        let status = response.status();
+        let body = response.bytes().map_err(delivery_error)?;
+        let downloaded = finish_blossom_download_http_response(
+            reference,
+            BlossomDownloadHttpResponse {
+                status: status.as_u16(),
+                body: body.as_ref(),
+            },
+        )
+        .map_err(client_error)?;
+        self.cache_attachment_plaintext(reference, &downloaded.plaintext)?;
+        self.cached_attachment_path(reference)?
+            .ok_or_else(|| FiniteChatCoreError::Filesystem {
+                reason: "attachment cache write did not produce a readable file".to_owned(),
+            })
+    }
+
+    fn apply_attachment_cache_paths(&self, messages: &mut [ChatMessage]) {
+        for message in messages {
+            let references = attachment_references_by_id(message);
+            for attachment in &mut message.media {
+                let Some(reference) = references.get(&attachment.attachment_id) else {
+                    continue;
+                };
+                attachment.local_path = self
+                    .cached_attachment_path(reference)
+                    .ok()
+                    .flatten()
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    fn cached_attachment_path(
+        &self,
+        reference: &AttachmentBlobReferenceV1,
+    ) -> Result<Option<PathBuf>, FiniteChatCoreError> {
+        let path = self.attachment_cache_path(reference);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let plaintext = fs::read(&path).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!("failed to read {}: {error}", path.display()),
+        })?;
+        if attachment_plaintext_matches(reference, &plaintext) {
+            return Ok(Some(path));
+        }
+        fs::remove_file(&path).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!(
+                "failed to remove corrupt attachment cache {}: {error}",
+                path.display()
+            ),
+        })?;
+        Ok(None)
+    }
+
+    fn cache_attachment_plaintext(
+        &self,
+        reference: &AttachmentBlobReferenceV1,
+        plaintext: &[u8],
+    ) -> Result<PathBuf, FiniteChatCoreError> {
+        if !attachment_plaintext_matches(reference, plaintext) {
+            return Err(FiniteChatCoreError::Client {
+                reason: "attachment plaintext does not match encrypted reference".to_owned(),
+            });
+        }
+        let path = self.attachment_cache_path(reference);
+        let Some(parent) = path.parent() else {
+            return Err(FiniteChatCoreError::Filesystem {
+                reason: format!("attachment cache path has no parent: {}", path.display()),
+            });
+        };
+        fs::create_dir_all(parent).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!("failed to create {}: {error}", parent.display()),
+        })?;
+        let tmp_path = path.with_file_name(format!(
+            ".{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment")
+        ));
+        fs::write(&tmp_path, plaintext).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!("failed to write {}: {error}", tmp_path.display()),
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|error| FiniteChatCoreError::Filesystem {
+            reason: format!(
+                "failed to move {} to {}: {error}",
+                tmp_path.display(),
+                path.display()
+            ),
+        })?;
+        Ok(path)
+    }
+
+    fn attachment_cache_path(&self, reference: &AttachmentBlobReferenceV1) -> PathBuf {
+        self.data_dir
+            .join(ATTACHMENT_CACHE_DIR)
+            .join(&reference.plaintext_sha256)
+            .join(sanitized_attachment_filename(&reference.metadata.filename))
     }
 
     fn room_server_url(&self, room_id: &str) -> String {
@@ -2105,6 +2280,66 @@ fn chat_media_attachment(index: usize, attachment: HermesAttachmentV1) -> ChatMe
         local_path: attachment.path,
         upload_progress_per_mille: None,
     }
+}
+
+fn attachment_references_by_id(
+    message: &ChatMessage,
+) -> BTreeMap<String, AttachmentBlobReferenceV1> {
+    let DecodedAppEvent::ChatMessage { payload, .. } = decode_application_event(&message.payload)
+    else {
+        return BTreeMap::new();
+    };
+    let Ok(Some(payload)) = HermesMessagePayloadV1::decode(&payload) else {
+        return BTreeMap::new();
+    };
+
+    let mut references = BTreeMap::new();
+    for (index, attachment) in payload.attachments.into_iter().enumerate() {
+        let projected = chat_media_attachment(index, attachment.clone());
+        if let Some(reference) = attachment.blob {
+            references.insert(projected.attachment_id, reference);
+        }
+    }
+    references
+}
+
+fn attachment_reference_for_id(
+    message: &ChatMessage,
+    attachment_id: &str,
+) -> Option<AttachmentBlobReferenceV1> {
+    attachment_references_by_id(message).remove(attachment_id)
+}
+
+fn attachment_plaintext_matches(reference: &AttachmentBlobReferenceV1, plaintext: &[u8]) -> bool {
+    plaintext.len() as u64 == reference.plaintext_size
+        && sha256_hex(plaintext) == reference.plaintext_sha256
+}
+
+fn sanitized_attachment_filename(filename: &str) -> String {
+    let trimmed = filename.trim();
+    let mut out = String::with_capacity(trimmed.len().min(128));
+    for ch in trimmed.chars() {
+        if out.len() >= 128 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('.');
+    if out.is_empty() || out == "_" {
+        return "attachment".to_owned();
+    }
+    if out == ".." {
+        return "attachment".to_owned();
+    }
+    out.to_owned()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn sender_display_name(sender: &DeviceRef, payload_name: Option<&str>, is_mine: bool) -> String {
@@ -3380,6 +3615,11 @@ mod tests {
         assert_eq!(media.kind, ChatMediaKind::Image);
         assert_eq!(media.filename, "photo.jpg");
         assert_eq!(media.mime_type, "image/jpeg");
+        let local_path = media
+            .local_path
+            .as_ref()
+            .expect("sender caches uploaded attachment plaintext");
+        assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
         assert_eq!(app_room(&sent, &room_id).last_message_preview, "photo.jpg");
 
         let reference = attachment_reference_from_message(message);
@@ -3417,9 +3657,124 @@ mod tests {
             .find(|message| message.room_id == room_id && !message.media.is_empty())
             .expect("attachment projection survives reopen");
         assert_eq!(reopened_message.media[0].filename, "photo.jpg");
+        assert!(reopened_message.media[0].local_path.is_some());
         assert_eq!(
             app_room(&reopened_state, &room_id).last_message_preview,
             "photo.jpg"
+        );
+    }
+
+    #[test]
+    fn app_runtime_downloads_attachment_blob_to_verified_local_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Media Download".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let alice_state = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+        let invite = alice_state.active_invite.unwrap();
+
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let plaintext = b"download me after sync".to_vec();
+        alice
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "remote photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: plaintext.clone(),
+                caption: "from alice".to_owned(),
+            })
+            .unwrap();
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let message = bob_state
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("receiver sees remote attachment");
+        assert_eq!(message.text, "from alice");
+        let attachment = message.media.first().unwrap();
+        assert_eq!(attachment.filename, "remote photo.jpg");
+        assert_eq!(attachment.local_path, None);
+
+        let bob_state = bob
+            .dispatch(AppAction::DownloadAttachment {
+                room_id: room_id.clone(),
+                message_id: message.message_id.clone(),
+                attachment_id: attachment.attachment_id.clone(),
+            })
+            .unwrap();
+        let downloaded = bob_state
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("downloaded message remains projected");
+        let local_path = downloaded.media[0]
+            .local_path
+            .as_ref()
+            .expect("downloaded attachment projects verified local path");
+        assert!(local_path.ends_with("remote_photo.jpg"));
+        assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
+
+        drop(bob);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        let reopened_message = reopened_state
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("cached attachment projection survives offline reopen");
+        assert_eq!(
+            std::fs::read(reopened_message.media[0].local_path.as_ref().unwrap()).unwrap(),
+            plaintext
         );
     }
 

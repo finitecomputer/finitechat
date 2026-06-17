@@ -4,18 +4,20 @@ import UIKit
 struct ChatTranscriptView: UIViewControllerRepresentable {
     struct ContentState: Equatable {
         let rows: [ChatTimelineRow]
+        let messagesById: [String: ChatMessage]
     }
 
     let roomID: String
     let rows: [ChatTimelineRow]
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
+    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     var canLoadOlder = false
     var onLoadOlderMessages: (() -> Void)?
     @Binding var followsBottom: Bool
 
     private var contentState: ContentState {
-        ContentState(rows: rows)
+        ContentState(rows: rows, messagesById: messagesById)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -62,7 +64,8 @@ struct ChatTranscriptView: UIViewControllerRepresentable {
                 ChatTimelineRowView(
                     row: row,
                     messagesById: coordinator.parent.messagesById,
-                    onReact: coordinator.parent.onReact
+                    onReact: coordinator.parent.onReact,
+                    onDownloadAttachment: coordinator.parent.onDownloadAttachment
                 )
             }
             .minSize(width: 0, height: 0)

@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 
 enum ChatBubblePosition {
@@ -11,6 +12,7 @@ struct ChatTimelineRowView: View {
     let row: ChatTimelineRow
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
+    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
 
     var body: some View {
         switch row {
@@ -18,7 +20,8 @@ struct ChatTimelineRowView: View {
             ChatMessageGroupRow(
                 group: group,
                 messagesById: messagesById,
-                onReact: onReact
+                onReact: onReact,
+                onDownloadAttachment: onDownloadAttachment
             )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
@@ -30,6 +33,7 @@ private struct ChatMessageGroupRow: View {
     let group: ChatTimelineMessageGroup
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
+    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
 
     private let avatarSize: CGFloat = 28
 
@@ -64,6 +68,7 @@ private struct ChatMessageGroupRow: View {
                     messages: group.messages,
                     messagesById: messagesById,
                     onReact: onReact,
+                    onDownloadAttachment: onDownloadAttachment,
                     alignment: .leading
                 )
             }
@@ -82,6 +87,7 @@ private struct ChatMessageGroupRow: View {
                     messages: group.messages,
                     messagesById: messagesById,
                     onReact: onReact,
+                    onDownloadAttachment: onDownloadAttachment,
                     alignment: .trailing
                 )
 
@@ -109,6 +115,7 @@ private struct ChatBubbleStack: View {
     let messages: [ChatMessage]
     let messagesById: [String: ChatMessage]
     let onReact: (ChatMessage, String) -> Void
+    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let alignment: HorizontalAlignment
 
     var body: some View {
@@ -118,7 +125,8 @@ private struct ChatBubbleStack: View {
                     message: message,
                     replyTarget: replyTarget(for: message),
                     position: bubblePosition(at: index, count: messages.count),
-                    onReact: onReact
+                    onReact: onReact,
+                    onDownloadAttachment: onDownloadAttachment
                 )
             }
         }
@@ -142,6 +150,7 @@ private struct ChatMessageBubble: View {
     let replyTarget: ChatMessage?
     let position: ChatBubblePosition
     let onReact: (ChatMessage, String) -> Void
+    let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
 
     @State private var isPressed = false
 
@@ -175,7 +184,13 @@ private struct ChatMessageBubble: View {
                 }
 
                 if !message.media.isEmpty {
-                    ChatMediaGrid(attachments: message.media, isMine: message.isMine)
+                    ChatMediaGrid(
+                        attachments: message.media,
+                        isMine: message.isMine,
+                        onDownloadAttachment: { attachment in
+                            onDownloadAttachment(message, attachment)
+                        }
+                    )
                         .padding(.top, message.replyToMessageId == nil ? 0 : 6)
                 }
 
@@ -354,6 +369,7 @@ private struct ReplyPreview: View {
 private struct ChatMediaGrid: View {
     let attachments: [ChatMediaAttachment]
     let isMine: Bool
+    let onDownloadAttachment: (ChatMediaAttachment) -> Void
 
     var body: some View {
         let visual = attachments.filter { $0.kind == .image || $0.kind == .video }
@@ -367,7 +383,13 @@ private struct ChatMediaGrid: View {
             }
 
             ForEach(files, id: \.attachmentId) { attachment in
-                FileAttachmentRow(attachment: attachment, isMine: isMine)
+                FileAttachmentRow(
+                    attachment: attachment,
+                    isMine: isMine,
+                    onDownload: {
+                        onDownloadAttachment(attachment)
+                    }
+                )
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
             }
@@ -383,24 +405,24 @@ private struct ChatMediaGrid: View {
 
             switch attachments.count {
             case 1:
-                MediaTile(attachment: attachments[0], isMine: isMine)
+                mediaTile(attachments[0])
                     .frame(width: width, height: geometry.size.height)
 
             case 2:
                 HStack(spacing: spacing) {
-                    MediaTile(attachment: attachments[0], isMine: isMine)
+                    mediaTile(attachments[0])
                         .frame(width: halfWidth)
-                    MediaTile(attachment: attachments[1], isMine: isMine)
+                    mediaTile(attachments[1])
                         .frame(width: halfWidth)
                 }
 
             case 3:
                 HStack(spacing: spacing) {
-                    MediaTile(attachment: attachments[0], isMine: isMine)
+                    mediaTile(attachments[0])
                         .frame(width: halfWidth)
                     VStack(spacing: spacing) {
-                        MediaTile(attachment: attachments[1], isMine: isMine)
-                        MediaTile(attachment: attachments[2], isMine: isMine)
+                        mediaTile(attachments[1])
+                        mediaTile(attachments[2])
                     }
                     .frame(width: halfWidth)
                 }
@@ -408,15 +430,15 @@ private struct ChatMediaGrid: View {
             default:
                 VStack(spacing: spacing) {
                     HStack(spacing: spacing) {
-                        MediaTile(attachment: attachments[0], isMine: isMine)
+                        mediaTile(attachments[0])
                             .frame(width: halfWidth)
-                        MediaTile(attachment: attachments[1], isMine: isMine)
+                        mediaTile(attachments[1])
                             .frame(width: halfWidth)
                     }
                     HStack(spacing: spacing) {
-                        MediaTile(attachment: attachments[2], isMine: isMine)
+                        mediaTile(attachments[2])
                             .frame(width: halfWidth)
-                        MediaTile(attachment: attachments[3], isMine: isMine)
+                        mediaTile(attachments[3])
                             .frame(width: halfWidth)
                             .overlay {
                                 let remaining = attachments.count - 4
@@ -434,6 +456,16 @@ private struct ChatMediaGrid: View {
         .background(Color(uiColor: .systemGray5))
     }
 
+    private func mediaTile(_ attachment: ChatMediaAttachment) -> MediaTile {
+        MediaTile(
+            attachment: attachment,
+            isMine: isMine,
+            onDownload: {
+                onDownloadAttachment(attachment)
+            }
+        )
+    }
+
     private func gridHeight(count: Int) -> CGFloat {
         switch count {
         case 0:
@@ -449,27 +481,13 @@ private struct ChatMediaGrid: View {
 private struct MediaTile: View {
     let attachment: ChatMediaAttachment
     let isMine: Bool
+    let onDownload: () -> Void
 
     var body: some View {
         ZStack {
-            if attachment.kind == .image,
-               let urlString = attachment.url,
-               let url = URL(string: urlString)
-            {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure:
-                        mediaPlaceholder
-                    case .empty:
-                        mediaPlaceholder
-                            .redacted(reason: .placeholder)
-                    @unknown default:
-                        mediaPlaceholder
-                    }
+            if attachment.kind == .image, let path = localPath {
+                VerifiedLocalImageView(path: path) {
+                    mediaPlaceholder
                 }
             } else {
                 mediaPlaceholder
@@ -487,6 +505,29 @@ private struct MediaTile: View {
         .clipped()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(mediaLabel(for: attachment.kind))
+        .task(id: attachment.attachmentId) {
+            if canDownload {
+                onDownload()
+            }
+        }
+    }
+
+    private var localPath: String? {
+        guard let path = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty
+        else {
+            return nil
+        }
+        return path
+    }
+
+    private var canDownload: Bool {
+        guard localPath == nil,
+              let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            return false
+        }
+        return !url.isEmpty
     }
 
     private var mediaPlaceholder: some View {
@@ -506,31 +547,106 @@ private struct MediaTile: View {
     }
 }
 
+private struct VerifiedLocalImageView<Placeholder: View>: View {
+    let path: String
+    let placeholder: () -> Placeholder
+
+    @Environment(\.displayScale) private var displayScale
+    @State private var image: CGImage?
+
+    var body: some View {
+        GeometryReader { geometry in
+            let maxPixelSize = max(64, Int(max(geometry.size.width, geometry.size.height) * displayScale))
+            ZStack {
+                if let image {
+                    Image(decorative: image, scale: displayScale)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    placeholder()
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+            .task(id: "\(path)|\(maxPixelSize)") {
+                image = await LocalImageLoader.thumbnail(path: path, maxPixelSize: maxPixelSize)
+            }
+        }
+    }
+}
+
+private enum LocalImageLoader {
+    nonisolated static func thumbnail(path: String, maxPixelSize: Int) async -> CGImage? {
+        await Task.detached(priority: .utility) {
+            let url = URL(fileURLWithPath: path) as CFURL
+            guard let source = CGImageSourceCreateWithURL(url, nil) else {
+                return nil
+            }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixelSize)
+            ]
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        }.value
+    }
+}
+
 private struct FileAttachmentRow: View {
     let attachment: ChatMediaAttachment
     let isMine: Bool
+    let onDownload: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: iconName(for: attachment.kind))
-                .font(.body.weight(.semibold))
-                .frame(width: 30, height: 30)
-                .background(
-                    Circle()
-                        .fill(isMine ? .white.opacity(0.16) : Color(uiColor: .systemGroupedBackground))
-                )
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(attachment.filename.isEmpty ? mediaLabel(for: attachment.kind) : attachment.filename)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                Text(attachment.mimeType.isEmpty ? mediaLabel(for: attachment.kind) : attachment.mimeType)
-                    .font(.caption)
-                    .foregroundStyle(isMine ? .white.opacity(0.72) : .secondary)
-                    .lineLimit(1)
+        Button {
+            if canDownload {
+                onDownload()
             }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: iconName(for: attachment.kind))
+                    .font(.body.weight(.semibold))
+                    .frame(width: 30, height: 30)
+                    .background(
+                        Circle()
+                            .fill(isMine ? .white.opacity(0.16) : Color(uiColor: .systemGroupedBackground))
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(attachment.filename.isEmpty ? mediaLabel(for: attachment.kind) : attachment.filename)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Text(detailText)
+                        .font(.caption)
+                        .foregroundStyle(isMine ? .white.opacity(0.72) : .secondary)
+                        .lineLimit(1)
+                }
+            }
+            .foregroundStyle(isMine ? .white : .primary)
         }
-        .foregroundStyle(isMine ? .white : .primary)
+        .buttonStyle(.plain)
+    }
+
+    private var canDownload: Bool {
+        let hasLocalPath = !(attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        guard !hasLocalPath,
+              let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            return false
+        }
+        return !url.isEmpty
+    }
+
+    private var detailText: String {
+        if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !localPath.isEmpty
+        {
+            return "Downloaded"
+        }
+        if canDownload {
+            return "Tap to download"
+        }
+        return attachment.mimeType.isEmpty ? mediaLabel(for: attachment.kind) : attachment.mimeType
     }
 }
 
