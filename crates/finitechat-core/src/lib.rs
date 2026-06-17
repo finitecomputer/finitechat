@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use finitechat_blob::{
+    BlobDescriptor, BlossomUploadHttpResponse, finish_blossom_upload_http_response,
+    prepare_attachment_upload, prepare_blossom_upload_http_request,
+};
 use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
@@ -16,11 +20,12 @@ use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessag
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1, CreateRoomRequest,
-    DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind, InviteCodeV1,
-    ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol, invite_current_pin,
-    npub_decode, npub_encode,
+    AttachmentBlobMetadataV1, AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1,
+    ChatReceiptV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind,
+    InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol,
+    invite_current_pin, npub_decode, npub_encode,
 };
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -276,6 +281,14 @@ pub enum AppAction {
         room_id: String,
         text: String,
     },
+    SendAttachment {
+        room_id: String,
+        filename: String,
+        mime_type: String,
+        kind: ChatMediaKind,
+        bytes: Vec<u8>,
+        caption: String,
+    },
     ReactToMessage {
         room_id: String,
         message_id: String,
@@ -429,6 +442,19 @@ impl FiniteChatCore {
         state.send_text(&room_id, &text)
     }
 
+    pub fn send_attachment(
+        &self,
+        room_id: String,
+        filename: String,
+        mime_type: String,
+        kind: ChatMediaKind,
+        bytes: Vec<u8>,
+        caption: String,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
+        let mut state = self.lock()?;
+        state.send_attachment(&room_id, filename, mime_type, kind, bytes, caption)
+    }
+
     pub fn sync(&self) -> Result<SyncResult, FiniteChatCoreError> {
         let mut state = self.lock()?;
         state.sync()
@@ -577,6 +603,14 @@ impl AppRuntimeState {
                 pin,
             } => self.submit_invite_pin(pending_room_id, pin)?,
             AppAction::SendMessage { room_id, text } => self.send_message(room_id, text)?,
+            AppAction::SendAttachment {
+                room_id,
+                filename,
+                mime_type,
+                kind,
+                bytes,
+                caption,
+            } => self.send_attachment(room_id, filename, mime_type, kind, bytes, caption)?,
             AppAction::ReactToMessage {
                 room_id,
                 message_id,
@@ -855,6 +889,28 @@ impl AppRuntimeState {
         if let Some(room) = self.room_mut(&room_id) {
             room.last_message_preview = trimmed.to_owned();
         }
+        self.app.status = "sent".to_owned();
+        Ok(())
+    }
+
+    fn send_attachment(
+        &mut self,
+        room_id: String,
+        filename: String,
+        mime_type: String,
+        kind: ChatMediaKind,
+        bytes: Vec<u8>,
+        caption: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to send"),
+            });
+        }
+        let result = self
+            .core
+            .send_attachment(&room_id, filename, mime_type, kind, bytes, caption)?;
+        self.append_messages(result.messages);
         self.app.status = "sent".to_owned();
         Ok(())
     }
@@ -1442,11 +1498,48 @@ impl CoreState {
     }
 
     fn send_text(&mut self, room_id: &str, text: &str) -> Result<SyncResult, FiniteChatCoreError> {
+        let chat_payload = encode_text_message_payload(text)?;
+        self.send_chat_payload(room_id, chat_payload)
+    }
+
+    fn send_attachment(
+        &mut self,
+        room_id: &str,
+        filename: String,
+        mime_type: String,
+        kind: ChatMediaKind,
+        bytes: Vec<u8>,
+        caption: String,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
+        let filename = filename.trim().to_owned();
+        let mime_type = mime_type.trim().to_owned();
+        let metadata = AttachmentBlobMetadataV1 {
+            mime_type: mime_type.clone(),
+            filename: filename.clone(),
+            dimensions: None,
+        };
+        metadata.validate_limits().map_err(client_error)?;
+        let room_server_url = self.room_server_url(room_id);
+        let reference = self.upload_attachment_blob(&room_server_url, &bytes, metadata)?;
+        let chat_payload = encode_attachment_message_payload(
+            caption.trim(),
+            &filename,
+            &mime_type,
+            kind,
+            reference,
+        )?;
+        self.send_chat_payload(room_id, chat_payload)
+    }
+
+    fn send_chat_payload(
+        &mut self,
+        room_id: &str,
+        chat_payload: Vec<u8>,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
         let idempotency_key = self
             .device
             .generate_object_id("msg")
             .map_err(client_error)?;
-        let chat_payload = encode_text_message_payload(text)?;
         let app_event_plaintext =
             encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
         let request = self
@@ -1458,11 +1551,7 @@ impl CoreState {
             .save_device_state(&self.device)
             .map_err(store_error)?;
 
-        let room_server_url = self
-            .device
-            .room_server_url(room_id)
-            .map(str::to_owned)
-            .unwrap_or_else(|| self.server_url.clone());
+        let room_server_url = self.room_server_url(room_id);
         let mut delivery = delivery_for(&room_server_url);
         let accepted = delivery
             .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
@@ -1483,6 +1572,45 @@ impl CoreState {
         let mut result = self.sync()?;
         result.messages.insert(0, message);
         Ok(result)
+    }
+
+    fn upload_attachment_blob(
+        &self,
+        server_url: &str,
+        plaintext: &[u8],
+        metadata: AttachmentBlobMetadataV1,
+    ) -> Result<AttachmentBlobReferenceV1, FiniteChatCoreError> {
+        let prepared = prepare_attachment_upload(plaintext, metadata).map_err(client_error)?;
+        let request = prepare_blossom_upload_http_request(&prepared).map_err(client_error)?;
+        let upload_url = format!("{}{}", server_url.trim_end_matches('/'), request.path);
+        let response = reqwest::blocking::Client::new()
+            .put(upload_url)
+            .header(CONTENT_TYPE, request.content_type)
+            .body(request.body.to_vec())
+            .send()
+            .map_err(delivery_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(delivery_error(format!(
+                "blob upload failed with status {status}"
+            )));
+        }
+        let descriptor = response.json::<BlobDescriptor>().map_err(delivery_error)?;
+        finish_blossom_upload_http_response(
+            &prepared,
+            BlossomUploadHttpResponse {
+                status: status.as_u16(),
+                descriptor,
+            },
+        )
+        .map_err(client_error)
+    }
+
+    fn room_server_url(&self, room_id: &str) -> String {
+        self.device
+            .room_server_url(room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.server_url.clone())
     }
 
     fn send_reaction(
@@ -1881,6 +2009,45 @@ fn encode_text_message_payload(text: &str) -> Result<Vec<u8>, FiniteChatCoreErro
     }
     .encode()
     .map_err(client_error)
+}
+
+fn encode_attachment_message_payload(
+    caption: &str,
+    filename: &str,
+    mime_type: &str,
+    kind: ChatMediaKind,
+    reference: AttachmentBlobReferenceV1,
+) -> Result<Vec<u8>, FiniteChatCoreError> {
+    HermesMessagePayloadV1 {
+        payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+        conversation_id: None,
+        text: caption.to_owned(),
+        kind: finitechat_hermes::HermesSendKindV1::Media,
+        status: finitechat_hermes::HermesMessageStatusV1::Complete,
+        edit_of: None,
+        attachments: vec![HermesAttachmentV1 {
+            kind: hermes_attachment_kind(&kind),
+            name: filename.to_owned(),
+            mime_type: mime_type.to_owned(),
+            path: None,
+            url: Some(reference.url.clone()),
+            blob: Some(reference),
+        }],
+        reply_to_message_id: None,
+        sender_name: None,
+        metadata: BTreeMap::new(),
+    }
+    .encode()
+    .map_err(client_error)
+}
+
+fn hermes_attachment_kind(kind: &ChatMediaKind) -> HermesAttachmentKindV1 {
+    match kind {
+        ChatMediaKind::Image => HermesAttachmentKindV1::Image,
+        ChatMediaKind::VoiceNote => HermesAttachmentKindV1::Audio,
+        ChatMediaKind::Video => HermesAttachmentKindV1::Video,
+        ChatMediaKind::File => HermesAttachmentKindV1::File,
+    }
 }
 
 fn encode_application_event(
@@ -2380,8 +2547,27 @@ fn apply_message_previews(rooms: &mut [AppRoomSummary], messages: &[ChatMessage]
             .iter_mut()
             .find(|room| room.room_id == message.room_id)
         {
-            room.last_message_preview = message.text.clone();
+            room.last_message_preview = message_preview(message);
         }
+    }
+}
+
+fn message_preview(message: &ChatMessage) -> String {
+    let text = message.text.trim();
+    if !text.is_empty() {
+        return text.to_owned();
+    }
+    let Some(attachment) = message.media.first() else {
+        return String::new();
+    };
+    if !attachment.filename.trim().is_empty() {
+        return attachment.filename.clone();
+    }
+    match &attachment.kind {
+        ChatMediaKind::Image => "Image".to_owned(),
+        ChatMediaKind::VoiceNote => "Voice note".to_owned(),
+        ChatMediaKind::Video => "Video".to_owned(),
+        ChatMediaKind::File => "File".to_owned(),
     }
 }
 
@@ -3153,6 +3339,91 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_sends_encrypted_attachment_blob_and_reopens_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Media Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let plaintext = b"fake jpeg plaintext bytes".to_vec();
+
+        let sent = alice
+            .dispatch(AppAction::SendAttachment {
+                room_id: room_id.clone(),
+                filename: "photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: plaintext.clone(),
+                caption: String::new(),
+            })
+            .unwrap();
+        let message = sent
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("attachment message projects");
+        assert_eq!(message.text, "");
+        assert_eq!(message.media.len(), 1);
+        let media = &message.media[0];
+        assert_eq!(media.kind, ChatMediaKind::Image);
+        assert_eq!(media.filename, "photo.jpg");
+        assert_eq!(media.mime_type, "image/jpeg");
+        assert_eq!(app_room(&sent, &room_id).last_message_preview, "photo.jpg");
+
+        let reference = attachment_reference_from_message(message);
+        let url = media.url.as_ref().expect("projected blob URL");
+        let ciphertext = reqwest::blocking::Client::new()
+            .get(url)
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap();
+        assert_ne!(ciphertext.as_ref(), plaintext.as_slice());
+        let downloaded = finitechat_blob::finish_blossom_download_http_response(
+            &reference,
+            finitechat_blob::BlossomDownloadHttpResponse {
+                status: 200,
+                body: ciphertext.as_ref(),
+            },
+        )
+        .unwrap();
+        assert_eq!(downloaded.plaintext, plaintext);
+
+        drop(alice);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        let reopened_message = reopened_state
+            .messages
+            .iter()
+            .find(|message| message.room_id == room_id && !message.media.is_empty())
+            .expect("attachment projection survives reopen");
+        assert_eq!(reopened_message.media[0].filename, "photo.jpg");
+        assert_eq!(
+            app_room(&reopened_state, &room_id).last_message_preview,
+            "photo.jpg"
+        );
+    }
+
+    #[test]
     fn app_runtime_recovers_invite_join_projection_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -3748,6 +4019,22 @@ mod tests {
         assert_eq!(receipt.delivered_count, delivered_count);
         assert_eq!(receipt.read_count, read_count);
         assert_eq!(receipt.display_text, display_text);
+    }
+
+    fn attachment_reference_from_message(message: &ChatMessage) -> AttachmentBlobReferenceV1 {
+        let DecodedAppEvent::ChatMessage { payload, .. } =
+            decode_application_event(&message.payload)
+        else {
+            panic!("expected chat message application event");
+        };
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("Hermes payload");
+        hermes
+            .attachments
+            .first()
+            .and_then(|attachment| attachment.blob.clone())
+            .expect("blob reference")
     }
 
     fn put_profile(server_url: &str, profile: NostrProfileRecord) {

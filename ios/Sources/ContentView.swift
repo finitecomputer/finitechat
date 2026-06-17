@@ -1,5 +1,6 @@
 import CoreImage.CIFilterBuiltins
 import SwiftUI
+import UniformTypeIdentifiers
 
 private enum AppSheet: Identifiable {
     case newRoom
@@ -184,6 +185,7 @@ private struct RoomThreadView: View {
     let roomID: String
     let showInvite: () -> Void
     @State private var followsBottom = true
+    @State private var importingAttachment = false
 
     private var room: AppRoomSummary? {
         model.state?.rooms.first(where: { $0.roomId == roomID })
@@ -233,6 +235,13 @@ private struct RoomThreadView: View {
                 model.markRoomRead(room)
             }
         }
+        .fileImporter(
+            isPresented: $importingAttachment,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: false
+        ) { result in
+            handleImportedAttachment(result)
+        }
     }
 
     @ViewBuilder
@@ -251,7 +260,9 @@ private struct RoomThreadView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(.systemGroupedBackground))
             .accessibilityLabel("Messages")
-            Composer(model: model)
+            Composer(model: model) {
+                importingAttachment = true
+            }
         case .waitingForApproval:
             PendingRoomView(room: room, model: model)
         case .joining:
@@ -263,13 +274,33 @@ private struct RoomThreadView: View {
             }
         }
     }
+
+    private func handleImportedAttachment(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            model.sendAttachment(roomID: roomID, fileURL: url)
+        case .failure(let error):
+            model.errorText = String(describing: error)
+        }
+    }
 }
 
 private struct Composer: View {
     @ObservedObject var model: AppModel
+    let onAttach: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
+            Button {
+                onAttach()
+            } label: {
+                Image(systemName: "paperclip")
+                    .font(.title3)
+            }
+            .accessibilityLabel("Attach")
+            .accessibilityIdentifier("AttachButton")
+
             TextField("Message", text: $model.outboundText, axis: .vertical)
                 .lineLimit(1...4)
                 .textFieldStyle(.roundedBorder)

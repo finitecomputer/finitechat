@@ -3,12 +3,14 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use finitechat_blob::{BLOB_CIPHERTEXT_CONTENT_TYPE, BlobDescriptor, BlobPutRequest};
 use finitechat_delivery::{
     HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryLimits,
     HttpDeliveryService, HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishCheck,
@@ -65,6 +67,7 @@ use finitechat_transport::{EpochId, GroupId, MemberId, MessageId};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
@@ -110,6 +113,7 @@ pub struct HttpServerState {
     nostr_profiles: Arc<Mutex<BTreeMap<String, NostrProfileRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
+    blob_objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
     /// Long-poll wake signal (/sync/wait). A single hub: every accepted
     /// publish or invite mutation wakes all waiters, who re-check their
@@ -158,6 +162,7 @@ impl HttpServerState {
             nostr_profiles: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             push_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            blob_objects: Arc::new(Mutex::new(BTreeMap::new())),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             wake: Arc::new(tokio::sync::Notify::new()),
             store: None,
@@ -213,6 +218,7 @@ impl HttpServerState {
         let nostr_profiles = store.load_nostr_profiles()?;
         let welcome_claims = store.load_welcome_claims()?;
         let push_tokens = store.load_push_tokens()?;
+        let blob_objects = store.load_blob_objects()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
             publish_idempotency: Arc::new(Mutex::new(publish_idempotency)),
@@ -229,10 +235,68 @@ impl HttpServerState {
             nostr_profiles: Arc::new(Mutex::new(nostr_profiles)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             push_tokens: Arc::new(Mutex::new(push_tokens)),
+            blob_objects: Arc::new(Mutex::new(blob_objects)),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             wake: Arc::new(tokio::sync::Notify::new()),
             store: Some(store),
         })
+    }
+
+    pub fn put_blob_object(
+        &self,
+        headers: &HeaderMap,
+        ciphertext: &[u8],
+    ) -> Result<BlobDescriptor, ServerHttpError> {
+        let content_type = blob_content_type(headers)?;
+        if content_type != BLOB_CIPHERTEXT_CONTENT_TYPE {
+            return Err(ServerHttpError::InvalidBlobRequest {
+                reason: format!(
+                    "blob upload content type must be {BLOB_CIPHERTEXT_CONTENT_TYPE}, got {content_type}"
+                ),
+            });
+        }
+        BlobPutRequest {
+            ciphertext,
+            content_type,
+        }
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidBlobRequest {
+            reason: error.to_string(),
+        })?;
+
+        let sha256 = sha256_hex(ciphertext);
+        let mut objects = self.blob_objects.lock().expect("HTTP blob objects mutex");
+        if let Some(existing) = objects.get(&sha256) {
+            if existing.as_slice() == ciphertext {
+                return Ok(BlobDescriptor {
+                    url: blob_url(headers, &sha256),
+                    sha256,
+                    size_bytes: ciphertext.len() as u64,
+                });
+            }
+            return Err(ServerHttpError::BlobConflict { sha256 });
+        }
+
+        if let Some(store) = &self.store {
+            store.upsert_blob_object(&sha256, ciphertext)?;
+        }
+        objects.insert(sha256.clone(), ciphertext.to_vec());
+        Ok(BlobDescriptor {
+            url: blob_url(headers, &sha256),
+            sha256,
+            size_bytes: ciphertext.len() as u64,
+        })
+    }
+
+    pub fn get_blob_object(&self, sha256: &str) -> Result<Vec<u8>, ServerHttpError> {
+        validate_blob_sha256(sha256)?;
+        let objects = self.blob_objects.lock().expect("HTTP blob objects mutex");
+        objects
+            .get(sha256)
+            .cloned()
+            .ok_or_else(|| ServerHttpError::BlobNotFound {
+                sha256: sha256.to_owned(),
+            })
     }
 
     /// Raw delivery-contract publish, also used by the shared delivery
@@ -2753,6 +2817,8 @@ pub fn http_router(state: HttpServerState) -> Router {
             post(get_application_effect_counts),
         )
         .route("/activities", post(append_ephemeral_activity))
+        .route("/upload", put(upload_blob_object))
+        .route("/blobs/{sha256}", get(download_blob_object))
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))
         .route("/sync/inbox", post(sync_inbox))
@@ -2831,6 +2897,26 @@ async fn append_ephemeral_activity(
     Json(request): Json<AppendEphemeralActivityRequest>,
 ) -> Result<Json<EphemeralActivityAccepted>, ServerHttpError> {
     Ok(Json(state.append_ephemeral_activity(request)?))
+}
+
+async fn upload_blob_object(
+    State(state): State<HttpServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<BlobDescriptor>, ServerHttpError> {
+    Ok(Json(state.put_blob_object(&headers, &body)?))
+}
+
+async fn download_blob_object(
+    State(state): State<HttpServerState>,
+    AxumPath(sha256): AxumPath<String>,
+) -> Result<impl IntoResponse, ServerHttpError> {
+    let body = state.get_blob_object(&sha256)?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, BLOB_CIPHERTEXT_CONTENT_TYPE)],
+        body,
+    ))
 }
 
 async fn submit_commit(
@@ -3556,6 +3642,11 @@ impl SqliteHttpDeliveryStore {
                 seq INTEGER NOT NULL,
                 message_json TEXT NOT NULL,
                 state_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_blob_objects (
+                sha256 TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                ciphertext BLOB NOT NULL
             );",
         )?;
         drop(conn);
@@ -3800,6 +3891,42 @@ impl SqliteHttpDeliveryStore {
             tokens.insert(key, serde_json::from_str(&json)?);
         }
         Ok(tokens)
+    }
+
+    fn load_blob_objects(&self) -> Result<BTreeMap<String, Vec<u8>>, DurableStoreError> {
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT sha256, size_bytes, ciphertext
+             FROM http_blob_objects
+             ORDER BY sha256 ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut objects = BTreeMap::new();
+        for row in rows {
+            let (sha256, size_bytes, ciphertext) = row?;
+            if size_bytes != ciphertext.len() as u64 || sha256 != sha256_hex(&ciphertext) {
+                return Err(DurableStoreError::BlobObjectCorrupt { sha256 });
+            }
+            objects.insert(sha256, ciphertext);
+        }
+        Ok(objects)
+    }
+
+    fn upsert_blob_object(&self, sha256: &str, ciphertext: &[u8]) -> Result<(), DurableStoreError> {
+        let conn = self.connection();
+        conn.execute(
+            "INSERT INTO http_blob_objects (sha256, size_bytes, ciphertext)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(sha256) DO NOTHING",
+            params![sha256, ciphertext.len() as u64, ciphertext],
+        )?;
+        Ok(())
     }
 
     fn upsert_push_token(&self, record: &PushTokenRecord) -> Result<(), DurableStoreError> {
@@ -4340,6 +4467,65 @@ fn upsert_application_effect_in_transaction(
         ],
     )?;
     Ok(())
+}
+
+fn blob_content_type(headers: &HeaderMap) -> Result<&str, ServerHttpError> {
+    let Some(value) = headers.get(header::CONTENT_TYPE) else {
+        return Err(ServerHttpError::InvalidBlobRequest {
+            reason: "blob upload must include a content-type header".to_owned(),
+        });
+    };
+    let content_type = value
+        .to_str()
+        .map_err(|_| ServerHttpError::InvalidBlobRequest {
+            reason: "blob upload content-type header is not valid UTF-8".to_owned(),
+        })?;
+    Ok(content_type.split(';').next().unwrap_or_default().trim())
+}
+
+fn blob_url(headers: &HeaderMap, sha256: &str) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| *value == "http" || *value == "https")
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}/blobs/{sha256}")
+}
+
+fn validate_blob_sha256(sha256: &str) -> Result<(), ServerHttpError> {
+    if sha256.len() != 64 {
+        return Err(ServerHttpError::InvalidBlobRequest {
+            reason: format!(
+                "blob sha256 must be 64 lowercase hex chars, got {}",
+                sha256.len()
+            ),
+        });
+    }
+    if sha256
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(ServerHttpError::InvalidBlobRequest {
+        reason: "blob sha256 must use lowercase hex".to_owned(),
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Result of a read-only publish admission check inside a typed commit.
@@ -5764,6 +5950,8 @@ pub enum DurableStoreError {
     Json(#[from] serde_json::Error),
     #[error("persisted delivery operation failed replay: {0}")]
     Replay(#[from] HttpServerError),
+    #[error("persisted blob object is corrupt: {sha256}")]
+    BlobObjectCorrupt { sha256: String },
 }
 
 #[derive(Debug)]
@@ -5947,6 +6135,15 @@ pub enum ServerHttpError {
     Store(DurableStoreError),
     WelcomeNotFound {
         message_id: MessageId,
+    },
+    InvalidBlobRequest {
+        reason: String,
+    },
+    BlobNotFound {
+        sha256: String,
+    },
+    BlobConflict {
+        sha256: String,
     },
 }
 
@@ -6273,6 +6470,21 @@ impl IntoResponse for ServerHttpError {
                 StatusCode::NOT_FOUND,
                 "welcome_not_found".to_owned(),
                 format!("welcome {message_id} was not claimed"),
+            ),
+            Self::InvalidBlobRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_blob_request".to_owned(),
+                reason,
+            ),
+            Self::BlobNotFound { sha256 } => (
+                StatusCode::NOT_FOUND,
+                "blob_not_found".to_owned(),
+                format!("blob object {sha256} was not found"),
+            ),
+            Self::BlobConflict { sha256 } => (
+                StatusCode::CONFLICT,
+                "blob_conflict".to_owned(),
+                format!("blob object {sha256} already exists with different bytes"),
             ),
         };
         let body = ErrorResponse { kind, error };

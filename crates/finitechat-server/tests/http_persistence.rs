@@ -2,6 +2,7 @@ use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Method, Request, Response, StatusCode};
+use finitechat_blob::BlobDescriptor;
 use finitechat_delivery::{
     HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
     HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
@@ -58,6 +59,54 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+#[tokio::test]
+async fn sqlite_blob_upload_download_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let ciphertext = b"encrypted attachment ciphertext";
+
+    let descriptor = {
+        let app = persistent_app(&db_path);
+        let response = put_blob(app.clone(), ciphertext).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let descriptor: BlobDescriptor = read_json(response).await;
+        assert_eq!(descriptor.size_bytes, ciphertext.len() as u64);
+        assert_eq!(descriptor.sha256.len(), 64);
+
+        let response = get_blob(app, &descriptor.sha256).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(read_body(response).await.as_ref(), ciphertext);
+        descriptor
+    };
+
+    let app = persistent_app(&db_path);
+    let response = get_blob(app.clone(), &descriptor.sha256).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(response).await.as_ref(), ciphertext);
+
+    let response = put_blob(app, ciphertext).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: BlobDescriptor = read_json(response).await;
+    assert_eq!(replayed.sha256, descriptor.sha256);
+    assert_eq!(replayed.size_bytes, descriptor.size_bytes);
+}
+
+#[tokio::test]
+async fn blob_download_rejects_bad_or_missing_hash() {
+    let app = http_router(HttpServerState::default());
+
+    let response = get_blob(app.clone(), "ABC").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: ErrorResponse = read_json(response).await;
+    assert_eq!(body.kind, "invalid_blob_request");
+
+    let missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let response = get_blob(app, missing).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: ErrorResponse = read_json(response).await;
+    assert_eq!(body.kind, "blob_not_found");
+}
 
 #[tokio::test]
 async fn sqlite_publish_idempotency_replays_original_receipt_after_restart() {
@@ -5466,11 +5515,43 @@ async fn post_json<T: Serialize>(app: Router, uri: &str, body: &T) -> Response<B
     .expect("response")
 }
 
+async fn put_blob(app: Router, body: &[u8]) -> Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method(Method::PUT)
+            .uri("/upload")
+            .header("content-type", "application/octet-stream")
+            .header("host", "blob.test")
+            .body(Body::from(body.to_vec()))
+            .expect("request"),
+    )
+    .await
+    .expect("response")
+}
+
+async fn get_blob(app: Router, sha256: &str) -> Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/blobs/{sha256}"))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await
+    .expect("response")
+}
+
 async fn read_json<T: DeserializeOwned>(response: Response<Body>) -> T {
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body");
     serde_json::from_slice(&bytes).expect("json response")
+}
+
+async fn read_body(response: Response<Body>) -> Bytes {
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body")
 }
 
 async fn read_next_sync_hint<S>(stream: &mut S) -> SyncHintEvent

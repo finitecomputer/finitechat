@@ -10,6 +10,7 @@ use finitechat_proto::{
 };
 use openmls::prelude::{AeadType, OpenMlsCrypto, OpenMlsProvider, OpenMlsRand};
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -178,7 +179,7 @@ impl<'a> BlobPutRequest<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobDescriptor {
     pub url: String,
     pub sha256: String,

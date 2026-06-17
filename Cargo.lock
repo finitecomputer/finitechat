@@ -673,6 +673,7 @@ dependencies = [
  "finitechat-proto",
  "openmls",
  "openmls_rust_crypto",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -731,6 +732,7 @@ name = "finitechat-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "finitechat-blob",
  "finitechat-client",
  "finitechat-hermes",
  "finitechat-http",
@@ -825,6 +827,7 @@ name = "finitechat-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "finitechat-blob",
  "finitechat-delivery",
  "finitechat-http",
  "finitechat-proto",
@@ -833,6 +836,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

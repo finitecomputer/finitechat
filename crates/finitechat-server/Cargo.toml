@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+finitechat-blob = { path = "../finitechat-blob" }
 finitechat-transport.workspace = true
 finitechat-http = { path = "../finitechat-http" }
 finitechat-proto = { path = "../finitechat-proto" }
@@ -19,6 +20,7 @@ futures-util.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 finitechat-delivery.workspace = true

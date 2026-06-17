@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct RuntimeConfig: Codable {
     let serverURL: String
@@ -224,6 +225,38 @@ final class AppModel: ObservableObject {
         dispatch(.sendMessage(roomId: room.roomId, text: text))
     }
 
+    func sendAttachment(roomID: String, fileURL: URL) {
+        let caption = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
+        outboundText = ""
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let attachment = try await Task.detached(priority: .userInitiated) {
+                    try Self.loadAttachment(from: fileURL)
+                }.value
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                let action = AppAction.sendAttachment(
+                    roomId: roomID,
+                    filename: attachment.filename,
+                    mimeType: attachment.mimeType,
+                    kind: attachment.kind,
+                    bytes: attachment.data,
+                    caption: caption
+                )
+                let nextState = try await Task.detached(priority: .userInitiated) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard openKey == runtimeKey else { return }
+                state = nextState
+                errorText = nil
+                startUpdateLoop()
+            } catch {
+                errorText = String(describing: error)
+            }
+        }
+    }
+
     func react(to message: ChatMessage, emoji: String) {
         dispatch(.reactToMessage(
             roomId: message.roomId,
@@ -401,4 +434,44 @@ final class AppModel: ObservableObject {
         }
         return args[valueIndex]
     }
+
+    nonisolated private static func loadAttachment(from url: URL) throws -> PreparedAttachment {
+        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let data = try Data(contentsOf: url)
+        let filename = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
+        let type = UTType(filenameExtension: url.pathExtension)
+        return PreparedAttachment(
+            data: data,
+            filename: filename,
+            mimeType: type?.preferredMIMEType ?? "application/octet-stream",
+            kind: chatMediaKind(for: type)
+        )
+    }
+
+    nonisolated private static func chatMediaKind(for type: UTType?) -> ChatMediaKind {
+        guard let type else { return .file }
+        if type.conforms(to: .image) {
+            return .image
+        }
+        if type.conforms(to: .movie) {
+            return .video
+        }
+        if type.conforms(to: .audio) {
+            return .voiceNote
+        }
+        return .file
+    }
+}
+
+private struct PreparedAttachment: Sendable {
+    let data: Data
+    let filename: String
+    let mimeType: String
+    let kind: ChatMediaKind
 }

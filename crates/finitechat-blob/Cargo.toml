@@ -10,6 +10,7 @@ rust-version.workspace = true
 finitechat-proto = { path = "../finitechat-proto" }
 openmls.workspace = true
 openmls_rust_crypto.workspace = true
+serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
