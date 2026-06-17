@@ -604,6 +604,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func sendPoll(roomID: String, question: String, options: [String]) -> Bool {
+        let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedOptions = options
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmedQuestion.isEmpty, trimmedOptions.count >= 2 else { return false }
+        return dispatch(.sendPoll(
+            roomId: roomID,
+            question: trimmedQuestion,
+            options: trimmedOptions
+        ))
+    }
+
+    func votePoll(message: ChatMessage, option: ChatPollOption) {
+        dispatch(.votePoll(
+            roomId: message.roomId,
+            messageId: message.messageId,
+            optionId: option.optionId
+        ))
+    }
+
     func downloadAttachment(roomID: String, message: ChatMessage, attachment: ChatMediaAttachment) {
         if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
            !localPath.isEmpty

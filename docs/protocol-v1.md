@@ -450,6 +450,14 @@ Finite Chat reserves generic durable chat kinds:
 - `chat.reaction`: reaction to a message;
 - `chat.receipt`: read, delivered, or seen state.
 
+FiniteChat-native poll creation is a `chat.message` payload with
+`type = "finitechat.chat.poll.v1"` so the poll appears as a normal
+user-visible transcript item and creates the same unread/push semantics as
+other messages. Poll votes are durable namespaced application events using
+`name = "chat.poll.vote.v1"` and `ApplicationDeliveryPolicy::NON_NOTIFYING`.
+Clients project votes into the poll message from ordered durable replay; the
+server only sees an opaque non-notifying event.
+
 Conversation creation should be explicit when the sender can do so. A client may
 lazily materialize a conversation when it sees the first durable event for an
 unknown `conversation_id`, but explicit `conversation.create` is preferred for
@@ -485,6 +493,7 @@ kind. V1 defaults are:
   policy;
 - `chat.edit`, `chat.reaction`, `chat.receipt`, and conversation metadata:
   `push_policy = never`;
+- namespaced `chat.poll.vote.v1`: `push_policy = never`;
 - `conversation.segment.start`: `push_policy = never`;
 - `runtime.state.snapshot`: `push_policy = never`;
 - `runtime.command.request`: may wake the encrypted target runtime device, but

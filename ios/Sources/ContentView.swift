@@ -215,6 +215,7 @@ private struct RoomThreadView: View {
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
+    @State private var pollComposerDraft: PollComposerDraft?
     @StateObject private var voiceRecorder = VoiceRecorder()
     @State private var voiceSendInFlight = false
 
@@ -318,6 +319,11 @@ private struct RoomThreadView: View {
                 documentPreviewItem = nil
             }
         }
+        .sheet(item: $pollComposerDraft) { draft in
+            PollComposerView { question, options in
+                model.sendPoll(roomID: draft.roomID, question: question, options: options)
+            }
+        }
         .onDisappear {
             dismissFocusedMessage(animated: false)
             voiceRecorder.cancelRecording()
@@ -343,6 +349,9 @@ private struct RoomThreadView: View {
                 },
                 onOpenAttachment: { message, attachment in
                     handleAttachmentOpen(message: message, attachment: attachment)
+                },
+                onVotePoll: { message, option in
+                    model.votePoll(message: message, option: option)
                 },
                 onLongPressMessage: { message, frame in
                     presentFocusedMessage(message, frame: frame)
@@ -415,6 +424,8 @@ private struct RoomThreadView: View {
                 }
             ) {
                 importingAttachment = true
+            } onCreatePoll: {
+                pollComposerDraft = PollComposerDraft(roomID: roomID)
             }
         }
     }

@@ -16,6 +16,7 @@ struct ChatTimelineRowView: View {
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     var body: some View {
@@ -28,6 +29,7 @@ struct ChatTimelineRowView: View {
                 onReact: onReact,
                 onDownloadAttachment: onDownloadAttachment,
                 onOpenAttachment: onOpenAttachment,
+                onVotePoll: onVotePoll,
                 onLongPressMessage: onLongPressMessage
             )
                 .padding(.horizontal, 12)
@@ -49,6 +51,7 @@ struct FocusedChatMessageCard: View {
             onReact: { _, _ in },
             onDownloadAttachment: { _, _ in },
             onOpenAttachment: { _, _ in },
+            onVotePoll: { _, _ in },
             onLongPressMessage: nil
         )
         .allowsHitTesting(false)
@@ -62,6 +65,7 @@ private struct ChatMessageGroupRow: View {
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
 
     private let avatarSize: CGFloat = 28
@@ -100,6 +104,7 @@ private struct ChatMessageGroupRow: View {
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
+                    onVotePoll: onVotePoll,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .leading
                 )
@@ -122,6 +127,7 @@ private struct ChatMessageGroupRow: View {
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
+                    onVotePoll: onVotePoll,
                     onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
@@ -153,6 +159,7 @@ private struct ChatBubbleStack: View {
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let alignment: HorizontalAlignment
 
@@ -167,6 +174,7 @@ private struct ChatBubbleStack: View {
                     onReact: onReact,
                     onDownloadAttachment: onDownloadAttachment,
                     onOpenAttachment: onOpenAttachment,
+                    onVotePoll: onVotePoll,
                     onLongPressMessage: onLongPressMessage
                 )
             }
@@ -194,6 +202,7 @@ private struct ChatMessageBubble: View {
     let onReact: (ChatMessage, String) -> Void
     let onDownloadAttachment: (ChatMessage, ChatMediaAttachment) -> Void
     let onOpenAttachment: (ChatMessage, ChatMediaAttachment) -> Void
+    let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onLongPressMessage: ((ChatMessage, CGRect) -> Void)?
 
     @State private var isPressed = false
@@ -242,7 +251,18 @@ private struct ChatMessageBubble: View {
                         .padding(.top, message.replyToMessageId == nil ? 0 : 6)
                 }
 
-                if !bodyText.isEmpty {
+                if let poll = message.poll {
+                    PollContentView(
+                        poll: poll,
+                        isMine: message.isMine,
+                        onVote: { option in
+                            onVotePoll(message, option)
+                        }
+                    )
+                    .padding(.horizontal, 10)
+                    .padding(.top, message.media.isEmpty ? 8 : 7)
+                    .padding(.bottom, statusText == nil ? 8 : 3)
+                } else if !bodyText.isEmpty {
                     Text(bodyText)
                         .font(.body)
                         .foregroundStyle(foregroundColor)
@@ -399,6 +419,135 @@ private struct ReactionChips: View {
                 )
             }
         }
+    }
+}
+
+private struct PollContentView: View {
+    let poll: ChatPoll
+    let isMine: Bool
+    let onVote: (ChatPollOption) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(poll.question)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(isMine ? .white : .primary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 6) {
+                ForEach(poll.options, id: \.optionId) { option in
+                    PollOptionButton(
+                        option: option,
+                        totalVotes: poll.totalVotes,
+                        isMine: isMine,
+                        onVote: {
+                            onVote(option)
+                        }
+                    )
+                }
+            }
+
+            if poll.totalVotes > 0 {
+                Text(voteCountText)
+                    .font(.caption2)
+                    .foregroundStyle(isMine ? .white.opacity(0.74) : .secondary)
+            }
+        }
+    }
+
+    private var voteCountText: String {
+        poll.totalVotes == 1 ? "1 vote" : "\(poll.totalVotes) votes"
+    }
+}
+
+private struct PollOptionButton: View {
+    let option: ChatPollOption
+    let totalVotes: UInt32
+    let isMine: Bool
+    let onVote: () -> Void
+
+    var body: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            onVote()
+        } label: {
+            HStack(spacing: 8) {
+                if option.votedByMe {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                }
+
+                Text(option.text)
+                    .font(.subheadline)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+
+                Spacer(minLength: 8)
+
+                if totalVotes > 0 {
+                    Text("\(percent)%")
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+            .background {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(rowBackground)
+
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(progressColor)
+                            .frame(width: geometry.size.width * progressFraction)
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                if option.votedByMe {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(foregroundColor.opacity(0.34), lineWidth: 1)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(option.votedByMe)
+        .accessibilityLabel(option.text)
+        .accessibilityValue(accessibilityValue)
+    }
+
+    private var progressFraction: CGFloat {
+        guard totalVotes > 0 else { return 0 }
+        return CGFloat(option.voteCount) / CGFloat(totalVotes)
+    }
+
+    private var percent: Int {
+        guard totalVotes > 0 else { return 0 }
+        return Int((Double(option.voteCount) / Double(totalVotes) * 100).rounded())
+    }
+
+    private var rowBackground: Color {
+        isMine ? .white.opacity(0.14) : Color(uiColor: .tertiarySystemGroupedBackground)
+    }
+
+    private var progressColor: Color {
+        isMine ? .white.opacity(0.22) : Color.accentColor.opacity(0.18)
+    }
+
+    private var foregroundColor: Color {
+        isMine ? .white : .primary
+    }
+
+    private var accessibilityValue: String {
+        if totalVotes == 0 {
+            return option.votedByMe ? "Selected" : "No votes"
+        }
+        let votes = option.voteCount == 1 ? "1 vote" : "\(option.voteCount) votes"
+        return option.votedByMe ? "Selected, \(votes), \(percent) percent" : "\(votes), \(percent) percent"
     }
 }
 

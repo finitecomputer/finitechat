@@ -23,10 +23,11 @@ use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessag
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    AttachmentBlobMetadataV1, AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1,
-    ChatReceiptV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef, DurableAppEventKind,
-    InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, RoomProtocol,
-    invite_current_pin, npub_decode, npub_encode, validate_item_count,
+    ApplicationDeliveryPolicy, AttachmentBlobMetadataV1, AttachmentBlobReferenceV1, ChatReactionV1,
+    ChatReceiptStateV1, ChatReceiptV1, CreateRoomRequest, DecryptedApplicationEventV1, DeviceRef,
+    DurableAppEventKind, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
+    MAX_OBJECT_ID_BYTES, RoomProtocol, invite_current_pin, npub_decode, npub_encode,
+    validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,12 @@ const DEFAULT_APP_UPDATE_WAIT_MILLIS: u64 = 30_000;
 const MIN_APP_UPDATE_WAIT_MILLIS: u64 = 1_000;
 const MAX_APP_UPDATE_WAIT_MILLIS: u64 = 60_000;
 const MAX_ATTACHMENTS_PER_MESSAGE: u32 = 32;
+const FINITECHAT_POLL_PAYLOAD_TYPE_V1: &str = "finitechat.chat.poll.v1";
+const FINITECHAT_POLL_VOTE_EVENT_V1: &str = "chat.poll.vote.v1";
+const MIN_POLL_OPTIONS: usize = 2;
+const MAX_POLL_OPTIONS: u32 = 10;
+const MAX_POLL_QUESTION_BYTES: u32 = 512;
+const MAX_POLL_OPTION_BYTES: u32 = 160;
 
 const _: () = {
     assert!(MAX_APP_MESSAGES > 0);
@@ -57,6 +64,8 @@ const _: () = {
     assert!(DEFAULT_TRANSCRIPT_WINDOW > 0);
     assert!(DEFAULT_TRANSCRIPT_WINDOW <= MAX_APP_MESSAGES);
     assert!(MAX_TRANSCRIPT_PAGE_SIZE > 0);
+    assert!(MIN_POLL_OPTIONS > 0);
+    assert!(MIN_POLL_OPTIONS <= MAX_POLL_OPTIONS as usize);
 };
 
 uniffi::setup_scaffolding!();
@@ -137,6 +146,22 @@ pub struct ChatReadReceiptSummary {
     pub display_text: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatPollOption {
+    pub option_id: String,
+    pub text: String,
+    pub vote_count: u32,
+    pub voted_by_me: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct ChatPoll {
+    pub question: String,
+    pub options: Vec<ChatPollOption>,
+    pub total_votes: u32,
+    pub my_vote_option_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
 pub enum ChatMediaKind {
     Image,
@@ -207,6 +232,8 @@ pub struct ChatMessage {
     pub media: Vec<ChatMediaAttachment>,
     #[serde(default)]
     pub read_receipt: Option<ChatReadReceiptSummary>,
+    #[serde(default)]
+    pub poll: Option<ChatPoll>,
     #[serde(default)]
     pub display_timestamp: String,
 }
@@ -326,6 +353,16 @@ pub enum AppAction {
         caption: String,
         reply_to_message_id: Option<String>,
     },
+    SendPoll {
+        room_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    VotePoll {
+        room_id: String,
+        message_id: String,
+        option_id: String,
+    },
     DownloadAttachment {
         room_id: String,
         message_id: String,
@@ -420,6 +457,7 @@ struct CoreSyncProjection {
 struct ChatProjectionState {
     messages: BTreeMap<(String, String), ChatMessage>,
     reaction_senders: BTreeSet<(String, String, String, String)>,
+    poll_votes: BTreeMap<(String, String, String), String>,
     delivered_through: BTreeMap<(String, String), u64>,
     read_through: BTreeMap<(String, String), u64>,
 }
@@ -521,6 +559,16 @@ impl FiniteChatCore {
         })
     }
 
+    pub fn send_poll(
+        &self,
+        room_id: String,
+        question: String,
+        options: Vec<String>,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
+        let mut state = self.lock()?;
+        state.send_poll(&room_id, &question, options)
+    }
+
     pub fn sync(&self) -> Result<SyncResult, FiniteChatCoreError> {
         let mut state = self.lock()?;
         state.sync()
@@ -610,6 +658,7 @@ impl AppRuntimeState {
                 .into_iter()
                 .filter_map(|message| chat_message_from_outbox(message, &owner))
                 .collect(),
+            &owner,
         );
         let all_messages = chat_projection.messages();
         let stored_rooms = core.store.load_app_rooms(&owner).map_err(store_error)?;
@@ -726,6 +775,16 @@ impl AppRuntimeState {
                 caption,
                 reply_to_message_id,
             })?,
+            AppAction::SendPoll {
+                room_id,
+                question,
+                options,
+            } => self.send_poll(room_id, question, options)?,
+            AppAction::VotePoll {
+                room_id,
+                message_id,
+                option_id,
+            } => self.vote_poll(room_id, message_id, option_id)?,
             AppAction::DownloadAttachment {
                 room_id,
                 message_id,
@@ -1045,6 +1104,21 @@ impl AppRuntimeState {
         let chat_payload = encode_text_message_payload(trimmed, reply_to_message_id.as_deref())?;
         let app_event_plaintext =
             encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
+        self.send_chat_message_with_local_outbox(
+            room_id,
+            app_event_plaintext,
+            trimmed.to_owned(),
+            "sent",
+        )
+    }
+
+    fn send_chat_message_with_local_outbox(
+        &mut self,
+        room_id: String,
+        app_event_plaintext: Vec<u8>,
+        preview: String,
+        sent_status: &str,
+    ) -> Result<(), FiniteChatCoreError> {
         let owner = self.core.device.device_ref().clone();
         let local_message_id = self.core.generate_object_id("local-msg")?;
         let mut pending = project_chat_message(
@@ -1060,7 +1134,8 @@ impl AppRuntimeState {
         })?;
         pending.delivery = MessageDeliveryState::Pending;
         self.persist_outbox_message(&pending)?;
-        self.chat_projection.append_messages(vec![pending.clone()]);
+        self.chat_projection
+            .append_messages(vec![pending.clone()], &owner);
         self.sync_chat_projection();
 
         match self
@@ -1073,16 +1148,16 @@ impl AppRuntimeState {
                     .remove_message(&room_id, &local_message_id);
                 self.append_messages(result.messages);
                 if let Some(room) = self.room_mut(&room_id) {
-                    room.last_message_preview = trimmed.to_owned();
+                    room.last_message_preview = preview;
                 }
-                self.app.status = "sent".to_owned();
+                self.app.status = sent_status.to_owned();
             }
             Err(error) => {
                 pending.delivery = MessageDeliveryState::Failed {
                     reason: compact_error_reason(&error),
                 };
                 self.persist_outbox_message(&pending)?;
-                self.chat_projection.append_messages(vec![pending]);
+                self.chat_projection.append_messages(vec![pending], &owner);
                 self.sync_chat_projection();
                 self.app.status = "delivery failed".to_owned();
                 self.app.toast = Some("Message saved locally; delivery failed.".to_owned());
@@ -1116,6 +1191,70 @@ impl AppRuntimeState {
         let result = self.core.send_attachment(input)?;
         self.append_messages(result.messages);
         self.app.status = "sent".to_owned();
+        Ok(())
+    }
+
+    fn send_poll(
+        &mut self,
+        room_id: String,
+        question: String,
+        options: Vec<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to send"),
+            });
+        }
+        let chat_payload = encode_poll_message_payload(&question, options)?;
+        let preview = chat_projection_payload(&chat_payload).text;
+        let app_event_plaintext =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
+        self.send_chat_message_with_local_outbox(room_id, app_event_plaintext, preview, "sent")
+    }
+
+    fn vote_poll(
+        &mut self,
+        room_id: String,
+        message_id: String,
+        option_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let option_id = option_id.trim().to_owned();
+        if option_id.is_empty() {
+            return Ok(());
+        }
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to vote"),
+            });
+        }
+        let Some(message) = self.chat_projection.message(&room_id, &message_id) else {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("message '{message_id}' is not available in room '{room_id}'"),
+            });
+        };
+        let Some(poll) = &message.poll else {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("message '{message_id}' is not a poll"),
+            });
+        };
+        if poll.my_vote_option_id.as_deref() == Some(option_id.as_str()) {
+            return Ok(());
+        }
+        if !poll
+            .options
+            .iter()
+            .any(|option| option.option_id == option_id)
+        {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("poll option '{option_id}' is not available"),
+            });
+        }
+
+        let event = self
+            .core
+            .send_poll_vote(&room_id, &message_id, &option_id)?;
+        self.apply_projection_events(vec![event]);
+        self.app.status = "voted".to_owned();
         Ok(())
     }
 
@@ -1481,6 +1620,7 @@ impl AppRuntimeState {
         if messages.is_empty() {
             return;
         }
+        let owner = self.core.device.device_ref().clone();
         let selected_room_id = self.app.selected_room_id.clone();
         let selected_message_count = selected_room_id.as_ref().map_or(0, |room_id| {
             messages
@@ -1488,7 +1628,7 @@ impl AppRuntimeState {
                 .filter(|message| message.room_id == *room_id)
                 .count()
         });
-        self.chat_projection.append_messages(messages);
+        self.chat_projection.append_messages(messages, &owner);
         if let Some(room_id) = selected_room_id
             && selected_message_count > 0
         {
@@ -2071,6 +2211,16 @@ impl CoreState {
         self.send_chat_payload(room_id, chat_payload)
     }
 
+    fn send_poll(
+        &mut self,
+        room_id: &str,
+        question: &str,
+        options: Vec<String>,
+    ) -> Result<SyncResult, FiniteChatCoreError> {
+        let chat_payload = encode_poll_message_payload(question, options)?;
+        self.send_chat_payload(room_id, chat_payload)
+    }
+
     fn send_attachment(
         &mut self,
         input: SendAttachmentInput,
@@ -2435,6 +2585,59 @@ impl CoreState {
         Ok(event)
     }
 
+    fn send_poll_vote(
+        &mut self,
+        room_id: &str,
+        poll_message_id: &str,
+        option_id: &str,
+    ) -> Result<StoredAppEvent, FiniteChatCoreError> {
+        let vote = ChatPollVoteV1 {
+            poll_message_id: poll_message_id.to_owned(),
+            option_id: option_id.trim().to_owned(),
+        };
+        validate_poll_vote(&vote)?;
+        let vote_payload = serde_json::to_vec(&vote).map_err(client_error)?;
+        let kind = poll_vote_event_kind();
+        let app_event_plaintext = encode_application_event(kind.clone(), None, &vote_payload)?;
+        let idempotency_key = self
+            .device
+            .generate_object_id("poll-vote")
+            .map_err(client_error)?;
+        let request = self
+            .device
+            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .map_err(|error| send_error(room_id, error))?;
+        let sender = request.sender.clone();
+        self.store
+            .save_device_state(&self.device)
+            .map_err(store_error)?;
+
+        let room_server_url = self
+            .device
+            .room_server_url(room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.server_url.clone());
+        let mut delivery = delivery_for(&room_server_url);
+        let accepted = delivery
+            .append_event(&request, kind.delivery_policy())
+            .map_err(delivery_error)?;
+        let event = StoredAppEvent {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+            message_id: accepted.message_id,
+            sender,
+            plaintext: app_event_plaintext,
+        };
+        self.store
+            .save_app_events(
+                self.device.device_ref(),
+                std::slice::from_ref(&event),
+                MAX_APP_MESSAGES_U32,
+            )
+            .map_err(store_error)?;
+        Ok(event)
+    }
+
     fn sync(&mut self) -> Result<SyncResult, FiniteChatCoreError> {
         Ok(self.sync_with_projection()?.result)
     }
@@ -2563,6 +2766,7 @@ enum DecodedAppEvent {
     },
     ChatReaction(ChatReactionV1),
     ChatReceipt(ChatReceiptV1),
+    PollVote(ChatPollVoteV1),
     Ignored,
 }
 
@@ -2573,6 +2777,27 @@ struct ChatProjectionPayload {
     reply_to_message_id: Option<String>,
     sender_name: Option<String>,
     media: Vec<ChatMediaAttachment>,
+    poll: Option<ChatPoll>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ChatPollPayloadV1 {
+    #[serde(rename = "type")]
+    payload_type: String,
+    question: String,
+    options: Vec<ChatPollPayloadOptionV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ChatPollPayloadOptionV1 {
+    option_id: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ChatPollVoteV1 {
+    poll_message_id: String,
+    option_id: String,
 }
 
 fn project_chat_message(
@@ -2608,6 +2833,7 @@ fn project_chat_message(
         reactions: Vec::new(),
         media: projection.media,
         read_receipt: None,
+        poll: projection.poll,
         display_timestamp: String::new(),
     })
 }
@@ -2628,11 +2854,24 @@ fn chat_projection_payload_from_application_plaintext(
         }
         DecodedAppEvent::ChatReaction(_)
         | DecodedAppEvent::ChatReceipt(_)
+        | DecodedAppEvent::PollVote(_)
         | DecodedAppEvent::Ignored => None,
     }
 }
 
 fn chat_projection_payload(payload_bytes: &[u8]) -> ChatProjectionPayload {
+    if let Some(payload) = poll_message_payload(payload_bytes) {
+        let question = payload.question.clone();
+        return ChatProjectionPayload {
+            display_content: question.clone(),
+            text: question,
+            conversation_id: None,
+            reply_to_message_id: None,
+            sender_name: None,
+            media: Vec::new(),
+            poll: Some(chat_poll_from_payload(payload)),
+        };
+    }
     if let Ok(Some(payload)) = HermesMessagePayloadV1::decode(payload_bytes) {
         return ChatProjectionPayload {
             display_content: payload.text.clone(),
@@ -2646,6 +2885,7 @@ fn chat_projection_payload(payload_bytes: &[u8]) -> ChatProjectionPayload {
                 .enumerate()
                 .map(|(index, attachment)| chat_media_attachment(index, attachment))
                 .collect(),
+            poll: None,
         };
     }
     let text = String::from_utf8_lossy(payload_bytes).into_owned();
@@ -2656,6 +2896,7 @@ fn chat_projection_payload(payload_bytes: &[u8]) -> ChatProjectionPayload {
         reply_to_message_id: None,
         sender_name: None,
         media: Vec::new(),
+        poll: None,
     }
 }
 
@@ -2690,6 +2931,16 @@ fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> Decode
             .filter(|receipt| receipt.validate_limits().is_ok())
             .map(DecodedAppEvent::ChatReceipt)
             .unwrap_or(DecodedAppEvent::Ignored),
+        DurableAppEventKind::Namespaced { name, policy }
+            if name == FINITECHAT_POLL_VOTE_EVENT_V1
+                && policy == ApplicationDeliveryPolicy::NON_NOTIFYING =>
+        {
+            serde_json::from_slice::<ChatPollVoteV1>(&event.payload)
+                .ok()
+                .filter(|vote| validate_poll_vote(vote).is_ok())
+                .map(DecodedAppEvent::PollVote)
+                .unwrap_or(DecodedAppEvent::Ignored)
+        }
         DurableAppEventKind::ConversationCreate
         | DurableAppEventKind::ConversationUpdate
         | DurableAppEventKind::ConversationArchive
@@ -2750,6 +3001,158 @@ fn encode_attachment_message_payload(
     }
     .encode()
     .map_err(client_error)
+}
+
+fn encode_poll_message_payload(
+    question: &str,
+    options: Vec<String>,
+) -> Result<Vec<u8>, FiniteChatCoreError> {
+    let payload = ChatPollPayloadV1 {
+        payload_type: FINITECHAT_POLL_PAYLOAD_TYPE_V1.to_owned(),
+        question: normalize_bounded_non_empty_string(
+            "chat_poll.question",
+            question,
+            MAX_POLL_QUESTION_BYTES,
+        )?,
+        options: normalized_poll_options(options)?,
+    };
+    validate_poll_payload(&payload)?;
+    serde_json::to_vec(&payload).map_err(client_error)
+}
+
+fn poll_message_payload(payload_bytes: &[u8]) -> Option<ChatPollPayloadV1> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload_bytes) else {
+        return None;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str)
+        != Some(FINITECHAT_POLL_PAYLOAD_TYPE_V1)
+    {
+        return None;
+    }
+    let payload = serde_json::from_value::<ChatPollPayloadV1>(value).ok()?;
+    validate_poll_payload(&payload).ok()?;
+    Some(payload)
+}
+
+fn normalized_poll_options(
+    options: Vec<String>,
+) -> Result<Vec<ChatPollPayloadOptionV1>, FiniteChatCoreError> {
+    if options.len() < MIN_POLL_OPTIONS {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!("poll must include at least {MIN_POLL_OPTIONS} options"),
+        });
+    }
+    validate_item_count("chat_poll.options", options.len(), MAX_POLL_OPTIONS)
+        .map_err(client_error)?;
+    let mut normalized = Vec::with_capacity(options.len());
+    for (index, option) in options.into_iter().enumerate() {
+        normalized.push(ChatPollPayloadOptionV1 {
+            option_id: poll_option_id(index),
+            text: normalize_bounded_non_empty_string(
+                "chat_poll.option",
+                &option,
+                MAX_POLL_OPTION_BYTES,
+            )?,
+        });
+    }
+    Ok(normalized)
+}
+
+fn validate_poll_payload(payload: &ChatPollPayloadV1) -> Result<(), FiniteChatCoreError> {
+    if payload.payload_type != FINITECHAT_POLL_PAYLOAD_TYPE_V1 {
+        return Err(FiniteChatCoreError::Client {
+            reason: "poll payload type is not supported".to_owned(),
+        });
+    }
+    normalize_bounded_non_empty_string(
+        "chat_poll.question",
+        &payload.question,
+        MAX_POLL_QUESTION_BYTES,
+    )?;
+    if payload.options.len() < MIN_POLL_OPTIONS {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!("poll must include at least {MIN_POLL_OPTIONS} options"),
+        });
+    }
+    validate_item_count("chat_poll.options", payload.options.len(), MAX_POLL_OPTIONS)
+        .map_err(client_error)?;
+    let mut option_ids = BTreeSet::new();
+    for option in &payload.options {
+        normalize_bounded_non_empty_string(
+            "chat_poll.option",
+            &option.text,
+            MAX_POLL_OPTION_BYTES,
+        )?;
+        normalize_bounded_non_empty_string(
+            "chat_poll.option_id",
+            &option.option_id,
+            MAX_OBJECT_ID_BYTES,
+        )?;
+        if !option_ids.insert(option.option_id.clone()) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("duplicate poll option id '{}'", option.option_id),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_poll_vote(vote: &ChatPollVoteV1) -> Result<(), FiniteChatCoreError> {
+    normalize_bounded_non_empty_string(
+        "chat_poll_vote.poll_message_id",
+        &vote.poll_message_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    normalize_bounded_non_empty_string(
+        "chat_poll_vote.option_id",
+        &vote.option_id,
+        MAX_OBJECT_ID_BYTES,
+    )?;
+    Ok(())
+}
+
+fn chat_poll_from_payload(payload: ChatPollPayloadV1) -> ChatPoll {
+    ChatPoll {
+        question: payload.question,
+        options: payload
+            .options
+            .into_iter()
+            .map(|option| ChatPollOption {
+                option_id: option.option_id,
+                text: option.text,
+                vote_count: 0,
+                voted_by_me: false,
+            })
+            .collect(),
+        total_votes: 0,
+        my_vote_option_id: None,
+    }
+}
+
+fn poll_vote_event_kind() -> DurableAppEventKind {
+    DurableAppEventKind::Namespaced {
+        name: FINITECHAT_POLL_VOTE_EVENT_V1.to_owned(),
+        policy: ApplicationDeliveryPolicy::NON_NOTIFYING,
+    }
+}
+
+fn poll_option_id(index: usize) -> String {
+    format!("option-{}", index + 1)
+}
+
+fn normalize_bounded_non_empty_string(
+    field: &str,
+    value: &str,
+    max_bytes: u32,
+) -> Result<String, FiniteChatCoreError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!("{field} must not be empty"),
+        });
+    }
+    validate_string_bytes(field, trimmed, max_bytes).map_err(client_error)?;
+    Ok(trimmed.to_owned())
 }
 
 fn hermes_attachment_kind(kind: &ChatMediaKind) -> HermesAttachmentKindV1 {
@@ -2961,7 +3364,7 @@ impl ChatProjectionState {
         let mut projection = Self::default();
         for message in stored_messages {
             if let Some(projected) = chat_message_from_stored(message, owner) {
-                projection.insert_message(projected);
+                projection.insert_message(projected, owner);
             }
         }
         for event in stored_events {
@@ -2971,9 +3374,9 @@ impl ChatProjectionState {
         projection
     }
 
-    fn append_messages(&mut self, messages: Vec<ChatMessage>) {
+    fn append_messages(&mut self, messages: Vec<ChatMessage>, owner: &DeviceRef) {
         for message in messages {
-            self.insert_message(message);
+            self.insert_message(message, owner);
         }
         self.trim_to_limit();
     }
@@ -2989,7 +3392,7 @@ impl ChatProjectionState {
                     event.plaintext,
                     owner,
                 ) {
-                    self.insert_message(message);
+                    self.insert_message(message, owner);
                 }
             }
             DecodedAppEvent::ChatReaction(reaction) => {
@@ -2997,6 +3400,9 @@ impl ChatProjectionState {
             }
             DecodedAppEvent::ChatReceipt(receipt) => {
                 self.apply_receipt(&event.room_id, &event.sender, receipt);
+            }
+            DecodedAppEvent::PollVote(vote) => {
+                self.apply_poll_vote(&event.room_id, &event.sender, owner, vote);
             }
             DecodedAppEvent::Ignored => {}
         }
@@ -3035,9 +3441,24 @@ impl ChatProjectionState {
             .contains_key(&(room_id.to_owned(), message_id.to_owned()))
     }
 
-    fn insert_message(&mut self, mut message: ChatMessage) {
+    fn message(&self, room_id: &str, message_id: &str) -> Option<&ChatMessage> {
+        self.messages
+            .get(&(room_id.to_owned(), message_id.to_owned()))
+    }
+
+    fn insert_message(&mut self, mut message: ChatMessage, owner: &DeviceRef) {
+        message.reactions = reaction_summaries_for_message(&message, &self.reaction_senders, owner);
         message.read_receipt =
             receipt_summary_for_message(&message, &self.delivered_through, &self.read_through);
+        if let Some(poll) = &message.poll {
+            message.poll = Some(poll_with_vote_summary(
+                poll,
+                &message.room_id,
+                &message.message_id,
+                &self.poll_votes,
+                owner,
+            ));
+        }
         self.messages.insert(message_key(&message), message);
     }
 
@@ -3047,6 +3468,10 @@ impl ChatProjectionState {
         self.reaction_senders
             .retain(|(reaction_room_id, target_message_id, _, _)| {
                 reaction_room_id != room_id || target_message_id != message_id
+            });
+        self.poll_votes
+            .retain(|(vote_room_id, poll_message_id, _), _| {
+                vote_room_id != room_id || poll_message_id != message_id
             });
     }
 
@@ -3104,23 +3529,7 @@ impl ChatProjectionState {
             return;
         }
 
-        let Some(message) = self.messages.get_mut(&key) else {
-            return;
-        };
-        let Some(summary) = message
-            .reactions
-            .iter_mut()
-            .find(|summary| summary.emoji == emoji)
-        else {
-            message.reactions.push(ChatReactionSummary {
-                emoji,
-                count: 1,
-                reacted_by_me: sender == owner,
-            });
-            return;
-        };
-        summary.count = summary.count.saturating_add(1);
-        summary.reacted_by_me |= sender == owner;
+        self.refresh_reactions_for_message(&key, owner);
     }
 
     fn apply_receipt(&mut self, room_id: &str, sender: &DeviceRef, receipt: ChatReceiptV1) {
@@ -3142,6 +3551,63 @@ impl ChatProjectionState {
             }
         }
         self.refresh_receipts_for_room(room_id);
+    }
+
+    fn apply_poll_vote(
+        &mut self,
+        room_id: &str,
+        sender: &DeviceRef,
+        owner: &DeviceRef,
+        vote: ChatPollVoteV1,
+    ) {
+        let message_key = (room_id.to_owned(), vote.poll_message_id.clone());
+        let option_is_valid = self
+            .messages
+            .get(&message_key)
+            .and_then(|message| message.poll.as_ref())
+            .is_some_and(|poll| {
+                poll.options
+                    .iter()
+                    .any(|option| option.option_id == vote.option_id)
+            });
+        if !option_is_valid {
+            return;
+        }
+
+        self.poll_votes.insert(
+            (
+                room_id.to_owned(),
+                vote.poll_message_id.clone(),
+                device_label(sender),
+            ),
+            vote.option_id,
+        );
+        self.refresh_poll_for_message(&message_key, owner);
+    }
+
+    fn refresh_reactions_for_message(&mut self, key: &(String, String), owner: &DeviceRef) {
+        let summaries = self
+            .messages
+            .get(key)
+            .map(|message| reaction_summaries_for_message(message, &self.reaction_senders, owner));
+        if let Some(summaries) = summaries
+            && let Some(message) = self.messages.get_mut(key)
+        {
+            message.reactions = summaries;
+        }
+    }
+
+    fn refresh_poll_for_message(&mut self, key: &(String, String), owner: &DeviceRef) {
+        let poll = self
+            .messages
+            .get(key)
+            .and_then(|message| message.poll.as_ref())
+            .map(|poll| poll_with_vote_summary(poll, &key.0, &key.1, &self.poll_votes, owner));
+        if let Some(poll) = poll
+            && let Some(message) = self.messages.get_mut(key)
+        {
+            message.poll = Some(poll);
+        }
     }
 
     fn refresh_receipts_for_room(&mut self, room_id: &str) {
@@ -3185,6 +3651,9 @@ impl ChatProjectionState {
         self.reaction_senders.retain(|(room_id, message_id, _, _)| {
             message_keys.contains(&(room_id.clone(), message_id.clone()))
         });
+        self.poll_votes.retain(|(room_id, message_id, _), _| {
+            message_keys.contains(&(room_id.clone(), message_id.clone()))
+        });
         let message_rooms = message_keys
             .into_iter()
             .map(|(room_id, _)| room_id)
@@ -3204,6 +3673,84 @@ fn upsert_receipt_marker(
     let entry = markers.entry(key).or_default();
     if target_seq > *entry {
         *entry = target_seq;
+    }
+}
+
+fn reaction_summaries_for_message(
+    message: &ChatMessage,
+    reaction_senders: &BTreeSet<(String, String, String, String)>,
+    owner: &DeviceRef,
+) -> Vec<ChatReactionSummary> {
+    let owner_key = device_label(owner);
+    let mut reactions = BTreeMap::<String, (u32, bool)>::new();
+    for (room_id, message_id, emoji, sender_key) in reaction_senders {
+        if room_id != &message.room_id || message_id != &message.message_id {
+            continue;
+        }
+        let entry = reactions.entry(emoji.clone()).or_default();
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 |= sender_key == &owner_key;
+    }
+    reactions
+        .into_iter()
+        .map(|(emoji, (count, reacted_by_me))| ChatReactionSummary {
+            emoji,
+            count,
+            reacted_by_me,
+        })
+        .collect()
+}
+
+fn poll_with_vote_summary(
+    poll: &ChatPoll,
+    room_id: &str,
+    message_id: &str,
+    poll_votes: &BTreeMap<(String, String, String), String>,
+    owner: &DeviceRef,
+) -> ChatPoll {
+    let option_ids = poll
+        .options
+        .iter()
+        .map(|option| option.option_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut counts = BTreeMap::<String, u32>::new();
+    let owner_key = device_label(owner);
+    let mut my_vote_option_id = None;
+    for ((vote_room_id, poll_message_id, voter_key), option_id) in poll_votes {
+        if vote_room_id != room_id || poll_message_id != message_id {
+            continue;
+        }
+        if !option_ids.contains(option_id) {
+            continue;
+        }
+        counts
+            .entry(option_id.clone())
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        if voter_key == &owner_key {
+            my_vote_option_id = Some(option_id.clone());
+        }
+    }
+    let mut total_votes = 0u32;
+    let options = poll
+        .options
+        .iter()
+        .map(|option| {
+            let vote_count = counts.remove(&option.option_id).unwrap_or_default();
+            total_votes = total_votes.saturating_add(vote_count);
+            ChatPollOption {
+                option_id: option.option_id.clone(),
+                text: option.text.clone(),
+                vote_count,
+                voted_by_me: my_vote_option_id.as_deref() == Some(option.option_id.as_str()),
+            }
+        })
+        .collect();
+    ChatPoll {
+        question: poll.question.clone(),
+        options,
+        total_votes,
+        my_vote_option_id,
     }
 }
 
@@ -3836,6 +4383,119 @@ mod tests {
                 read_count: 1,
                 display_text: "Read by 1".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn chat_projection_rebuilds_poll_votes_and_survives_duplicate_message_append() {
+        let owner = DeviceRef {
+            account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            device_id: "phone".to_owned(),
+        };
+        let peer = DeviceRef {
+            account_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+            device_id: "tablet".to_owned(),
+        };
+        let poll_payload = encode_poll_message_payload(
+            "Where should we meet?",
+            vec!["Office".to_owned(), "Cafe".to_owned()],
+        )
+        .unwrap();
+        let poll_event =
+            encode_application_event(DurableAppEventKind::ChatMessage, None, &poll_payload)
+                .unwrap();
+        let vote = ChatPollVoteV1 {
+            poll_message_id: "poll-1".to_owned(),
+            option_id: "option-2".to_owned(),
+        };
+        let vote_payload = serde_json::to_vec(&vote).unwrap();
+        let vote_event = encode_application_event(poll_vote_event_kind(), None, &vote_payload)
+            .expect("poll vote event encodes");
+        let mut projection = ChatProjectionState::from_stored(
+            Vec::new(),
+            vec![
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 1,
+                    message_id: "poll-1".to_owned(),
+                    sender: peer.clone(),
+                    plaintext: poll_event.clone(),
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 2,
+                    message_id: "vote-1".to_owned(),
+                    sender: owner.clone(),
+                    plaintext: vote_event,
+                },
+            ],
+            &owner,
+        );
+        let messages = projection.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "Where should we meet?");
+        assert_poll_message(
+            &messages[0],
+            "Where should we meet?",
+            "option-2",
+            1,
+            1,
+            true,
+        );
+
+        let duplicate = project_chat_message(
+            "room-main".to_owned(),
+            1,
+            "poll-1".to_owned(),
+            peer,
+            poll_event,
+            &owner,
+        )
+        .expect("poll projects as a transcript row");
+        projection.append_messages(vec![duplicate], &owner);
+        let messages = projection.messages();
+        assert_poll_message(
+            &messages[0],
+            "Where should we meet?",
+            "option-2",
+            1,
+            1,
+            true,
+        );
+    }
+
+    #[test]
+    fn poll_payload_validation_rejects_unusable_shapes() {
+        assert!(
+            encode_poll_message_payload("Question?", vec!["Only one".to_owned()]).is_err(),
+            "single-option polls are not actionable"
+        );
+        assert!(
+            encode_poll_message_payload(
+                "Question?",
+                vec![
+                    "1".to_owned(),
+                    "2".to_owned(),
+                    "3".to_owned(),
+                    "4".to_owned(),
+                    "5".to_owned(),
+                    "6".to_owned(),
+                    "7".to_owned(),
+                    "8".to_owned(),
+                    "9".to_owned(),
+                    "10".to_owned(),
+                    "11".to_owned(),
+                ],
+            )
+            .is_err(),
+            "poll options are explicitly bounded"
+        );
+        assert!(
+            encode_poll_message_payload("Question?", vec!["Yes".to_owned(), " ".to_owned()])
+                .is_err(),
+            "blank options are rejected before send"
         );
     }
 
@@ -5382,6 +6042,138 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_polls_are_durable_and_votes_are_non_notifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let bob_dir = dir.path().join("bob");
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Poll Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        bob.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url,
+        })
+        .unwrap();
+        bob.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        bob.dispatch(AppAction::RetryRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let bob_state = bob
+            .dispatch(AppAction::SendPoll {
+                room_id: room_id.clone(),
+                question: "Lunch?".to_owned(),
+                options: vec!["Tacos".to_owned(), "Sushi".to_owned()],
+            })
+            .unwrap();
+        let poll_message_id = bob_state
+            .messages
+            .iter()
+            .find(|message| message.poll.is_some())
+            .expect("poll message projects")
+            .message_id
+            .clone();
+        assert_eq!(
+            app_room(&bob_state, &room_id).last_message_preview,
+            "Lunch?"
+        );
+
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_poll(
+            &alice_state,
+            &poll_message_id,
+            "Lunch?",
+            "option-2",
+            0,
+            0,
+            false,
+        );
+        let alice_state = alice
+            .dispatch(AppAction::VotePoll {
+                room_id: room_id.clone(),
+                message_id: poll_message_id.clone(),
+                option_id: "option-2".to_owned(),
+            })
+            .unwrap();
+        assert_poll(
+            &alice_state,
+            &poll_message_id,
+            "Lunch?",
+            "option-2",
+            1,
+            1,
+            true,
+        );
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert_poll(
+            &bob_state,
+            &poll_message_id,
+            "Lunch?",
+            "option-2",
+            1,
+            1,
+            false,
+        );
+        assert_eq!(
+            app_room(&bob_state, &room_id).unread_count,
+            0,
+            "poll votes are durable but must not create unread chat"
+        );
+        drop(bob);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: bob_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        assert_poll(
+            &reopened.state().unwrap(),
+            &poll_message_id,
+            "Lunch?",
+            "option-2",
+            1,
+            1,
+            false,
+        );
+    }
+
+    #[test]
     fn app_runtime_reactions_are_durable_and_live_projected() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -5864,6 +6656,57 @@ mod tests {
             .unwrap_or_else(|| panic!("missing reaction {emoji} on {message_id}"));
         assert_eq!(reaction.count, count);
         assert_eq!(reaction.reacted_by_me, reacted_by_me);
+    }
+
+    fn assert_poll(
+        state: &AppState,
+        message_id: &str,
+        question: &str,
+        option_id: &str,
+        option_votes: u32,
+        total_votes: u32,
+        voted_by_me: bool,
+    ) {
+        let message = state
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .unwrap_or_else(|| panic!("missing poll message {message_id}"));
+        assert_poll_message(
+            message,
+            question,
+            option_id,
+            option_votes,
+            total_votes,
+            voted_by_me,
+        );
+    }
+
+    fn assert_poll_message(
+        message: &ChatMessage,
+        question: &str,
+        option_id: &str,
+        option_votes: u32,
+        total_votes: u32,
+        voted_by_me: bool,
+    ) {
+        let poll = message
+            .poll
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing poll on {}", message.message_id));
+        assert_eq!(poll.question, question);
+        assert_eq!(poll.total_votes, total_votes);
+        assert_eq!(
+            poll.my_vote_option_id.as_deref() == Some(option_id),
+            voted_by_me
+        );
+        let option = poll
+            .options
+            .iter()
+            .find(|option| option.option_id == option_id)
+            .unwrap_or_else(|| panic!("missing poll option {option_id}"));
+        assert_eq!(option.vote_count, option_votes);
+        assert_eq!(option.voted_by_me, voted_by_me);
     }
 
     fn assert_read_receipt(

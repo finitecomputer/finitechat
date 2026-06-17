@@ -15,6 +15,7 @@ struct Composer: View {
     let onSend: () -> Void
     let onStartVoiceRecording: () -> Void
     let onAttach: () -> Void
+    let onCreatePoll: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -54,6 +55,12 @@ struct Composer: View {
                         onAttach()
                     } label: {
                         Label("Files", systemImage: "doc")
+                    }
+
+                    Button {
+                        onCreatePoll()
+                    } label: {
+                        Label("Poll", systemImage: "chart.bar.doc.horizontal")
                     }
                 } label: {
                     Image(systemName: "plus")
