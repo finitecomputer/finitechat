@@ -68,10 +68,14 @@ struct RuntimeConfig: Codable, Equatable {
             serverURL: persisted.serverURL ?? defaultServerURL,
             deviceID: fallbackDeviceID
         )
-        let hasLaunchOverride = serverURL != nil || deviceID != nil
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
         let persistLaunchOverride = argumentFlag(persistLaunchConfigArgument, in: args)
             || truthyEnvironmentValue(persistLaunchConfigEnvironmentKey, in: environment)
+        let hasLaunchOverride = serverURL != nil || deviceID != nil
+        let hasPersistentLaunchState = persisted.serverURL != nil
+            || persisted.deviceID != nil
+            || persistedDeviceIsRecoverable
+            || recoveredDeviceID != nil
         let hasLaunchAutomation = launchAutomationArguments.contains {
             argumentValue($0, in: args) != nil
         }
@@ -79,19 +83,26 @@ struct RuntimeConfig: Codable, Equatable {
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
             || (hasLaunchAutomation && !persistLaunchOverride)
+            || (hasLaunchOverride && hasPersistentLaunchState && !persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
             usesTransientStore: transientOverride
         )
-        // Runtime identity is product state. Ordinary server/device launch
-        // values persist so a Home Screen relaunch opens the same client store.
-        // Automation stays transient unless it explicitly opts into persistence.
-        if !transientOverride
+        let shouldPersistFirstLaunchOverride = hasLaunchOverride
+            && !hasPersistentLaunchState
+        let shouldPersistFallbackRepair = !hasLaunchOverride
             && (
                 persisted.serverURL != config.serverURL
                     || persisted.deviceID != config.deviceID
-                    || hasLaunchOverride
+            )
+        // Runtime identity is product state. First-run launch values can seed a
+        // stable client store, but existing saved identities win over one-off
+        // launch overrides. Those stay transient unless explicitly persisted.
+        if !transientOverride
+            && (
+                shouldPersistFallbackRepair
+                    || shouldPersistFirstLaunchOverride
                     || persistLaunchOverride
             )
         {
