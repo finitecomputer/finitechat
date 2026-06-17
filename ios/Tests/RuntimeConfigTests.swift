@@ -901,6 +901,42 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.developerRuntimeStatus, "offline")
     }
 
+    func testUnavailableSavedRoomKeepsCachedMessagesButCannotSend() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let unavailableState = savedChatState(
+            roomState: .needsAttention,
+            roomStatus: "room is not available on this device"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: unavailableState,
+            startRuntimeState: unavailableState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        model.outboundText = "this should not send yet"
+
+        XCTAssertEqual(model.rooms.map(\.roomId), ["room-main"])
+        XCTAssertEqual(model.selectedRoom?.state, .needsAttention)
+        XCTAssertEqual(model.selectedRoom?.status, "room is not available on this device")
+        XCTAssertEqual(model.selectedRoomMessages.map(\.text), ["saved before force close"])
+        XCTAssertEqual(model.chatProjections["room-main"]?.messages.map(\.text), [
+            "saved before force close",
+        ])
+        XCTAssertFalse(model.canSend)
+        XCTAssertNil(model.errorText)
+    }
+
     func testExplicitTransientDiagnosticLaunchKeepsStableRelaunchOnSavedIdentity() throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")
@@ -1067,7 +1103,9 @@ final class AppModelPersistenceTests: XCTestCase {
 
     private func savedChatState(
         status: String = "ready",
-        toast: String? = nil
+        toast: String? = nil,
+        roomState: AppRoomState = .connected,
+        roomStatus: String = "connected"
     ) -> AppState {
         let identity = Identity(
             accountId: "alice-account",
@@ -1077,8 +1115,8 @@ final class AppModelPersistenceTests: XCTestCase {
         let room = AppRoomSummary(
             roomId: "room-main",
             displayName: "Main Room",
-            state: .connected,
-            status: "connected",
+            state: roomState,
+            status: roomStatus,
             lastMessagePreview: "saved before force close",
             unreadCount: 0,
             canLoadOlder: false
@@ -1116,6 +1154,7 @@ final class AppModelPersistenceTests: XCTestCase {
             toast: toast,
             messages: [message],
             mediaGallery: nil,
+            roomDetails: nil,
             profiles: [],
             devices: [],
             typingMembers: []
@@ -1142,6 +1181,7 @@ final class AppModelPersistenceTests: XCTestCase {
             toast: toast,
             messages: [],
             mediaGallery: nil,
+            roomDetails: nil,
             profiles: [],
             devices: [],
             typingMembers: []

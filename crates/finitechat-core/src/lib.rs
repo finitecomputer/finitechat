@@ -301,6 +301,18 @@ pub struct AppRoomSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppRoomDetailsState {
+    pub room_id: String,
+    pub display_name: String,
+    pub state: AppRoomState,
+    pub status: String,
+    pub user_status_text: String,
+    pub can_create_invite: bool,
+    pub media_item_count: u32,
+    pub devices: Vec<AppDeviceSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct AppInviteState {
     pub room_id: String,
     pub invite_url: String,
@@ -348,6 +360,7 @@ pub struct AppState {
     pub toast: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub media_gallery: Option<ChatMediaGalleryState>,
+    pub room_details: Option<AppRoomDetailsState>,
     pub profiles: Vec<AppProfileSummary>,
     pub devices: Vec<AppDeviceSummary>,
     pub typing_members: Vec<AppTypingMember>,
@@ -772,6 +785,7 @@ impl AppRuntimeState {
                 toast: None,
                 messages: Vec::new(),
                 media_gallery: None,
+                room_details: None,
                 profiles: Vec::new(),
                 devices: Vec::new(),
                 typing_members: Vec::new(),
@@ -1046,15 +1060,9 @@ impl AppRuntimeState {
             Ok(invite) => invite,
             Err(error) => {
                 self.app.active_invite = None;
-                self.upsert_room(
-                    &room_id,
-                    &display_name,
-                    AppRoomState::NeedsAttention,
-                    &error.to_string(),
-                );
-                self.persist_room_projection(&room_id)?;
-                self.app.status = "room needs attention".to_owned();
+                self.app.status = "invite unavailable".to_owned();
                 self.app.toast = Some("Invite could not be created".to_owned());
+                debug_assert!(!error.to_string().is_empty());
                 return Ok(());
             }
         };
@@ -1883,6 +1891,7 @@ impl AppRuntimeState {
             after_room_id = Some(next);
         }
         self.app.devices = devices.into_values().collect();
+        self.sync_selected_room_details();
         self.app.status = "devices refreshed".to_owned();
         Ok(())
     }
@@ -1980,6 +1989,7 @@ impl AppRuntimeState {
         let Some(room_id) = self.app.selected_room_id.clone() else {
             self.app.messages.clear();
             self.app.media_gallery = None;
+            self.app.room_details = None;
             self.sync_transcript_load_state();
             return;
         };
@@ -1992,6 +2002,7 @@ impl AppRuntimeState {
         self.app.messages = messages;
         self.sync_selected_room_media_gallery(&room_id);
         self.sync_transcript_load_state();
+        self.sync_selected_room_details();
     }
 
     fn sync_selected_room_media_gallery(&mut self, room_id: &str) {
@@ -2001,6 +2012,34 @@ impl AppRuntimeState {
         self.app.media_gallery = Some(ChatProjectionState::media_gallery_from_messages(
             room_id, &messages,
         ));
+    }
+
+    fn sync_selected_room_details(&mut self) {
+        let Some(room_id) = self.app.selected_room_id.clone() else {
+            self.app.room_details = None;
+            return;
+        };
+        let Some(room) = self.room(&room_id).cloned() else {
+            self.app.room_details = None;
+            return;
+        };
+        let media_item_count = self
+            .app
+            .media_gallery
+            .as_ref()
+            .filter(|gallery| gallery.room_id == room_id)
+            .map(|gallery| gallery.items.len().min(u32::MAX as usize) as u32)
+            .unwrap_or_default();
+        self.app.room_details = Some(AppRoomDetailsState {
+            room_id,
+            display_name: room.display_name.clone(),
+            state: room.state.clone(),
+            status: room.status.clone(),
+            user_status_text: app_room_user_status_text(&room),
+            can_create_invite: room.state == AppRoomState::Connected,
+            media_item_count,
+            devices: self.app.devices.clone(),
+        });
     }
 
     fn apply_attachment_download_progress(&self, messages: &mut [ChatMessage]) {
@@ -4622,6 +4661,22 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
         last_message_preview: String::new(),
         unread_count: 0,
         can_load_older: false,
+    }
+}
+
+fn app_room_user_status_text(room: &AppRoomSummary) -> String {
+    match room.state {
+        AppRoomState::Connected => "Connected".to_owned(),
+        AppRoomState::WaitingForApproval => {
+            if room.status.to_ascii_lowercase().contains("pin") {
+                "Enter the invite PIN".to_owned()
+            } else {
+                "Waiting for approval".to_owned()
+            }
+        }
+        AppRoomState::Joining => "Joining".to_owned(),
+        AppRoomState::NeedsAttention => "Needs attention".to_owned(),
+        AppRoomState::Offline => "Offline".to_owned(),
     }
 }
 
@@ -7350,6 +7405,15 @@ mod tests {
             item.item_id,
             format!("{}|{}|{}", room_id, item.message_id, item.attachment_id)
         );
+        let details = synced
+            .room_details
+            .as_ref()
+            .expect("selected room must project details");
+        assert_eq!(details.room_id, room_id);
+        assert_eq!(details.display_name, "Gallery Window");
+        assert_eq!(details.user_status_text, "Connected");
+        assert!(details.can_create_invite);
+        assert_eq!(details.media_item_count, 1);
 
         let downloaded = alice
             .dispatch(AppAction::DownloadAttachment {
@@ -7404,6 +7468,12 @@ mod tests {
             std::fs::read(reopened_item.attachment.local_path.as_ref().unwrap()).unwrap(),
             plaintext
         );
+        let reopened_details = reopened_state
+            .room_details
+            .as_ref()
+            .expect("room details survive offline reopen");
+        assert_eq!(reopened_details.room_id, room_id);
+        assert_eq!(reopened_details.media_item_count, 1);
     }
 
     #[test]
@@ -8215,11 +8285,23 @@ mod tests {
             })
             .unwrap();
         alice.dispatch(AppAction::StartRuntime).unwrap();
-        tablet.dispatch(AppAction::RetryRoom { room_id }).unwrap();
+        tablet
+            .dispatch(AppAction::RetryRoom {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
 
         let devices = alice.dispatch(AppAction::RefreshDevices).unwrap();
         assert_device(&devices, "alice-phone", true, true, false);
         assert_device(&devices, "alice-tablet", true, false, false);
+        let details = devices
+            .room_details
+            .as_ref()
+            .expect("selected room details include refreshed device projection");
+        assert_eq!(details.room_id, room_id);
+        assert_eq!(details.devices.len(), 2);
+        assert_device_in_room_details(details, "alice-phone", true, true, false);
+        assert_device_in_room_details(details, "alice-tablet", true, false, false);
 
         let devices = alice
             .dispatch(AppAction::RevokeDevice {
@@ -8228,10 +8310,20 @@ mod tests {
             })
             .unwrap();
         assert_device(&devices, "alice-tablet", true, false, true);
+        assert_device_in_room_details(
+            devices
+                .room_details
+                .as_ref()
+                .expect("selected room details include revoked device projection"),
+            "alice-tablet",
+            true,
+            false,
+            true,
+        );
     }
 
     #[test]
-    fn app_invite_marks_stale_local_room_needs_attention() {
+    fn app_invite_failure_keeps_existing_chat_readable() {
         let dir = tempfile::tempdir().unwrap();
         let alice_dir = dir.path().join("alice");
         let first_server_url = spawn_live_http_server(dir.path().join("server-one.sqlite3"));
@@ -8267,13 +8359,27 @@ mod tests {
             })
             .unwrap();
         let room = app_room(&stale_state, &room_id);
-        assert_eq!(room.state, AppRoomState::NeedsAttention);
-        assert!(room.status.contains("room"));
-        assert!(room.status.contains("does not exist"));
+        assert_eq!(room.state, AppRoomState::Connected);
+        assert_eq!(room.status, "connected");
         assert_eq!(stale_state.active_invite, None);
+        assert_eq!(stale_state.status, "invite unavailable");
         assert_eq!(
             stale_state.toast.as_deref(),
             Some("Invite could not be created")
+        );
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert_eq!(
+            app_room(&reopened_state, &room_id).state,
+            AppRoomState::Connected
         );
     }
 
@@ -8305,6 +8411,24 @@ mod tests {
             .iter()
             .find(|device| device.device_id == device_id)
             .unwrap_or_else(|| panic!("missing device {device_id}"));
+        assert_eq!(device.active, active);
+        assert_eq!(device.current_device, current_device);
+        assert_eq!(device.revoked, revoked);
+        assert_eq!(device.room_count, 1);
+    }
+
+    fn assert_device_in_room_details(
+        details: &AppRoomDetailsState,
+        device_id: &str,
+        active: bool,
+        current_device: bool,
+        revoked: bool,
+    ) {
+        let device = details
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .unwrap_or_else(|| panic!("missing room details device {device_id}"));
         assert_eq!(device.active, active);
         assert_eq!(device.current_device, current_device);
         assert_eq!(device.revoked, revoked);

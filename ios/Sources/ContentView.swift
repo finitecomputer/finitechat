@@ -64,7 +64,7 @@ struct ContentView: View {
         }
         .task {
             model.start()
-            routeSelectedRoomIfNeeded(model.state?.selectedRoomId)
+            lastAppliedSelectedRoomID = model.state?.selectedRoomId
         }
         .onChange(of: model.state?.selectedRoomId) { _, selectedRoomID in
             routeSelectedRoomIfNeeded(selectedRoomID)
@@ -73,6 +73,7 @@ struct ContentView: View {
 
     private func routeSelectedRoomIfNeeded(_ selectedRoomID: String?) {
         guard let selectedRoomID else {
+            path = []
             lastAppliedSelectedRoomID = nil
             return
         }
@@ -161,9 +162,7 @@ private struct RoomRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(room.state.tint)
-                .frame(width: 12, height: 12)
+            RoomAvatar(room: room)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
@@ -195,7 +194,41 @@ private struct RoomRow: View {
         if !room.lastMessagePreview.isEmpty {
             return room.lastMessagePreview
         }
-        return room.userStatusText
+        switch room.state {
+        case .connected:
+            return "No messages yet"
+        case .waitingForApproval, .joining, .needsAttention, .offline:
+            return room.userStatusText
+        }
+    }
+}
+
+private struct RoomAvatar: View {
+    let room: AppRoomSummary
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Circle()
+                .fill(Color(.tertiarySystemFill))
+            Text(initial)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            if room.state != .connected {
+                Circle()
+                    .fill(room.state.tint)
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
+            }
+        }
+        .frame(width: 40, height: 40)
+        .accessibilityHidden(true)
+    }
+
+    private var initial: String {
+        let trimmed = room.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "#" }
+        return String(first).uppercased()
     }
 }
 
@@ -215,6 +248,7 @@ private struct RoomThreadView: View {
     @State private var videoPreviewItem: ChatAttachmentPreviewItem?
     @State private var documentPreviewItem: ChatAttachmentPreviewItem?
     @State private var showMediaGallery = false
+    @State private var showRoomDetails = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
@@ -237,6 +271,15 @@ private struct RoomThreadView: View {
             return []
         }
         return gallery.items
+    }
+
+    private var roomDetails: AppRoomDetailsState? {
+        guard let details = model.state?.roomDetails,
+              details.roomId == roomID
+        else {
+            return nil
+        }
+        return details
     }
 
     private var latestMessageID: String? {
@@ -311,6 +354,14 @@ private struct RoomThreadView: View {
             if let room, room.state == .connected {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
+                        showRoomDetails = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .accessibilityLabel("Details")
+                    .accessibilityIdentifier("RoomDetailsButton")
+
+                    Button {
                         showMediaGallery = true
                     } label: {
                         Image(systemName: "photo.on.rectangle.angled")
@@ -329,6 +380,30 @@ private struct RoomThreadView: View {
                     .accessibilityIdentifier("InviteButton")
                 }
             }
+        }
+        .navigationDestination(isPresented: $showRoomDetails) {
+            RoomDetailsView(
+                details: roomDetails,
+                mediaItems: mediaGalleryItems,
+                onDownloadAttachment: { item in
+                    model.downloadAttachment(
+                        roomID: roomID,
+                        messageID: item.messageId,
+                        attachment: item.attachment
+                    )
+                },
+                onCreateInvite: {
+                    if let room, model.createInvite(for: room) {
+                        showInvite()
+                    }
+                },
+                onRefreshDevices: {
+                    model.refreshDevices()
+                },
+                onRevokeDevice: { device in
+                    model.revokeDevice(device)
+                }
+            )
         }
         .navigationDestination(isPresented: $showMediaGallery) {
             ChatMediaGalleryView(
@@ -404,49 +479,66 @@ private struct RoomThreadView: View {
     private func messageSurface(room: AppRoomSummary) -> some View {
         switch room.state {
         case .connected:
-            ChatTranscriptView(
-                roomID: room.roomId,
-                rows: transcriptRows,
-                messagesById: projection.messagesById,
-                onReact: { message, emoji in
-                    model.react(to: message, emoji: emoji)
-                },
-                onDownloadAttachment: { message, attachment in
-                    model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
-                },
-                onOpenAttachment: { message, attachment in
-                    handleAttachmentOpen(message: message, attachment: attachment)
-                },
-                onVotePoll: { message, option in
-                    model.votePoll(message: message, option: option)
-                },
-                onRetryMessage: { message in
-                    model.retry(message)
-                },
-                onLongPressMessage: { message, frame in
-                    presentFocusedMessage(message, frame: frame)
-                },
-                accessoryContent: composerAccessory,
-                isInputFocused: composerFocused,
-                canLoadOlder: room.canLoadOlder,
-                onLoadOlderMessages: { beforeMessageID in
-                    model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
-                },
-                followsBottom: $followsBottom
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemGroupedBackground))
-            .accessibilityLabel("Messages")
+            transcriptView(room: room) {
+                composerAccessory
+            }
         case .waitingForApproval:
             PendingRoomView(room: room, model: model)
         case .joining:
             ProgressView(room.userStatusText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .needsAttention, .offline:
-            NeedsAttentionView(room: room) {
-                model.retry(room)
+            if projection.rows.isEmpty {
+                NeedsAttentionView(room: room) {
+                    model.retry(room)
+                }
+            } else {
+                transcriptView(room: room) {
+                    RoomUnavailableComposerBar(room: room) {
+                        model.retry(room)
+                    }
+                }
             }
         }
+    }
+
+    private func transcriptView<AccessoryContent: View>(
+        room: AppRoomSummary,
+        @ViewBuilder accessoryContent: () -> AccessoryContent
+    ) -> some View {
+        ChatTranscriptView(
+            roomID: room.roomId,
+            rows: transcriptRows,
+            messagesById: projection.messagesById,
+            onReact: { message, emoji in
+                model.react(to: message, emoji: emoji)
+            },
+            onDownloadAttachment: { message, attachment in
+                model.downloadAttachment(roomID: room.roomId, message: message, attachment: attachment)
+            },
+            onOpenAttachment: { message, attachment in
+                handleAttachmentOpen(message: message, attachment: attachment)
+            },
+            onVotePoll: { message, option in
+                model.votePoll(message: message, option: option)
+            },
+            onRetryMessage: { message in
+                model.retry(message)
+            },
+            onLongPressMessage: { message, frame in
+                presentFocusedMessage(message, frame: frame)
+            },
+            accessoryContent: accessoryContent(),
+            isInputFocused: room.state == .connected && composerFocused,
+            canLoadOlder: room.canLoadOlder,
+            onLoadOlderMessages: { beforeMessageID in
+                model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
+            },
+            followsBottom: $followsBottom
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemGroupedBackground))
+        .accessibilityLabel("Messages")
     }
 
     private func messageCanRetry(_ message: ChatMessage) -> Bool {
@@ -1288,6 +1380,38 @@ private struct NeedsAttentionView: View {
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+private struct RoomUnavailableComposerBar: View {
+    let room: AppRoomSummary
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Text(room.userStatusText)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                retry()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Retry")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.bar)
     }
 }
 
