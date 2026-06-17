@@ -81,7 +81,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertFalse(persisted.usesTransientStore)
     }
 
-    func testLaunchAutomationOverridesDoNotRewritePersistedConfig() throws {
+    func testLaunchAutomationOverridesPersistForManualRelaunch() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://persisted.example",
@@ -96,8 +96,54 @@ final class RuntimeConfigTests: XCTestCase {
                 "http://127.0.0.1:1",
                 "--finitechat-device",
                 "codex-persist-check",
+                "--finitechat-auto-join",
+                "finite://join?v=1&s=http%3A%2F%2F127.0.0.1%3A1&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
                 "--finitechat-auto-send",
                 "probe",
+            ],
+            storageURL: url
+        )
+
+        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(loaded.deviceID, "codex-persist-check")
+        XCTAssertFalse(loaded.usesTransientStore)
+
+        let persisted = try persistedConfig(at: url)
+        XCTAssertEqual(persisted.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(persisted.deviceID, "codex-persist-check")
+        XCTAssertFalse(persisted.usesTransientStore)
+
+        let relaunched = RuntimeConfig.load(
+            environment: [:],
+            args: ["FiniteChat"],
+            storageURL: url
+        )
+
+        XCTAssertEqual(relaunched.serverURL, "http://127.0.0.1:1")
+        XCTAssertEqual(relaunched.deviceID, "codex-persist-check")
+        XCTAssertFalse(relaunched.usesTransientStore)
+    }
+
+    func testExplicitTransientLaunchAutomationDoesNotRewritePersistedConfig() throws {
+        let url = try temporaryConfigURL()
+        try RuntimeConfig(
+            serverURL: "http://persisted.example",
+            deviceID: "persisted-device"
+        ).save(storageURL: url)
+
+        let loaded = RuntimeConfig.load(
+            environment: [:],
+            args: [
+                "FiniteChat",
+                "--finitechat-server",
+                "http://127.0.0.1:1",
+                "--finitechat-device",
+                "codex-persist-check",
+                "--finitechat-auto-join",
+                "finite://join?v=1&s=http%3A%2F%2F127.0.0.1%3A1&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
+                "--finitechat-auto-send",
+                "probe",
+                "--finitechat-transient-config",
             ],
             storageURL: url
         )

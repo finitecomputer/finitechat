@@ -63,13 +63,9 @@ struct RuntimeConfig: Codable, Equatable {
         )
         let hasLaunchOverride = serverURL != nil || deviceID != nil
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
-        let launchAutomation = argumentFlag("--finitechat-auto-join", in: args)
-            || argumentFlag("--finitechat-auto-send", in: args)
-            || argumentFlag("--finitechat-room", in: args)
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
-            || launchAutomation
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
@@ -77,8 +73,9 @@ struct RuntimeConfig: Codable, Equatable {
         )
         // Runtime identity is product state. A phone launched from Xcode with a
         // LAN server or device id must reopen that same SQLite store after a
-        // manual force-close. Tests and launch automations stay process-local
-        // so they cannot poison normal app relaunches.
+        // manual force-close. Tests opt into transient state explicitly, or via
+        // the hosted XCTest environment, so product automation does not make a
+        // real chat vanish on the next manual relaunch.
         if !transientOverride
             && (
                 persisted.serverURL != config.serverURL
