@@ -14,9 +14,10 @@ use finitechat_client::{
     AppliedLogEntry, ClientError, ClientStoreError, CreateRoomInviteParams, FiniteChatDevice,
     FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery,
     RuntimeSyncOptions, SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent,
-    StoredAppMessage, StoredAppRoom, StoredAppRoomState, accept_pending_invite_joins,
-    create_room_invite, finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
-    run_runtime_sync_tick, submit_invite_join_request,
+    StoredAppMessage, StoredAppProfile, StoredAppRoom, StoredAppRoomState,
+    accept_pending_invite_joins, create_room_invite, finalize_invited_room,
+    generate_account_secret, run_room_server_sync_tick, run_runtime_sync_tick,
+    submit_invite_join_request,
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom};
@@ -649,6 +650,7 @@ impl AppRuntimeState {
             revoked_devices: BTreeSet::new(),
         };
         state.sync_selected_room_messages();
+        state.load_profile_cache()?;
         Ok(state)
     }
 
@@ -900,6 +902,7 @@ impl AppRuntimeState {
                 self.app.toast = None;
             } else {
                 let profile = placeholder_profile(&account_id);
+                self.persist_profile(&profile)?;
                 self.profile_cache.insert(account_id, profile);
                 self.sync_profile_state();
                 self.app.status = "profile not found".to_owned();
@@ -1237,19 +1240,70 @@ impl AppRuntimeState {
     fn fetch_profiles(&mut self, account_ids: Vec<String>) -> Result<bool, FiniteChatCoreError> {
         let now_ms = self.core.now_millis()?;
         let mut delivery = self.core.home_delivery();
-        let response = delivery
-            .get_nostr_profiles(account_ids, now_ms)
-            .map_err(runtime_error)?;
+        let response = match delivery.get_nostr_profiles(account_ids.clone(), now_ms) {
+            Ok(response) => response,
+            Err(error) => {
+                let found = account_ids
+                    .iter()
+                    .any(|account_id| self.profile_cache.contains_key(account_id));
+                self.sync_profile_state();
+                if found {
+                    return Ok(true);
+                }
+                return Err(runtime_error(error));
+            }
+        };
         let mut found = false;
+        let mut stored = Vec::new();
         for entry in response.profiles {
             found = true;
+            stored.push(StoredAppProfile {
+                profile: entry.profile.clone(),
+                stale: entry.stale,
+            });
             self.profile_cache.insert(
                 entry.profile.account_id.clone(),
                 profile_from_record(entry.profile, entry.stale),
             );
         }
+        if !stored.is_empty() {
+            let owner = self.core.device.device_ref().clone();
+            self.core
+                .store
+                .save_app_profiles(&owner, &stored)
+                .map_err(store_error)?;
+        }
         self.sync_profile_state();
         Ok(found)
+    }
+
+    fn load_profile_cache(&mut self) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        let now_ms = self.core.now_millis()?;
+        let stored = self
+            .core
+            .store
+            .load_app_profiles(&owner)
+            .map_err(store_error)?;
+        self.profile_cache.clear();
+        for profile in stored {
+            let stale = profile.stale || profile.profile.expires_at_ms <= now_ms;
+            self.profile_cache.insert(
+                profile.profile.account_id.clone(),
+                profile_from_record(profile.profile, stale),
+            );
+        }
+        self.sync_profile_state();
+        Ok(())
+    }
+
+    fn persist_profile(&mut self, profile: &AppProfileSummary) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        let stored = stored_profile_from_app(profile);
+        self.core
+            .store
+            .save_app_profiles(&owner, std::slice::from_ref(&stored))
+            .map_err(store_error)
     }
 
     fn sync_profile_state(&mut self) {
@@ -1538,6 +1592,21 @@ fn placeholder_profile(account_id: &str) -> AppProfileSummary {
         about: None,
         picture: None,
         stale: true,
+    }
+}
+
+fn stored_profile_from_app(profile: &AppProfileSummary) -> StoredAppProfile {
+    StoredAppProfile {
+        profile: finitechat_http::NostrProfileRecord {
+            account_id: profile.account_id.clone(),
+            name: None,
+            display_name: Some(profile.display_name.clone()),
+            about: profile.about.clone(),
+            picture: profile.picture.clone(),
+            fetched_at_ms: 0,
+            expires_at_ms: 1,
+        },
+        stale: profile.stale,
     }
 }
 
@@ -3767,6 +3836,7 @@ mod tests {
     #[test]
     fn app_scan_npub_loads_server_backed_profile_cache() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let account_id =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
@@ -3784,8 +3854,8 @@ mod tests {
             },
         );
         let app = FiniteChatRuntime::open(OpenOptions {
-            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
-            server_url,
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
@@ -3811,17 +3881,44 @@ mod tests {
             Some("profile cache test")
         );
         assert!(!state.profiles[0].stale);
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let cached = reopened.state().unwrap();
+        assert_eq!(cached.profiles.len(), 1);
+        assert_eq!(cached.profiles[0].display_name, "Alice Finite");
+        assert!(!cached.profiles[0].stale);
+
+        let scanned_offline = reopened
+            .dispatch(AppAction::ScanTarget {
+                value: npub.clone(),
+            })
+            .unwrap();
+        assert_eq!(scanned_offline.status, "profile loaded");
+        assert_eq!(
+            scanned_offline.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(scanned_offline.profiles[0].display_name, "Alice Finite");
     }
 
     #[test]
     fn app_scan_missing_npub_surfaces_stale_profile_placeholder() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let account_id =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let npub = npub_encode(&account_id).unwrap();
         let app = FiniteChatRuntime::open(OpenOptions {
-            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
@@ -3847,6 +3944,20 @@ mod tests {
         assert_eq!(state.profiles[0].account_id, account_id);
         assert_eq!(state.profiles[0].npub, npub);
         assert!(state.profiles[0].stale);
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let cached = reopened.state().unwrap();
+        assert_eq!(cached.profiles.len(), 1);
+        assert_eq!(cached.profiles[0].account_id, account_id);
+        assert!(cached.profiles[0].stale);
     }
 
     #[test]

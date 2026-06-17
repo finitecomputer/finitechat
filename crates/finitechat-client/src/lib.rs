@@ -72,6 +72,7 @@ const CLIENT_STATE_SNAPSHOT_MAGIC: &[u8] = b"finitechat.client-state-snapshot.v1
 const CLIENT_APP_MESSAGE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-message.v1";
 const CLIENT_APP_EVENT_AAD_DOMAIN: &[u8] = b"finitechat.client-app-event.v1";
 const CLIENT_APP_ROOM_AAD_DOMAIN: &[u8] = b"finitechat.client-app-room.v1";
+const CLIENT_APP_PROFILE_AAD_DOMAIN: &[u8] = b"finitechat.client-app-profile.v1";
 const CLIENT_STATE_SNAPSHOT_VERSION: u16 = 8;
 const CLIENT_STORE_KEY_BYTES: usize = 32;
 const CLIENT_STORE_NONCE_BYTES: usize = 12;
@@ -105,7 +106,14 @@ const MAX_APP_ROOM_INVITE_URL_BYTES: u32 = 4096;
 const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 8192;
 const MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
+const MAX_APP_PROFILE_NAME_BYTES: u32 = 128;
+const MAX_APP_PROFILE_ABOUT_BYTES: u32 = 4 * 1024;
+const MAX_APP_PROFILE_PICTURE_BYTES: u32 = 2 * 1024;
+const MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES: u32 = 8192;
+const MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES: u32 =
+    MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_STORED_APP_MESSAGES: u32 = 5_000;
+const MAX_STORED_APP_PROFILES: u32 = 4_096;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
 const U64_BYTES: usize = 8;
@@ -136,8 +144,10 @@ const _: () = {
     assert!(MAX_APP_MESSAGE_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_APP_EVENT_CIPHERTEXT_BYTES > MAX_ENVELOPE_PAYLOAD_BYTES);
     assert!(MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES > MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES);
+    assert!(MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES > MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES);
     assert!(MAX_APP_ROOM_INVITE_URL_BYTES >= MAX_ROOM_SERVER_URL_BYTES);
     assert!(MAX_STORED_APP_MESSAGES > 0);
+    assert!(MAX_STORED_APP_PROFILES > 0);
 };
 
 #[derive(Debug, Clone)]
@@ -394,6 +404,26 @@ struct StoredAppRoomMetadataV1 {
     pending_invite_url: Option<String>,
     #[serde(default)]
     owned_invite_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAppProfile {
+    pub profile: NostrProfileRecord,
+    pub stale: bool,
+}
+
+impl StoredAppProfile {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        validate_nostr_profile_record(&self.profile)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredAppProfileMetadataV1 {
+    profile: NostrProfileRecord,
+    #[serde(default)]
+    stale: bool,
 }
 
 fn default_app_room_status() -> String {
@@ -3080,6 +3110,61 @@ impl SqliteClientStore {
         self.with_transaction(|tx| save_app_rooms_tx(tx, &encryption_key, owner, rooms))
     }
 
+    pub fn load_app_profiles(
+        &self,
+        owner: &DeviceRef,
+    ) -> Result<Vec<StoredAppProfile>, ClientStoreError> {
+        validate_app_message_owner(owner)?;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT profile_account_id, nonce, ciphertext
+            FROM client_app_profiles
+            WHERE account_id = ?1 AND device_id = ?2
+            ORDER BY profile_account_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![&owner.account_id, &owner.device_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut profiles = Vec::new();
+        for row in rows {
+            let (profile_account_id, nonce, ciphertext) = row?;
+            decode_lower_hex_32(&profile_account_id)?;
+            let metadata = decrypt_app_profile_metadata(
+                &self.options.encryption_key,
+                AppProfileIdentity {
+                    owner,
+                    profile_account_id: &profile_account_id,
+                },
+                &nonce,
+                &ciphertext,
+            )?;
+            let profile = StoredAppProfile {
+                profile: metadata.profile,
+                stale: metadata.stale,
+            };
+            profile.validate_limits()?;
+            profiles.push(profile);
+        }
+        Ok(profiles)
+    }
+
+    pub fn save_app_profiles(
+        &mut self,
+        owner: &DeviceRef,
+        profiles: &[StoredAppProfile],
+    ) -> Result<(), ClientStoreError> {
+        let encryption_key = self.options.encryption_key.clone();
+        self.with_transaction(|tx| {
+            save_app_profiles_tx(tx, &encryption_key, owner, profiles)?;
+            prune_app_profiles_tx(tx, owner, MAX_STORED_APP_PROFILES)
+        })
+    }
+
     pub fn save_device_state_and_app_rooms(
         &mut self,
         device: &FiniteChatDevice,
@@ -4969,6 +5054,18 @@ pub enum ClientStoreError {
     EncodeAppRoomMetadata,
     #[error("failed to decode app room metadata")]
     DecodeAppRoomMetadata,
+    #[error("encrypted app profile nonce has {actual_bytes} bytes")]
+    InvalidAppProfileNonceLength { actual_bytes: usize },
+    #[error("failed to encrypt app profile metadata")]
+    EncryptAppProfile,
+    #[error("failed to decrypt app profile metadata")]
+    DecryptAppProfile,
+    #[error("failed to encode app profile metadata")]
+    EncodeAppProfileMetadata,
+    #[error("failed to decode app profile metadata")]
+    DecodeAppProfileMetadata,
+    #[error("stored app profile count cannot be represented in sqlite")]
+    StoredAppProfileCountOverflow,
 }
 
 #[derive(Debug, Error)]
@@ -5126,6 +5223,15 @@ pub enum ClientError {
     },
     #[error("prepared commit message id does not match request")]
     PreparedCommitMessageIdMismatch,
+    #[error("profile picture URL must be http(s): {0}")]
+    ProfilePictureUrl(String),
+    #[error(
+        "profile expires_at_ms {expires_at_ms} must be greater than fetched_at_ms {fetched_at_ms}"
+    )]
+    ProfileExpiry {
+        fetched_at_ms: u64,
+        expires_at_ms: u64,
+    },
     #[error("link fanout already exists: {0}")]
     DuplicateLinkFanout(String),
     #[error("link fanout not found: {0}")]
@@ -5657,6 +5763,21 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
 
         CREATE INDEX IF NOT EXISTS client_app_rooms_owner_idx
           ON client_app_rooms(account_id, device_id);
+
+        CREATE TABLE IF NOT EXISTS client_app_profiles (
+          account_id TEXT NOT NULL,
+          device_id TEXT NOT NULL,
+          profile_account_id TEXT NOT NULL,
+          nonce BLOB NOT NULL,
+          ciphertext BLOB NOT NULL,
+          PRIMARY KEY (account_id, device_id, profile_account_id),
+          FOREIGN KEY (account_id, device_id)
+            REFERENCES client_device_states(account_id, device_id)
+            ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS client_app_profiles_owner_idx
+          ON client_app_profiles(account_id, device_id);
         "#,
     )?;
     Ok(())
@@ -5926,6 +6047,55 @@ fn validate_optional_app_room_url(
     Ok(())
 }
 
+fn validate_nostr_profile_record(profile: &NostrProfileRecord) -> Result<(), ClientError> {
+    decode_lower_hex_32(&profile.account_id)?;
+    validate_optional_profile_text(
+        "profile.name",
+        profile.name.as_deref(),
+        MAX_APP_PROFILE_NAME_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.display_name",
+        profile.display_name.as_deref(),
+        MAX_APP_PROFILE_NAME_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.about",
+        profile.about.as_deref(),
+        MAX_APP_PROFILE_ABOUT_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.picture",
+        profile.picture.as_deref(),
+        MAX_APP_PROFILE_PICTURE_BYTES,
+    )?;
+    if let Some(picture) = &profile.picture
+        && !picture.starts_with("http://")
+        && !picture.starts_with("https://")
+    {
+        return Err(ClientError::ProfilePictureUrl(picture.clone()));
+    }
+    if profile.expires_at_ms <= profile.fetched_at_ms {
+        return Err(ClientError::ProfileExpiry {
+            fetched_at_ms: profile.fetched_at_ms,
+            expires_at_ms: profile.expires_at_ms,
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_profile_text(
+    field: &'static str,
+    value: Option<&str>,
+    max_bytes: u32,
+) -> Result<(), ClientError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_string_bytes(field, value, max_bytes)?;
+    Ok(())
+}
+
 fn sqlite_seq_from_u64(seq: u64) -> Result<i64, ClientStoreError> {
     i64::try_from(seq).map_err(|_| ClientStoreError::StoredAppMessageSeqOutOfRange { seq })
 }
@@ -6069,6 +6239,43 @@ fn save_app_rooms_tx(
     Ok(())
 }
 
+fn save_app_profiles_tx(
+    tx: &Transaction<'_>,
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    profiles: &[StoredAppProfile],
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    validate_item_count("app_profiles", profiles.len(), MAX_STORED_APP_PROFILES)
+        .map_err(ClientError::from)?;
+    let mut stmt = tx.prepare(
+        r#"
+        INSERT INTO client_app_profiles (
+          account_id,
+          device_id,
+          profile_account_id,
+          nonce,
+          ciphertext
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(account_id, device_id, profile_account_id) DO UPDATE SET
+          nonce = excluded.nonce,
+          ciphertext = excluded.ciphertext
+        "#,
+    )?;
+    for profile in profiles {
+        profile.validate_limits()?;
+        let sealed = encrypt_app_profile_metadata(encryption_key, owner, profile)?;
+        stmt.execute(params![
+            &owner.account_id,
+            &owner.device_id,
+            &profile.profile.account_id,
+            &sealed.nonce,
+            &sealed.ciphertext,
+        ])?;
+    }
+    Ok(())
+}
+
 fn prune_app_messages_tx(
     tx: &Transaction<'_>,
     owner: &DeviceRef,
@@ -6144,6 +6351,43 @@ fn prune_app_events_tx(
     Ok(())
 }
 
+fn prune_app_profiles_tx(
+    tx: &Transaction<'_>,
+    owner: &DeviceRef,
+    max_profiles: u32,
+) -> Result<(), ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    let count = tx.query_row(
+        r#"
+        SELECT COUNT(*)
+        FROM client_app_profiles
+        WHERE account_id = ?1 AND device_id = ?2
+        "#,
+        params![&owner.account_id, &owner.device_id],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let excess = count.saturating_sub(u64::from(max_profiles));
+    if excess == 0 {
+        return Ok(());
+    }
+    let limit =
+        i64::try_from(excess).map_err(|_| ClientStoreError::StoredAppProfileCountOverflow)?;
+    tx.execute(
+        r#"
+        DELETE FROM client_app_profiles
+        WHERE rowid IN (
+          SELECT rowid
+          FROM client_app_profiles
+          WHERE account_id = ?1 AND device_id = ?2
+          ORDER BY rowid ASC
+          LIMIT ?3
+        )
+        "#,
+        params![&owner.account_id, &owner.device_id, limit],
+    )?;
+    Ok(())
+}
+
 fn load_device_state(
     conn: &Connection,
     encryption_key: &ClientStoreEncryptionKey,
@@ -6201,6 +6445,12 @@ struct SealedAppRoom {
     ciphertext: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SealedAppProfile {
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 struct AppMessageIdentity<'a> {
     owner: &'a DeviceRef,
@@ -6214,6 +6464,12 @@ struct AppMessageIdentity<'a> {
 struct AppRoomIdentity<'a> {
     owner: &'a DeviceRef,
     room_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct AppProfileIdentity<'a> {
+    owner: &'a DeviceRef,
+    profile_account_id: &'a str,
 }
 
 fn encrypt_device_state(
@@ -6385,6 +6641,56 @@ fn encrypt_app_room_metadata(
     )
     .map_err(ClientError::from)?;
     Ok(SealedAppRoom {
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
+fn encrypt_app_profile_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    owner: &DeviceRef,
+    profile: &StoredAppProfile,
+) -> Result<SealedAppProfile, ClientStoreError> {
+    validate_app_message_owner(owner)?;
+    profile.validate_limits()?;
+    let metadata = StoredAppProfileMetadataV1 {
+        profile: profile.profile.clone(),
+        stale: profile.stale,
+    };
+    let plaintext =
+        serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppProfileMetadata)?;
+    validate_bytes_len(
+        "app_profile.metadata",
+        plaintext.len(),
+        MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_profile_aad(AppProfileIdentity {
+        owner,
+        profile_account_id: &profile.profile.account_id,
+    })?;
+    let provider = OpenMlsRustCrypto::default();
+    let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider
+        .rand()
+        .random_array()
+        .map_err(|_| ClientStoreError::Randomness)?;
+    let ciphertext = provider
+        .crypto()
+        .aead_encrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            &plaintext,
+            &nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::EncryptAppProfile)?;
+    validate_bytes_len(
+        "app_profile.ciphertext",
+        ciphertext.len(),
+        MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    Ok(SealedAppProfile {
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -6562,6 +6868,52 @@ fn decrypt_app_room_metadata(
     Ok(metadata)
 }
 
+fn decrypt_app_profile_metadata(
+    encryption_key: &ClientStoreEncryptionKey,
+    identity: AppProfileIdentity<'_>,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<StoredAppProfileMetadataV1, ClientStoreError> {
+    if nonce.len() != CLIENT_STORE_NONCE_BYTES {
+        return Err(ClientStoreError::InvalidAppProfileNonceLength {
+            actual_bytes: nonce.len(),
+        });
+    }
+    validate_bytes_non_empty("app_profile.ciphertext", ciphertext.len())
+        .map_err(ClientError::from)?;
+    validate_bytes_len(
+        "app_profile.ciphertext",
+        ciphertext.len(),
+        MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let aad = app_profile_aad(identity)?;
+    let provider = OpenMlsRustCrypto::default();
+    let plaintext = provider
+        .crypto()
+        .aead_decrypt(
+            AeadType::Aes256Gcm,
+            encryption_key.as_bytes(),
+            ciphertext,
+            nonce,
+            &aad,
+        )
+        .map_err(|_| ClientStoreError::DecryptAppProfile)?;
+    validate_bytes_len(
+        "app_profile.metadata",
+        plaintext.len(),
+        MAX_APP_PROFILE_METADATA_PLAINTEXT_BYTES,
+    )
+    .map_err(ClientError::from)?;
+    let metadata = serde_json::from_slice::<StoredAppProfileMetadataV1>(&plaintext)
+        .map_err(|_| ClientStoreError::DecodeAppProfileMetadata)?;
+    if metadata.profile.account_id != identity.profile_account_id {
+        return Err(ClientStoreError::DecodeAppProfileMetadata);
+    }
+    validate_nostr_profile_record(&metadata.profile)?;
+    Ok(metadata)
+}
+
 fn client_store_aad(account_id: &str, device_id: &str) -> Result<Vec<u8>, ClientStoreError> {
     validate_string_bytes("account_id", account_id, MAX_ACCOUNT_ID_BYTES)
         .map_err(ClientError::from)?;
@@ -6655,6 +7007,25 @@ fn app_room_aad(identity: AppRoomIdentity<'_>) -> Result<Vec<u8>, ClientStoreErr
     append_raw_len_prefixed(&mut aad, identity.owner.account_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.owner.device_id.as_bytes())?;
     append_raw_len_prefixed(&mut aad, identity.room_id.as_bytes())?;
+    Ok(aad)
+}
+
+fn app_profile_aad(identity: AppProfileIdentity<'_>) -> Result<Vec<u8>, ClientStoreError> {
+    validate_app_message_owner(identity.owner)?;
+    decode_lower_hex_32(identity.profile_account_id)?;
+    let mut aad = Vec::with_capacity(
+        CLIENT_APP_PROFILE_AAD_DOMAIN.len()
+            + U32_BYTES
+            + identity.owner.account_id.len()
+            + U32_BYTES
+            + identity.owner.device_id.len()
+            + U32_BYTES
+            + identity.profile_account_id.len(),
+    );
+    aad.extend_from_slice(CLIENT_APP_PROFILE_AAD_DOMAIN);
+    append_raw_len_prefixed(&mut aad, identity.owner.account_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.owner.device_id.as_bytes())?;
+    append_raw_len_prefixed(&mut aad, identity.profile_account_id.as_bytes())?;
     Ok(aad)
 }
 
@@ -8067,6 +8438,63 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_client_store_persists_app_profiles_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([10; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: secret.clone(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(60),
+        };
+        let device = FiniteChatDevice::new(config).unwrap();
+        let owner = device.device_ref().clone();
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+
+        let alice = app_profile("alice", "Alice Finite");
+        let bob = StoredAppProfile {
+            stale: true,
+            ..app_profile("bob", "Bob Cached")
+        };
+
+        let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+        store.save_device_state(&device).unwrap();
+        store
+            .save_app_profiles(&owner, &[bob.clone(), alice.clone()])
+            .unwrap();
+        assert_eq!(
+            store.load_app_profiles(&owner).unwrap(),
+            vec![alice.clone(), bob.clone()]
+        );
+        drop(store);
+
+        let mut reopened = SqliteClientStore::open(&db_path, options).unwrap();
+        assert_eq!(
+            reopened.load_app_profiles(&owner).unwrap(),
+            vec![alice.clone(), bob.clone()]
+        );
+
+        let updated = StoredAppProfile {
+            profile: NostrProfileRecord {
+                display_name: Some("Alice Updated".to_owned()),
+                about: Some("updated profile".to_owned()),
+                ..alice.profile.clone()
+            },
+            stale: false,
+        };
+        reopened
+            .save_app_profiles(&owner, std::slice::from_ref(&updated))
+            .unwrap();
+        assert_eq!(
+            reopened.load_app_profiles(&owner).unwrap(),
+            vec![updated, bob]
+        );
+    }
+
+    #[test]
     fn sqlite_client_store_migrates_plaintext_app_messages_to_encrypted_rows() {
         let dir = tempfile::tempdir().unwrap();
         let secret = NostrSecretKey::from_bytes([9; NOSTR_SECRET_KEY_BYTES]).unwrap();
@@ -8196,6 +8624,26 @@ mod tests {
             local_read_seq: 0,
             pending_invite_url: None,
             owned_invite_url: None,
+        }
+    }
+
+    fn app_profile(seed: &str, display_name: &str) -> StoredAppProfile {
+        let account_id = match seed {
+            "alice" => "000000000000000000000000000000000000000000000000000000000000000a",
+            "bob" => "000000000000000000000000000000000000000000000000000000000000000b",
+            other => panic!("unknown profile seed {other}"),
+        };
+        StoredAppProfile {
+            profile: NostrProfileRecord {
+                account_id: account_id.to_owned(),
+                name: Some(display_name.to_ascii_lowercase().replace(' ', "_")),
+                display_name: Some(display_name.to_owned()),
+                about: None,
+                picture: Some(format!("https://example.invalid/{seed}.png")),
+                fetched_at_ms: NOW.saturating_mul(1000),
+                expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
+            },
+            stale: false,
         }
     }
 }
