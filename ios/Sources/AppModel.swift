@@ -442,7 +442,6 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
-        runLaunchAutomationIfRequested()
         do {
             let runtime = try currentRuntime()
             state = try runtime.state()
@@ -456,6 +455,9 @@ final class AppModel: ObservableObject {
             errorText = String(describing: error)
         }
         startUpdateLoop()
+        if runtime != nil {
+            runLaunchAutomationIfRequested()
+        }
     }
 
     func openRoom(_ room: AppRoomSummary) {
