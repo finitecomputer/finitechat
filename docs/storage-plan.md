@@ -64,17 +64,20 @@ that powers chat lists and room views. It is not an authoritative server log
 and it is not a profile-style cache: each row is scoped to the owning
 account/device, keyed by `(room_id, message_id)`, ordered by local insertion,
 and contains the authenticated sender plus decrypted application plaintext
-encrypted at rest. The row plaintext is sealed with the same client-store key
-as the device snapshot, and the AEAD AAD binds owner, room id, sequence,
-message id, and authenticated sender so copied or tampered rows fail closed
-on load. The table has owner and owner/room/seq indexes so startup can load a
-bounded recent projection without replaying room history.
+encrypted at rest. The structured row also stores the server-projected message
+timestamp so Rust can rebuild raw and display timestamp fields without asking
+Swift to infer chat semantics. The row plaintext is sealed with the same
+client-store key as the device snapshot, and the AEAD AAD binds owner, room
+id, sequence, message id, and authenticated sender so copied or tampered rows
+fail closed on load. The table has owner and owner/room/seq indexes so startup
+can load a bounded recent projection without replaying room history.
 
 `client_app_outbox` stores encrypted local pending/failed chat sends that have
 not become accepted server log entries. Outbox rows are scoped to the owning
 account/device and keyed by `(room_id, message_id)`, where `message_id` is a
 local client id. The encrypted payload carries the sender, decrypted application
-plaintext, and delivery state (`pending` or `failed` with a bounded reason).
+plaintext, delivery state (`pending` or `failed` with a bounded reason), and
+the local send timestamp used for the pending/failed bubble projection.
 Runtime startup merges these rows into the Rust-owned chat projection after
 accepted messages/events, so a force-close after a failed send reopens with the
 visible failed bubble instead of an empty transcript. When a send is accepted by
@@ -112,17 +115,20 @@ creating local pending MLS state and still submit the exact server request that
 matches that pending Commit.
 
 Received application messages are inserted in the same SQLite transaction that
-persists the device cursor that consumed them. Own sends are first inserted into
+persists the device cursor that consumed them, including the timestamp carried
+by the server room-log entry. Own sends are first inserted into
 `client_app_outbox` before network delivery, then promoted by deleting the
 outbox row after the server append is accepted and the accepted app
-message/event projection is saved. Failed own sends are retried through the same
-stored outbox row after restart; successful retry promotes to the accepted
-server-backed row and removes the local failed id. Swift and the app runtime
-render the Rust state and do not own persistence. Startup reads the bounded SQLite app-state,
-room, message, outbox, and profile projections before network sync; delivery
-failure during startup must return the saved chat list and selected transcript
-as offline local state, not an empty UI. Full room-history sync remains a
-repair/recovery path, not the ordinary way the UI gets messages after launch.
+message/event projection, including the accepted timestamp, is saved. Failed
+own sends are retried through the same stored outbox row after restart;
+successful retry promotes to the accepted server-backed row and removes the
+local failed id. Swift and the app runtime render the Rust state and do not own
+persistence or timestamp formatting. Startup reads the bounded SQLite
+app-state, room, message, outbox, and profile projections before network sync;
+delivery failure during startup must return the saved chat list and selected
+transcript as offline local state, not an empty UI. Full room-history sync
+remains a repair/recovery path, not the ordinary way the UI gets messages after
+launch.
 
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an

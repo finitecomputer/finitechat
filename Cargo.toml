@@ -36,7 +36,7 @@ sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
 thiserror = "2"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

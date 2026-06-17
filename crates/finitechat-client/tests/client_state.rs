@@ -613,6 +613,7 @@ fn sync_projection_advances_only_from_finitechat_http_pull_pages() {
                         format!(r#"{{"body":"message {index}"}}"#).into_bytes(),
                     ),
                     idempotency_key,
+                    timestamp_unix_seconds: 1_700_000_000 + index,
                 },
                 DurableAppEventKind::ChatMessage.delivery_policy(),
             )
@@ -998,6 +999,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
             b"forged removed sender".to_vec(),
         ),
         idempotency_key: "charlie_removed_new_epoch_http".to_owned(),
+        timestamp_unix_seconds: 1_700_000_000,
     };
     let err = delivery
         .append_event(
@@ -1117,6 +1119,7 @@ fn http_runtime_delivery_filters_membership_and_rejects_pending_sends() {
             b"pending send".to_vec(),
         ),
         idempotency_key: "alice_pending_http_filter".to_owned(),
+        timestamp_unix_seconds: 1_700_000_000,
     };
     let err = delivery
         .append_event(

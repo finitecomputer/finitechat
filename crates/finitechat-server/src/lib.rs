@@ -5522,6 +5522,7 @@ fn commit_publish_request(
         epoch: request.expected_epoch,
         envelope: request.envelope.clone(),
         idempotency_key: request.idempotency_key.clone(),
+        timestamp_unix_seconds: 0,
     };
     Ok(PublishMessageRequest {
         target: HttpPublishTarget::Group {
@@ -5564,6 +5565,7 @@ fn event_publish_request(
         epoch: request.envelope.epoch,
         envelope: request.envelope.clone(),
         idempotency_key: request.idempotency_key.clone(),
+        timestamp_unix_seconds: request.timestamp_unix_seconds,
     };
     Ok(PublishMessageRequest {
         target: HttpPublishTarget::Group {
@@ -5575,7 +5577,7 @@ fn event_publish_request(
             id: MessageId::new(message_id.as_bytes().to_vec()),
             payload: serde_json::to_vec(&placeholder_entry)
                 .map_err(|error| ServerHttpError::ProjectionJson(error.to_string()))?,
-            timestamp: Timestamp(0),
+            timestamp: Timestamp(request.timestamp_unix_seconds),
             causal_deps: Vec::new(),
             source: TransportSource(HTTP_SERVER_SOURCE.to_owned()),
             envelope: TransportEnvelope::GroupMessage { transport_group_id },

@@ -843,6 +843,7 @@ final class AppModelPersistenceTests: XCTestCase {
             media: [],
             readReceipt: nil,
             poll: nil,
+            timestampUnixSeconds: 1_700_000_000,
             displayTimestamp: "now"
         )
         return AppState(

@@ -307,6 +307,7 @@ pub struct RuntimeAppliedEntry {
     pub room_id: RoomId,
     pub seq: u64,
     pub message_id: String,
+    pub timestamp_unix_seconds: u64,
     pub entry: AppliedLogEntry,
 }
 
@@ -317,6 +318,7 @@ pub struct StoredAppMessage {
     pub message_id: MessageId,
     pub sender: DeviceRef,
     pub plaintext: Vec<u8>,
+    pub timestamp_unix_seconds: u64,
 }
 
 impl StoredAppMessage {
@@ -344,6 +346,7 @@ pub struct StoredAppEvent {
     pub message_id: MessageId,
     pub sender: DeviceRef,
     pub plaintext: Vec<u8>,
+    pub timestamp_unix_seconds: u64,
 }
 
 impl StoredAppEvent {
@@ -371,6 +374,7 @@ pub struct StoredOutboundMessage {
     pub sender: DeviceRef,
     pub plaintext: Vec<u8>,
     pub delivery_state: StoredOutboundDeliveryState,
+    pub timestamp_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +427,8 @@ struct StoredOutboundMessageMetadataV1 {
     plaintext: Vec<u8>,
     #[serde(default)]
     delivery_state: StoredOutboundDeliveryState,
+    #[serde(default)]
+    timestamp_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2193,6 +2199,21 @@ impl FiniteChatDevice {
         plaintext: &[u8],
         idempotency_key: impl Into<String>,
     ) -> Result<AppendEventRequest, ClientError> {
+        self.create_application_request_at(
+            room_id,
+            plaintext,
+            idempotency_key,
+            self.now_unix_seconds,
+        )
+    }
+
+    pub fn create_application_request_at(
+        &mut self,
+        room_id: &str,
+        plaintext: &[u8],
+        idempotency_key: impl Into<String>,
+        timestamp_unix_seconds: u64,
+    ) -> Result<AppendEventRequest, ClientError> {
         let own_device_ref = self.device_ref.clone();
         let provider = &self.provider;
         let signer = &self.signer;
@@ -2219,6 +2240,7 @@ impl FiniteChatDevice {
                 payload,
             ),
             idempotency_key: idempotency_key.into(),
+            timestamp_unix_seconds,
         };
         request.validate_limits()?;
         Ok(request)
@@ -2942,7 +2964,7 @@ impl SqliteClientStore {
         validate_app_message_limit(limit)?;
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT room_id, seq, message_id, sender_account_id, sender_device_id, nonce, ciphertext
+            SELECT room_id, seq, message_id, sender_account_id, sender_device_id, nonce, ciphertext, timestamp_unix_seconds
             FROM (
               SELECT
                 rowid AS row_id,
@@ -2952,7 +2974,8 @@ impl SqliteClientStore {
                 sender_account_id,
                 sender_device_id,
                 nonce,
-                ciphertext
+                ciphertext,
+                timestamp_unix_seconds
               FROM client_app_messages
               WHERE account_id = ?1 AND device_id = ?2
               ORDER BY rowid DESC
@@ -2972,6 +2995,7 @@ impl SqliteClientStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Vec<u8>>(5)?,
                     row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )?;
@@ -2985,8 +3009,10 @@ impl SqliteClientStore {
                 sender_device_id,
                 nonce,
                 ciphertext,
+                stored_timestamp_unix_seconds,
             ) = row?;
             let seq = sqlite_seq_to_u64(stored_seq)?;
+            let timestamp_unix_seconds = sqlite_timestamp_to_u64(stored_timestamp_unix_seconds)?;
             let sender = DeviceRef {
                 account_id: sender_account_id,
                 device_id: sender_device_id,
@@ -3009,6 +3035,7 @@ impl SqliteClientStore {
                 message_id,
                 sender,
                 plaintext,
+                timestamp_unix_seconds,
             };
             message.validate_limits()?;
             messages.push(message);
@@ -3056,7 +3083,7 @@ impl SqliteClientStore {
         validate_app_event_limit(limit)?;
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT room_id, seq, message_id, sender_account_id, sender_device_id, nonce, ciphertext
+            SELECT room_id, seq, message_id, sender_account_id, sender_device_id, nonce, ciphertext, timestamp_unix_seconds
             FROM (
               SELECT
                 rowid AS row_id,
@@ -3066,7 +3093,8 @@ impl SqliteClientStore {
                 sender_account_id,
                 sender_device_id,
                 nonce,
-                ciphertext
+                ciphertext,
+                timestamp_unix_seconds
               FROM client_app_events
               WHERE account_id = ?1 AND device_id = ?2
               ORDER BY rowid DESC
@@ -3086,6 +3114,7 @@ impl SqliteClientStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Vec<u8>>(5)?,
                     row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )?;
@@ -3099,8 +3128,10 @@ impl SqliteClientStore {
                 sender_device_id,
                 nonce,
                 ciphertext,
+                stored_timestamp_unix_seconds,
             ) = row?;
             let seq = sqlite_app_event_seq_to_u64(stored_seq)?;
+            let timestamp_unix_seconds = sqlite_timestamp_to_u64(stored_timestamp_unix_seconds)?;
             let sender = DeviceRef {
                 account_id: sender_account_id,
                 device_id: sender_device_id,
@@ -3123,6 +3154,7 @@ impl SqliteClientStore {
                 message_id,
                 sender,
                 plaintext,
+                timestamp_unix_seconds,
             };
             event.validate_limits()?;
             events.push(event);
@@ -3184,6 +3216,7 @@ impl SqliteClientStore {
                 sender: metadata.sender,
                 plaintext: metadata.plaintext,
                 delivery_state: metadata.delivery_state,
+                timestamp_unix_seconds: metadata.timestamp_unix_seconds,
             };
             message.validate_limits()?;
             messages.push(message);
@@ -3553,14 +3586,24 @@ impl SqliteClientStore {
         }
         let applied = device.complete_link_fanout_room_from_log(fanout_id, room_id, entry)?;
         device.set_last_applied_seq(room_id, entry.seq)?;
-        let app_messages =
-            stored_app_message_from_applied(room_id, entry.seq, &entry.message_id, &applied)
-                .into_iter()
-                .collect::<Vec<_>>();
-        let app_events =
-            stored_app_event_from_applied(room_id, entry.seq, &entry.message_id, &applied)
-                .into_iter()
-                .collect::<Vec<_>>();
+        let app_messages = stored_app_message_from_applied(
+            room_id,
+            entry.seq,
+            &entry.message_id,
+            entry.timestamp_unix_seconds,
+            &applied,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        let app_events = stored_app_event_from_applied(
+            room_id,
+            entry.seq,
+            &entry.message_id,
+            entry.timestamp_unix_seconds,
+            &applied,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
         self.save_device_state_and_app_messages_and_events(device, &app_messages, &app_events)?;
         Ok(Some(applied))
     }
@@ -3581,6 +3624,7 @@ impl SqliteClientStore {
                         room_id,
                         entry.seq,
                         &entry.message_id,
+                        entry.timestamp_unix_seconds,
                         applied_entry,
                     )
                 })
@@ -3593,6 +3637,7 @@ impl SqliteClientStore {
                         room_id,
                         entry.seq,
                         &entry.message_id,
+                        entry.timestamp_unix_seconds,
                         applied_entry,
                     )
                 })
@@ -3664,6 +3709,7 @@ fn stored_app_message_from_applied(
     room_id: &str,
     seq: u64,
     message_id: &str,
+    timestamp_unix_seconds: u64,
     applied: &AppliedLogEntry,
 ) -> Option<StoredAppMessage> {
     let AppliedLogEntry::Application { plaintext, sender } = applied else {
@@ -3675,6 +3721,7 @@ fn stored_app_message_from_applied(
         message_id: message_id.to_owned(),
         sender: sender.clone(),
         plaintext: plaintext.clone(),
+        timestamp_unix_seconds,
     })
 }
 
@@ -3682,6 +3729,7 @@ fn stored_app_event_from_applied(
     room_id: &str,
     seq: u64,
     message_id: &str,
+    timestamp_unix_seconds: u64,
     applied: &AppliedLogEntry,
 ) -> Option<StoredAppEvent> {
     let AppliedLogEntry::Application { plaintext, sender } = applied else {
@@ -3693,6 +3741,7 @@ fn stored_app_event_from_applied(
         message_id: message_id.to_owned(),
         sender: sender.clone(),
         plaintext: plaintext.clone(),
+        timestamp_unix_seconds,
     })
 }
 
@@ -5006,6 +5055,7 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
                         room_id: room_id.to_string(),
                         seq,
                         message_id,
+                        timestamp_unix_seconds: entry.timestamp_unix_seconds,
                         entry: applied,
                     });
                     report.record_completed_room()?;
@@ -5015,20 +5065,29 @@ fn complete_link_fanout_room_from_sync<D: RuntimeDelivery>(
             let before_seq = device.last_applied_seq(room_id)?;
             if let Some(applied) = apply_log_entry_in_memory(device, room_id, &entry)? {
                 dirty = true;
-                if let Some(message) =
-                    stored_app_message_from_applied(room_id, seq, &entry.message_id, &applied)
-                {
+                if let Some(message) = stored_app_message_from_applied(
+                    room_id,
+                    seq,
+                    &entry.message_id,
+                    entry.timestamp_unix_seconds,
+                    &applied,
+                ) {
                     app_messages.push(message);
                 }
-                if let Some(event) =
-                    stored_app_event_from_applied(room_id, seq, &entry.message_id, &applied)
-                {
+                if let Some(event) = stored_app_event_from_applied(
+                    room_id,
+                    seq,
+                    &entry.message_id,
+                    entry.timestamp_unix_seconds,
+                    &applied,
+                ) {
                     app_events.push(event);
                 }
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.to_string(),
                     seq,
                     message_id: entry.message_id.clone(),
+                    timestamp_unix_seconds: entry.timestamp_unix_seconds,
                     entry: applied,
                 });
             } else if device.last_applied_seq(room_id)? > before_seq {
@@ -5101,20 +5160,29 @@ fn sync_room_pages<D: RuntimeDelivery>(
             let before_seq = device.last_applied_seq(&room_id)?;
             if let Some(applied) = apply_log_entry_in_memory(device, &room_id, &entry)? {
                 dirty = true;
-                if let Some(message) =
-                    stored_app_message_from_applied(&room_id, seq, &message_id, &applied)
-                {
+                if let Some(message) = stored_app_message_from_applied(
+                    &room_id,
+                    seq,
+                    &message_id,
+                    entry.timestamp_unix_seconds,
+                    &applied,
+                ) {
                     app_messages.push(message);
                 }
-                if let Some(event) =
-                    stored_app_event_from_applied(&room_id, seq, &message_id, &applied)
-                {
+                if let Some(event) = stored_app_event_from_applied(
+                    &room_id,
+                    seq,
+                    &message_id,
+                    entry.timestamp_unix_seconds,
+                    &applied,
+                ) {
                     app_events.push(event);
                 }
                 report.applied_entries.push(RuntimeAppliedEntry {
                     room_id: room_id.clone(),
                     seq,
                     message_id,
+                    timestamp_unix_seconds: entry.timestamp_unix_seconds,
                     entry: applied,
                 });
             } else if device.last_applied_seq(&room_id)? > before_seq {
@@ -5252,6 +5320,10 @@ pub enum ClientStoreError {
     NegativeStoredAppEventSeq { seq: i64 },
     #[error("stored app event count cannot be represented in sqlite")]
     StoredAppEventCountOverflow,
+    #[error("stored app timestamp {timestamp} cannot be represented in sqlite")]
+    StoredAppTimestampOutOfRange { timestamp: u64 },
+    #[error("stored app timestamp is negative: {timestamp}")]
+    NegativeStoredAppTimestamp { timestamp: i64 },
     #[error("encrypted app outbox nonce has {actual_bytes} bytes")]
     InvalidAppOutboxNonceLength { actual_bytes: usize },
     #[error("failed to encrypt app outbox metadata")]
@@ -5926,6 +5998,25 @@ fn migrate_client_store(
         migrate_plaintext_app_messages(conn, encryption_key)?;
     }
     create_current_client_store_schema(conn)?;
+    migrate_app_timestamp_columns(conn)?;
+    Ok(())
+}
+
+fn migrate_app_timestamp_columns(conn: &Connection) -> Result<(), ClientStoreError> {
+    if sqlite_table_exists(conn, "client_app_messages")?
+        && !sqlite_table_has_column(conn, "client_app_messages", "timestamp_unix_seconds")?
+    {
+        conn.execute_batch(
+            "ALTER TABLE client_app_messages ADD COLUMN timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if sqlite_table_exists(conn, "client_app_events")?
+        && !sqlite_table_has_column(conn, "client_app_events", "timestamp_unix_seconds")?
+    {
+        conn.execute_batch(
+            "ALTER TABLE client_app_events ADD COLUMN timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 
@@ -5948,6 +6039,7 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
           message_id TEXT NOT NULL,
           sender_account_id TEXT NOT NULL,
           sender_device_id TEXT NOT NULL,
+          timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0,
           nonce BLOB NOT NULL,
           ciphertext BLOB NOT NULL,
           PRIMARY KEY (account_id, device_id, room_id, message_id),
@@ -5970,6 +6062,7 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
           message_id TEXT NOT NULL,
           sender_account_id TEXT NOT NULL,
           sender_device_id TEXT NOT NULL,
+          timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0,
           nonce BLOB NOT NULL,
           ciphertext BLOB NOT NULL,
           PRIMARY KEY (account_id, device_id, room_id, message_id),
@@ -6071,9 +6164,10 @@ fn migrate_plaintext_app_messages(
               message_id,
               sender_account_id,
               sender_device_id,
+              timestamp_unix_seconds,
               nonce,
               ciphertext
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )?;
         for row in legacy {
@@ -6088,6 +6182,7 @@ fn migrate_plaintext_app_messages(
                 &row.message.message_id,
                 &row.message.sender.account_id,
                 &row.message.sender.device_id,
+                sqlite_timestamp_from_u64(row.message.timestamp_unix_seconds)?,
                 &sealed.nonce,
                 &sealed.ciphertext,
             ])?;
@@ -6154,6 +6249,7 @@ fn load_plaintext_app_messages(
                 device_id: sender_device_id,
             },
             plaintext,
+            timestamp_unix_seconds: 0,
         };
         message.validate_limits()?;
         let owner = DeviceRef {
@@ -6170,10 +6266,18 @@ fn client_app_messages_has_column(
     conn: &Connection,
     column: &str,
 ) -> Result<bool, ClientStoreError> {
-    if !sqlite_table_exists(conn, "client_app_messages")? {
+    sqlite_table_has_column(conn, "client_app_messages", column)
+}
+
+fn sqlite_table_has_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, ClientStoreError> {
+    if !sqlite_table_exists(conn, table)? {
         return Ok(false);
     }
-    let mut stmt = conn.prepare("PRAGMA table_info(client_app_messages)")?;
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for row in rows {
         if row? == column {
@@ -6374,6 +6478,15 @@ fn sqlite_app_event_seq_to_u64(seq: i64) -> Result<u64, ClientStoreError> {
     u64::try_from(seq).map_err(|_| ClientStoreError::NegativeStoredAppEventSeq { seq })
 }
 
+fn sqlite_timestamp_from_u64(timestamp: u64) -> Result<i64, ClientStoreError> {
+    i64::try_from(timestamp)
+        .map_err(|_| ClientStoreError::StoredAppTimestampOutOfRange { timestamp })
+}
+
+fn sqlite_timestamp_to_u64(timestamp: i64) -> Result<u64, ClientStoreError> {
+    u64::try_from(timestamp).map_err(|_| ClientStoreError::NegativeStoredAppTimestamp { timestamp })
+}
+
 fn save_app_messages_tx(
     tx: &Transaction<'_>,
     encryption_key: &ClientStoreEncryptionKey,
@@ -6391,13 +6504,15 @@ fn save_app_messages_tx(
           message_id,
           sender_account_id,
           sender_device_id,
+          timestamp_unix_seconds,
           nonce,
           ciphertext
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(account_id, device_id, room_id, message_id) DO UPDATE SET
           seq = excluded.seq,
           sender_account_id = excluded.sender_account_id,
           sender_device_id = excluded.sender_device_id,
+          timestamp_unix_seconds = excluded.timestamp_unix_seconds,
           nonce = excluded.nonce,
           ciphertext = excluded.ciphertext
         "#,
@@ -6413,6 +6528,7 @@ fn save_app_messages_tx(
             &message.message_id,
             &message.sender.account_id,
             &message.sender.device_id,
+            sqlite_timestamp_from_u64(message.timestamp_unix_seconds)?,
             &sealed.nonce,
             &sealed.ciphertext,
         ])?;
@@ -6437,13 +6553,15 @@ fn save_app_events_tx(
           message_id,
           sender_account_id,
           sender_device_id,
+          timestamp_unix_seconds,
           nonce,
           ciphertext
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(account_id, device_id, room_id, message_id) DO UPDATE SET
           seq = excluded.seq,
           sender_account_id = excluded.sender_account_id,
           sender_device_id = excluded.sender_device_id,
+          timestamp_unix_seconds = excluded.timestamp_unix_seconds,
           nonce = excluded.nonce,
           ciphertext = excluded.ciphertext
         "#,
@@ -6459,6 +6577,7 @@ fn save_app_events_tx(
             &event.message_id,
             &event.sender.account_id,
             &event.sender.device_id,
+            sqlite_timestamp_from_u64(event.timestamp_unix_seconds)?,
             &sealed.nonce,
             &sealed.ciphertext,
         ])?;
@@ -6994,6 +7113,7 @@ fn encrypt_app_outbox_metadata(
         sender: message.sender.clone(),
         plaintext: message.plaintext.clone(),
         delivery_state: message.delivery_state.clone(),
+        timestamp_unix_seconds: message.timestamp_unix_seconds,
     };
     let plaintext =
         serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppOutboxMetadata)?;
@@ -8920,6 +9040,8 @@ mod tests {
             .unwrap();
         assert!(!client_app_messages_has_column(&store.conn, "plaintext").unwrap());
         assert!(client_app_messages_has_column(&store.conn, "ciphertext").unwrap());
+        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
+        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
         assert_eq!(
             store.load_app_messages(&owner, 10).unwrap(),
             vec![first.clone(), second.clone()]
@@ -8978,6 +9100,10 @@ mod tests {
         store
             .save_app_events(&owner, &[first.clone(), second.clone()], 10)
             .unwrap();
+        assert!(
+            sqlite_table_has_column(&store.conn, "client_app_events", "timestamp_unix_seconds")
+                .unwrap()
+        );
         assert_eq!(
             store.load_app_events(&owner, 10).unwrap(),
             vec![first.clone(), second.clone()]
@@ -9062,6 +9188,144 @@ mod tests {
             .delete_app_outbox_message(&owner, "room-store", "local-1")
             .unwrap();
         assert!(reopened.load_app_outbox(&owner).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sqlite_client_store_migrates_encrypted_app_rows_without_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([12; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let owner = DeviceRef {
+            account_id: hex_lower(secret.public_key().as_bytes()),
+            device_id: device_id.to_owned(),
+        };
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let message = app_message(&owner, 7, "msg-old-encrypted", "old encrypted message");
+        let event = app_event(&owner, 8, "event-old-encrypted", "old encrypted event");
+        let sealed_message =
+            encrypt_app_message_plaintext(&options.encryption_key, &owner, &message).unwrap();
+        let sealed_event =
+            encrypt_app_event_plaintext(&options.encryption_key, &owner, &event).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE client_device_states (
+                  account_id TEXT NOT NULL,
+                  device_id TEXT NOT NULL,
+                  nonce BLOB NOT NULL,
+                  ciphertext BLOB NOT NULL,
+                  PRIMARY KEY (account_id, device_id)
+                );
+                CREATE TABLE client_app_messages (
+                  account_id TEXT NOT NULL,
+                  device_id TEXT NOT NULL,
+                  room_id TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  message_id TEXT NOT NULL,
+                  sender_account_id TEXT NOT NULL,
+                  sender_device_id TEXT NOT NULL,
+                  nonce BLOB NOT NULL,
+                  ciphertext BLOB NOT NULL,
+                  PRIMARY KEY (account_id, device_id, room_id, message_id)
+                );
+                CREATE TABLE client_app_events (
+                  account_id TEXT NOT NULL,
+                  device_id TEXT NOT NULL,
+                  room_id TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  message_id TEXT NOT NULL,
+                  sender_account_id TEXT NOT NULL,
+                  sender_device_id TEXT NOT NULL,
+                  nonce BLOB NOT NULL,
+                  ciphertext BLOB NOT NULL,
+                  PRIMARY KEY (account_id, device_id, room_id, message_id)
+                );
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO client_device_states (account_id, device_id, nonce, ciphertext) VALUES (?1, ?2, X'00', X'00')",
+                params![&owner.account_id, &owner.device_id],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO client_app_messages (
+                  account_id,
+                  device_id,
+                  room_id,
+                  seq,
+                  message_id,
+                  sender_account_id,
+                  sender_device_id,
+                  nonce,
+                  ciphertext
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    &owner.account_id,
+                    &owner.device_id,
+                    &message.room_id,
+                    sqlite_seq_from_u64(message.seq).unwrap(),
+                    &message.message_id,
+                    &message.sender.account_id,
+                    &message.sender.device_id,
+                    &sealed_message.nonce,
+                    &sealed_message.ciphertext,
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO client_app_events (
+                  account_id,
+                  device_id,
+                  room_id,
+                  seq,
+                  message_id,
+                  sender_account_id,
+                  sender_device_id,
+                  nonce,
+                  ciphertext
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    &owner.account_id,
+                    &owner.device_id,
+                    &event.room_id,
+                    sqlite_app_event_seq_from_u64(event.seq).unwrap(),
+                    &event.message_id,
+                    &event.sender.account_id,
+                    &event.sender.device_id,
+                    &sealed_event.nonce,
+                    &sealed_event.ciphertext,
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteClientStore::open(&db_path, options).unwrap();
+        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
+        assert!(
+            sqlite_table_has_column(&store.conn, "client_app_events", "timestamp_unix_seconds")
+                .unwrap()
+        );
+
+        let mut expected_message = message;
+        expected_message.timestamp_unix_seconds = 0;
+        let mut expected_event = event;
+        expected_event.timestamp_unix_seconds = 0;
+        assert_eq!(
+            store.load_app_messages(&owner, 10).unwrap(),
+            vec![expected_message]
+        );
+        assert_eq!(
+            store.load_app_events(&owner, 10).unwrap(),
+            vec![expected_event]
+        );
     }
 
     #[test]
@@ -9303,6 +9567,7 @@ mod tests {
                 message_id: "msg-legacy".to_owned(),
                 sender: owner.clone(),
                 plaintext: b"legacy-message".to_vec(),
+                timestamp_unix_seconds: 0,
             }]
         );
         assert_eq!(store.load_app_events(&owner, 10).unwrap(), Vec::new());
@@ -9320,6 +9585,7 @@ mod tests {
             message_id: message_id.to_owned(),
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
+            timestamp_unix_seconds: NOW + seq,
         }
     }
 
@@ -9335,6 +9601,7 @@ mod tests {
             message_id: message_id.to_owned(),
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
+            timestamp_unix_seconds: NOW + seq,
         }
     }
 
@@ -9349,6 +9616,7 @@ mod tests {
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
             delivery_state: StoredOutboundDeliveryState::Pending,
+            timestamp_unix_seconds: NOW,
         }
     }
 

@@ -6914,6 +6914,7 @@ fn commit_publish_request_for_test(
         epoch: request.expected_epoch,
         envelope: request.envelope.clone(),
         idempotency_key: request.idempotency_key.clone(),
+        timestamp_unix_seconds: 0,
     };
     let payload = serde_json::to_vec(&FiniteAccountRoomCommitProjection {
         entry,
@@ -7011,6 +7012,7 @@ fn append_application_request(
             payload: payload.to_vec(),
         },
         idempotency_key: idempotency_key.to_owned(),
+        timestamp_unix_seconds: 1_700_000_000,
     }
 }
 

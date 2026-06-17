@@ -2459,6 +2459,8 @@ pub struct RoomLogEntry {
     pub epoch: Epoch,
     pub envelope: FiniteEnvelope,
     pub idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    pub timestamp_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize)]

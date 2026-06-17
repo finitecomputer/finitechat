@@ -92,6 +92,8 @@ pub struct AppendEventRequest {
     pub sender: DeviceRef,
     pub envelope: FiniteEnvelope,
     pub idempotency_key: IdempotencyKey,
+    #[serde(default)]
+    pub timestamp_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

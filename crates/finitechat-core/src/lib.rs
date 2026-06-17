@@ -39,6 +39,7 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use time::{OffsetDateTime, UtcOffset};
 
 const ACCOUNT_SECRET_FILE: &str = "account-secret.hex";
 const CLIENT_STORE_FILE: &str = "client.sqlite3";
@@ -242,6 +243,8 @@ pub struct ChatMessage {
     #[serde(default)]
     pub poll: Option<ChatPoll>,
     #[serde(default)]
+    pub timestamp_unix_seconds: u64,
+    #[serde(default)]
     pub display_timestamp: String,
 }
 
@@ -420,7 +423,7 @@ struct CoreState {
     data_dir: PathBuf,
     server_url: String,
     account_secret: NostrSecretKey,
-    config: FiniteChatDeviceConfig,
+    fixed_now_unix_seconds: Option<u64>,
     store: SqliteClientStore,
     device: FiniteChatDevice,
 }
@@ -1163,12 +1166,14 @@ impl AppRuntimeState {
     ) -> Result<(), FiniteChatCoreError> {
         let owner = self.core.device.device_ref().clone();
         let local_message_id = self.core.generate_object_id("local-msg")?;
+        let timestamp_unix_seconds = self.core.now_unix_seconds()?;
         let mut pending = project_chat_message(
             room_id.clone(),
             u64::MAX,
             local_message_id.clone(),
             owner.clone(),
             app_event_plaintext.clone(),
+            timestamp_unix_seconds,
             &owner,
         )
         .ok_or_else(|| FiniteChatCoreError::Client {
@@ -1234,6 +1239,7 @@ impl AppRuntimeState {
 
         let owner = self.core.device.device_ref().clone();
         let local_message_id = self.core.generate_object_id("local-msg")?;
+        let timestamp_unix_seconds = self.core.now_unix_seconds()?;
         let local_chat_payload = self.core.local_attachment_message_payload(
             input.caption.trim(),
             &input.attachments,
@@ -1247,6 +1253,7 @@ impl AppRuntimeState {
             local_message_id.clone(),
             owner.clone(),
             app_event_plaintext,
+            timestamp_unix_seconds,
             &owner,
         )
         .ok_or_else(|| FiniteChatCoreError::Client {
@@ -2294,9 +2301,8 @@ impl CoreState {
 
         let account_secret =
             load_or_create_account_secret(&data_dir, options.account_secret_hex.as_deref())?;
-        let now = options
-            .now_unix_seconds
-            .unwrap_or_else(current_unix_seconds);
+        let fixed_now_unix_seconds = options.now_unix_seconds;
+        let now = fixed_now_unix_seconds.unwrap_or_else(current_unix_seconds);
         let mut config = FiniteChatDeviceConfig {
             account_secret_key: account_secret.clone(),
             device_id: requested_device_id.clone(),
@@ -2331,7 +2337,7 @@ impl CoreState {
             data_dir,
             server_url: options.server_url,
             account_secret,
-            config,
+            fixed_now_unix_seconds,
             store,
             device,
         })
@@ -2347,7 +2353,9 @@ impl CoreState {
     }
 
     fn now_unix_seconds(&self) -> Result<u64, FiniteChatCoreError> {
-        Ok(self.config.now_unix_seconds)
+        Ok(self
+            .fixed_now_unix_seconds
+            .unwrap_or_else(current_unix_seconds))
     }
 
     fn now_millis(&self) -> Result<u64, FiniteChatCoreError> {
@@ -2659,9 +2667,15 @@ impl CoreState {
             .device
             .generate_object_id("msg")
             .map_err(client_error)?;
+        let timestamp_unix_seconds = self.now_unix_seconds()?;
         let request = self
             .device
-            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .create_application_request_at(
+                room_id,
+                &app_event_plaintext,
+                idempotency_key,
+                timestamp_unix_seconds,
+            )
             .map_err(|error| send_error(room_id, error))?;
         let sender = request.sender.clone();
         self.store
@@ -2680,6 +2694,7 @@ impl CoreState {
             accepted.message_id,
             sender,
             app_event_plaintext,
+            request.timestamp_unix_seconds,
             self.device.device_ref(),
         )
         .ok_or_else(|| FiniteChatCoreError::Client {
@@ -2947,9 +2962,15 @@ impl CoreState {
             .device
             .generate_object_id("reaction")
             .map_err(client_error)?;
+        let timestamp_unix_seconds = self.now_unix_seconds()?;
         let request = self
             .device
-            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .create_application_request_at(
+                room_id,
+                &app_event_plaintext,
+                idempotency_key,
+                timestamp_unix_seconds,
+            )
             .map_err(|error| send_error(room_id, error))?;
         let sender = request.sender.clone();
         self.store
@@ -2974,6 +2995,7 @@ impl CoreState {
             message_id: accepted.message_id,
             sender,
             plaintext: app_event_plaintext,
+            timestamp_unix_seconds: request.timestamp_unix_seconds,
         };
         self.store
             .save_app_events(
@@ -3005,9 +3027,15 @@ impl CoreState {
             .device
             .generate_object_id("receipt")
             .map_err(client_error)?;
+        let timestamp_unix_seconds = self.now_unix_seconds()?;
         let request = self
             .device
-            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .create_application_request_at(
+                room_id,
+                &app_event_plaintext,
+                idempotency_key,
+                timestamp_unix_seconds,
+            )
             .map_err(|error| send_error(room_id, error))?;
         let sender = request.sender.clone();
         self.store
@@ -3029,6 +3057,7 @@ impl CoreState {
             message_id: accepted.message_id,
             sender,
             plaintext: app_event_plaintext,
+            timestamp_unix_seconds: request.timestamp_unix_seconds,
         };
         self.store
             .save_app_events(
@@ -3058,9 +3087,15 @@ impl CoreState {
             .device
             .generate_object_id("poll-vote")
             .map_err(client_error)?;
+        let timestamp_unix_seconds = self.now_unix_seconds()?;
         let request = self
             .device
-            .create_application_request(room_id, &app_event_plaintext, idempotency_key)
+            .create_application_request_at(
+                room_id,
+                &app_event_plaintext,
+                idempotency_key,
+                timestamp_unix_seconds,
+            )
             .map_err(|error| send_error(room_id, error))?;
         let sender = request.sender.clone();
         self.store
@@ -3082,6 +3117,7 @@ impl CoreState {
             message_id: accepted.message_id,
             sender,
             plaintext: app_event_plaintext,
+            timestamp_unix_seconds: request.timestamp_unix_seconds,
         };
         self.store
             .save_app_events(
@@ -3188,6 +3224,7 @@ impl CoreSyncProjection {
                         entry.message_id.clone(),
                         sender.clone(),
                         plaintext.clone(),
+                        entry.timestamp_unix_seconds,
                         owner,
                     ) {
                         self.result.messages.push(message);
@@ -3198,6 +3235,7 @@ impl CoreSyncProjection {
                         message_id: entry.message_id,
                         sender,
                         plaintext,
+                        timestamp_unix_seconds: entry.timestamp_unix_seconds,
                     });
                 }
                 AppliedLogEntry::Commit { .. } => {}
@@ -3261,6 +3299,7 @@ fn project_chat_message(
     message_id: String,
     sender: DeviceRef,
     plaintext: Vec<u8>,
+    timestamp_unix_seconds: u64,
     owner: &DeviceRef,
 ) -> Option<ChatMessage> {
     let projection = chat_projection_payload_from_application_plaintext(&plaintext)?;
@@ -3289,8 +3328,29 @@ fn project_chat_message(
         media: projection.media,
         read_receipt: None,
         poll: projection.poll,
-        display_timestamp: String::new(),
+        timestamp_unix_seconds,
+        display_timestamp: display_timestamp(timestamp_unix_seconds),
     })
+}
+
+fn display_timestamp(timestamp_unix_seconds: u64) -> String {
+    if timestamp_unix_seconds == 0 {
+        return String::new();
+    }
+    let Ok(timestamp) = i64::try_from(timestamp_unix_seconds) else {
+        return String::new();
+    };
+    let Ok(utc) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return String::new();
+    };
+    let datetime = utc.to_offset(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+    let hour = datetime.hour();
+    let hour_12 = match hour % 12 {
+        0 => 12,
+        value => value,
+    };
+    let period = if hour < 12 { "AM" } else { "PM" };
+    format!("{hour_12}:{:02} {period}", datetime.minute())
 }
 
 fn chat_projection_payload_from_application_plaintext(
@@ -3851,6 +3911,7 @@ fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Opt
         message.message_id,
         message.sender,
         message.plaintext,
+        message.timestamp_unix_seconds,
         owner,
     )
 }
@@ -3869,6 +3930,7 @@ fn chat_message_from_outbox(
         message.message_id,
         message.sender,
         message.plaintext,
+        message.timestamp_unix_seconds,
         owner,
     )?;
     projected.delivery = delivery;
@@ -3892,6 +3954,7 @@ fn stored_outbox_from_chat(message: &ChatMessage) -> StoredOutboundMessage {
         },
         plaintext: message.payload.clone(),
         delivery_state,
+        timestamp_unix_seconds: message.timestamp_unix_seconds,
     }
 }
 
@@ -3939,6 +4002,7 @@ impl ChatProjectionState {
                     event.message_id,
                     event.sender,
                     event.plaintext,
+                    event.timestamp_unix_seconds,
                     owner,
                 ) {
                     self.insert_message(message, owner);
@@ -4353,6 +4417,7 @@ fn stored_message_from_chat(message: &ChatMessage) -> StoredAppMessage {
             device_id: message.sender_device_id.clone(),
         },
         plaintext: message.payload.clone(),
+        timestamp_unix_seconds: message.timestamp_unix_seconds,
     }
 }
 
@@ -4366,6 +4431,7 @@ fn stored_event_from_chat(message: &ChatMessage) -> StoredAppEvent {
             device_id: message.sender_device_id.clone(),
         },
         plaintext: message.payload.clone(),
+        timestamp_unix_seconds: message.timestamp_unix_seconds,
     }
 }
 
@@ -4823,6 +4889,7 @@ mod tests {
                 "reaction-1".to_owned(),
                 sender,
                 event,
+                NOW,
                 &owner,
             )
             .is_none(),
@@ -4873,6 +4940,7 @@ mod tests {
                     message_id: "message-1".to_owned(),
                     sender: owner.clone(),
                     plaintext: chat_event,
+                    timestamp_unix_seconds: NOW,
                 },
                 StoredAppEvent {
                     room_id: "room-main".to_owned(),
@@ -4880,6 +4948,7 @@ mod tests {
                     message_id: "reaction-1".to_owned(),
                     sender: peer.clone(),
                     plaintext: reaction_event,
+                    timestamp_unix_seconds: NOW + 1,
                 },
                 StoredAppEvent {
                     room_id: "room-main".to_owned(),
@@ -4892,6 +4961,7 @@ mod tests {
                         &reaction_payload,
                     )
                     .unwrap(),
+                    timestamp_unix_seconds: NOW + 2,
                 },
                 StoredAppEvent {
                     room_id: "room-main".to_owned(),
@@ -4904,6 +4974,7 @@ mod tests {
                         &reaction_payload,
                     )
                     .unwrap(),
+                    timestamp_unix_seconds: NOW + 3,
                 },
                 StoredAppEvent {
                     room_id: "room-main".to_owned(),
@@ -4911,6 +4982,7 @@ mod tests {
                     message_id: "receipt-1".to_owned(),
                     sender: peer.clone(),
                     plaintext: receipt_event,
+                    timestamp_unix_seconds: NOW + 4,
                 },
             ],
             &owner,
@@ -4972,6 +5044,7 @@ mod tests {
                     message_id: "poll-1".to_owned(),
                     sender: peer.clone(),
                     plaintext: poll_event.clone(),
+                    timestamp_unix_seconds: NOW,
                 },
                 StoredAppEvent {
                     room_id: "room-main".to_owned(),
@@ -4979,6 +5052,7 @@ mod tests {
                     message_id: "vote-1".to_owned(),
                     sender: owner.clone(),
                     plaintext: vote_event,
+                    timestamp_unix_seconds: NOW + 1,
                 },
             ],
             &owner,
@@ -5001,6 +5075,7 @@ mod tests {
             "poll-1".to_owned(),
             peer,
             poll_event,
+            NOW,
             &owner,
         )
         .expect("poll projects as a transcript row");
@@ -5114,6 +5189,7 @@ mod tests {
             "message-7".to_owned(),
             sender,
             payload,
+            NOW,
             &owner,
         )
         .expect("hermes chat payload should project");
@@ -5645,13 +5721,21 @@ mod tests {
             app_room(&local_snapshot, &room_id).display_name,
             "Local First"
         );
-        assert!(
-            local_snapshot
-                .messages
-                .iter()
-                .any(|message| message.text == "saved before force close"),
-            "force-close reopen must render the durable local transcript before sync"
+        assert_eq!(
+            local_snapshot.selected_room_id.as_deref(),
+            Some(room_id.as_str())
         );
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).last_message_preview,
+            "saved before force close"
+        );
+        let reopened_message = local_snapshot
+            .messages
+            .iter()
+            .find(|message| message.text == "saved before force close")
+            .expect("force-close reopen must render the durable local transcript before sync");
+        assert_eq!(reopened_message.timestamp_unix_seconds, NOW);
+        assert!(!reopened_message.display_timestamp.is_empty());
 
         let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
         assert_eq!(started.status, "offline");
@@ -5659,13 +5743,13 @@ mod tests {
             started.toast.as_deref(),
             Some("Showing saved chats. Connection will retry.")
         );
-        assert!(
-            started
-                .messages
-                .iter()
-                .any(|message| message.text == "saved before force close"),
-            "startup sync failure must not hide the durable local transcript"
-        );
+        let started_message = started
+            .messages
+            .iter()
+            .find(|message| message.text == "saved before force close")
+            .expect("startup sync failure must not hide the durable local transcript");
+        assert_eq!(started_message.timestamp_unix_seconds, NOW);
+        assert!(!started_message.display_timestamp.is_empty());
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
     }
 
