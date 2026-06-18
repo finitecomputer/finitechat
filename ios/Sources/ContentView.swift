@@ -339,8 +339,11 @@ private struct RoomThreadView: View {
                         dismissFocusedMessage()
                     },
                     onMoreReaction: {
-                        reactionPickerContext = ReactionPickerContext(message: focusedMessage)
+                        let message = focusedMessage
                         dismissFocusedMessage()
+                        DispatchQueue.main.async {
+                            reactionPickerContext = ReactionPickerContext(message: message)
+                        }
                     },
                     onReply: {
                         replyDraftMessage = focusedMessage
@@ -393,9 +396,8 @@ private struct RoomThreadView: View {
                     .accessibilityIdentifier("MediaGalleryButton")
 
                     Button {
-                        if model.createInvite(for: room) {
-                            showInvite()
-                        }
+                        _ = model.createInvite(for: room)
+                        showInvite()
                     } label: {
                         Image(systemName: "qrcode")
                     }
@@ -416,7 +418,8 @@ private struct RoomThreadView: View {
                     )
                 },
                 onCreateInvite: {
-                    if let room, model.createInvite(for: room) {
+                    if let room {
+                        _ = model.createInvite(for: room)
                         showInvite()
                     }
                 },
@@ -700,7 +703,7 @@ private struct RoomThreadView: View {
 
     private func sendComposerDraft() {
         if stagedAttachments.isEmpty {
-            if model.send(replyTo: replyDraftMessage) {
+            if model.send(roomID: roomID, replyTo: replyDraftMessage) {
                 model.setTyping(roomID: roomID, isTyping: false)
                 replyDraftMessage = nil
             }
@@ -916,6 +919,7 @@ private struct FocusedReactionBar: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("React \(emoji)")
+                .accessibilityIdentifier("ReactionQuickButton-\(reactionEmojiStableID(emoji))")
             }
 
             Button {
@@ -930,6 +934,7 @@ private struct FocusedReactionBar: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("More reactions")
+            .accessibilityIdentifier("ReactionMoreButton")
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
@@ -1254,10 +1259,18 @@ private struct ReactionEmojiSectionView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(choice.name)
+                    .accessibilityIdentifier("ReactionEmojiButton-\(reactionEmojiStableID(choice.emoji))")
                 }
             }
         }
     }
+}
+
+private func reactionEmojiStableID(_ emoji: String) -> String {
+    let scalars = emoji.unicodeScalars
+        .map { String($0.value, radix: 16, uppercase: true) }
+        .joined(separator: "-")
+    return scalars.isEmpty ? "empty" : scalars
 }
 
 private func messageClipboardText(_ message: ChatMessage) -> String {

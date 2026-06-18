@@ -1411,6 +1411,51 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send through local membership")
     }
 
+    func testSendUsesExplicitRoomIDInsteadOfSelectedRoom() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = savedChatState()
+        state.rooms.append(AppRoomSummary(
+            roomId: "room-secondary",
+            displayName: "Secondary Room",
+            state: .connected,
+            status: "connected",
+            userStatusText: "Connected",
+            lastMessagePreview: "",
+            unreadCount: 0,
+            canLoadOlder: false
+        ))
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-main")
+
+        model.outboundText = "send to the visible thread only"
+        XCTAssertTrue(model.send(roomID: "room-secondary"))
+
+        guard case .sendMessage(
+            let roomID,
+            let text
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendMessage for explicit room")
+        }
+        XCTAssertEqual(roomID, "room-secondary")
+        XCTAssertEqual(text, "send to the visible thread only")
+    }
+
     func testNoticeBarPresentationExposesStableAccessibilityOnlyWhenVisible() {
         let visible = NoticeBarPresentation(text: " Network problem ")
         XCTAssertEqual(visible.visibleText, "Network problem")

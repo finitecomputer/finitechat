@@ -1431,7 +1431,7 @@ private struct ChatRichTextView: View {
         default:
             .body.weight(.semibold)
         }
-        return inlineText(from: node.children)
+        return Text(inlineAttributedString(from: node.children))
             .font(font)
             .foregroundStyle(foregroundColor)
             .padding(.bottom, 1)
@@ -1440,9 +1440,9 @@ private struct ChatRichTextView: View {
     @ViewBuilder
     private func renderParagraph(_ node: ChatRichTextAstNode) -> some View {
         if hasOnlyInlineChildren(node) {
-            inlineText(from: node.children)
+            Text(inlineAttributedString(from: node.children))
                 .font(.body)
-                .foregroundStyle(foregroundColor)
+                .tint(linkColor)
                 .lineSpacing(1)
         } else {
             renderChildren(node, spacing: 4)
@@ -1554,6 +1554,64 @@ private struct ChatRichTextView: View {
                 inlineText(from: node.children)
             }
         }
+    }
+
+    private func inlineAttributedString(from children: [ChatRichTextAstNode]?) -> AttributedString {
+        var result = AttributedString()
+        for node in children ?? [] {
+            result += inlineAttributedNode(node)
+        }
+        return result
+    }
+
+    private func inlineAttributedNode(_ node: ChatRichTextAstNode) -> AttributedString {
+        switch node.type {
+        case "text":
+            return attributedText(node.value ?? "")
+        case "strong":
+            return attributedText(from: node.children, font: .body.bold())
+        case "emphasis":
+            return attributedText(from: node.children, font: .body.italic())
+        case "strikethrough":
+            var text = inlineAttributedString(from: node.children)
+            text.strikethroughStyle = .single
+            return text
+        case "code_inline":
+            var text = attributedText(node.value ?? "")
+            text.font = .system(.body, design: .monospaced)
+            return text
+        case "link":
+            var text = inlineAttributedString(from: node.children)
+            if text.characters.isEmpty {
+                text = attributedText(node.url ?? "")
+            }
+            if let urlString = node.url, let url = URL(string: urlString) {
+                text.link = url
+                text.underlineStyle = .single
+                text.foregroundColor = linkColor
+            }
+            return text
+        case "hard_break":
+            return attributedText("\n")
+        default:
+            if let value = node.value {
+                return attributedText(value)
+            } else {
+                return inlineAttributedString(from: node.children)
+            }
+        }
+    }
+
+    private func attributedText(from children: [ChatRichTextAstNode]?, font: Font) -> AttributedString {
+        var text = inlineAttributedString(from: children)
+        text.font = font
+        return text
+    }
+
+    private func attributedText(_ value: String) -> AttributedString {
+        var text = AttributedString(value)
+        text.foregroundColor = foregroundColor
+        return text
     }
 
     private func extractText(from children: [ChatRichTextAstNode]?) -> String {

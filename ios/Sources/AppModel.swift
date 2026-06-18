@@ -592,26 +592,31 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    func send(replyTo message: ChatMessage? = nil) -> Bool {
-        guard let room = selectedRoom else { return false }
-        guard room.state == .connected else { return false }
+    func send(roomID: String, replyTo message: ChatMessage? = nil) -> Bool {
+        guard roomAllowsComposition(roomID) else { return false }
         let text = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
         let action: AppAction
         if let message {
             action = .sendReply(
-                roomId: room.roomId,
+                roomId: roomID,
                 text: text,
                 replyToMessageId: message.messageId
             )
         } else {
-            action = .sendMessage(roomId: room.roomId, text: text)
+            action = .sendMessage(roomId: roomID, text: text)
         }
         let sent = dispatch(action)
         if sent {
             outboundText = ""
         }
         return sent
+    }
+
+    @discardableResult
+    func send(replyTo message: ChatMessage? = nil) -> Bool {
+        guard let roomID = selectedRoom?.roomId else { return false }
+        return send(roomID: roomID, replyTo: message)
     }
 
     @discardableResult
