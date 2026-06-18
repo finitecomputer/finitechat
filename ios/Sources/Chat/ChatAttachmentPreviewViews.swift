@@ -419,12 +419,22 @@ func attachmentLocalURL(_ attachment: ChatMediaAttachment) -> URL? {
 
 func attachmentCanDownload(_ attachment: ChatMediaAttachment) -> Bool {
     guard attachmentLocalURL(attachment) == nil,
+          attachment.uploadProgressPerMille == nil,
           attachment.downloadProgressPerMille == nil,
           let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines)
     else {
         return false
     }
     return !url.isEmpty
+}
+
+func attachmentDeterminateTransferProgress(_ progressPerMille: UInt32?) -> Double? {
+    guard let progress = progressPerMille,
+          progress > 0
+    else {
+        return nil
+    }
+    return Double(min(progress, 1_000)) / 1_000
 }
 
 private func previewTitle(_ attachment: ChatMediaAttachment) -> String {

@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -8,6 +9,10 @@ use crate::bindings::BuildProfile;
 use crate::cli::{CliError, JsonOk, human_log, json_print};
 use crate::config::load_rmp_toml;
 use crate::util::{discover_xcode_dev_dir, run_capture};
+
+const IOS_DEVICE_STORE_DIR: &str = "FiniteChatStore";
+const IOS_DEVICE_STORE_SOURCE: &str = "Library/Application Support/FiniteChatStore";
+const IOS_DEVICE_STORE_DESTINATION: &str = "Library/Application Support";
 
 pub fn run(
     root: &Path,
@@ -72,6 +77,59 @@ fn run_ios(
     args: crate::cli::RunIosArgs,
     release: bool,
 ) -> Result<(), CliError> {
+    let installed = build_install_ios_simulator(root, verbose, args, release)?;
+
+    // Optional local runtime config for simulator runs.
+    if std::env::var("FINITECHAT_RELAY_URLS").is_ok()
+        || std::env::var("FINITECHAT_SERVER_URL").is_ok()
+    {
+        maybe_write_ios_relay_config(
+            &installed.dev_dir,
+            &installed.udid,
+            &installed.bundle_id,
+            verbose,
+        )?;
+    }
+
+    launch_ios_simulator_app(
+        &installed.dev_dir,
+        &installed.udid,
+        &installed.bundle_id,
+        &[],
+        verbose,
+    )?;
+
+    let _ = Command::new("open").arg("-a").arg("Simulator").status();
+
+    if json {
+        json_print(&JsonOk {
+            ok: true,
+            data: serde_json::json!({"platform":"ios","kind":"simulator","udid":installed.udid,"bundle_id":installed.bundle_id}),
+        });
+    } else {
+        eprintln!("ok: ios app launched (simulator)");
+    }
+    Ok(())
+}
+
+pub(crate) struct IosInstalledApp {
+    pub dev_dir: PathBuf,
+    pub udid: String,
+    pub bundle_id: String,
+}
+
+pub(crate) struct IosDeviceInstalledApp {
+    pub dev_dir: PathBuf,
+    pub udid: String,
+    pub bundle_id: String,
+}
+
+pub(crate) fn build_install_ios_simulator(
+    root: &Path,
+    verbose: bool,
+    args: crate::cli::RunIosArgs,
+    release: bool,
+) -> Result<IosInstalledApp, CliError> {
     let cfg = load_rmp_toml(root)?;
     let ios = cfg
         .ios
@@ -147,6 +205,7 @@ fn run_ios(
         &xcode_scheme,
         &udid,
         xcode_config,
+        "iphonesimulator",
         xcode_arch,
     )?;
     if !app_path.is_dir() {
@@ -172,31 +231,163 @@ fn run_ios(
         return Err(CliError::operational("simctl install failed"));
     }
 
-    // Optional local runtime config for simulator runs.
-    if std::env::var("FINITECHAT_RELAY_URLS").is_ok()
-        || std::env::var("FINITECHAT_SERVER_URL").is_ok()
-    {
-        maybe_write_ios_relay_config(&dev_dir, &udid, &bundle_id, verbose)?;
+    Ok(IosInstalledApp {
+        dev_dir,
+        udid,
+        bundle_id,
+    })
+}
+
+pub(crate) fn build_install_ios_device(
+    root: &Path,
+    verbose: bool,
+    args: crate::cli::RunIosArgs,
+    release: bool,
+    reset_app: bool,
+) -> Result<IosDeviceInstalledApp, CliError> {
+    let cfg = load_rmp_toml(root)?;
+    let ios = cfg
+        .ios
+        .ok_or_else(|| CliError::user("rmp.toml missing [ios] section"))?;
+    let dev_dir = discover_xcode_dev_dir()?;
+    let profile = build_profile(release);
+    let crate::cli::RunIosArgs {
+        udid,
+        development_team,
+    } = args;
+    let requested_udid = udid.ok_or_else(|| {
+        CliError::user("product harness ios-device requires --udid for an attached physical iPhone")
+    })?;
+    let development_team = resolve_ios_development_team(development_team)?;
+    let udid = resolve_ios_device_udid(&dev_dir, &requested_udid)?;
+
+    bindings::build_swift_for_run(root, "aarch64-apple-ios", profile, verbose)?;
+
+    human_log(verbose, "xcodegen generate");
+    let status = Command::new("xcodegen")
+        .current_dir(root.join("ios"))
+        .arg("generate")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run xcodegen: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational("xcodegen generate failed"));
     }
 
-    // Launch.
-    let _ = Command::new("/usr/bin/xcrun")
-        .env("DEVELOPER_DIR", &dev_dir)
-        .arg("simctl")
-        .arg("terminate")
-        .arg(&udid)
-        .arg(&bundle_id)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let bundle_id = ios.bundle_id;
+    if reset_app {
+        uninstall_ios_device_app(&dev_dir, &udid, &bundle_id, verbose)?;
+    }
 
-    human_log(verbose, "simctl launch");
+    let xcode_name = read_xcode_project_name(root).unwrap_or_else(|| "App".to_string());
+    let xcode_scheme = ios.scheme.clone().unwrap_or_else(|| xcode_name.clone());
+    let xcode_config = if release { "Release" } else { "Debug" };
+    let xcode_arch = "arm64";
+    let xcode_project_path = root.join(format!("ios/{xcode_name}.xcodeproj"));
+
+    human_log(
+        verbose,
+        format!("xcodebuild ({xcode_config}, iphoneos, arch={xcode_arch})"),
+    );
+    let mut cmd = Command::new("/usr/bin/xcrun");
+    cmd.env("DEVELOPER_DIR", &dev_dir)
+        .env_remove("LD")
+        .env_remove("CC")
+        .env_remove("CXX")
+        .arg("xcodebuild")
+        .arg("-project")
+        .arg(&xcode_project_path)
+        .arg("-scheme")
+        .arg(&xcode_scheme)
+        .arg("-destination")
+        .arg(format!("id={udid}"))
+        .arg("-configuration")
+        .arg(xcode_config)
+        .arg("-sdk")
+        .arg("iphoneos");
+    if development_team.is_some() {
+        cmd.arg("-allowProvisioningUpdates")
+            .arg("-allowProvisioningDeviceRegistration");
+    }
+    cmd.arg("build")
+        .arg(format!("ARCHS={xcode_arch}"))
+        .arg("ONLY_ACTIVE_ARCH=YES")
+        .arg(format!("PRODUCT_BUNDLE_IDENTIFIER={bundle_id}"));
+    if let Some(team) = development_team.as_deref() {
+        cmd.arg(format!("DEVELOPMENT_TEAM={team}"));
+    }
+
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run xcodebuild: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational("xcodebuild failed"));
+    }
+
+    let app_path = resolve_ios_app_path(
+        &dev_dir,
+        &xcode_project_path,
+        &xcode_scheme,
+        &udid,
+        xcode_config,
+        "iphoneos",
+        xcode_arch,
+    )?;
+    if !app_path.is_dir() {
+        return Err(CliError::operational(format!(
+            "missing built app at {}",
+            app_path.to_string_lossy()
+        )));
+    }
+
+    human_log(verbose, format!("devicectl install app (udid={udid})"));
     let status = Command::new("/usr/bin/xcrun")
         .env("DEVELOPER_DIR", &dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("install")
+        .arg("app")
+        .arg("--device")
+        .arg(&udid)
+        .arg(&app_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl install: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational("devicectl install app failed"));
+    }
+
+    Ok(IosDeviceInstalledApp {
+        dev_dir,
+        udid,
+        bundle_id,
+    })
+}
+
+pub(crate) fn launch_ios_simulator_app(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    launch_args: &[String],
+    verbose: bool,
+) -> Result<(), CliError> {
+    let _ = terminate_ios_simulator_app(dev_dir, udid, bundle_id, verbose);
+
+    human_log(verbose, "simctl launch");
+    let mut cmd = Command::new("/usr/bin/xcrun");
+    cmd.env("DEVELOPER_DIR", dev_dir)
         .arg("simctl")
         .arg("launch")
-        .arg(&udid)
-        .arg(&bundle_id)
+        .arg(udid)
+        .arg(bundle_id);
+    for arg in launch_args {
+        cmd.arg(arg);
+    }
+    let status = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -204,18 +395,434 @@ fn run_ios(
     if !status.success() {
         return Err(CliError::operational("simctl launch failed"));
     }
+    Ok(())
+}
 
-    let _ = Command::new("open").arg("-a").arg("Simulator").status();
+pub(crate) fn launch_ios_device_app(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    launch_args: &[String],
+    verbose: bool,
+) -> Result<u64, CliError> {
+    human_log(verbose, "devicectl launch");
+    let json_output = tempfile::NamedTempFile::new()
+        .map_err(|error| CliError::operational(format!("failed to create temp file: {error}")))?;
+    let mut cmd = Command::new("/usr/bin/xcrun");
+    cmd.env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("process")
+        .arg("launch")
+        .arg("--device")
+        .arg(udid)
+        .arg("--terminate-existing")
+        .arg("--json-output")
+        .arg(json_output.path())
+        .arg(bundle_id);
+    for arg in launch_args {
+        cmd.arg(arg);
+    }
+    let status = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl launch: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational("devicectl launch failed"));
+    }
+    let bytes = fs::read(json_output.path()).map_err(|error| {
+        CliError::operational(format!(
+            "failed to read devicectl launch JSON {}: {error}",
+            json_output.path().display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::operational(format!("failed to parse devicectl launch JSON: {error}"))
+    })?;
+    find_process_identifier(&value).ok_or_else(|| {
+        CliError::operational(
+            "devicectl launch did not report a process identifier; cannot force-close app",
+        )
+    })
+}
 
-    if json {
-        json_print(&JsonOk {
-            ok: true,
-            data: serde_json::json!({"platform":"ios","kind":"simulator","udid":udid,"bundle_id":bundle_id}),
-        });
-    } else {
-        eprintln!("ok: ios app launched (simulator)");
+pub(crate) fn terminate_ios_device_app(
+    dev_dir: &Path,
+    udid: &str,
+    pid: u64,
+    verbose: bool,
+) -> Result<(), CliError> {
+    human_log(verbose, format!("devicectl terminate (pid={pid})"));
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("process")
+        .arg("terminate")
+        .arg("--device")
+        .arg(udid)
+        .arg("--pid")
+        .arg(pid.to_string())
+        .arg("--kill")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl terminate: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational("devicectl terminate failed"));
     }
     Ok(())
+}
+
+pub(crate) fn pull_ios_device_app_store(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    store_path: &Path,
+    verbose: bool,
+) -> Result<(), CliError> {
+    checked_ios_device_store_path(store_path)?;
+    let support_root = store_path.parent().ok_or_else(|| {
+        CliError::operational(format!("store path {} has no parent", store_path.display()))
+    })?;
+    fs::create_dir_all(support_root).map_err(|error| {
+        CliError::operational(format!(
+            "failed to create support root {}: {error}",
+            support_root.display()
+        ))
+    })?;
+    let pull_parent = support_root.join(".device-pull-FiniteChatStore");
+    let _ = fs::remove_dir_all(&pull_parent);
+    fs::create_dir_all(&pull_parent).map_err(|error| {
+        CliError::operational(format!(
+            "failed to create device pull directory {}: {error}",
+            pull_parent.display()
+        ))
+    })?;
+
+    human_log(verbose, "devicectl copy app store from device");
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("copy")
+        .arg("from")
+        .arg("--device")
+        .arg(udid)
+        .arg("--domain-type")
+        .arg("appDataContainer")
+        .arg("--domain-identifier")
+        .arg(bundle_id)
+        .arg("--source")
+        .arg(IOS_DEVICE_STORE_SOURCE)
+        .arg("--destination")
+        .arg(&pull_parent)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl copy from: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational(
+            "devicectl copy from appDataContainer failed",
+        ));
+    }
+
+    let source_path = pulled_ios_device_store_source(&pull_parent)?;
+    let _ = fs::remove_dir_all(store_path);
+    fs::rename(&source_path, store_path).map_err(|error| {
+        CliError::operational(format!(
+            "failed to move pulled device store from {} to {}: {error}",
+            source_path.display(),
+            store_path.display()
+        ))
+    })?;
+    let _ = fs::remove_dir_all(&pull_parent);
+    if !store_path.is_dir() {
+        return Err(CliError::operational(format!(
+            "pulled device store is missing at {}",
+            store_path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn push_ios_device_app_store(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    store_path: &Path,
+    verbose: bool,
+) -> Result<(), CliError> {
+    checked_ios_device_store_path(store_path)?;
+    if !store_path.is_dir() {
+        return Err(CliError::operational(format!(
+            "cannot push missing device store {}",
+            store_path.display()
+        )));
+    }
+    human_log(verbose, "devicectl copy app store to device");
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("copy")
+        .arg("to")
+        .arg("--device")
+        .arg(udid)
+        .arg("--domain-type")
+        .arg("appDataContainer")
+        .arg("--domain-identifier")
+        .arg(bundle_id)
+        .arg("--source")
+        .arg(store_path)
+        .arg("--destination")
+        .arg(IOS_DEVICE_STORE_DESTINATION)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl copy to: {e}")))?;
+    if !status.success() {
+        return Err(CliError::operational(
+            "devicectl copy to appDataContainer failed",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_ios_device_store_path(store_path: &Path) -> Result<(), CliError> {
+    if store_path.file_name().and_then(|name| name.to_str()) != Some(IOS_DEVICE_STORE_DIR) {
+        return Err(CliError::operational(format!(
+            "device store path must end with {IOS_DEVICE_STORE_DIR}: {}",
+            store_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn pulled_ios_device_store_source(pull_parent: &Path) -> Result<PathBuf, CliError> {
+    let copied_store = pull_parent.join(IOS_DEVICE_STORE_DIR);
+    if copied_store.is_dir() {
+        return Ok(copied_store);
+    }
+    if is_ios_device_store_root(pull_parent) {
+        return Ok(pull_parent.to_owned());
+    }
+    Err(CliError::operational(format!(
+        "devicectl copy did not produce expected {IOS_DEVICE_STORE_DIR} directory or direct store contents under {}",
+        pull_parent.display()
+    )))
+}
+
+fn is_ios_device_store_root(path: &Path) -> bool {
+    path.join("account-secret.hex").is_file() && path.join("client.sqlite3").is_file()
+}
+
+pub(crate) fn terminate_ios_simulator_app(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    verbose: bool,
+) -> Result<(), CliError> {
+    human_log(verbose, "simctl terminate");
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("simctl")
+        .arg("terminate")
+        .arg(udid)
+        .arg(bundle_id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run simctl terminate: {e}")))?;
+    if !status.success() {
+        human_log(
+            verbose,
+            format!("simctl terminate returned status {status}; continuing"),
+        );
+    }
+    Ok(())
+}
+
+fn uninstall_ios_device_app(
+    dev_dir: &Path,
+    udid: &str,
+    bundle_id: &str,
+    verbose: bool,
+) -> Result<(), CliError> {
+    human_log(verbose, format!("devicectl uninstall app (udid={udid})"));
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("device")
+        .arg("uninstall")
+        .arg("app")
+        .arg("--device")
+        .arg(udid)
+        .arg(bundle_id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl uninstall: {e}")))?;
+    if !status.success() {
+        human_log(
+            verbose,
+            format!("devicectl uninstall returned status {status}; continuing"),
+        );
+    }
+    Ok(())
+}
+
+fn resolve_ios_device_udid(dev_dir: &Path, requested: &str) -> Result<String, CliError> {
+    let mut cmd = Command::new("/usr/bin/xcrun");
+    cmd.env("DEVELOPER_DIR", dev_dir)
+        .arg("xctrace")
+        .arg("list")
+        .arg("devices");
+    let out = run_capture(cmd)?;
+    if !out.status.success() {
+        return Err(CliError::operational("failed to list iOS devices"));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains(requested) {
+        return Ok(requested.to_owned());
+    }
+    if let Some(udid) = resolve_ios_device_udid_from_devicectl(dev_dir, requested)?
+        && stdout.contains(&udid)
+    {
+        return Ok(udid);
+    }
+
+    Err(CliError::user(format!(
+        "requested physical iOS device identifier or UDID not found: {requested}"
+    )))
+}
+
+fn resolve_ios_device_udid_from_devicectl(
+    dev_dir: &Path,
+    requested: &str,
+) -> Result<Option<String>, CliError> {
+    let json_output = tempfile::NamedTempFile::new()
+        .map_err(|error| CliError::operational(format!("failed to create temp file: {error}")))?;
+    let status = Command::new("/usr/bin/xcrun")
+        .env("DEVELOPER_DIR", dev_dir)
+        .arg("devicectl")
+        .arg("list")
+        .arg("devices")
+        .arg("--json-output")
+        .arg(json_output.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| CliError::operational(format!("failed to run devicectl list devices: {e}")))?;
+    if !status.success() {
+        return Ok(None);
+    }
+    let bytes = fs::read(json_output.path()).map_err(|error| {
+        CliError::operational(format!(
+            "failed to read devicectl device JSON {}: {error}",
+            json_output.path().display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::operational(format!("failed to parse devicectl device JSON: {error}"))
+    })?;
+    Ok(resolve_ios_device_udid_from_devicectl_value(
+        &value, requested,
+    ))
+}
+
+fn resolve_ios_device_udid_from_devicectl_value(
+    value: &serde_json::Value,
+    requested: &str,
+) -> Option<String> {
+    let devices = value.get("result")?.get("devices")?.as_array()?;
+    for device in devices {
+        let identifier = device.get("identifier").and_then(|value| value.as_str());
+        let hardware_udid = device
+            .get("hardwareProperties")
+            .and_then(|value| value.get("udid"))
+            .and_then(|value| value.as_str());
+        if identifier == Some(requested) || hardware_udid == Some(requested) {
+            return hardware_udid.map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+pub(crate) fn resolve_ios_development_team(
+    explicit: Option<String>,
+) -> Result<Option<String>, CliError> {
+    resolve_ios_development_team_with(explicit, std::env::var("RMP_IOS_DEVELOPMENT_TEAM").ok())
+}
+
+pub(crate) fn require_ios_development_team_with(
+    explicit: Option<String>,
+    env_value: Option<String>,
+) -> Result<String, CliError> {
+    resolve_ios_development_team_with(explicit, env_value)?.ok_or_else(|| {
+        CliError::user(
+            "product harness ios-device requires --ios-development-team or RMP_IOS_DEVELOPMENT_TEAM for physical iOS signing",
+        )
+    })
+}
+
+fn resolve_ios_development_team_with(
+    explicit: Option<String>,
+    env_value: Option<String>,
+) -> Result<Option<String>, CliError> {
+    explicit
+        .or(env_value)
+        .map(|team| checked_development_team(&team))
+        .transpose()
+}
+
+pub(crate) fn checked_development_team(value: &str) -> Result<String, CliError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::user("iOS development team id must not be empty"));
+    }
+    if !trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(CliError::user(
+            "iOS development team id must contain only ASCII letters and digits",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn find_process_identifier(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let normalized = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if matches!(
+                    normalized.as_str(),
+                    "pid" | "processid" | "processidentifier"
+                ) && let Some(pid) = json_u64(value)
+                {
+                    return Some(pid);
+                }
+            }
+            map.values().find_map(find_process_identifier)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_process_identifier),
+        _ => None,
+    }
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
 }
 
 pub(crate) fn ensure_ios_simulator(
@@ -1175,6 +1782,7 @@ fn resolve_ios_app_path(
     xcode_scheme: &str,
     udid: &str,
     xcode_config: &str,
+    sdk: &str,
     xcode_arch: &str,
 ) -> Result<PathBuf, CliError> {
     let mut cmd = Command::new("/usr/bin/xcrun");
@@ -1192,7 +1800,7 @@ fn resolve_ios_app_path(
         .arg("-configuration")
         .arg(xcode_config)
         .arg("-sdk")
-        .arg("iphonesimulator")
+        .arg(sdk)
         .arg(format!("ARCHS={xcode_arch}"))
         .arg("ONLY_ACTIVE_ARCH=YES")
         .arg("-showBuildSettings");
@@ -1295,5 +1903,169 @@ mod tests {
             default_app_kp_relay_csv,
         );
         assert_eq!(from_empty_primary, default_app_kp_relay_csv());
+    }
+
+    #[test]
+    fn ios_development_team_resolution_prefers_explicit_then_env() {
+        assert_eq!(
+            resolve_ios_development_team_with(
+                Some("  TEAM123  ".to_owned()),
+                Some("ENV999".to_owned()),
+            )
+            .expect("explicit team"),
+            Some("TEAM123".to_owned())
+        );
+        assert_eq!(
+            resolve_ios_development_team_with(None, Some("  ENV999  ".to_owned()))
+                .expect("env team"),
+            Some("ENV999".to_owned())
+        );
+        assert_eq!(
+            resolve_ios_development_team_with(None, None).expect("missing team"),
+            None
+        );
+    }
+
+    #[test]
+    fn ios_development_team_resolution_rejects_empty_or_non_alphanumeric() {
+        let empty_error = resolve_ios_development_team_with(Some("   ".to_owned()), None)
+            .expect_err("empty team should fail");
+        assert!(
+            empty_error.to_string().contains("must not be empty"),
+            "unexpected error: {empty_error}"
+        );
+
+        let punctuation_error =
+            resolve_ios_development_team_with(None, Some("TEAM-123".to_owned()))
+                .expect_err("punctuation should fail");
+        assert!(
+            punctuation_error
+                .to_string()
+                .contains("only ASCII letters and digits"),
+            "unexpected error: {punctuation_error}"
+        );
+    }
+
+    #[test]
+    fn required_ios_development_team_uses_injected_env_for_harness_preflight() {
+        assert_eq!(
+            require_ios_development_team_with(None, Some("  ENV999  ".to_owned()))
+                .expect("env team"),
+            "ENV999"
+        );
+        let missing =
+            require_ios_development_team_with(None, None).expect_err("missing team should fail");
+        assert!(
+            missing
+                .to_string()
+                .contains("requires --ios-development-team"),
+            "unexpected error: {missing}"
+        );
+    }
+
+    #[test]
+    fn devicectl_identifier_resolves_to_xcode_hardware_udid() {
+        let value = serde_json::json!({
+            "result": {
+                "devices": [
+                    {
+                        "identifier": "8C10824B-840E-5717-BC9C-55B537D33060",
+                        "hardwareProperties": {
+                            "udid": "00008150-0010149A26F0401C"
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            resolve_ios_device_udid_from_devicectl_value(
+                &value,
+                "8C10824B-840E-5717-BC9C-55B537D33060",
+            ),
+            Some("00008150-0010149A26F0401C".to_owned())
+        );
+        assert_eq!(
+            resolve_ios_device_udid_from_devicectl_value(&value, "00008150-0010149A26F0401C"),
+            Some("00008150-0010149A26F0401C".to_owned())
+        );
+        assert_eq!(
+            resolve_ios_device_udid_from_devicectl_value(&value, "missing-device"),
+            None
+        );
+    }
+
+    #[test]
+    fn devicectl_process_identifier_is_found_recursively() {
+        let value = serde_json::json!({
+            "result": {
+                "launch": {
+                    "process": {
+                        "processIdentifier": "4242"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(find_process_identifier(&value), Some(4242));
+    }
+
+    #[test]
+    fn ios_device_store_path_must_end_with_finitechat_store() {
+        checked_ios_device_store_path(Path::new("/tmp/harness/FiniteChatStore"))
+            .expect("valid store path");
+
+        let error = checked_ios_device_store_path(Path::new("/tmp/harness/store"))
+            .expect_err("wrong store directory should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("device store path must end with FiniteChatStore"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pulled_ios_device_store_source_requires_exact_store_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pull_parent = temp.path().join("pull");
+        std::fs::create_dir_all(pull_parent.join(IOS_DEVICE_STORE_DIR)).expect("store dir");
+
+        assert_eq!(
+            pulled_ios_device_store_source(&pull_parent).expect("store source"),
+            pull_parent.join(IOS_DEVICE_STORE_DIR)
+        );
+    }
+
+    #[test]
+    fn pulled_ios_device_store_source_accepts_direct_store_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pull_parent = temp.path().join("pull");
+        std::fs::create_dir_all(&pull_parent).expect("pull dir");
+        std::fs::write(pull_parent.join("account-secret.hex"), "secret").expect("secret");
+        std::fs::write(pull_parent.join("client.sqlite3"), "").expect("sqlite");
+
+        assert_eq!(
+            pulled_ios_device_store_source(&pull_parent).expect("direct store source"),
+            pull_parent
+        );
+    }
+
+    #[test]
+    fn pulled_ios_device_store_source_rejects_ambiguous_copy_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pull_parent = temp.path().join("pull");
+        std::fs::create_dir_all(pull_parent.join("client.sqlite3")).expect("ambiguous dir");
+
+        let error = pulled_ios_device_store_source(&pull_parent)
+            .expect_err("ambiguous copy shape should be rejected");
+
+        assert!(
+            error.to_string().contains(
+                "did not produce expected FiniteChatStore directory or direct store contents"
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

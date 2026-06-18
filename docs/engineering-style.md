@@ -63,6 +63,29 @@ Reference: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE
   relying on it. Each item needs an observed source, risk, first proof, and
   delete condition. A shortcut without a delete condition is not accepted debt;
   it is unfinished design.
+- Before the first user release, prefer hard cuts over compatibility work. Do
+  not add migrations, legacy shims, or make-work patches to preserve pre-release
+  dev/test state; rename or delete the old shape and reset local stores/tests
+  unless real user data exists.
+- Do not build product harnesses around known-wrong pre-release shapes. Hard-cut
+  the domain model first, then write product proof against the model users will
+  actually see.
+- Dev/test product-state cleanup must go through one documented reset command
+  that deletes whole explicit roots. Do not add ad hoc cleanup scripts, targeted
+  SQL cleanup, row mutation, or partial config clearing.
+- Before the first user release, do not add automatic diagnostic upload or
+  telemetry to compensate for weak debugging. Use hidden Developer diagnostics
+  with explicit local copy/share export.
+- Product E2E should be simulator-first for deterministic automation and fast
+  hard cuts. Before first users, repeat the same product matrix on a physical
+  phone; do not replace it with a looser device smoke test.
+- Product offline tests must preserve runtime identity and the configured
+  server URL, then toggle reachability. Wrong-server-URL tests belong to
+  diagnostics coverage, not the offline-send matrix.
+- In planning/grilling sessions, ask the user for product semantics,
+  user-visible behavior, privacy posture, and irreversible tradeoffs. Engineers
+  own command-line flags, path fences, test mechanics, and implementation
+  guardrails unless those details change product behavior.
 
 ## Assert Boundary
 

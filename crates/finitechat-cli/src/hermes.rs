@@ -696,6 +696,19 @@ fn append_payload<W: Write>(
     let accepted = delivery
         .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
         .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+    let _ = if let Some(room_server_url) = device.room_server_url(room_id).map(str::to_owned) {
+        let mut room_delivery =
+            HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(room_server_url.clone()));
+        run_room_server_sync_tick(
+            &mut store,
+            &mut device,
+            &mut room_delivery,
+            &sync_options(),
+            &room_server_url,
+        )
+    } else {
+        run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &sync_options())
+    };
     crate::write_pretty_json(
         output,
         &json!({ "message_id": accepted.message_id, "seq": accepted.seq }),

@@ -52,12 +52,14 @@ Startup reconstructs the chat list from the union of persisted app-room rows
 and MLS-known rooms, because a pending invite can be user-visible before the
 device has joined the MLS group.
 
-`client_app_state` stores encrypted single-row application navigation state
-owned by Rust. The first field is `selected_room_id`, which lets a phone
-force-close and reopen into the same selected transcript before any network
-sync. Swift mirrors this field into native navigation; it does not decide which
-room is selected or persist chat routing on its own. The AEAD AAD binds the row
-to the owning account/device so copied state fails closed.
+`client_app_state` stores encrypted single-row local application state owned by
+Rust. It carries `selected_room_id`, which lets a phone force-close and reopen
+into the same selected transcript before any network sync, plus local
+revoked-device marks used to render the account device list after relaunch.
+Swift mirrors this field into native navigation; it does not decide which room
+is selected, persist chat routing, or own device-list repair state on its own.
+The AEAD AAD binds the row to the owning account/device so copied state fails
+closed.
 
 `client_app_messages` stores the bounded local application-message projection
 that powers chat lists and room views. It is not an authoritative server log
@@ -72,31 +74,59 @@ id, sequence, message id, and authenticated sender so copied or tampered rows
 fail closed on load. The table has owner and owner/room/seq indexes so startup
 can load a bounded recent projection without replaying room history.
 
-`client_app_outbox` stores encrypted local pending/failed chat sends that have
-not become accepted server log entries. Outbox rows are scoped to the owning
+`client_app_outbox` stores encrypted local chat sends that have not become
+accepted server log entries. Outbox rows are scoped to the owning
 account/device and keyed by `(room_id, message_id)`, where `message_id` is a
 local client id. The encrypted payload carries the sender, decrypted application
-plaintext, delivery state (`pending` or `failed` with a bounded reason), and
-the local send timestamp used for the pending/failed bubble projection.
-Runtime startup merges these rows into the Rust-owned chat projection after
-accepted messages/events, so a force-close after a failed send reopens with the
-visible failed bubble instead of an empty transcript. When a send is accepted by
-the room server, the runtime writes the accepted app message/event projection
-and deletes the matching outbox row. Message retry is a Rust action over this
-stored row, keyed by `(room_id, message_id)`; Swift only asks to retry the
-projected failed message and never reconstructs plaintext send intent from UI
-state.
+plaintext, local send state, server delivery state, a bounded failure reason
+when the message send or upload request receives a non-success server response,
+local-to-server correlation material, and retry metadata. Runtime startup
+merges these rows into the Rust-owned chat projection after accepted
+messages/events, so a force-close after an
+undelivered send reopens with the visible saved bubble instead of an empty
+transcript. When a send is accepted by the room server, the runtime writes the
+accepted app message/event projection with outbound delivery marked delivered,
+projects it through the same visible message identity as the local bubble, and
+deletes the matching outbox row.
+A failed outbox row is not a room lifecycle transition. Auth, admission, or
+room-not-found style send rejections attach to the outbound message and hidden
+diagnostics/repair work; only confirmed missing or unusable local MLS
+membership projects the room as unavailable on this device.
+Message retry is a Rust action over this stored row, keyed by `(room_id,
+message_id)`; Swift only asks to retry the projected failed message and never
+reconstructs plaintext send intent from UI state. Retry reuses the same local
+message id, visible message identity, local-to-server correlation material, and
+idempotency material; it must not create a new message row or second visible
+bubble. Inbound messages do not carry outbound delivery state. Read receipts
+may change the rendered checkmark for a delivered outbound message, but they do
+not alter outbox rows, delivery state, or retry policy.
 
-Attachment outbox rows do not store plaintext bytes in SQLite. Before upload,
-the runtime validates and writes the plaintext into the local attachment cache,
-then stores a path-only Hermes media payload in `client_app_outbox` so Swift can
-render the pending or failed bubble after restart. Successful delivery removes
-that local outbox row and replaces it with the accepted encrypted blob-reference
-message; the cached plaintext remains addressable through the verified
-plaintext hash path used by the accepted blob reference. Retrying a failed media
-row reads the path-only cached plaintext from Rust, uploads it, sends the
-encrypted blob-reference payload, and leaves the failed placeholder behind only
-if the retry still cannot complete.
+Attachment sends are not part of the v1 offline outbox. Before a sent
+attachment message exists, the runtime validates the local file, encrypts it,
+uploads ciphertext, and then sends the encrypted blob-reference payload. If
+upload is unreachable, the attachment send fails immediately with transient
+feedback and creates no sent bubble, no outbound delivery state, and no
+`client_app_outbox` row. SQLite must not store plaintext attachment bytes.
+After the accepted encrypted blob-reference message exists, the local plaintext
+cache is not delivery state. If plaintext is absent on a later open, the
+runtime treats it as an attachment cache miss. It waits for an explicit
+tap/download action before fetching and decrypting from the blob reference, and
+reports attachment-view unavailable/download error if that fails while the
+message remains delivered.
+Attachment crash recovery is therefore smaller than text outbox recovery in v1:
+before server acceptance, relaunch must not show a sent attachment bubble;
+after server acceptance, relaunch must restore the delivered blob-reference
+message. There is no durable undelivered offline media row.
+Attachment upload/download progress is not inferred by Swift. Until the blob
+transport reports real byte counts through Rust projection, the app exposes
+only coarse Rust-owned in-flight activity; `0` progress is rendered as
+indeterminate activity, not a fabricated percentage. Byte-level progress remains
+omitted.
+If local attachment staging or delivered attachment cache metadata is missing
+or fails validation, the runtime treats that as local attachment
+unavailable/cache-miss state, not a server delivery failure. It does not change
+room lifecycle, does not become a failed send, and normal test cleanup must not
+manufacture it; corrupted-state repair tests must name the fixture explicitly.
 
 The wrapping key is derived from the user's Nostr secret and device id using
 HKDF with Finite Chat domain separation. SQLite metadata, row counts, WAL
@@ -119,13 +149,17 @@ persists the device cursor that consumed them, including the timestamp carried
 by the server room-log entry. Own sends are first inserted into
 `client_app_outbox` before network delivery, then promoted by deleting the
 outbox row after the server append is accepted and the accepted app
-message/event projection, including the accepted timestamp, is saved. Failed
-own sends are retried through the same stored outbox row after restart;
-successful retry promotes to the accepted server-backed row and removes the
-local failed id. Swift and the app runtime render the Rust state and do not own
-persistence or timestamp formatting. Startup reads the bounded SQLite
+message/event projection, including the accepted timestamp, is saved.
+Undelivered own sends drain automatically through the same stored outbox row on
+bounded runtime ticks after restart, sync/hint wake, or opening a room; failed
+own sends are excluded from automatic drain and require explicit user retry or
+a named repair flow over the same outbox row and idempotency material.
+Successful delivery promotes to the accepted server-backed row while preserving
+the same visible message identity, then removes the local outbox placeholder.
+Swift and the app runtime render the Rust state and do not own persistence or
+timestamp formatting. Startup reads the bounded SQLite
 app-state, room, message, outbox, and profile projections before network sync;
-delivery failure during startup must return the saved chat list and selected
+transport failure during startup must return the saved chat list and selected
 transcript as offline local state, not an empty UI. Full room-history sync
 remains a repair/recovery path, not the ordinary way the UI gets messages after
 launch. Regression coverage must include a remote-synced message that survives
@@ -138,6 +172,36 @@ the resolved runtime identity back to its config file so a force-close relaunch
 without Xcode launch arguments reopens the same local SQLite identity and
 projection. Throwaway diagnostics must use the explicit transient store flag;
 ordinary stable launches are not temporary.
+Normal startup no longer scans or migrates pre-release `FiniteChat/<device>`
+app-support stores. Those old dev stores are reset-only inputs; product launch
+opens `FiniteChatStore` or an explicit `FiniteChatTransient/<device>` root, and
+`RuntimeConfigTests` assert that legacy directories are ignored rather than
+recovered.
+
+Normal runtime startup also no longer imports pre-release `app-messages.json`
+or rewrites old app projection tables into the current encrypted shape. If
+`client_app_messages` or `client_app_events` already exists with a plaintext
+column, or without the current timestamp, nonce, and ciphertext columns, client
+store open fails closed with a reset-store error. The fix for that dev/test
+state is the documented whole-store reset, not a row rewrite or compatibility
+migration. App projection timestamp columns must not carry old `DEFAULT 0`
+schema defaults, and encrypted app projection tables must not carry extra
+columns beyond the current schema; those schemas fail closed as reset-only
+state.
+Legacy unencrypted client-store tables (`client_openmls_storage`,
+`client_rooms`, `client_profiles`) are reset-only as well, even when empty.
+Store open fails closed instead of dropping them as compatibility cleanup.
+Encrypted app-room metadata is also strict: rows missing the current
+`state`/`status`/`local_read_seq` fields, or carrying the old `Offline` /
+`NeedsAttention` lifecycle payloads, fail closed instead of defaulting into a
+connected room.
+Encrypted app-outbox metadata is strict as well: rows missing
+`timestamp_unix_seconds`, or carrying the old one-axis `delivery_state` instead
+of current `local_state` plus `server_delivery_state`, fail closed instead of
+being interpreted as v1 outbound delivery.
+Encrypted app-state and app-profile metadata must carry the current
+selected-room, revoked-device, and stale-profile fields. Missing fields fail
+closed instead of being silently defaulted into product state.
 
 Production still needs the unlock policy that decides whether the Nostr key
 comes from OS keychain, user passphrase, hardware-backed storage, or an
@@ -152,12 +216,22 @@ The blob store sees ciphertext bytes, a ciphertext content type, ciphertext
 hash, object size, URL, timing, and requester metadata. It does not receive the
 plaintext filename or MIME type in the Finite Chat abstraction.
 
-The current proof uses an in-memory content-addressed store plus a
-Blossom-shaped HTTP request/response boundary so the cryptographic and metadata
-invariants are tested without adding a networking dependency. The
-finitecomputer integration should replace runtime-local attachment bytes by
-executing that boundary against real Blossom-compatible storage, not by
-changing the encrypted reference shape.
+Debug logs follow the same boundary. They may record blob reference ids,
+hashes, sizes, timing, transfer states, and error categories, but they must not
+include plaintext message bodies, attachment bytes, plaintext filenames, or
+plaintext media metadata. Export is explicit local copy/share only before first
+release; the app must not automatically upload attachment-related diagnostics
+or send them through telemetry.
+
+Unit proof uses an in-memory content-addressed store plus a Blossom-shaped HTTP
+request/response boundary so the cryptographic and metadata invariants are
+tested without adding a networking dependency. If attachment UI ships in v1,
+product proof must use the real finitechat-server `/upload` and
+`/blobs/{sha256}` routes backed by durable server blob storage. Offline
+attachment send still fails fast because upload is required. The finitecomputer
+integration should replace runtime-local attachment bytes by executing that
+boundary against real Blossom-compatible storage, not by changing the encrypted
+reference shape.
 
 `finitechat-store` now uses normalized SQLite tables that mirror the intended
 Postgres shape:

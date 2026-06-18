@@ -363,7 +363,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(relaunched.deviceID, "qt433")
     }
 
-    func testMissingConfigAdoptsSingleExistingDeviceStore() throws {
+    func testMissingConfigIgnoresLegacyDeviceStore() throws {
         let url = try temporaryConfigURL()
         let supportURL = url.deletingLastPathComponent()
         let deviceStoreURL = supportURL
@@ -382,11 +382,11 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
-        XCTAssertEqual(loaded.deviceID, "qt433")
+        XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
-    func testMissingConfigDoesNotAdoptEmptyPlaceholderStore() throws {
+    func testMissingConfigIgnoresLegacyPlaceholderStore() throws {
         let url = try temporaryConfigURL()
         let supportURL = url.deletingLastPathComponent()
         let deviceStoreURL = supportURL
@@ -409,7 +409,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
-    func testPersistedEmptyDeviceRecoversUniqueInitializedStore() throws {
+    func testPersistedConfigDoesNotRecoverLegacyDeviceStore() throws {
         let url = try temporaryConfigURL()
         try RuntimeConfig(
             serverURL: "http://192.168.1.226:8789",
@@ -439,11 +439,11 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(loaded.serverURL, "http://192.168.1.226:8789")
-        XCTAssertEqual(loaded.deviceID, "qt433")
+        XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
-    func testMissingConfigDoesNotGuessAmongMultipleInitializedStores() throws {
+    func testMissingConfigIgnoresMultipleLegacyDeviceStores() throws {
         let url = try temporaryConfigURL()
         let supportURL = url.deletingLastPathComponent()
         let dataRoot = supportURL.appendingPathComponent("FiniteChat", isDirectory: true)
@@ -467,7 +467,7 @@ final class RuntimeConfigTests: XCTestCase {
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
-    func testRuntimeDataStoreMigratesRequestedLegacyStoreToStableStore() throws {
+    func testRuntimeDataStoreIgnoresLegacyStoreAndCreatesStableStore() throws {
         let supportURL = try temporarySupportURL()
         let legacyStoreURL = supportURL
             .appendingPathComponent("FiniteChat", isDirectory: true)
@@ -485,16 +485,19 @@ final class RuntimeConfigTests: XCTestCase {
             deviceID: "qt433",
             applicationSupportURL: supportURL
         )
-        let migratedURL = URL(fileURLWithPath: dataDir)
+        let stableURL = URL(fileURLWithPath: dataDir)
 
-        XCTAssertEqual(migratedURL.lastPathComponent, "FiniteChatStore")
-        XCTAssertTrue(FileManager.default.fileExists(
-            atPath: migratedURL.appendingPathComponent("account-secret.hex").path
+        XCTAssertEqual(stableURL.lastPathComponent, "FiniteChatStore")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stableURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: stableURL.appendingPathComponent("account-secret.hex").path
         ))
-        XCTAssertEqual(
-            try Data(contentsOf: migratedURL.appendingPathComponent("client.sqlite3")),
-            Data("sqlite".utf8)
-        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: stableURL.appendingPathComponent("client.sqlite3").path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: legacyStoreURL.appendingPathComponent("account-secret.hex").path
+        ))
     }
 
     func testRuntimeDataStoreKeepsExistingStableStore() throws {
@@ -622,10 +625,11 @@ final class ChatTimelineTypingTests: XCTestCase {
             senderNpub: nil,
             text: text,
             displayContent: text,
+            richTextJson: "",
             payload: Data(text.utf8),
             replyToMessageId: nil,
             isMine: false,
-            delivery: .sent,
+            outboundDelivery: nil,
             reactions: [],
             media: [],
             readReceipt: nil,
@@ -679,7 +683,7 @@ final class AppModelPersistenceTests: XCTestCase {
         ])
         XCTAssertEqual(firstLaunch.runtimeStorePath, openedOptions[0].dataDir)
         XCTAssertEqual(firstLaunch.state?.status, "offline")
-        XCTAssertEqual(firstLaunch.userNoticeText, "Showing saved chats. Connection will retry.")
+        XCTAssertNil(firstLaunch.userNoticeText)
         XCTAssertEqual(firstLaunch.developerRuntimeStatus, "offline")
         XCTAssertEqual(firstRuntime.dispatchedActions, [.startRuntime])
 
@@ -721,7 +725,7 @@ final class AppModelPersistenceTests: XCTestCase {
             relaunch.state?.toast,
             "Showing saved chats. Connection will retry."
         )
-        XCTAssertEqual(relaunch.userNoticeText, "Showing saved chats. Connection will retry.")
+        XCTAssertNil(relaunch.userNoticeText)
         XCTAssertEqual(relaunch.developerRuntimeStatus, "offline")
         XCTAssertEqual(
             relaunch.developerPersistenceSummary,
@@ -729,6 +733,60 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         XCTAssertNil(relaunch.errorText)
         XCTAssertEqual(secondRuntime.dispatchedActions, [.startRuntime])
+    }
+
+    func testProductHarnessDeliveredTranscriptPresentationHasNoNormalOfflineBanner() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let transcriptState = productHarnessDeliveredTranscriptState()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: transcriptState,
+            startRuntimeState: transcriptState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        let notice = NoticeBarPresentation(text: model.userNoticeText)
+        XCTAssertNil(model.userNoticeText)
+        XCTAssertNil(notice.visibleText)
+        XCTAssertFalse(
+            notice.visibleText?.localizedCaseInsensitiveContains("offline") ?? false
+        )
+        XCTAssertFalse(
+            notice.visibleText?.localizedCaseInsensitiveContains("reconnecting") ?? false
+        )
+
+        let projection = try XCTUnwrap(model.chatProjections["room-main"])
+        XCTAssertEqual(projection.rows.count, 1)
+        XCTAssertEqual(
+            projection.messages.map(\.text),
+            ["online product harness message", "offline product harness message"]
+        )
+        XCTAssertEqual(model.selectedRoomMessages, projection.messages)
+
+        let descriptors = projection.messages.map(ChatMessageBubbleAccessibilityDescriptor.init)
+        XCTAssertEqual(
+            descriptors.map(\.label),
+            [
+                "online product harness message, 2:32 PM, Delivered",
+                "offline product harness message, 2:32 PM, Delivered",
+            ]
+        )
+        XCTAssertEqual(descriptors.map(\.value), ["two checks", "two checks"])
+        XCTAssertEqual(
+            descriptors.map(\.identifier),
+            ["ChatMessageBubble-message-online", "ChatMessageBubble-message-offline"]
+        )
     }
 
     func testRawRuntimeDiagnosticsStayOutOfNormalChatSurfaces() throws {
@@ -757,6 +815,66 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    func testDeveloperDiagnosticsExportRedactsTransportDetails() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let longHex = String(repeating: "a", count: 64)
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            throw RawDiagnosticError(
+                description: "HTTP failed at http://127.0.0.1:8787 with /Users/alice/private-store/\(longHex)"
+            )
+        }
+
+        model.start()
+
+        let export = model.developerDiagnosticsExport
+        XCTAssertNil(model.userNoticeText)
+        XCTAssertTrue(export.contains("event=open.failed"))
+        XCTAssertTrue(export.contains("[url]"))
+        XCTAssertTrue(export.contains("[path]"))
+        XCTAssertFalse(export.contains("http://127.0.0.1:8787"))
+        XCTAssertFalse(export.contains("/Users/alice"))
+        XCTAssertFalse(export.contains(longHex))
+    }
+
+    func testDeveloperDiagnosticsDoNotIncludeMessageTextAndStayBounded() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        for index in 0..<240 {
+            model.outboundText = "secret message body \(index)"
+            XCTAssertTrue(model.send())
+        }
+
+        let export = model.developerDiagnosticsExport
+        XCTAssertLessThanOrEqual(model.developerDiagnostics.count, 200)
+        XCTAssertTrue(export.contains("event=send_message.requested"))
+        XCTAssertFalse(export.contains("secret message body"))
+        XCTAssertFalse(export.contains("saved before force close"))
+    }
+
     func testInjectedApplicationSupportKeepsRuntimeIdentityConfigLocal() throws {
         let supportURL = try temporarySupportURL()
         let localConfigURL = supportURL.appendingPathComponent("finitechat_config.json")
@@ -781,6 +899,79 @@ final class AppModelPersistenceTests: XCTestCase {
 
         XCTAssertEqual(try persistedConfig(at: localConfigURL).serverURL, "http://127.0.0.1:1")
         XCTAssertEqual(try persistedConfig(at: localConfigURL).deviceID, "qt433")
+    }
+
+    func testProductHarnessLaunchArgumentUsesExplicitSupportForConfigAndStore() throws {
+        let harnessRoot = try temporarySupportURL()
+            .appendingPathComponent(".state", isDirectory: true)
+            .appendingPathComponent("product-harness", isDirectory: true)
+            .appendingPathComponent("ios", isDirectory: true)
+            .appendingPathComponent("text-offline", isDirectory: true)
+            .appendingPathComponent("simulator-a", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: harnessRoot,
+            withIntermediateDirectories: true
+        )
+        try RuntimeConfig(
+            serverURL: "http://127.0.0.1:8787",
+            deviceID: "simulator-a"
+        ).save(storageURL: harnessRoot.appendingPathComponent("finitechat_config.json"))
+
+        var openedOptions: [OpenOptions] = []
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(deviceID: "simulator-a"),
+            startRuntimeState: emptyChatState(deviceID: "simulator-a")
+        )
+        let model = AppModel(
+            args: [
+                "FiniteChat",
+                "--finitechat-product-harness-root",
+                harnessRoot.path,
+            ],
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return runtime
+        }
+
+        model.start()
+
+        XCTAssertEqual(openedOptions.count, 1)
+        XCTAssertEqual(openedOptions[0].serverUrl, "http://127.0.0.1:8787")
+        XCTAssertEqual(openedOptions[0].deviceId, "simulator-a")
+        XCTAssertEqual(
+            URL(fileURLWithPath: openedOptions[0].dataDir),
+            harnessRoot.appendingPathComponent("FiniteChatStore", isDirectory: true)
+        )
+        XCTAssertEqual(model.runtimeStorePath, openedOptions[0].dataDir)
+        XCTAssertNil(model.developerErrorText)
+    }
+
+    func testInvalidProductHarnessLaunchArgumentDoesNotOpenDefaultStore() throws {
+        var openedOptions: [OpenOptions] = []
+        let model = AppModel(
+            args: [
+                "FiniteChat",
+                "--finitechat-product-harness-root",
+                "relative/path",
+            ],
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return FakeFiniteChatRuntime(
+                initialState: self.savedChatState(),
+                startRuntimeState: self.savedChatState()
+            )
+        }
+
+        model.start()
+
+        XCTAssertTrue(openedOptions.isEmpty)
+        XCTAssertEqual(
+            model.developerErrorText,
+            "--finitechat-product-harness-root must be an absolute path"
+        )
+        XCTAssertNil(model.runtimeStorePath)
     }
 
     func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {
@@ -832,6 +1023,154 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(caption, "hello from transcript")
         XCTAssertNil(replyToMessageID)
         XCTAssertEqual(model.outboundText, "typed draft")
+    }
+
+    func testLaunchAutomationSendsSyntheticAttachmentThroughRustAction() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: [
+                "FiniteChat",
+                "--finitechat-auto-send-attachment-text",
+                "offline attachment proof",
+            ],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 3
+        }
+        guard case .sendAttachments(
+            let roomID,
+            let attachments,
+            let caption,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected launch automation sendAttachments action")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(caption, "")
+        XCTAssertNil(replyToMessageID)
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments[0].filename, "launch-automation.txt")
+        XCTAssertEqual(attachments[0].mimeType, "text/plain")
+        XCTAssertEqual(attachments[0].kind, .file)
+        XCTAssertEqual(attachments[0].bytes, Data("offline attachment proof".utf8))
+    }
+
+    func testLaunchAutomationSendsAttachmentFileThroughRustAction() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let supportURL = try temporarySupportURL()
+        let imageURL = supportURL.appendingPathComponent("launch-image.png")
+        let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        try imageBytes.write(to: imageURL)
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: supportURL,
+            args: [
+                "FiniteChat",
+                "--finitechat-auto-send-attachment-file",
+                imageURL.path,
+                "--finitechat-auto-send-attachment-caption",
+                "image caption",
+            ],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 3
+        }
+        guard case .sendAttachments(
+            let roomID,
+            let attachments,
+            let caption,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected launch automation sendAttachments action")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(caption, "image caption")
+        XCTAssertNil(replyToMessageID)
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments[0].filename, "launch-image.png")
+        XCTAssertEqual(attachments[0].mimeType, "image/png")
+        XCTAssertEqual(attachments[0].kind, .image)
+        XCTAssertEqual(attachments[0].bytes, imageBytes)
+    }
+
+    func testLaunchAutomationSendsBase64AttachmentThroughRustAction() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: [
+                "FiniteChat",
+                "--finitechat-auto-send-attachment-base64",
+                imageBytes.base64EncodedString(),
+                "--finitechat-auto-send-attachment-filename",
+                "launch-image.png",
+                "--finitechat-auto-send-attachment-mime-type",
+                "image/png",
+                "--finitechat-auto-send-attachment-caption",
+                "image caption",
+            ],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 3
+        }
+        guard case .sendAttachments(
+            let roomID,
+            let attachments,
+            let caption,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected launch automation sendAttachments action")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(caption, "image caption")
+        XCTAssertNil(replyToMessageID)
+        XCTAssertEqual(attachments.count, 1)
+        XCTAssertEqual(attachments[0].filename, "launch-image.png")
+        XCTAssertEqual(attachments[0].mimeType, "image/png")
+        XCTAssertEqual(attachments[0].kind, .image)
+        XCTAssertEqual(attachments[0].bytes, imageBytes)
     }
 
     func testDownloadAttachmentDispatchesRustBeginBeforeBlockingDownload() async throws {
@@ -898,6 +1237,71 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(downloadAttachmentID, "attachment-1")
     }
 
+    func testDownloadAttachmentDispatchesOnlyForExplicitCacheMissCandidate() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let savedState = savedChatState()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedState,
+            startRuntimeState: savedState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+        model.start()
+        let message = savedState.messages[0]
+
+        func attachment(
+            url: String? = "http://blob.example/sha256",
+            localPath: String? = nil,
+            uploadProgressPerMille: UInt32? = nil,
+            downloadProgressPerMille: UInt32? = nil
+        ) -> ChatMediaAttachment {
+            ChatMediaAttachment(
+                attachmentId: UUID().uuidString,
+                url: url,
+                mimeType: "image/jpeg",
+                filename: "photo.jpg",
+                kind: .image,
+                width: nil,
+                height: nil,
+                localPath: localPath,
+                uploadProgressPerMille: uploadProgressPerMille,
+                downloadProgressPerMille: downloadProgressPerMille
+            )
+        }
+
+        model.downloadAttachment(
+            roomID: "room-main",
+            message: message,
+            attachment: attachment(localPath: "/tmp/photo.jpg")
+        )
+        model.downloadAttachment(
+            roomID: "room-main",
+            message: message,
+            attachment: attachment(url: nil)
+        )
+        model.downloadAttachment(
+            roomID: "room-main",
+            message: message,
+            attachment: attachment(uploadProgressPerMille: 0)
+        )
+        model.downloadAttachment(
+            roomID: "room-main",
+            message: message,
+            attachment: attachment(downloadProgressPerMille: 0)
+        )
+
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+    }
+
     func testOfflineNoticeIsSuppressedWhenThereAreNoSavedChats() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -927,13 +1331,102 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.developerRuntimeStatus, "offline")
     }
 
+    func testQueuedOfflineTextStateDoesNotRequestNormalSurfaceOfflineBanner() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var queuedState = savedChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        queuedState.messages[0].outboundDelivery = OutboundDelivery(
+            localSend: .sent,
+            serverDelivery: .undelivered
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: queuedState,
+            startRuntimeState: queuedState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        XCTAssertNil(model.userNoticeText)
+        let presentation = NoticeBarPresentation(text: model.userNoticeText)
+        XCTAssertNil(presentation.visibleText)
+        XCTAssertFalse(
+            presentation.visibleText?.localizedCaseInsensitiveContains("offline") ?? false
+        )
+        XCTAssertFalse(
+            presentation.visibleText?.localizedCaseInsensitiveContains("reconnecting") ?? false
+        )
+    }
+
+    func testConnectedSavedRoomCanSendWhileRuntimeStatusIsOffline() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let offlineConnectedState = savedChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: offlineConnectedState,
+            startRuntimeState: offlineConnectedState
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        model.outboundText = "send through local membership"
+
+        XCTAssertEqual(model.selectedRoom?.state, .connected)
+        XCTAssertEqual(model.developerRuntimeStatus, "offline")
+        XCTAssertNil(model.userNoticeText)
+        XCTAssertTrue(model.canSend)
+        XCTAssertTrue(model.send())
+        XCTAssertEqual(model.outboundText, "")
+        XCTAssertEqual(runtime.dispatchedActions.count, 2)
+        guard case .sendMessage(
+            let roomID,
+            let text
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendMessage for connected local room")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(text, "send through local membership")
+    }
+
+    func testNoticeBarPresentationExposesStableAccessibilityOnlyWhenVisible() {
+        let visible = NoticeBarPresentation(text: " Network problem ")
+        XCTAssertEqual(visible.visibleText, "Network problem")
+        XCTAssertEqual(visible.accessibilityIdentifier, "NoticeBar")
+
+        let hidden = NoticeBarPresentation(text: "   ")
+        XCTAssertNil(hidden.visibleText)
+    }
+
     func testUnavailableSavedRoomKeepsCachedMessagesButCannotSend() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
         )
         let unavailableState = savedChatState(
-            roomState: .needsAttention,
+            roomState: .unavailableOnDevice,
             roomStatus: "room is not available on this device"
         )
         let runtime = FakeFiniteChatRuntime(
@@ -951,17 +1444,136 @@ final class AppModelPersistenceTests: XCTestCase {
 
         model.start()
         model.outboundText = "this should not send yet"
+        let selectedRoom = try XCTUnwrap(model.selectedRoom)
 
         XCTAssertEqual(model.rooms.map(\.roomId), ["room-main"])
-        XCTAssertEqual(model.selectedRoom?.state, .needsAttention)
-        XCTAssertEqual(model.selectedRoom?.status, "room is not available on this device")
-        XCTAssertEqual(model.selectedRoom?.userStatusText, "Read-only on this device")
+        XCTAssertEqual(selectedRoom.state, .unavailableOnDevice)
+        XCTAssertEqual(selectedRoom.status, "room is not available on this device")
+        XCTAssertEqual(selectedRoom.userStatusText, "Unavailable on this device")
         XCTAssertEqual(model.selectedRoomMessages.map(\.text), ["saved before force close"])
         XCTAssertEqual(model.chatProjections["room-main"]?.messages.map(\.text), [
             "saved before force close",
         ])
         XCTAssertFalse(model.canSend)
+        XCTAssertFalse(model.send())
+        XCTAssertFalse(model.createInvite(for: selectedRoom))
+        model.pinDraft = "123456"
+        XCTAssertFalse(model.submitPin(for: selectedRoom))
+        XCTAssertEqual(model.pinDraft, "123456")
+        XCTAssertFalse(model.sendPoll(
+            roomID: selectedRoom.roomId,
+            question: "Should not leave Swift?",
+            options: ["Yes", "No"]
+        ))
+        XCTAssertFalse(model.sendAttachment(
+            roomID: selectedRoom.roomId,
+            fileURL: URL(fileURLWithPath: "/tmp/finitechat-unavailable.txt")
+        ))
+        XCTAssertFalse(model.sendAttachments(
+            roomID: selectedRoom.roomId,
+            attachments: [
+                OutboundAttachment(
+                    filename: "blocked.txt",
+                    mimeType: "text/plain",
+                    kind: .file,
+                    bytes: Data("blocked".utf8)
+                ),
+            ],
+            captionOverride: "blocked"
+        ))
+        XCTAssertEqual(model.outboundText, "this should not send yet")
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
         XCTAssertNil(model.errorText)
+    }
+
+    func testRetryMessageDispatchesOnlyForFailedLocalOutbound() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+        model.start()
+
+        func message(
+            _ id: String,
+            isMine: Bool = true,
+            outboundDelivery: OutboundDelivery?
+        ) -> ChatMessage {
+            ChatMessage(
+                roomId: "room-main",
+                seq: 1,
+                messageId: id,
+                conversationId: nil,
+                senderAccountId: isMine ? "alice-account" : "bob-account",
+                senderDeviceId: isMine ? "qt433" : "bob-ios",
+                senderDisplayName: isMine ? "qt433" : "Bob",
+                senderNpub: nil,
+                text: "retry candidate",
+                displayContent: "retry candidate",
+                richTextJson: "",
+                payload: Data("retry candidate".utf8),
+                replyToMessageId: nil,
+                isMine: isMine,
+                outboundDelivery: outboundDelivery,
+                reactions: [],
+                media: [],
+                readReceipt: nil,
+                poll: nil,
+                timestampUnixSeconds: 1_700_000_000,
+                displayTimestamp: "now"
+            )
+        }
+
+        XCTAssertFalse(model.retry(message(
+            "message-inbound-failed",
+            isMine: false,
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "malformed nonlocal state")
+            )
+        )))
+        XCTAssertFalse(model.retry(message(
+            "message-undelivered",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .undelivered
+            )
+        )))
+        XCTAssertFalse(model.retry(message(
+            "message-delivered",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            )
+        )))
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+
+        XCTAssertTrue(model.retry(message(
+            "message-failed",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "server rejected send")
+            )
+        )))
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 2
+        }
+        guard case .retryMessage(let roomID, let messageID) = runtime.dispatchedActions.last else {
+            return XCTFail("expected retryMessage action")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(messageID, "message-failed")
     }
 
     func testExplicitTransientDiagnosticLaunchKeepsStableRelaunchOnSavedIdentity() throws {
@@ -1160,10 +1772,14 @@ final class AppModelPersistenceTests: XCTestCase {
             senderNpub: nil,
             text: "saved before force close",
             displayContent: "saved before force close",
+            richTextJson: "",
             payload: Data("saved before force close".utf8),
             replyToMessageId: nil,
             isMine: true,
-            delivery: .sent,
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            ),
             reactions: [],
             media: [],
             readReceipt: nil,
@@ -1186,6 +1802,64 @@ final class AppModelPersistenceTests: XCTestCase {
             profiles: [],
             devices: [],
             typingMembers: []
+        )
+    }
+
+    private func productHarnessDeliveredTranscriptState() -> AppState {
+        var state = savedChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        state.rooms[0].lastMessagePreview = "offline product harness message"
+        state.messages = [
+            productHarnessMessage(
+                id: "message-online",
+                seq: 1,
+                text: "online product harness message"
+            ),
+            productHarnessMessage(
+                id: "message-offline",
+                seq: 2,
+                text: "offline product harness message"
+            ),
+        ]
+        return state
+    }
+
+    private func productHarnessMessage(
+        id: String,
+        seq: UInt64,
+        text: String
+    ) -> ChatMessage {
+        ChatMessage(
+            roomId: "room-main",
+            seq: seq,
+            messageId: id,
+            conversationId: nil,
+            senderAccountId: "alice-account",
+            senderDeviceId: "qt433",
+            senderDisplayName: "qt433",
+            senderNpub: nil,
+            text: text,
+            displayContent: text,
+            richTextJson: "",
+            payload: Data(text.utf8),
+            replyToMessageId: nil,
+            isMine: true,
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            ),
+            reactions: [],
+            media: [],
+            readReceipt: ChatReadReceiptSummary(
+                deliveredCount: 1,
+                readCount: 0,
+                displayText: "Delivered"
+            ),
+            poll: nil,
+            timestampUnixSeconds: 1_700_000_000 + seq,
+            displayTimestamp: "2:32 PM"
         )
     }
 
@@ -1227,13 +1901,8 @@ final class AppModelPersistenceTests: XCTestCase {
             return "Waiting for approval"
         case .joining:
             return "Joining"
-        case .needsAttention:
-            if status == "room is not available on this device" {
-                return "Read-only on this device"
-            }
-            return "Needs attention"
-        case .offline:
-            return "Offline"
+        case .unavailableOnDevice:
+            return "Unavailable on this device"
         }
     }
 
@@ -1289,6 +1958,263 @@ final class ReactionEmojiCatalogTests: XCTestCase {
     }
 }
 
+final class OutboundDeliveryAccessibilityTests: XCTestCase {
+    func testDeliveredBubbleProjectsTranscriptCheckmarkAccessibility() {
+        let message = chatMessage(
+            id: "message-delivered",
+            text: "online product harness message",
+            displayTimestamp: "2:32 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            )
+        )
+
+        let descriptor = ChatMessageBubbleAccessibilityDescriptor(message: message)
+
+        XCTAssertEqual(
+            descriptor.label,
+            "online product harness message, 2:32 PM, Delivered"
+        )
+        XCTAssertEqual(descriptor.value, "two checks")
+        XCTAssertEqual(descriptor.identifier, "ChatMessageBubble-message-delivered")
+    }
+
+    func testUndeliveredBubbleProjectsOneCheckAccessibility() {
+        let message = chatMessage(
+            id: "message-local",
+            text: "offline product harness message",
+            displayTimestamp: "2:33 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .undelivered
+            )
+        )
+
+        let descriptor = ChatMessageBubbleAccessibilityDescriptor(message: message)
+
+        XCTAssertEqual(
+            descriptor.label,
+            "offline product harness message, 2:33 PM, Sent locally"
+        )
+        XCTAssertEqual(descriptor.value, "one check")
+        XCTAssertEqual(descriptor.identifier, "ChatMessageBubble-message-local")
+    }
+
+    func testReadBubbleProjectsFilledCheckmarkAccessibility() {
+        let message = chatMessage(
+            id: "message-read",
+            text: "read product harness message",
+            displayTimestamp: "2:34 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            ),
+            readReceipt: ChatReadReceiptSummary(
+                deliveredCount: 1,
+                readCount: 1,
+                displayText: "Read"
+            )
+        )
+
+        let descriptor = ChatMessageBubbleAccessibilityDescriptor(message: message)
+
+        XCTAssertEqual(descriptor.label, "read product harness message, 2:34 PM, Read")
+        XCTAssertEqual(descriptor.value, "two filled checks")
+        XCTAssertEqual(descriptor.identifier, "ChatMessageBubble-message-read")
+    }
+
+    func testFailedBubbleProjectsRetryAccessibility() {
+        let message = chatMessage(
+            id: "message-failed",
+            text: "failed product harness message",
+            displayTimestamp: "2:35 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "server rejected send")
+            )
+        )
+
+        let descriptor = ChatMessageBubbleAccessibilityDescriptor(message: message)
+
+        XCTAssertEqual(descriptor.label, "failed product harness message, 2:35 PM, Not sent")
+        XCTAssertEqual(descriptor.value, "retry required")
+        XCTAssertEqual(descriptor.identifier, "ChatMessageBubble-message-failed")
+    }
+
+    func testInboundBubbleDoesNotInventOutboundDeliveryAccessibility() {
+        let message = chatMessage(
+            id: "message-inbound",
+            text: "peer product harness message",
+            displayTimestamp: "2:36 PM",
+            isMine: false,
+            outboundDelivery: nil
+        )
+
+        let descriptor = ChatMessageBubbleAccessibilityDescriptor(message: message)
+
+        XCTAssertEqual(descriptor.label, "peer product harness message, 2:36 PM")
+        XCTAssertEqual(descriptor.value, "")
+        XCTAssertEqual(descriptor.identifier, "ChatMessageBubble-message-inbound")
+    }
+
+    func testUndeliveredMessageProjectsOneCheckDescriptor() {
+        let descriptor = OutboundDeliveryAccessibilityDescriptor(
+            messageID: "message-local",
+            delivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .undelivered
+            ),
+            readReceipt: nil
+        )
+
+        XCTAssertEqual(descriptor.state, "sent-undelivered")
+        XCTAssertEqual(descriptor.label, "Sent locally")
+        XCTAssertEqual(descriptor.value, "one check")
+        XCTAssertEqual(
+            descriptor.identifier,
+            "OutboundDeliveryMark-sent-undelivered-message-local"
+        )
+    }
+
+    func testDeliveredMessageProjectsTwoCheckDescriptor() {
+        let descriptor = OutboundDeliveryAccessibilityDescriptor(
+            messageID: "message-delivered",
+            delivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            ),
+            readReceipt: ChatReadReceiptSummary(
+                deliveredCount: 1,
+                readCount: 0,
+                displayText: "Delivered"
+            )
+        )
+
+        XCTAssertEqual(descriptor.state, "delivered-unread")
+        XCTAssertEqual(descriptor.label, "Delivered")
+        XCTAssertEqual(descriptor.value, "two checks")
+        XCTAssertEqual(
+            descriptor.identifier,
+            "OutboundDeliveryMark-delivered-unread-message-delivered"
+        )
+    }
+
+    func testReadMessageProjectsFilledTwoCheckDescriptor() {
+        let descriptor = OutboundDeliveryAccessibilityDescriptor(
+            messageID: "message-read",
+            delivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .delivered
+            ),
+            readReceipt: ChatReadReceiptSummary(
+                deliveredCount: 1,
+                readCount: 1,
+                displayText: "Read"
+            )
+        )
+
+        XCTAssertEqual(descriptor.state, "delivered-read")
+        XCTAssertEqual(descriptor.label, "Read")
+        XCTAssertEqual(descriptor.value, "two filled checks")
+        XCTAssertEqual(
+            descriptor.identifier,
+            "OutboundDeliveryMark-delivered-read-message-read"
+        )
+    }
+
+    func testFailedMessageProjectsRetryDescriptor() {
+        let descriptor = OutboundDeliveryAccessibilityDescriptor(
+            messageID: "message-failed",
+            delivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "server rejected send")
+            ),
+            readReceipt: nil
+        )
+
+        XCTAssertEqual(descriptor.state, "failed")
+        XCTAssertEqual(descriptor.label, "Not sent")
+        XCTAssertEqual(descriptor.value, "retry required")
+        XCTAssertEqual(descriptor.identifier, "OutboundDeliveryMark-failed-message-failed")
+    }
+
+    func testFailedLocalMessageShowsExplicitRetryAffordance() {
+        let message = chatMessage(
+            id: "message-failed",
+            text: "failed product harness message",
+            displayTimestamp: "2:35 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "server rejected send")
+            )
+        )
+
+        let presentation = MessageRetryPresentation(message: message)
+
+        XCTAssertTrue(presentation.isVisible)
+        XCTAssertEqual(presentation.accessibilityIdentifier, "RetryMessageButton-message-failed")
+    }
+
+    func testRetryAffordanceDoesNotAppearForInboundOrUndeliveredMessages() {
+        let inbound = chatMessage(
+            id: "message-inbound",
+            text: "peer product harness message",
+            displayTimestamp: "2:36 PM",
+            isMine: false,
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .failed(reason: "malformed nonlocal state")
+            )
+        )
+        let undelivered = chatMessage(
+            id: "message-local",
+            text: "offline product harness message",
+            displayTimestamp: "2:33 PM",
+            outboundDelivery: OutboundDelivery(
+                localSend: .sent,
+                serverDelivery: .undelivered
+            )
+        )
+
+        XCTAssertFalse(MessageRetryPresentation(message: inbound).isVisible)
+        XCTAssertFalse(MessageRetryPresentation(message: undelivered).isVisible)
+    }
+
+    private func chatMessage(
+        id: String,
+        text: String,
+        displayTimestamp: String,
+        isMine: Bool = true,
+        outboundDelivery: OutboundDelivery?,
+        readReceipt: ChatReadReceiptSummary? = nil
+    ) -> ChatMessage {
+        ChatMessage(
+            roomId: "room-main",
+            seq: 1,
+            messageId: id,
+            conversationId: nil,
+            senderAccountId: isMine ? "alice-account" : "bob-account",
+            senderDeviceId: isMine ? "alice-ios" : "bob-ios",
+            senderDisplayName: isMine ? "Alice" : "Bob",
+            senderNpub: nil,
+            text: text,
+            displayContent: text,
+            richTextJson: "",
+            payload: Data(text.utf8),
+            replyToMessageId: nil,
+            isMine: isMine,
+            outboundDelivery: outboundDelivery,
+            reactions: [],
+            media: [],
+            readReceipt: readReceipt,
+            poll: nil,
+            timestampUnixSeconds: 1_700_000_000,
+            displayTimestamp: displayTimestamp
+        )
+    }
+}
+
 final class ChatMediaGalleryItemIdentityTests: XCTestCase {
     func testGeneratedGalleryItemUsesRustStableItemIdForSwiftIdentity() {
         let item = ChatMediaGalleryItem(
@@ -1315,6 +2241,42 @@ final class ChatMediaGalleryItemIdentityTests: XCTestCase {
         )
 
         XCTAssertEqual(item.id, "room-main|message-1|image-1")
+    }
+}
+
+final class AttachmentTransferPresentationTests: XCTestCase {
+    func testZeroProgressMeansCoarseInFlightNotDeterminateProgress() {
+        XCTAssertNil(attachmentDeterminateTransferProgress(nil))
+        XCTAssertNil(attachmentDeterminateTransferProgress(0))
+        XCTAssertEqual(attachmentDeterminateTransferProgress(1), 0.001)
+        XCTAssertEqual(attachmentDeterminateTransferProgress(1_000), 1.0)
+        XCTAssertEqual(attachmentDeterminateTransferProgress(5_000), 1.0)
+    }
+
+    func testDeliveredCacheMissIsExplicitDownloadCandidate() {
+        XCTAssertTrue(attachmentCanDownload(remoteAttachment()))
+        XCTAssertFalse(attachmentCanDownload(remoteAttachment(localPath: "/tmp/photo.jpg")))
+        XCTAssertFalse(attachmentCanDownload(remoteAttachment(uploadProgressPerMille: 0)))
+        XCTAssertFalse(attachmentCanDownload(remoteAttachment(downloadProgressPerMille: 0)))
+    }
+
+    private func remoteAttachment(
+        localPath: String? = nil,
+        uploadProgressPerMille: UInt32? = nil,
+        downloadProgressPerMille: UInt32? = nil
+    ) -> ChatMediaAttachment {
+        ChatMediaAttachment(
+            attachmentId: "image-1",
+            url: "https://example.invalid/image-1",
+            mimeType: "image/jpeg",
+            filename: "image-1.jpg",
+            kind: .image,
+            width: nil,
+            height: nil,
+            localPath: localPath,
+            uploadProgressPerMille: uploadProgressPerMille,
+            downloadProgressPerMille: downloadProgressPerMille
+        )
     }
 }
 
@@ -1375,10 +2337,11 @@ final class SaveMediaActionTests: XCTestCase {
             senderNpub: nil,
             text: "photo",
             displayContent: "photo",
+            richTextJson: "",
             payload: Data("photo".utf8),
             replyToMessageId: nil,
             isMine: false,
-            delivery: .sent,
+            outboundDelivery: nil,
             reactions: [],
             media: media,
             readReceipt: nil,
@@ -1454,6 +2417,47 @@ final class MessageCollectionLayoutTests: XCTestCase {
 
         XCTAssertEqual(inset.top, 292)
         XCTAssertEqual(inset.bottom, 84)
+    }
+
+    func testBottomViewportInsetIncludesKeyboardAndAccessory() {
+        XCTAssertEqual(
+            MessageCollectionLayout.bottomViewportInset(
+                keyboardInset: 330,
+                accessoryHeight: 58
+            ),
+            388
+        )
+        XCTAssertEqual(
+            MessageCollectionLayout.bottomViewportInset(
+                keyboardInset: -12,
+                accessoryHeight: 58
+            ),
+            58
+        )
+    }
+
+    func testBottomPinSurvivesKeyboardGeometryTransition() {
+        XCTAssertTrue(
+            MessageCollectionLayout.shouldPinToBottom(
+                isNearBottom: false,
+                followsBottom: true,
+                isHoldingInitialBottomPin: false
+            )
+        )
+        XCTAssertTrue(
+            MessageCollectionLayout.shouldPinToBottom(
+                isNearBottom: false,
+                followsBottom: false,
+                isHoldingInitialBottomPin: true
+            )
+        )
+        XCTAssertFalse(
+            MessageCollectionLayout.shouldPinToBottom(
+                isNearBottom: false,
+                followsBottom: false,
+                isHoldingInitialBottomPin: false
+            )
+        )
     }
 
     func testNearBottomUsesVisibleViewportBottom() {

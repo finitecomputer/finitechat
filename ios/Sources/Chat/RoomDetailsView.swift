@@ -176,10 +176,8 @@ private extension AppRoomState {
             .green
         case .waitingForApproval, .joining:
             .orange
-        case .needsAttention:
+        case .unavailableOnDevice:
             .red
-        case .offline:
-            .gray
         }
     }
 }

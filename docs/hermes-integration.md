@@ -73,6 +73,20 @@ CI runs both sides of the boundary:
   round trips, and room/conversation mapping.
 - `python3 -m unittest discover -s tests -p '*test*.py'` validates the Hermes
   plugin without requiring a Hermes checkout.
+- `scripts/hermes-agent-media-e2e.sh` installs the real upstream
+  `hermes-agent` package with `uvx`, starts a live `finitechat-server`, pairs a
+  CLI user through the agent invite/PIN, sends image media to the agent, and
+  asserts the user receives both agent text and image replies.
+- `scripts/ios-hermes-agent-media-e2e.sh` repeats that media round trip through
+  the iOS Simulator app: the app joins the real Hermes agent invite, sends an
+  image attachment with a caption, the agent replies with text plus image
+  media, and the harness inspects the simulator app's persisted Rust-projected
+  state for those replies.
+- `scripts/ios-device-hermes-agent-media-e2e.sh` is the physical-phone version
+  of the same media round trip. It requires an already installed
+  `computer.finite.finitechat` build, an unlocked/awake paired iPhone, and a
+  Mac LAN server URL so the phone talks to the same configured server instead
+  of Mac loopback.
 
 The plugin tests prove:
 

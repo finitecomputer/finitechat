@@ -10,6 +10,21 @@ enum MessageCollectionLayout {
     static let jumpButtonSpacing: CGFloat = 12
     static let bottomContentSpacing: CGFloat = 12
 
+    static func bottomViewportInset(
+        keyboardInset: CGFloat,
+        accessoryHeight: CGFloat
+    ) -> CGFloat {
+        max(0, keyboardInset) + max(0, accessoryHeight)
+    }
+
+    static func shouldPinToBottom(
+        isNearBottom: Bool,
+        followsBottom: Bool,
+        isHoldingInitialBottomPin: Bool
+    ) -> Bool {
+        isNearBottom || followsBottom || isHoldingInitialBottomPin
+    }
+
     static func effectiveContentInset(
         boundsHeight: CGFloat,
         contentHeight: CGFloat,

@@ -27,6 +27,7 @@ targets:
           - "*.modulemap"
     settings:
       base:
+        DEVELOPMENT_TEAM: Y392XZ3MST
         PRODUCT_NAME: "$(TARGET_NAME)"
         INFOPLIST_FILE: Info.plist
         ENABLE_TESTABILITY: YES

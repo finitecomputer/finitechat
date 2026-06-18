@@ -523,11 +523,6 @@ struct VoiceAttachmentRow: View {
         }
         .buttonStyle(.plain)
         .disabled(isDownloading)
-        .task(id: attachment.attachmentId) {
-            if attachmentCanDownload(attachment) {
-                onDownload()
-            }
-        }
     }
 
     private var localPath: String? {

@@ -4,6 +4,8 @@ mod config;
 mod devices;
 mod doctor;
 mod init;
+mod product_harness;
+mod product_store;
 mod run;
 mod util;
 
@@ -33,6 +35,12 @@ fn main() -> ExitCode {
                 } => devices::devices_start(&root, args.json, args.verbose, s),
                 cli::Cmd::Bindings(b) => bindings::bindings(&root, args.json, args.verbose, b),
                 cli::Cmd::Run(r) => run::run(&root, args.json, args.verbose, r),
+                cli::Cmd::ResetProductStore(r) => {
+                    product_store::reset_product_store(&root, args.json, args.verbose, r)
+                }
+                cli::Cmd::ProductHarness(h) => {
+                    product_harness::product_harness(&root, args.json, args.verbose, h)
+                }
                 cli::Cmd::Init(_) => unreachable!(),
             }
         }

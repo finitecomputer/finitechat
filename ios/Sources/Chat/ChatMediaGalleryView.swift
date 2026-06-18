@@ -177,16 +177,11 @@ private struct ChatMediaGalleryTile: View {
     }
 
     private var uploadProgress: Double? {
-        guard let progress = attachment.uploadProgressPerMille else { return nil }
-        return Double(min(progress, 1_000)) / 1_000
+        attachmentDeterminateTransferProgress(attachment.uploadProgressPerMille)
     }
 
     private var downloadProgress: Double? {
-        guard let progress = attachment.downloadProgressPerMille else { return nil }
-        if progress == 0 {
-            return nil
-        }
-        return Double(min(progress, 1_000)) / 1_000
+        attachmentDeterminateTransferProgress(attachment.downloadProgressPerMille)
     }
 
     private var accessibilityLabel: String {

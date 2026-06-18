@@ -746,6 +746,7 @@ dependencies = [
  "finitechat-proto",
  "finitechat-server",
  "hex",
+ "hypernote-mdx",
  "reqwest",
  "serde",
  "serde_json",
@@ -822,6 +823,8 @@ name = "finitechat-rmp"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "finitechat-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1286,6 +1289,14 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "hypernote-mdx"
+version = "0.3.0"
+source = "git+https://github.com/futurepaul/hypernote-mdx?rev=db23b3d72e81389247716c5a59174cc4f4d55a34#db23b3d72e81389247716c5a59174cc4f4d55a34"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

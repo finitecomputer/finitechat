@@ -56,20 +56,9 @@ struct RuntimeConfig: Codable, Equatable {
         let deviceID = argumentValue("--finitechat-device", in: args)
             ?? environmentValue("FINITECHAT_DEVICE_ID", in: environment)
         let persisted = loadPersisted(storageURL: storageURL)
-        let recoveredDeviceID = existingSingleRecoverableDeviceStoreID(storageURL: storageURL)
-        let persistedDeviceIsRecoverable = persisted.deviceID
-            .map { recoverableDeviceStoreExists($0, storageURL: storageURL) } ?? false
-        let fallbackDeviceID: String
-        if let persistedDeviceID = persisted.deviceID,
-           persistedDeviceIsRecoverable || recoveredDeviceID == nil
-        {
-            fallbackDeviceID = persistedDeviceID
-        } else {
-            fallbackDeviceID = recoveredDeviceID ?? defaultDeviceID
-        }
         let fallback = RuntimeConfig(
             serverURL: persisted.serverURL ?? defaultServerURL,
-            deviceID: fallbackDeviceID
+            deviceID: persisted.deviceID ?? defaultDeviceID
         )
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
         let persistLaunchOverride = argumentFlag(persistLaunchConfigArgument, in: args)
@@ -77,8 +66,6 @@ struct RuntimeConfig: Codable, Equatable {
         let hasLaunchOverride = serverURL != nil || deviceID != nil
         let hasPersistentLaunchState = persisted.serverURL != nil
             || persisted.deviceID != nil
-            || persistedDeviceIsRecoverable
-            || recoveredDeviceID != nil
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
@@ -142,37 +129,6 @@ struct RuntimeConfig: Codable, Equatable {
             create: true
         )
         return support.appendingPathComponent("finitechat_config.json")
-    }
-
-    private static func existingSingleRecoverableDeviceStoreID(storageURL: URL?) -> String? {
-        let candidates = recoverableDeviceStores(storageURL: storageURL)
-        guard candidates.count == 1 else { return nil }
-        return candidates[0]
-    }
-
-    private static func recoverableDeviceStoreExists(
-        _ deviceID: String,
-        storageURL: URL?
-    ) -> Bool {
-        recoverableDeviceStores(storageURL: storageURL).contains(deviceID)
-    }
-
-    private static func recoverableDeviceStores(storageURL: URL?) -> [String] {
-        let supportURL: URL
-        if let storageURL {
-            supportURL = storageURL.deletingLastPathComponent()
-        } else if let applicationSupport = try? FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false
-        ) {
-            supportURL = applicationSupport
-        } else {
-            return []
-        }
-
-        return RuntimeDataStore.recoverableLegacyDeviceStoreIDs(applicationSupportURL: supportURL)
     }
 
     enum ConfigError: Error {
@@ -249,11 +205,8 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
 typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProtocol
 
 struct RuntimeDataStore {
-    private static let legacyDataRootDirectoryName = "FiniteChat"
     private static let currentDataDirectoryName = "FiniteChatStore"
     private static let transientDataRootDirectoryName = "FiniteChatTransient"
-    private static let clientStoreFileName = "client.sqlite3"
-    private static let accountSecretFileName = "account-secret.hex"
 
     static func dataDir(
         deviceID: String,
@@ -280,107 +233,11 @@ struct RuntimeDataStore {
             currentDataDirectoryName,
             isDirectory: true
         )
-        if !deviceStoreIsRecoverable(currentStoreURL) {
-            try migrateLegacyStoreIfNeeded(
-                to: currentStoreURL,
-                requestedDeviceID: deviceID,
-                applicationSupportURL: supportURL
-            )
-        }
         try FileManager.default.createDirectory(
             at: currentStoreURL,
             withIntermediateDirectories: true
         )
         return currentStoreURL.path
-    }
-
-    static func recoverableLegacyDeviceStoreIDs(applicationSupportURL: URL) -> [String] {
-        recoverableLegacyDeviceStores(applicationSupportURL: applicationSupportURL)
-            .map(\.deviceID)
-    }
-
-    private static func migrateLegacyStoreIfNeeded(
-        to currentStoreURL: URL,
-        requestedDeviceID: String,
-        applicationSupportURL: URL
-    ) throws {
-        let candidates = recoverableLegacyDeviceStores(applicationSupportURL: applicationSupportURL)
-        guard !candidates.isEmpty else { return }
-        let requestedID = safeDeviceDirectoryName(requestedDeviceID)
-        let selected = candidates.first { $0.deviceID == requestedID }
-            ?? candidates.sorted { lhs, rhs in
-                if lhs.modifiedAt == rhs.modifiedAt {
-                    return lhs.deviceID < rhs.deviceID
-                }
-                return lhs.modifiedAt > rhs.modifiedAt
-            }.first
-        guard let selected else { return }
-
-        let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: currentStoreURL.path) {
-            try fileManager.removeItem(at: currentStoreURL)
-        }
-        try fileManager.copyItem(at: selected.url, to: currentStoreURL)
-    }
-
-    private static func recoverableLegacyDeviceStores(
-        applicationSupportURL: URL
-    ) -> [LegacyDeviceStore] {
-        let dataRoot = applicationSupportURL.appendingPathComponent(
-            legacyDataRootDirectoryName,
-            isDirectory: true
-        )
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: dataRoot,
-            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        return entries.compactMap { entry in
-            let values = try? entry.resourceValues(
-                forKeys: [.isDirectoryKey, .contentModificationDateKey]
-            )
-            guard values?.isDirectory == true else { return nil }
-            guard deviceStoreIsRecoverable(entry) else { return nil }
-            let deviceID = entry.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !deviceID.isEmpty else { return nil }
-            return LegacyDeviceStore(
-                deviceID: deviceID,
-                url: entry,
-                modifiedAt: latestModificationDate(for: entry)
-                    ?? values?.contentModificationDate
-                    ?? .distantPast
-            )
-        }
-    }
-
-    private static func deviceStoreIsRecoverable(_ url: URL) -> Bool {
-        let accountSecret = url.appendingPathComponent(accountSecretFileName)
-        if FileManager.default.fileExists(atPath: accountSecret.path) {
-            return true
-        }
-
-        let clientStore = url.appendingPathComponent(clientStoreFileName)
-        guard FileManager.default.fileExists(atPath: clientStore.path) else {
-            return false
-        }
-        let size = (try? clientStore.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return size > 0
-    }
-
-    private static func latestModificationDate(for storeURL: URL) -> Date? {
-        let candidates = [
-            storeURL,
-            storeURL.appendingPathComponent(accountSecretFileName),
-            storeURL.appendingPathComponent(clientStoreFileName),
-            storeURL.appendingPathComponent("\(clientStoreFileName)-wal"),
-            storeURL.appendingPathComponent("\(clientStoreFileName)-shm"),
-        ]
-        return candidates.compactMap { url in
-            try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        }.max()
     }
 
     private static func safeDeviceDirectoryName(_ deviceID: String) -> String {
@@ -399,19 +256,69 @@ struct RuntimeDataStore {
     }
 }
 
-private struct LegacyDeviceStore {
-    let deviceID: String
-    let url: URL
-    let modifiedAt: Date
+private struct ProductHarnessSupportResolution {
+    let url: URL?
+    let error: String?
+}
+
+private struct AppLaunchConfigurationError: Error, CustomStringConvertible {
+    let message: String
+
+    var description: String {
+        message
+    }
+}
+
+struct DeveloperDiagnosticEntry: Identifiable, Equatable {
+    let id: Int
+    let timestampUnixSeconds: Int64
+    let category: String
+    let event: String
+    let details: [String: String]
+
+    static func exportText(_ entries: [DeveloperDiagnosticEntry]) -> String {
+        var lines = [
+            "Finite Chat diagnostics",
+            "redaction=urls,paths,long-hex",
+            "event_count=\(entries.count)",
+        ]
+        for entry in entries {
+            let details = entry.details
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: " ")
+            if details.isEmpty {
+                lines.append(
+                    "seq=\(entry.id) ts=\(entry.timestampUnixSeconds) category=\(entry.category) event=\(entry.event)"
+                )
+            } else {
+                lines.append(
+                    "seq=\(entry.id) ts=\(entry.timestampUnixSeconds) category=\(entry.category) event=\(entry.event) \(details)"
+                )
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+private struct DiagnosticActionSummary {
+    let category: String
+    let name: String
+    let details: [String: String]
 }
 
 @MainActor
 final class AppModel: ObservableObject {
+    private static let developerDiagnosticsLimit = 200
+
     @Published var serverURL: String
     @Published var deviceID: String
     @Published private(set) var state: AppState? {
         didSet {
             rebuildChatProjections()
+            if let state {
+                appendStateDiagnostic(state, event: "state.projected")
+            }
         }
     }
     private(set) var chatProjections: [String: ChatRoomProjection] = [:]
@@ -421,6 +328,7 @@ final class AppModel: ObservableObject {
     @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
     @Published private(set) var runtimeStorePath: String?
+    @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
 
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
@@ -437,6 +345,7 @@ final class AppModel: ObservableObject {
     private var messageRetriesInFlight = Set<String>()
     private var lastTypingIntentByRoom: [String: Bool] = [:]
     private var didRunLaunchAutomation = false
+    private let launchConfigurationError: String?
 
     deinit {
         updateTask?.cancel()
@@ -444,7 +353,7 @@ final class AppModel: ObservableObject {
     }
 
     init(
-        config: RuntimeConfig = RuntimeConfig.load(),
+        config: RuntimeConfig? = nil,
         applicationSupportURL: URL? = nil,
         configStorageURL: URL? = nil,
         args: [String] = CommandLine.arguments,
@@ -453,16 +362,31 @@ final class AppModel: ObservableObject {
             try FiniteChatRuntime.open(options: options)
         }
     ) {
-        serverURL = config.serverURL
-        deviceID = config.deviceID
-        usesTransientStore = config.usesTransientStore
-        persistsRuntimeIdentityUpdates = config.persistsRuntimeIdentityUpdates
-        self.applicationSupportURL = applicationSupportURL
+        let productHarnessSupport = Self.productHarnessApplicationSupportURL(args: args)
+        let resolvedApplicationSupportURL = applicationSupportURL ?? productHarnessSupport.url
+        let resolvedConfigStorageURL = configStorageURL
+            ?? resolvedApplicationSupportURL?.appendingPathComponent("finitechat_config.json")
+        let resolvedConfig = config ?? RuntimeConfig.load(storageURL: resolvedConfigStorageURL)
+        serverURL = resolvedConfig.serverURL
+        deviceID = resolvedConfig.deviceID
+        usesTransientStore = resolvedConfig.usesTransientStore
+        persistsRuntimeIdentityUpdates = resolvedConfig.persistsRuntimeIdentityUpdates
+        self.applicationSupportURL = resolvedApplicationSupportURL
         self.configStorageURL = configStorageURL
-            ?? applicationSupportURL?.appendingPathComponent("finitechat_config.json")
+            ?? resolvedConfigStorageURL
         self.args = args
         self.runtimeFactory = runtimeFactory
         self.startsUpdateLoop = startsUpdateLoop
+        launchConfigurationError = productHarnessSupport.error
+        appendDiagnostic(
+            category: "persistence",
+            event: "app.configured",
+            details: [
+                "store_mode": usesTransientStore ? "transient" : "stable",
+                "has_explicit_support_root": resolvedApplicationSupportURL == nil ? "false" : "true",
+                "has_launch_configuration_error": launchConfigurationError == nil ? "false" : "true",
+            ]
+        )
     }
 
     var rooms: [AppRoomSummary] {
@@ -498,7 +422,11 @@ final class AppModel: ObservableObject {
         if rooms.isEmpty {
             return nil
         }
-        return state?.toast?.nonEmptyTrimmed
+        let toast = state?.toast?.nonEmptyTrimmed
+        if toast == "Showing saved chats. Connection will retry." {
+            return nil
+        }
+        return toast
     }
 
     var developerErrorText: String? {
@@ -517,6 +445,14 @@ final class AppModel: ObservableObject {
         return "\(roomCount) room(s), selected \(selectedRoomID), \(selectedMessages) selected message(s), \(projectedMessages) projected message(s)"
     }
 
+    var developerDiagnosticsExport: String {
+        DeveloperDiagnosticEntry.exportText(developerDiagnostics)
+    }
+
+    var developerDiagnosticsPreview: [DeveloperDiagnosticEntry] {
+        Array(developerDiagnostics.suffix(8))
+    }
+
     var activeProfile: AppProfileSummary? {
         guard let state, let activeProfileId = state.activeProfileId else { return nil }
         return state.profiles.first { $0.accountId == activeProfileId }
@@ -528,17 +464,43 @@ final class AppModel: ObservableObject {
             && !outboundText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private func roomAllowsComposition(_ roomID: String) -> Bool {
+        state?.rooms.first(where: { $0.roomId == roomID })?.state == .connected
+    }
+
+    private static func messageAllowsRetry(_ message: ChatMessage) -> Bool {
+        guard message.isMine,
+              let serverDelivery = message.outboundDelivery?.serverDelivery,
+              case .failed = serverDelivery
+        else {
+            return false
+        }
+        return true
+    }
+
     func start() {
+        appendDiagnostic(category: "runtime", event: "start.requested")
         do {
             let runtime = try currentRuntime()
             state = try runtime.state()
             do {
                 state = try runtime.dispatch(action: .startRuntime)
+                appendDiagnostic(category: "runtime", event: "start.succeeded")
                 errorText = nil
             } catch {
+                appendDiagnostic(
+                    category: "runtime",
+                    event: "start.failed",
+                    details: diagnosticErrorDetails(error)
+                )
                 errorText = String(describing: error)
             }
         } catch {
+            appendDiagnostic(
+                category: "runtime",
+                event: "open.failed",
+                details: diagnosticErrorDetails(error)
+            )
             errorText = String(describing: error)
         }
         restartUpdateLoopIfEnabled()
@@ -563,6 +525,7 @@ final class AppModel: ObservableObject {
     }
 
     func createInvite(for room: AppRoomSummary) -> Bool {
+        guard room.state == .connected else { return false }
         dispatch(.createInvite(roomId: room.roomId))
         return state?.activeInvite?.roomId == room.roomId
     }
@@ -576,20 +539,21 @@ final class AppModel: ObservableObject {
         return activeProfile == nil
     }
 
-    func submitPin(for room: AppRoomSummary) {
+    @discardableResult
+    func submitPin(for room: AppRoomSummary) -> Bool {
+        guard room.state == .waitingForApproval else { return false }
         let pin = pinDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pin.isEmpty else { return }
+        guard !pin.isEmpty else { return false }
         pinDraft = ""
         dispatch(.submitInvitePin(pendingRoomId: room.roomId, pin: pin))
+        return true
     }
 
-    func retry(_ room: AppRoomSummary) {
-        dispatch(.retryRoom(roomId: room.roomId))
-    }
-
-    func retry(_ message: ChatMessage) {
+    @discardableResult
+    func retry(_ message: ChatMessage) -> Bool {
+        guard Self.messageAllowsRetry(message) else { return false }
         let key = "\(message.roomId)|\(message.messageId)"
-        guard !messageRetriesInFlight.contains(key) else { return }
+        guard !messageRetriesInFlight.contains(key) else { return false }
         messageRetriesInFlight.insert(key)
 
         Task { [weak self] in
@@ -615,6 +579,7 @@ final class AppModel: ObservableObject {
                 errorText = String(describing: error)
             }
         }
+        return true
     }
 
     func refreshDevices() {
@@ -629,6 +594,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func send(replyTo message: ChatMessage? = nil) -> Bool {
         guard let room = selectedRoom else { return false }
+        guard room.state == .connected else { return false }
         let text = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
         let action: AppAction
@@ -648,12 +614,14 @@ final class AppModel: ObservableObject {
         return sent
     }
 
+    @discardableResult
     func sendAttachment(
         roomID: String,
         fileURL: URL,
         replyTo message: ChatMessage? = nil,
         onSuccess: (@MainActor () -> Void)? = nil
-    ) {
+    ) -> Bool {
+        guard roomAllowsComposition(roomID) else { return false }
         let caption = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
         outboundText = ""
         Task { [weak self] in
@@ -685,16 +653,19 @@ final class AppModel: ObservableObject {
                 errorText = String(describing: error)
             }
         }
+        return true
     }
 
+    @discardableResult
     func sendAttachments(
         roomID: String,
         attachments: [OutboundAttachment],
         replyTo message: ChatMessage? = nil,
         captionOverride: String? = nil,
         onSuccess: (@MainActor () -> Void)? = nil
-    ) {
-        guard !attachments.isEmpty else { return }
+    ) -> Bool {
+        guard roomAllowsComposition(roomID) else { return false }
+        guard !attachments.isEmpty else { return false }
         let caption = (captionOverride ?? outboundText)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         Task { [weak self] in
@@ -723,10 +694,12 @@ final class AppModel: ObservableObject {
                 errorText = String(describing: error)
             }
         }
+        return true
     }
 
     @discardableResult
     func sendPoll(roomID: String, question: String, options: [String]) -> Bool {
+        guard roomAllowsComposition(roomID) else { return false }
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedOptions = options
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -752,16 +725,7 @@ final class AppModel: ObservableObject {
     }
 
     func downloadAttachment(roomID: String, messageID: String, attachment: ChatMediaAttachment) {
-        if let localPath = attachment.localPath?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !localPath.isEmpty
-        {
-            return
-        }
-        guard let url = attachment.url?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !url.isEmpty
-        else {
-            return
-        }
+        guard attachmentCanDownload(attachment) else { return }
 
         let key = "\(roomID)|\(messageID)|\(attachment.attachmentId)"
         guard !attachmentDownloadsInFlight.contains(key) else { return }
@@ -836,11 +800,17 @@ final class AppModel: ObservableObject {
     }
 
     func applyDevSettings() {
+        appendDiagnostic(category: "persistence", event: "settings.apply.requested")
         do {
             try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
                 storageURL: configStorageURL
             )
         } catch {
+            appendDiagnostic(
+                category: "persistence",
+                event: "settings.apply.failed",
+                details: diagnosticErrorDetails(error)
+            )
             errorText = String(describing: error)
             return
         }
@@ -861,10 +831,16 @@ final class AppModel: ObservableObject {
                     guard !Task.isCancelled else { return }
                     guard let self, self.openKey == runtimeKey else { return }
                     self.state = nextState
+                    self.appendDiagnostic(category: "runtime", event: "update.received")
                     self.errorText = nil
                 } catch {
                     guard !Task.isCancelled else { return }
                     guard let self, self.openKey == runtimeKey else { return }
+                    self.appendDiagnostic(
+                        category: "runtime",
+                        event: "update.failed",
+                        details: self.diagnosticErrorDetails(error)
+                    )
                     self.errorText = String(describing: error)
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
@@ -875,10 +851,31 @@ final class AppModel: ObservableObject {
     @discardableResult
     private func dispatch(_ action: AppAction) -> Bool {
         var succeeded = false
+        let diagnostic = diagnosticAction(action)
+        appendDiagnostic(
+            category: diagnostic.category,
+            event: "\(diagnostic.name).requested",
+            details: diagnostic.details
+        )
         run {
             let runtime = try currentRuntime()
             self.state = try runtime.dispatch(action: action)
             succeeded = true
+        }
+        if succeeded {
+            appendDiagnostic(
+                category: diagnostic.category,
+                event: "\(diagnostic.name).succeeded",
+                details: diagnostic.details
+            )
+        } else {
+            appendDiagnostic(
+                category: diagnostic.category,
+                event: "\(diagnostic.name).failed",
+                details: diagnostic.details.merging(diagnosticErrorDetails(errorText)) { current, _ in
+                    current
+                }
+            )
         }
         restartUpdateLoopIfEnabled()
         return succeeded
@@ -891,6 +888,9 @@ final class AppModel: ObservableObject {
     }
 
     private func currentRuntime() throws -> any FiniteChatRuntimeProtocol {
+        if let launchConfigurationError {
+            throw AppLaunchConfigurationError(message: launchConfigurationError)
+        }
         let key = "\(serverURL)|\(deviceID)"
         if let runtime, openKey == key {
             return runtime
@@ -901,6 +901,14 @@ final class AppModel: ObservableObject {
             transient: usesTransientStore
         )
         runtimeStorePath = dataDir
+        appendDiagnostic(
+            category: "persistence",
+            event: "store.resolved",
+            details: [
+                "store": redactedPathSummary(dataDir),
+                "mode": usesTransientStore ? "transient" : "stable",
+            ]
+        )
         let opened = try runtimeFactory(
             OpenOptions(
                 dataDir: dataDir,
@@ -913,6 +921,11 @@ final class AppModel: ObservableObject {
         let openedState = try opened.state()
         let resolvedDeviceID = openedState.identity.deviceId
         if resolvedDeviceID != deviceID {
+            appendDiagnostic(
+                category: "runtime",
+                event: "identity.resolved",
+                details: ["device_changed": "true"]
+            )
             deviceID = resolvedDeviceID
         }
         if !usesTransientStore && persistsRuntimeIdentityUpdates {
@@ -922,6 +935,7 @@ final class AppModel: ObservableObject {
         }
         runtime = opened
         openKey = "\(serverURL)|\(deviceID)"
+        appendDiagnostic(category: "runtime", event: "open.succeeded")
         return opened
     }
 
@@ -952,8 +966,288 @@ final class AppModel: ObservableObject {
             try operation()
             errorText = nil
         } catch {
+            appendDiagnostic(
+                category: "runtime",
+                event: "operation.failed",
+                details: diagnosticErrorDetails(error)
+            )
             errorText = String(describing: error)
         }
+    }
+
+    private func appendStateDiagnostic(_ state: AppState, event: String) {
+        let outboundMessages = state.messages.compactMap(\.outboundDelivery)
+        var undelivered = 0
+        var delivered = 0
+        var failed = 0
+        for delivery in outboundMessages {
+            switch delivery.serverDelivery {
+            case .undelivered:
+                undelivered += 1
+            case .delivered:
+                delivered += 1
+            case .failed:
+                failed += 1
+            }
+        }
+        let roomStates = Dictionary(grouping: state.rooms, by: \.state)
+            .mapValues(\.count)
+        appendDiagnostic(
+            category: "runtime",
+            event: event,
+            details: [
+                "rev": "\(state.rev)",
+                "status": Self.redactedDiagnosticValue(state.status),
+                "rooms": "\(state.rooms.count)",
+                "connected_rooms": "\(roomStates[.connected] ?? 0)",
+                "unavailable_rooms": "\(roomStates[.unavailableOnDevice] ?? 0)",
+                "selected_room": state.selectedRoomId.map(Self.redactedDiagnosticValue) ?? "none",
+                "messages": "\(state.messages.count)",
+                "outbound": "\(outboundMessages.count)",
+                "undelivered": "\(undelivered)",
+                "delivered": "\(delivered)",
+                "failed": "\(failed)",
+                "profiles": "\(state.profiles.count)",
+                "devices": "\(state.devices.count)",
+            ]
+        )
+    }
+
+    private func appendDiagnostic(
+        category: String,
+        event: String,
+        details: [String: String] = [:]
+    ) {
+        let sanitizedDetails = details.reduce(into: [String: String]()) { output, item in
+            output[item.key] = Self.redactedDiagnosticValue(item.value)
+        }
+        developerDiagnostics.append(DeveloperDiagnosticEntry(
+            id: (developerDiagnostics.last?.id ?? 0) + 1,
+            timestampUnixSeconds: Int64(Date().timeIntervalSince1970),
+            category: Self.redactedDiagnosticValue(category),
+            event: Self.redactedDiagnosticValue(event),
+            details: sanitizedDetails
+        ))
+        if developerDiagnostics.count > Self.developerDiagnosticsLimit {
+            developerDiagnostics.removeFirst(
+                developerDiagnostics.count - Self.developerDiagnosticsLimit
+            )
+        }
+    }
+
+    private func diagnosticErrorDetails(_ error: Error) -> [String: String] {
+        diagnosticErrorDetails(String(describing: error))
+    }
+
+    private func diagnosticErrorDetails(_ errorText: String?) -> [String: String] {
+        guard let errorText = errorText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !errorText.isEmpty
+        else {
+            return [:]
+        }
+        return ["error": Self.redactedDiagnosticValue(errorText)]
+    }
+
+    private func diagnosticAction(_ action: AppAction) -> DiagnosticActionSummary {
+        switch action {
+        case .startRuntime:
+            return DiagnosticActionSummary(category: "runtime", name: "start_runtime", details: [:])
+        case .stopRuntime:
+            return DiagnosticActionSummary(category: "runtime", name: "stop_runtime", details: [:])
+        case .openRoom(let roomId):
+            return DiagnosticActionSummary(
+                category: "runtime",
+                name: "open_room",
+                details: ["room": roomId]
+            )
+        case .createRoom:
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "create_room",
+                details: [:]
+            )
+        case .createInvite(let roomId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "create_invite",
+                details: ["room": roomId]
+            )
+        case .scanTarget:
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "scan_target",
+                details: [:]
+            )
+        case .submitInvitePin(let pendingRoomId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "submit_invite_pin",
+                details: ["room": pendingRoomId]
+            )
+        case .sendMessage(let roomId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_message",
+                details: ["room": roomId]
+            )
+        case .sendReply(let roomId, _, let replyToMessageId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_reply",
+                details: ["room": roomId, "reply_to": replyToMessageId]
+            )
+        case .sendAttachment(let roomId, _, _, _, _, let caption, let replyToMessageId):
+            var details = [
+                "room": roomId,
+                "attachment_count": "1",
+                "has_caption": caption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "false" : "true",
+            ]
+            if let replyToMessageId {
+                details["reply_to"] = replyToMessageId
+            }
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_attachment",
+                details: details
+            )
+        case .sendAttachments(let roomId, let attachments, let caption, let replyToMessageId):
+            var details = [
+                "room": roomId,
+                "attachment_count": "\(attachments.count)",
+                "has_caption": caption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "false" : "true",
+            ]
+            if let replyToMessageId {
+                details["reply_to"] = replyToMessageId
+            }
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_attachments",
+                details: details
+            )
+        case .sendPoll(let roomId, _, let options):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_poll",
+                details: ["room": roomId, "option_count": "\(options.count)"]
+            )
+        case .votePoll(let roomId, let messageId, let optionId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "vote_poll",
+                details: ["room": roomId, "message": messageId, "option": optionId]
+            )
+        case .downloadAttachment(let roomId, let messageId, let attachmentId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "download_attachment",
+                details: ["room": roomId, "message": messageId, "attachment": attachmentId]
+            )
+        case .beginDownloadAttachment(let roomId, let messageId, let attachmentId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "begin_download_attachment",
+                details: ["room": roomId, "message": messageId, "attachment": attachmentId]
+            )
+        case .loadOlderMessages(let roomId, let beforeMessageId, let limit):
+            return DiagnosticActionSummary(
+                category: "runtime",
+                name: "load_older_messages",
+                details: [
+                    "room": roomId,
+                    "before": beforeMessageId,
+                    "limit": "\(limit)",
+                ]
+            )
+        case .reactToMessage(let roomId, let messageId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "react_to_message",
+                details: ["room": roomId, "message": messageId]
+            )
+        case .markRoomRead(let roomId):
+            return DiagnosticActionSummary(
+                category: "runtime",
+                name: "mark_room_read",
+                details: ["room": roomId]
+            )
+        case .retryMessage(let roomId, let messageId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "retry_message",
+                details: ["room": roomId, "message": messageId]
+            )
+        case .setTyping(let roomId, let isTyping):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "set_typing",
+                details: ["room": roomId, "typing": isTyping ? "true" : "false"]
+            )
+        case .refreshDevices:
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "refresh_devices",
+                details: [:]
+            )
+        case .revokeDevice(let accountId, let deviceId):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "revoke_device",
+                details: ["account": accountId, "device": deviceId]
+            )
+        }
+    }
+
+    private func redactedPathSummary(_ path: String) -> String {
+        let components = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        let suffix = components.suffix(2).joined(separator: "/")
+        return suffix.isEmpty ? "[path]" : "[path:\(suffix)]"
+    }
+
+    private static func redactedDiagnosticValue(_ value: String) -> String {
+        var output = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        output = replacingMatches(
+            in: output,
+            pattern: #"https?://[^\s]+"#,
+            replacement: "[url]"
+        )
+        output = replacingMatches(
+            in: output,
+            pattern: #"file://[^\s]+"#,
+            replacement: "[url]"
+        )
+        output = replacingMatches(
+            in: output,
+            pattern: #"/(?:Users|private|var|tmp|Volumes)/[^\s]+"#,
+            replacement: "[path]"
+        )
+        output = replacingMatches(
+            in: output,
+            pattern: #"\b[0-9a-fA-F]{32,}\b"#,
+            replacement: "[hex]"
+        )
+        if output.count > 240 {
+            output = String(output.prefix(237)) + "..."
+        }
+        return output
+    }
+
+    private static func replacingMatches(
+        in value: String,
+        pattern: String,
+        replacement: String
+    ) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return value
+        }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return regex.stringByReplacingMatches(
+            in: value,
+            options: [],
+            range: range,
+            withTemplate: replacement
+        )
     }
 
     private func runLaunchAutomationIfRequested() {
@@ -961,7 +1255,37 @@ final class AppModel: ObservableObject {
         let inviteURL = Self.argumentValue("--finitechat-auto-join", in: args)
         let createRoomName = Self.argumentValue("--finitechat-auto-create-room", in: args)
         let outbound = Self.argumentValue("--finitechat-auto-send", in: args)
-        guard inviteURL != nil || createRoomName != nil || outbound != nil else {
+        let attachmentText = Self.argumentValue(
+            "--finitechat-auto-send-attachment-text",
+            in: args
+        )
+        let attachmentFile = Self.argumentValue(
+            "--finitechat-auto-send-attachment-file",
+            in: args
+        )
+        let attachmentBase64 = Self.argumentValue(
+            "--finitechat-auto-send-attachment-base64",
+            in: args
+        )
+        let attachmentFilename = Self.argumentValue(
+            "--finitechat-auto-send-attachment-filename",
+            in: args
+        ) ?? "launch-automation.bin"
+        let attachmentMimeType = Self.argumentValue(
+            "--finitechat-auto-send-attachment-mime-type",
+            in: args
+        ) ?? "application/octet-stream"
+        let attachmentCaption = Self.argumentValue(
+            "--finitechat-auto-send-attachment-caption",
+            in: args
+        )
+        guard inviteURL != nil
+            || createRoomName != nil
+            || outbound != nil
+            || attachmentText != nil
+            || attachmentFile != nil
+            || attachmentBase64 != nil
+        else {
             return
         }
 
@@ -990,6 +1314,31 @@ final class AppModel: ObservableObject {
             if let outbound, !outbound.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 await self.sendLaunchAutomationMessage(roomID: roomID, text: outbound)
             }
+            if let attachmentText,
+               !attachmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                await self.sendLaunchAutomationAttachment(roomID: roomID, text: attachmentText)
+            }
+            if let attachmentFile,
+               !attachmentFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                await self.sendLaunchAutomationAttachmentFile(
+                    roomID: roomID,
+                    path: attachmentFile,
+                    caption: attachmentCaption ?? ""
+                )
+            }
+            if let attachmentBase64,
+               !attachmentBase64.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                await self.sendLaunchAutomationAttachmentBase64(
+                    roomID: roomID,
+                    base64: attachmentBase64,
+                    filename: attachmentFilename,
+                    mimeType: attachmentMimeType,
+                    caption: attachmentCaption ?? ""
+                )
+            }
         }
     }
 
@@ -1016,6 +1365,105 @@ final class AppModel: ObservableObject {
         errorText = "Launch automation timed out waiting for the room to connect"
     }
 
+    private func sendLaunchAutomationAttachmentBase64(
+        roomID: String?,
+        base64: String,
+        filename: String,
+        mimeType: String,
+        caption: String
+    ) async {
+        let deadline = Date().addingTimeInterval(90)
+        while !Task.isCancelled, Date() < deadline {
+            if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
+                dispatch(.openRoom(roomId: room.roomId))
+                let normalized = base64.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let data = Data(base64Encoded: normalized) else {
+                    errorText = "Launch automation attachment base64 was invalid"
+                    return
+                }
+                let cleanedFilename = filename.trimmingCharacters(in: .whitespacesAndNewlines)
+                let finalFilename = cleanedFilename.isEmpty ? "launch-automation.bin" : cleanedFilename
+                let cleanedMimeType = mimeType.trimmingCharacters(in: .whitespacesAndNewlines)
+                let finalMimeType = cleanedMimeType.isEmpty
+                    ? "application/octet-stream"
+                    : cleanedMimeType
+                let type = UTType(filenameExtension: URL(fileURLWithPath: finalFilename).pathExtension)
+                let attachment = OutboundAttachment(
+                    filename: finalFilename,
+                    mimeType: finalMimeType,
+                    kind: Self.chatMediaKind(for: type),
+                    bytes: data
+                )
+                sendAttachments(
+                    roomID: room.roomId,
+                    attachments: [attachment],
+                    captionOverride: caption
+                )
+                return
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        errorText = "Launch automation timed out waiting for the room to connect"
+    }
+
+    private func sendLaunchAutomationAttachmentFile(
+        roomID: String?,
+        path: String,
+        caption: String
+    ) async {
+        let fileURL = URL(fileURLWithPath: path).standardizedFileURL
+        let deadline = Date().addingTimeInterval(90)
+        while !Task.isCancelled, Date() < deadline {
+            if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
+                dispatch(.openRoom(roomId: room.roomId))
+                do {
+                    let prepared = try await Task.detached(priority: .userInitiated) {
+                        try Self.loadAttachment(from: fileURL)
+                    }.value
+                    let attachment = OutboundAttachment(
+                        filename: prepared.filename,
+                        mimeType: prepared.mimeType,
+                        kind: prepared.kind,
+                        bytes: prepared.data
+                    )
+                    sendAttachments(
+                        roomID: room.roomId,
+                        attachments: [attachment],
+                        captionOverride: caption
+                    )
+                } catch {
+                    errorText = String(describing: error)
+                }
+                return
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        errorText = "Launch automation timed out waiting for the room to connect"
+    }
+
+    private func sendLaunchAutomationAttachment(roomID: String?, text: String) async {
+        let deadline = Date().addingTimeInterval(90)
+        while !Task.isCancelled, Date() < deadline {
+            if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
+                dispatch(.openRoom(roomId: room.roomId))
+                let attachment = OutboundAttachment(
+                    filename: "launch-automation.txt",
+                    mimeType: "text/plain",
+                    kind: .file,
+                    bytes: Data(text.utf8)
+                )
+                sendAttachments(
+                    roomID: room.roomId,
+                    attachments: [attachment],
+                    captionOverride: ""
+                )
+                return
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        errorText = "Launch automation timed out waiting for the room to connect"
+    }
+
     private static func argumentValue(_ name: String, in args: [String]) -> String? {
         guard let index = args.firstIndex(of: name) else {
             return nil
@@ -1025,6 +1473,42 @@ final class AppModel: ObservableObject {
             return nil
         }
         return args[valueIndex]
+    }
+
+    private static func productHarnessApplicationSupportURL(
+        args: [String]
+    ) -> ProductHarnessSupportResolution {
+        let argument = "--finitechat-product-harness-root"
+        guard let rawValue = argumentValue(argument, in: args) else {
+            return ProductHarnessSupportResolution(url: nil, error: nil)
+        }
+        let url = URL(fileURLWithPath: rawValue).standardizedFileURL
+        guard url.path == rawValue || rawValue.hasPrefix("/") else {
+            return ProductHarnessSupportResolution(
+                url: nil,
+                error: "\(argument) must be an absolute path"
+            )
+        }
+        guard url.isFileURL, url.path.hasPrefix("/") else {
+            return ProductHarnessSupportResolution(
+                url: nil,
+                error: "\(argument) must be an absolute file path"
+            )
+        }
+        if let defaultSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ).standardizedFileURL,
+            url == defaultSupport
+        {
+            return ProductHarnessSupportResolution(
+                url: nil,
+                error: "\(argument) must not be the default Application Support path"
+            )
+        }
+        return ProductHarnessSupportResolution(url: url, error: nil)
     }
 
     nonisolated private static func loadAttachment(from url: URL) throws -> PreparedAttachment {

@@ -30,6 +30,7 @@ struct ContentView: View {
     @State private var sheet: AppSheet?
     @State private var path: [String] = []
     @State private var lastAppliedSelectedRoomID: String?
+    @State private var scheduledRoomRouteID: String?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -40,8 +41,7 @@ struct ContentView: View {
                 },
                 open: { room in
                     model.openRoom(room)
-                    path = [room.roomId]
-                    lastAppliedSelectedRoomID = room.roomId
+                    routeSelectedRoom(room.roomId)
                 }
             )
             .navigationDestination(for: String.self) { roomID in
@@ -73,13 +73,36 @@ struct ContentView: View {
 
     private func routeSelectedRoomIfNeeded(_ selectedRoomID: String?) {
         guard let selectedRoomID else {
-            path = []
             lastAppliedSelectedRoomID = nil
+            scheduledRoomRouteID = nil
+            schedulePathUpdate([])
             return
         }
         guard selectedRoomID != lastAppliedSelectedRoomID else { return }
-        path = [selectedRoomID]
         lastAppliedSelectedRoomID = selectedRoomID
+        scheduledRoomRouteID = selectedRoomID
+        schedulePathUpdate([selectedRoomID])
+    }
+
+    private func routeSelectedRoom(_ selectedRoomID: String) {
+        lastAppliedSelectedRoomID = selectedRoomID
+        scheduledRoomRouteID = selectedRoomID
+        schedulePathUpdate([selectedRoomID])
+    }
+
+    private func schedulePathUpdate(_ nextPath: [String]) {
+        Task { @MainActor in
+            if let expectedRouteID = nextPath.last,
+               scheduledRoomRouteID != expectedRouteID
+            {
+                return
+            }
+            if nextPath.isEmpty, scheduledRoomRouteID != nil {
+                return
+            }
+            guard path != nextPath else { return }
+            path = nextPath
+        }
     }
 }
 
@@ -197,7 +220,7 @@ private struct RoomRow: View {
         switch room.state {
         case .connected:
             return "No messages yet"
-        case .waitingForApproval, .joining, .needsAttention, .offline:
+        case .waitingForApproval, .joining, .unavailableOnDevice:
             return room.userStatusText
         }
     }
@@ -487,16 +510,8 @@ private struct RoomThreadView: View {
         case .joining:
             ProgressView(room.userStatusText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .needsAttention, .offline:
-            if projection.rows.isEmpty {
-                NeedsAttentionView(room: room) {
-                    model.retry(room)
-                }
-            } else {
-                transcriptView(room: room) {
-                    ReadOnlyComposerBar(room: room)
-                }
-            }
+        case .unavailableOnDevice:
+            UnavailableOnDeviceView(room: room)
         }
     }
 
@@ -540,15 +555,16 @@ private struct RoomThreadView: View {
     }
 
     private func messageCanRetry(_ message: ChatMessage) -> Bool {
-        guard message.isMine else { return false }
-        if case .failed = message.delivery {
+        guard message.isMine, let outboundDelivery = message.outboundDelivery else { return false }
+        if case .failed = outboundDelivery.serverDelivery {
             return true
         }
         return false
     }
 
     private func messageCanUseSentActions(_ message: ChatMessage) -> Bool {
-        if case .sent = message.delivery {
+        guard let outboundDelivery = message.outboundDelivery else { return true }
+        if case .delivered = outboundDelivery.serverDelivery {
             return true
         }
         return false
@@ -1356,9 +1372,8 @@ private struct PendingRoomView: View {
     }
 }
 
-private struct NeedsAttentionView: View {
+private struct UnavailableOnDeviceView: View {
     let room: AppRoomSummary
-    let retry: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
@@ -1369,36 +1384,9 @@ private struct NeedsAttentionView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button {
-                retry()
-            } label: {
-                Label("Retry", systemImage: "arrow.clockwise")
-            }
-            .buttonStyle(.borderedProminent)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-private struct ReadOnlyComposerBar: View {
-    let room: AppRoomSummary
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "lock")
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.secondary)
-
-            Text(room.userStatusText)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.bar)
     }
 }
 
@@ -1590,6 +1578,34 @@ private struct SettingsSheet: View {
                                 .textSelection(.enabled)
                         }
                     }
+                    if !model.developerDiagnostics.isEmpty {
+                        LabeledContent(
+                            "Debug Events",
+                            value: "\(model.developerDiagnostics.count)"
+                        )
+                        HStack {
+                            Button {
+                                UIPasteboard.general.string = model.developerDiagnosticsExport
+                            } label: {
+                                Label("Copy Logs", systemImage: "doc.on.doc")
+                            }
+                            ShareLink(item: model.developerDiagnosticsExport) {
+                                Label("Share Logs", systemImage: "square.and.arrow.up")
+                            }
+                        }
+                        ForEach(model.developerDiagnosticsPreview) { entry in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("\(entry.category) / \(entry.event)")
+                                    .font(.caption.weight(.medium))
+                                if !entry.details.isEmpty {
+                                    Text(developerDiagnosticDetails(entry.details))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .navigationTitle("Settings")
@@ -1611,6 +1627,13 @@ private struct SettingsSheet: View {
             }
         }
     }
+}
+
+private func developerDiagnosticDetails(_ details: [String: String]) -> String {
+    details
+        .sorted { $0.key < $1.key }
+        .map { "\($0.key)=\($0.value)" }
+        .joined(separator: " ")
 }
 
 private struct ProfileRow: View {
@@ -1768,11 +1791,30 @@ private struct QRCodeView: View {
     }
 }
 
-private struct NoticeBar: View {
+struct NoticeBarPresentation: Equatable {
     let text: String?
 
+    var visibleText: String? {
+        guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return nil
+        }
+        return text
+    }
+
+    var accessibilityIdentifier: String {
+        "NoticeBar"
+    }
+}
+
+struct NoticeBar: View {
+    let presentation: NoticeBarPresentation
+
+    init(text: String?) {
+        presentation = NoticeBarPresentation(text: text)
+    }
+
     var body: some View {
-        if let text, !text.isEmpty {
+        if let text = presentation.visibleText {
             Text(text)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1781,6 +1823,7 @@ private struct NoticeBar: View {
                 .padding(.horizontal)
                 .padding(.vertical, 8)
                 .background(.bar)
+                .accessibilityIdentifier(presentation.accessibilityIdentifier)
         }
     }
 }
@@ -1792,10 +1835,8 @@ private extension AppRoomState {
             .green
         case .waitingForApproval, .joining:
             .orange
-        case .needsAttention:
+        case .unavailableOnDevice:
             .red
-        case .offline:
-            .gray
         }
     }
 }

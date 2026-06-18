@@ -52,7 +52,13 @@ pub fn build_swift_for_run(
     let core_pkg = cfg.core.crate_.clone();
     let core_lib = core_pkg.replace('-', "_");
     generate_ios_sources(root, &cfg, profile, true, verbose)?;
-    build_ios_xcframework(root, &core_lib, &core_pkg, &[rust_target], profile, verbose)
+    let mut targets = vec![rust_target];
+    for default_target in default_ios_targets() {
+        if !targets.contains(&default_target) {
+            targets.push(default_target);
+        }
+    }
+    build_ios_xcframework(root, &core_lib, &core_pkg, &targets, profile, verbose)
 }
 
 pub fn build_kotlin_for_run(

@@ -153,10 +153,6 @@ private struct ChatMessageGroupRow: View {
                     onLongPressMessage: onLongPressMessage,
                     alignment: .trailing
                 )
-
-                if let last = group.messages.last {
-                    MessageStatusLine(message: last, onRetryMessage: onRetryMessage)
-                }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
@@ -205,6 +201,7 @@ private struct ChatBubbleStack: View {
                     onJumpToMessage: onJumpToMessage,
                     onLongPressMessage: onLongPressMessage
                 )
+                MessageStatusLine(message: message, onRetryMessage: onRetryMessage)
             }
         }
     }
@@ -249,6 +246,10 @@ private struct ChatMessageBubble: View {
 
     private var secondaryForegroundColor: Color {
         message.isMine ? .white.opacity(0.78) : .secondary
+    }
+
+    private var accessibility: ChatMessageBubbleAccessibilityDescriptor {
+        ChatMessageBubbleAccessibilityDescriptor(message: message)
     }
 
     private var bodyText: String {
@@ -297,22 +298,39 @@ private struct ChatMessageBubble: View {
                     )
                     .padding(.horizontal, 10)
                     .padding(.top, message.media.isEmpty ? 8 : 7)
-                    .padding(.bottom, statusText == nil ? 8 : 3)
+                    .padding(.bottom, hasFooter ? 3 : 8)
                 } else if !bodyText.isEmpty {
-                    Text(bodyText)
-                        .font(.body)
-                        .foregroundStyle(foregroundColor)
+                    ChatRichTextView(
+                        astJson: message.richTextJson,
+                        fallbackText: bodyText,
+                        isMine: message.isMine,
+                        foregroundColor: foregroundColor,
+                        secondaryForegroundColor: secondaryForegroundColor
+                    )
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.horizontal, 12)
                         .padding(.top, message.media.isEmpty ? 8 : 7)
-                        .padding(.bottom, statusText == nil ? 8 : 3)
+                        .padding(.bottom, hasFooter ? 3 : 8)
                 }
 
-                if let statusText {
-                    Text(statusText)
-                        .font(.caption2)
-                        .foregroundStyle(secondaryForegroundColor)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
+                if hasFooter {
+                    HStack(spacing: 5) {
+                        if let statusText {
+                            Text(statusText)
+                                .font(.caption2)
+                                .foregroundStyle(secondaryForegroundColor)
+                                .lineLimit(1)
+                        }
+
+                        if let outboundDelivery = message.outboundDelivery {
+                            OutboundDeliveryMarks(
+                                messageID: message.messageId,
+                                delivery: outboundDelivery,
+                                readReceipt: message.readReceipt
+                            )
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                         .padding(.horizontal, 12)
                         .padding(.bottom, 6)
                 }
@@ -363,6 +381,9 @@ private struct ChatMessageBubble: View {
             }
         }
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityValue(accessibility.value)
+        .accessibilityIdentifier(accessibility.identifier)
         .onDisappear {
             messageFrameRegistry?.removeFrame(for: message.messageId)
         }
@@ -380,6 +401,10 @@ private struct ChatMessageBubble: View {
         return nil
     }
 
+    private var hasFooter: Bool {
+        statusText != nil || message.outboundDelivery != nil
+    }
+
     private var cornerRadius: CGFloat {
         switch position {
         case .single:
@@ -389,6 +414,162 @@ private struct ChatMessageBubble: View {
         case .middle:
             return 12
         }
+    }
+}
+
+private struct OutboundDeliveryMarks: View {
+    let messageID: String
+    let delivery: OutboundDelivery
+    let readReceipt: ChatReadReceiptSummary?
+
+    private var accessibility: OutboundDeliveryAccessibilityDescriptor {
+        OutboundDeliveryAccessibilityDescriptor(
+            messageID: messageID,
+            delivery: delivery,
+            readReceipt: readReceipt
+        )
+    }
+
+    var body: some View {
+        Group {
+            switch delivery.localSend {
+            case .sending:
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(.white)
+            case .sent:
+                switch delivery.serverDelivery {
+                case .undelivered:
+                    checkmark(filled: false)
+                        .accessibilityLabel("Sent locally")
+                case .delivered:
+                    doubleCheckmark(filled: isRead)
+                        .accessibilityLabel(isRead ? "Read" : "Delivered")
+                case .failed:
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                        .accessibilityLabel("Not sent")
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityValue(accessibility.value)
+        .accessibilityIdentifier(accessibility.identifier)
+    }
+
+    private var isRead: Bool {
+        (readReceipt?.readCount ?? 0) > 0
+    }
+
+    private func doubleCheckmark(filled: Bool) -> some View {
+        HStack(spacing: -3) {
+            checkmark(filled: filled)
+            checkmark(filled: filled)
+        }
+    }
+
+    private func checkmark(filled: Bool) -> some View {
+        Image(systemName: filled ? "checkmark.circle.fill" : "checkmark")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white.opacity(filled ? 0.95 : 0.78))
+    }
+}
+
+struct OutboundDeliveryAccessibilityDescriptor: Equatable {
+    let state: String
+    let label: String
+    let value: String
+    let identifier: String
+
+    init(
+        messageID: String,
+        delivery: OutboundDelivery,
+        readReceipt: ChatReadReceiptSummary?
+    ) {
+        let isRead = (readReceipt?.readCount ?? 0) > 0
+        let resolved: (state: String, label: String, value: String)
+        switch delivery.localSend {
+        case .sending:
+            resolved = ("sending", "Sending", "progress")
+        case .sent:
+            switch delivery.serverDelivery {
+            case .undelivered:
+                resolved = ("sent-undelivered", "Sent locally", "one check")
+            case .delivered:
+                resolved = isRead
+                    ? ("delivered-read", "Read", "two filled checks")
+                    : ("delivered-unread", "Delivered", "two checks")
+            case .failed:
+                resolved = ("failed", "Not sent", "retry required")
+            }
+        }
+        state = resolved.state
+        label = resolved.label
+        value = resolved.value
+        identifier = "OutboundDeliveryMark-\(state)-\(messageID)"
+    }
+}
+
+struct ChatMessageBubbleAccessibilityDescriptor: Equatable {
+    let label: String
+    let value: String
+    let identifier: String
+
+    init(message: ChatMessage) {
+        var labelParts: [String] = []
+        let display = message.displayContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !display.isEmpty {
+            labelParts.append(display)
+        } else if !text.isEmpty {
+            labelParts.append(text)
+        } else if !message.media.isEmpty {
+            labelParts.append("Attachment")
+        } else if let poll = message.poll {
+            labelParts.append(poll.question)
+        } else {
+            labelParts.append("Message")
+        }
+
+        if !message.displayTimestamp.isEmpty {
+            labelParts.append(message.displayTimestamp)
+        }
+
+        if let outboundDelivery = message.outboundDelivery {
+            let delivery = OutboundDeliveryAccessibilityDescriptor(
+                messageID: message.messageId,
+                delivery: outboundDelivery,
+                readReceipt: message.readReceipt
+            )
+            labelParts.append(delivery.label)
+            value = delivery.value
+        } else {
+            value = ""
+        }
+
+        label = labelParts.joined(separator: ", ")
+        identifier = "ChatMessageBubble-\(message.messageId)"
+    }
+}
+
+struct MessageRetryPresentation: Equatable {
+    let isVisible: Bool
+    let accessibilityIdentifier: String?
+
+    init(message: ChatMessage) {
+        guard message.isMine,
+              let serverDelivery = message.outboundDelivery?.serverDelivery,
+              case .failed = serverDelivery
+        else {
+            isVisible = false
+            accessibilityIdentifier = nil
+            return
+        }
+
+        isVisible = true
+        accessibilityIdentifier = "RetryMessageButton-\(message.messageId)"
     }
 }
 
@@ -898,11 +1079,6 @@ private struct MediaTile: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(mediaLabel(for: attachment.kind))
-        .task(id: attachment.attachmentId) {
-            if canDownload {
-                onDownload()
-            }
-        }
     }
 
     private var localPath: String? {
@@ -925,8 +1101,7 @@ private struct MediaTile: View {
     }
 
     private var uploadProgress: Double? {
-        guard let progress = attachment.uploadProgressPerMille else { return nil }
-        return Double(min(progress, 1_000)) / 1_000
+        attachmentDeterminateTransferProgress(attachment.uploadProgressPerMille)
     }
 
     private var isDownloading: Bool {
@@ -934,11 +1109,7 @@ private struct MediaTile: View {
     }
 
     private var downloadProgress: Double? {
-        guard let progress = attachment.downloadProgressPerMille else { return nil }
-        if progress == 0 {
-            return nil
-        }
-        return Double(min(progress, 1_000)) / 1_000
+        attachmentDeterminateTransferProgress(attachment.downloadProgressPerMille)
     }
 
     private var mediaPlaceholder: some View {
@@ -1034,9 +1205,14 @@ private struct FileAttachmentRow: View {
                         .font(.caption)
                         .foregroundStyle(isMine ? .white.opacity(0.72) : .secondary)
                         .lineLimit(1)
-                    if let uploadProgress {
-                        ProgressView(value: uploadProgress)
-                            .tint(isMine ? .white : .accentColor)
+                    if isUploading {
+                        if let uploadProgress {
+                            ProgressView(value: uploadProgress)
+                                .tint(isMine ? .white : .accentColor)
+                        } else {
+                            ProgressView()
+                                .tint(isMine ? .white : .accentColor)
+                        }
                     } else if isDownloading {
                         ProgressView()
                             .tint(isMine ? .white : .accentColor)
@@ -1062,9 +1238,12 @@ private struct FileAttachmentRow: View {
         attachmentCanDownload(attachment)
     }
 
+    private var isUploading: Bool {
+        attachment.uploadProgressPerMille != nil
+    }
+
     private var uploadProgress: Double? {
-        guard let progress = attachment.uploadProgressPerMille else { return nil }
-        return Double(min(progress, 1_000)) / 1_000
+        attachmentDeterminateTransferProgress(attachment.uploadProgressPerMille)
     }
 
     private var isDownloading: Bool {
@@ -1072,8 +1251,8 @@ private struct FileAttachmentRow: View {
     }
 
     private var detailText: String {
-        if let uploadProgress {
-            return "Uploading \(Int(uploadProgress * 100))%"
+        if isUploading {
+            return "Uploading..."
         }
         if isDownloading {
             return "Downloading..."
@@ -1088,7 +1267,7 @@ private struct FileAttachmentRow: View {
     }
 
     private var accessoryIconName: String {
-        if uploadProgress != nil {
+        if isUploading {
             return "arrow.up.circle"
         }
         if isDownloading {
@@ -1127,12 +1306,316 @@ private struct AttachmentProgressOverlay: View {
     }
 }
 
+private struct ChatRichTextAstNode: Decodable {
+    let type: String
+    let value: String?
+    let children: [ChatRichTextAstNode]?
+    let level: Int?
+    let url: String?
+    let lang: String?
+    let name: String?
+
+    static func decodeRoot(from json: String) -> ChatRichTextAstNode? {
+        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ChatRichTextAstNode.self, from: data)
+    }
+}
+
+private struct ChatRichTextView: View {
+    let astJson: String
+    let fallbackText: String
+    let isMine: Bool
+    let foregroundColor: Color
+    let secondaryForegroundColor: Color
+
+    private var root: ChatRichTextAstNode? {
+        ChatRichTextAstNode.decodeRoot(from: astJson)
+    }
+
+    private var linkColor: Color {
+        isMine ? .white : .accentColor
+    }
+
+    private var codeBackground: Color {
+        isMine ? .white.opacity(0.16) : Color(uiColor: .tertiarySystemFill)
+    }
+
+    private var codeBorder: Color {
+        isMine ? .white.opacity(0.24) : Color(uiColor: .separator).opacity(0.7)
+    }
+
+    var body: some View {
+        Group {
+            if let children = root?.children, !children.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(children.enumerated()), id: \.offset) { _, node in
+                        renderNode(node)
+                    }
+                }
+            } else {
+                Text(fallbackText)
+                    .font(.body)
+                    .foregroundStyle(foregroundColor)
+            }
+        }
+        .foregroundStyle(foregroundColor)
+        .textSelection(.enabled)
+    }
+
+    private func renderNode(_ node: ChatRichTextAstNode) -> AnyView {
+        switch node.type {
+        case "heading":
+            AnyView(renderHeading(node))
+        case "paragraph":
+            AnyView(renderParagraph(node))
+        case "strong", "emphasis", "strikethrough", "text", "code_inline", "link", "hard_break":
+            AnyView(inlineTextNode(node))
+        case "code_block":
+            AnyView(
+                ChatRichTextCodeBlock(
+                    code: node.value ?? "",
+                    language: node.lang,
+                    foregroundColor: foregroundColor,
+                    secondaryForegroundColor: secondaryForegroundColor,
+                    backgroundColor: codeBackground,
+                    borderColor: codeBorder
+                )
+            )
+        case "list_unordered":
+            AnyView(renderList(node, ordered: false))
+        case "list_ordered":
+            AnyView(renderList(node, ordered: true))
+        case "list_item":
+            AnyView(renderChildren(node, spacing: 3))
+        case "blockquote":
+            AnyView(renderBlockquote(node))
+        case "hr":
+            AnyView(
+                Rectangle()
+                    .fill(secondaryForegroundColor.opacity(0.45))
+                    .frame(height: 1)
+                    .padding(.vertical, 3)
+            )
+        case "image":
+            AnyView(renderImageReference(node))
+        case "table":
+            AnyView(renderChildren(node, spacing: 4))
+        case "table_row":
+            AnyView(renderTableRow(node))
+        case "table_cell":
+            AnyView(renderChildren(node, spacing: 2))
+        case "mdx_jsx_element", "mdx_jsx_self_closing":
+            AnyView(renderChildren(node, spacing: 5))
+        default:
+            AnyView(renderChildren(node, spacing: 4))
+        }
+    }
+
+    private func renderChildren(_ node: ChatRichTextAstNode, spacing: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            ForEach(Array((node.children ?? []).enumerated()), id: \.offset) { _, child in
+                renderNode(child)
+            }
+        }
+    }
+
+    private func renderHeading(_ node: ChatRichTextAstNode) -> some View {
+        let font: Font = switch node.level ?? 1 {
+        case 1:
+            .headline
+        case 2:
+            .subheadline.weight(.semibold)
+        default:
+            .body.weight(.semibold)
+        }
+        return inlineText(from: node.children)
+            .font(font)
+            .foregroundStyle(foregroundColor)
+            .padding(.bottom, 1)
+    }
+
+    @ViewBuilder
+    private func renderParagraph(_ node: ChatRichTextAstNode) -> some View {
+        if hasOnlyInlineChildren(node) {
+            inlineText(from: node.children)
+                .font(.body)
+                .foregroundStyle(foregroundColor)
+                .lineSpacing(1)
+        } else {
+            renderChildren(node, spacing: 4)
+        }
+    }
+
+    private func renderList(_ node: ChatRichTextAstNode, ordered: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array((node.children ?? []).enumerated()), id: \.offset) { index, item in
+                HStack(alignment: .top, spacing: 7) {
+                    Text(ordered ? "\(index + 1)." : "\u{2022}")
+                        .font(.body)
+                        .foregroundStyle(secondaryForegroundColor)
+                        .frame(minWidth: ordered ? 18 : 10, alignment: .trailing)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array((item.children ?? []).enumerated()), id: \.offset) { _, child in
+                            renderNode(child)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private func renderBlockquote(_ node: ChatRichTextAstNode) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(secondaryForegroundColor.opacity(0.45))
+                .frame(width: 3)
+            renderChildren(node, spacing: 4)
+                .foregroundStyle(secondaryForegroundColor)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func renderImageReference(_ node: ChatRichTextAstNode) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "photo")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(secondaryForegroundColor)
+            VStack(alignment: .leading, spacing: 2) {
+                let label = extractText(from: node.children).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !label.isEmpty {
+                    Text(label)
+                        .font(.body)
+                        .foregroundStyle(foregroundColor)
+                }
+                if let url = node.url, !url.isEmpty {
+                    Text(url)
+                        .font(.caption)
+                        .foregroundStyle(secondaryForegroundColor)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(8)
+        .background(codeBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func renderTableRow(_ node: ChatRichTextAstNode) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            ForEach(Array((node.children ?? []).enumerated()), id: \.offset) { _, child in
+                renderNode(child)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    private func hasOnlyInlineChildren(_ node: ChatRichTextAstNode) -> Bool {
+        let inlineTypes: Set<String> = [
+            "text", "strong", "emphasis", "strikethrough", "code_inline", "link", "hard_break"
+        ]
+        return (node.children ?? []).allSatisfy { inlineTypes.contains($0.type) }
+    }
+
+    private func inlineText(from children: [ChatRichTextAstNode]?) -> Text {
+        (children ?? []).reduce(Text("")) { partial, node in
+            partial + inlineTextNode(node)
+        }
+    }
+
+    private func inlineTextNode(_ node: ChatRichTextAstNode) -> Text {
+        switch node.type {
+        case "text":
+            Text(node.value ?? "")
+        case "strong":
+            inlineText(from: node.children).bold()
+        case "emphasis":
+            inlineText(from: node.children).italic()
+        case "strikethrough":
+            inlineText(from: node.children).strikethrough()
+        case "code_inline":
+            Text(node.value ?? "")
+                .font(.system(.body, design: .monospaced))
+        case "link":
+            inlineText(from: node.children)
+                .underline()
+                .foregroundColor(linkColor)
+        case "hard_break":
+            Text("\n")
+        default:
+            if let value = node.value {
+                Text(value)
+            } else {
+                inlineText(from: node.children)
+            }
+        }
+    }
+
+    private func extractText(from children: [ChatRichTextAstNode]?) -> String {
+        (children ?? []).map { node in
+            if let value = node.value {
+                return value
+            }
+            return extractText(from: node.children)
+        }
+        .joined()
+    }
+}
+
+private struct ChatRichTextCodeBlock: View {
+    let code: String
+    let language: String?
+    let foregroundColor: Color
+    let secondaryForegroundColor: Color
+    let backgroundColor: Color
+    let borderColor: Color
+
+    private var languageLabel: String {
+        let trimmed = (language ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "code" : trimmed
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(languageLabel)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(secondaryForegroundColor)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(backgroundColor.opacity(0.8))
+
+            Text(code)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(foregroundColor)
+                .textSelection(.enabled)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(backgroundColor)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(borderColor, lineWidth: 0.75)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 private struct MessageStatusLine: View {
     let message: ChatMessage
     let onRetryMessage: (ChatMessage) -> Void
 
+    private var presentation: MessageRetryPresentation {
+        MessageRetryPresentation(message: message)
+    }
+
     var body: some View {
-        if isFailed {
+        if presentation.isVisible {
             HStack(spacing: 6) {
                 Button {
                     onRetryMessage(message)
@@ -1142,42 +1625,14 @@ private struct MessageStatusLine: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Retry message")
+                .accessibilityIdentifier(presentation.accessibilityIdentifier ?? "RetryMessageButton")
 
                 Text("Not sent")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-        } else if let text = readReceiptText ?? deliveryText {
-            Text(text)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
         }
-    }
-
-    private var readReceiptText: String? {
-        guard let readReceipt = message.readReceipt else { return nil }
-        let text = readReceipt.displayText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
-    }
-
-    private var deliveryText: String? {
-        switch message.delivery {
-        case .pending:
-            return "Sending"
-        case .sent:
-            return nil
-        case .failed:
-            return "Not sent"
-        }
-    }
-
-    private var isFailed: Bool {
-        if case .failed = message.delivery {
-            return true
-        }
-        return false
     }
 }
 

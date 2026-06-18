@@ -1,5 +1,6 @@
 use std::io::Write;
 
+mod app;
 mod core;
 mod hermes;
 
@@ -95,6 +96,7 @@ where
             )
             .map_err(CliError::Output)
         }
+        Some("app") => app::run(args.into_iter().skip(1).collect(), output),
         Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
         Some("core") => core::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
@@ -890,7 +892,8 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat <http-smoke|http|hermes|core>\n\n{}\n\n{}",
+        "usage: finitechat <http-smoke|http|hermes|core|app>\n\n{}\n\n{}\n\n{}",
+        app::usage(),
         core::usage(),
         http_usage()
     )

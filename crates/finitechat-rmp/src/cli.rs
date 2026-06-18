@@ -42,6 +42,12 @@ pub enum Cmd {
 
     /// Build/install/launch on iOS/Android/desktop (debug).
     Run(RunArgs),
+
+    /// Delete a whole explicit product harness store root.
+    ResetProductStore(ResetProductStoreArgs),
+
+    /// Run the canonical product-state harness.
+    ProductHarness(ProductHarnessArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -135,7 +141,7 @@ pub enum DeviceStartPlatform {
 
 #[derive(clap::Args, Debug, Default)]
 pub struct DevicesStartIosArgs {
-    /// iOS simulator UDID to target.
+    /// iOS simulator UDID, or physical-device hardware UDID/CoreDevice identifier to target.
     #[arg(long)]
     pub udid: Option<String>,
 }
@@ -195,11 +201,83 @@ pub enum RunPlatform {
     Iced,
 }
 
-#[derive(clap::Args, Debug, Default)]
-pub struct RunIosArgs {
-    /// iOS simulator UDID to target.
+#[derive(clap::Args, Debug)]
+pub struct ResetProductStoreArgs {
+    #[arg(value_enum)]
+    pub platform: ResetProductStorePlatform,
+
+    /// Product harness scenario name. Required so this cannot target the default app store.
+    #[arg(long)]
+    pub scenario: String,
+
+    /// Product harness device id. Required so this cannot target the default app store.
+    #[arg(long)]
+    pub device: String,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum ResetProductStorePlatform {
+    Ios,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ProductHarnessArgs {
+    #[arg(value_enum)]
+    pub platform: ProductHarnessPlatform,
+
+    /// Product harness scenario name. Use text-offline for the first-user gate.
+    #[arg(long)]
+    pub scenario: String,
+
+    /// Stable product device identity for this harness run.
+    #[arg(long)]
+    pub device: String,
+
+    /// Configured server URL. Offline phases toggle reachability of this same URL.
+    #[arg(long, default_value = "http://127.0.0.1:8787")]
+    pub server_url: String,
+
+    /// Server bind address. Simulator defaults to the host:port parsed from --server-url.
+    /// Physical iOS device defaults to 0.0.0.0:<server-url-port>.
+    #[arg(long)]
+    pub server_addr: Option<String>,
+
+    /// iOS simulator UDID, or physical-device hardware UDID/CoreDevice identifier to target.
     #[arg(long)]
     pub udid: Option<String>,
+
+    /// Apple development team id for physical iOS device signing.
+    #[arg(long)]
+    pub ios_development_team: Option<String>,
+
+    /// Print the resolved matrix paths and phases without building or launching.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_run: bool,
+
+    /// Keep the existing explicit harness store root instead of deleting it first.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub no_reset: bool,
+
+    /// Seconds to wait after each app launch phase.
+    #[arg(long, default_value_t = 8)]
+    pub settle_seconds: u64,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum ProductHarnessPlatform {
+    IosSimulator,
+    IosDevice,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct RunIosArgs {
+    /// iOS simulator UDID, or physical-device hardware UDID/CoreDevice identifier to target.
+    #[arg(long)]
+    pub udid: Option<String>,
+
+    /// Apple development team id for physical iOS device signing.
+    #[arg(long)]
+    pub development_team: Option<String>,
 }
 
 #[derive(clap::Args, Debug, Default)]

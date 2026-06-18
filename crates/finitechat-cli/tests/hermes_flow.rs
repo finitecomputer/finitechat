@@ -395,11 +395,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
         r#"{"timeout_millis":0}"#,
     ]);
     assert_eq!(poll["joined"].as_array().unwrap().len(), 1);
-    let joined = user
-        .dispatch(AppAction::RetryRoom {
-            room_id: room_id.clone(),
-        })
-        .unwrap();
+    let joined = user.dispatch(AppAction::StartRuntime).unwrap();
     assert_eq!(
         joined
             .rooms
@@ -609,6 +605,30 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
         })
         .to_string(),
     ]);
+    let agent_image = dir.path().join("agent-reply.png");
+    std::fs::write(&agent_image, b"\x89PNG\r\n\x1a\nagent media reply").unwrap();
+    hermes(&[
+        "hermes",
+        "--home",
+        &agent_home,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "image back",
+            "kind": "media",
+            "status": "complete",
+            "attachments": [{
+                "kind": "image",
+                "path": agent_image.display().to_string(),
+                "name": "agent-reply.png",
+                "mime_type": "image/png",
+            }],
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
     let user_poll = hermes(&[
         "hermes",
         "--home",
@@ -618,6 +638,9 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
         r#"{"timeout_millis":10000}"#,
     ]);
     let events = user_poll["events"].as_array().unwrap();
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0]["text"], "hello back");
+    assert_eq!(events[1]["text"], "image back");
+    assert_eq!(events[1]["message_type"], "photo");
+    assert_eq!(events[1]["attachments"][0]["mime_type"], "image/png");
 }

@@ -112,7 +112,7 @@ const MAX_APP_ROOM_INVITE_URL_BYTES: u32 = 4096;
 const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 8192;
 const MAX_APP_ROOM_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
-const MAX_APP_STATE_METADATA_PLAINTEXT_BYTES: u32 = 1024;
+const MAX_APP_STATE_METADATA_PLAINTEXT_BYTES: u32 = 32 * 1024;
 const MAX_APP_STATE_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_STATE_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_PROFILE_NAME_BYTES: u32 = 128;
@@ -124,6 +124,7 @@ const MAX_APP_PROFILE_METADATA_CIPHERTEXT_BYTES: u32 =
 const MAX_STORED_APP_MESSAGES: u32 = 5_000;
 const MAX_STORED_APP_OUTBOX_MESSAGES: u32 = 512;
 const MAX_STORED_APP_PROFILES: u32 = 4_096;
+const MAX_STORED_APP_REVOKED_DEVICES: u32 = 64;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
 const U64_BYTES: usize = 8;
@@ -373,23 +374,38 @@ pub struct StoredOutboundMessage {
     pub message_id: MessageId,
     pub sender: DeviceRef,
     pub plaintext: Vec<u8>,
-    pub delivery_state: StoredOutboundDeliveryState,
+    pub local_state: StoredOutboundLocalState,
+    pub server_delivery_state: StoredOutboundServerDeliveryState,
+    pub append_request: AppendEventRequest,
     pub timestamp_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StoredOutboundDeliveryState {
+pub enum StoredOutboundLocalState {
+    Sending,
     #[default]
-    Pending,
+    Sent,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredOutboundServerDeliveryState {
+    #[default]
+    Undelivered,
     Failed {
         reason: String,
     },
 }
 
-impl StoredOutboundDeliveryState {
+impl StoredOutboundLocalState {
+    fn validate_limits(&self) -> Result<(), ClientError> {
+        Ok(())
+    }
+}
+
+impl StoredOutboundServerDeliveryState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         match self {
-            Self::Pending => Ok(()),
+            Self::Undelivered => Ok(()),
             Self::Failed { reason } => {
                 validate_string_bytes(
                     "app_outbox.failure_reason",
@@ -416,7 +432,32 @@ impl StoredOutboundMessage {
             self.plaintext.len(),
             MAX_ENVELOPE_PAYLOAD_BYTES,
         )?;
-        self.delivery_state.validate_limits()?;
+        self.local_state.validate_limits()?;
+        self.server_delivery_state.validate_limits()?;
+        self.append_request.validate_limits()?;
+        if self.append_request.room_id != self.room_id {
+            return Err(ClientError::OutboxRoomMismatch {
+                expected: self.room_id.clone(),
+                actual: self.append_request.room_id.clone(),
+            });
+        }
+        let append_message_id = self
+            .append_request
+            .envelope
+            .message_id()
+            .map_err(ClientError::EnvelopeMessageId)?;
+        if append_message_id != self.message_id {
+            return Err(ClientError::OutboxMessageIdMismatch {
+                expected: self.message_id.clone(),
+                actual: append_message_id,
+            });
+        }
+        if self.append_request.sender != self.sender {
+            return Err(ClientError::OutboxSenderMismatch {
+                expected: self.sender.clone(),
+                actual: self.append_request.sender.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -425,9 +466,9 @@ impl StoredOutboundMessage {
 struct StoredOutboundMessageMetadataV1 {
     sender: DeviceRef,
     plaintext: Vec<u8>,
-    #[serde(default)]
-    delivery_state: StoredOutboundDeliveryState,
-    #[serde(default)]
+    local_state: StoredOutboundLocalState,
+    server_delivery_state: StoredOutboundServerDeliveryState,
+    append_request: AppendEventRequest,
     timestamp_unix_seconds: u64,
 }
 
@@ -448,8 +489,7 @@ pub enum StoredAppRoomState {
     Connected,
     WaitingForApproval,
     Joining,
-    NeedsAttention,
-    Offline,
+    UnavailableOnDevice,
 }
 
 impl StoredAppRoom {
@@ -471,11 +511,8 @@ impl StoredAppRoom {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAppRoomMetadataV1 {
     display_name: String,
-    #[serde(default)]
     state: StoredAppRoomState,
-    #[serde(default = "default_app_room_status")]
     status: String,
-    #[serde(default)]
     local_read_seq: u64,
     #[serde(default)]
     pending_invite_url: Option<String>,
@@ -486,6 +523,7 @@ struct StoredAppRoomMetadataV1 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredAppState {
     pub selected_room_id: Option<RoomId>,
+    pub revoked_devices: BTreeSet<DeviceRef>,
 }
 
 impl StoredAppState {
@@ -493,14 +531,23 @@ impl StoredAppState {
         if let Some(room_id) = &self.selected_room_id {
             validate_room_id(room_id)?;
         }
+        validate_item_count(
+            "app_state.revoked_devices",
+            self.revoked_devices.len(),
+            MAX_STORED_APP_REVOKED_DEVICES,
+        )?;
+        for device in &self.revoked_devices {
+            device.validate_limits()?;
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAppStateMetadataV1 {
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     selected_room_id: Option<RoomId>,
+    revoked_devices: BTreeSet<DeviceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,12 +566,15 @@ impl StoredAppProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAppProfileMetadataV1 {
     profile: NostrProfileRecord,
-    #[serde(default)]
     stale: bool,
 }
 
-fn default_app_room_status() -> String {
-    "connected".to_owned()
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2902,7 +2952,7 @@ impl SqliteClientStore {
         }
 
         let conn = open_client_store_connection(&db_path)?;
-        migrate_client_store(&conn, &options.encryption_key)?;
+        prepare_client_store_schema(&conn)?;
         Ok(Self {
             db_path,
             conn,
@@ -3215,7 +3265,9 @@ impl SqliteClientStore {
                 message_id,
                 sender: metadata.sender,
                 plaintext: metadata.plaintext,
-                delivery_state: metadata.delivery_state,
+                local_state: metadata.local_state,
+                server_delivery_state: metadata.server_delivery_state,
+                append_request: metadata.append_request,
                 timestamp_unix_seconds: metadata.timestamp_unix_seconds,
             };
             message.validate_limits()?;
@@ -3336,6 +3388,7 @@ impl SqliteClientStore {
             decrypt_app_state_metadata(&self.options.encryption_key, owner, &nonce, &ciphertext)?;
         let state = StoredAppState {
             selected_room_id: metadata.selected_room_id,
+            revoked_devices: metadata.revoked_devices,
         };
         state.validate_limits()?;
         Ok(state)
@@ -5272,10 +5325,10 @@ pub enum ClientStoreError {
         account_id: String,
         device_id: String,
     },
-    #[error(
-        "legacy unencrypted client store table {table:?} contains state; explicit migration is required"
-    )]
-    LegacyUnencryptedStatePresent { table: LegacyClientStoreTable },
+    #[error("legacy unencrypted client store table {table:?} is reset-only; reset the store")]
+    LegacyUnencryptedStoreTable { table: LegacyClientStoreTable },
+    #[error("unsupported pre-release app projection table {table}: {reason}; reset the store")]
+    LegacyAppProjectionSchema { table: String, reason: String },
     #[error("failed to generate encrypted client store nonce")]
     Randomness,
     #[error("failed to encrypt client state")]
@@ -5386,6 +5439,15 @@ pub enum ClientError {
     Engine(#[from] EngineError),
     #[error("failed to derive envelope message id")]
     EnvelopeMessageId(#[source] serde_json::Error),
+    #[error("stored outbox request room mismatch: expected {expected}, actual {actual}")]
+    OutboxRoomMismatch { expected: String, actual: String },
+    #[error("stored outbox request message id mismatch: expected {expected}, actual {actual}")]
+    OutboxMessageIdMismatch { expected: String, actual: String },
+    #[error("stored outbox request sender mismatch: expected {expected:?}, actual {actual:?}")]
+    OutboxSenderMismatch {
+        expected: DeviceRef,
+        actual: DeviceRef,
+    },
     #[error("failed to create OpenMLS signer")]
     CreateSigner,
     #[error("failed to store OpenMLS signer")]
@@ -5989,34 +6051,10 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn migrate_client_store(
-    conn: &Connection,
-    encryption_key: &ClientStoreEncryptionKey,
-) -> Result<(), ClientStoreError> {
-    reject_or_remove_legacy_client_store_tables(conn)?;
-    if client_app_messages_has_column(conn, "plaintext")? {
-        migrate_plaintext_app_messages(conn, encryption_key)?;
-    }
+fn prepare_client_store_schema(conn: &Connection) -> Result<(), ClientStoreError> {
+    reject_legacy_client_store_tables(conn)?;
+    reject_legacy_app_projection_schema(conn)?;
     create_current_client_store_schema(conn)?;
-    migrate_app_timestamp_columns(conn)?;
-    Ok(())
-}
-
-fn migrate_app_timestamp_columns(conn: &Connection) -> Result<(), ClientStoreError> {
-    if sqlite_table_exists(conn, "client_app_messages")?
-        && !sqlite_table_has_column(conn, "client_app_messages", "timestamp_unix_seconds")?
-    {
-        conn.execute_batch(
-            "ALTER TABLE client_app_messages ADD COLUMN timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0;",
-        )?;
-    }
-    if sqlite_table_exists(conn, "client_app_events")?
-        && !sqlite_table_has_column(conn, "client_app_events", "timestamp_unix_seconds")?
-    {
-        conn.execute_batch(
-            "ALTER TABLE client_app_events ADD COLUMN timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0;",
-        )?;
-    }
     Ok(())
 }
 
@@ -6039,7 +6077,7 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
           message_id TEXT NOT NULL,
           sender_account_id TEXT NOT NULL,
           sender_device_id TEXT NOT NULL,
-          timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0,
+          timestamp_unix_seconds INTEGER NOT NULL,
           nonce BLOB NOT NULL,
           ciphertext BLOB NOT NULL,
           PRIMARY KEY (account_id, device_id, room_id, message_id),
@@ -6062,7 +6100,7 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
           message_id TEXT NOT NULL,
           sender_account_id TEXT NOT NULL,
           sender_device_id TEXT NOT NULL,
-          timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0,
+          timestamp_unix_seconds INTEGER NOT NULL,
           nonce BLOB NOT NULL,
           ciphertext BLOB NOT NULL,
           PRIMARY KEY (account_id, device_id, room_id, message_id),
@@ -6138,137 +6176,147 @@ fn create_current_client_store_schema(conn: &Connection) -> Result<(), ClientSto
     Ok(())
 }
 
-fn migrate_plaintext_app_messages(
-    conn: &Connection,
-    encryption_key: &ClientStoreEncryptionKey,
-) -> Result<(), ClientStoreError> {
-    let legacy = load_plaintext_app_messages(conn)?;
-    conn.execute_batch(
-        r#"
-        DROP TABLE client_app_messages;
-        "#,
+fn reject_legacy_app_projection_schema(conn: &Connection) -> Result<(), ClientStoreError> {
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_messages",
+        &[
+            "account_id",
+            "device_id",
+            "room_id",
+            "seq",
+            "message_id",
+            "sender_account_id",
+            "sender_device_id",
+            "timestamp_unix_seconds",
+            "nonce",
+            "ciphertext",
+        ],
     )?;
-    create_current_client_store_schema(conn)?;
-    if legacy.is_empty() {
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_events",
+        &[
+            "account_id",
+            "device_id",
+            "room_id",
+            "seq",
+            "message_id",
+            "sender_account_id",
+            "sender_device_id",
+            "timestamp_unix_seconds",
+            "nonce",
+            "ciphertext",
+        ],
+    )?;
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_outbox",
+        &[
+            "account_id",
+            "device_id",
+            "room_id",
+            "message_id",
+            "nonce",
+            "ciphertext",
+        ],
+    )?;
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_rooms",
+        &["account_id", "device_id", "room_id", "nonce", "ciphertext"],
+    )?;
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_state",
+        &["account_id", "device_id", "nonce", "ciphertext"],
+    )?;
+    reject_legacy_app_projection_table(
+        conn,
+        "client_app_profiles",
+        &[
+            "account_id",
+            "device_id",
+            "profile_account_id",
+            "nonce",
+            "ciphertext",
+        ],
+    )
+}
+
+fn reject_legacy_app_projection_table(
+    conn: &Connection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<(), ClientStoreError> {
+    if !sqlite_table_exists(conn, table)? {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            r#"
-            INSERT INTO client_app_messages (
-              account_id,
-              device_id,
-              room_id,
-              seq,
-              message_id,
-              sender_account_id,
-              sender_device_id,
-              timestamp_unix_seconds,
-              nonce,
-              ciphertext
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-        )?;
-        for row in legacy {
-            row.owner.validate_limits().map_err(ClientError::from)?;
-            row.message.validate_limits()?;
-            let sealed = encrypt_app_message_plaintext(encryption_key, &row.owner, &row.message)?;
-            stmt.execute(params![
-                &row.owner.account_id,
-                &row.owner.device_id,
-                &row.message.room_id,
-                sqlite_seq_from_u64(row.message.seq)?,
-                &row.message.message_id,
-                &row.message.sender.account_id,
-                &row.message.sender.device_id,
-                sqlite_timestamp_from_u64(row.message.timestamp_unix_seconds)?,
-                &sealed.nonce,
-                &sealed.ciphertext,
-            ])?;
+    let columns = sqlite_table_columns(conn, table)?;
+    if columns.iter().any(|column| column == "plaintext") {
+        return Err(ClientStoreError::LegacyAppProjectionSchema {
+            table: table.to_owned(),
+            reason: "plaintext column is unsupported".to_owned(),
+        });
+    }
+    for column in required_columns {
+        if !columns.iter().any(|found| found == column) {
+            return Err(ClientStoreError::LegacyAppProjectionSchema {
+                table: table.to_owned(),
+                reason: format!("missing required column {column}"),
+            });
         }
     }
-    tx.commit()?;
+    for column in &columns {
+        if !required_columns.contains(&column.as_str()) {
+            return Err(ClientStoreError::LegacyAppProjectionSchema {
+                table: table.to_owned(),
+                reason: format!("unsupported column {column}"),
+            });
+        }
+    }
+    if sqlite_table_column_default(conn, table, "timestamp_unix_seconds")?.is_some() {
+        return Err(ClientStoreError::LegacyAppProjectionSchema {
+            table: table.to_owned(),
+            reason: "timestamp_unix_seconds default is unsupported".to_owned(),
+        });
+    }
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlaintextAppMessageRow {
-    owner: DeviceRef,
-    message: StoredAppMessage,
-}
-
-fn load_plaintext_app_messages(
+fn sqlite_table_column_default(
     conn: &Connection,
-) -> Result<Vec<PlaintextAppMessageRow>, ClientStoreError> {
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT
-          account_id,
-          device_id,
-          room_id,
-          seq,
-          message_id,
-          sender_account_id,
-          sender_device_id,
-          plaintext
-        FROM client_app_messages
-        ORDER BY rowid ASC
-        "#,
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, RoomId>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, MessageId>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, Vec<u8>>(7)?,
-        ))
-    })?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (
-            account_id,
-            device_id,
-            room_id,
-            stored_seq,
-            message_id,
-            sender_account_id,
-            sender_device_id,
-            plaintext,
-        ) = row?;
-        let message = StoredAppMessage {
-            room_id,
-            seq: sqlite_seq_to_u64(stored_seq)?,
-            message_id,
-            sender: DeviceRef {
-                account_id: sender_account_id,
-                device_id: sender_device_id,
-            },
-            plaintext,
-            timestamp_unix_seconds: 0,
-        };
-        message.validate_limits()?;
-        let owner = DeviceRef {
-            account_id,
-            device_id,
-        };
-        owner.validate_limits().map_err(ClientError::from)?;
-        messages.push(PlaintextAppMessageRow { owner, message });
-    }
-    Ok(messages)
-}
-
-fn client_app_messages_has_column(
-    conn: &Connection,
+    table: &str,
     column: &str,
-) -> Result<bool, ClientStoreError> {
-    sqlite_table_has_column(conn, "client_app_messages", column)
+) -> Result<Option<String>, ClientStoreError> {
+    if !sqlite_table_exists(conn, table)? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get(4)?)))?;
+    for row in rows {
+        let (found_column, default): (String, Option<String>) = row?;
+        if found_column == column {
+            return Ok(default);
+        }
+    }
+    Ok(None)
 }
 
+fn sqlite_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, ClientStoreError> {
+    if !sqlite_table_exists(conn, table)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row?);
+    }
+    Ok(columns)
+}
+
+#[cfg(test)]
 fn sqlite_table_has_column(
     conn: &Connection,
     table: &str,
@@ -6296,27 +6344,17 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool, ClientSto
     Ok(exists)
 }
 
-fn reject_or_remove_legacy_client_store_tables(conn: &Connection) -> Result<(), ClientStoreError> {
+fn reject_legacy_client_store_tables(conn: &Connection) -> Result<(), ClientStoreError> {
     let tables = [
         LegacyClientStoreTable::OpenMlsStorage,
         LegacyClientStoreTable::Rooms,
         LegacyClientStoreTable::Profiles,
     ];
     for table in tables {
-        if !legacy_table_exists(conn, table)? {
-            continue;
-        }
-        if legacy_table_row_count(conn, table)? > 0 {
-            return Err(ClientStoreError::LegacyUnencryptedStatePresent { table });
+        if legacy_table_exists(conn, table)? {
+            return Err(ClientStoreError::LegacyUnencryptedStoreTable { table });
         }
     }
-    conn.execute_batch(
-        r#"
-        DROP TABLE IF EXISTS client_openmls_storage;
-        DROP TABLE IF EXISTS client_rooms;
-        DROP TABLE IF EXISTS client_profiles;
-        "#,
-    )?;
     Ok(())
 }
 
@@ -6330,30 +6368,6 @@ fn legacy_table_exists(
         |row| row.get::<_, bool>(0),
     )?;
     Ok(exists)
-}
-
-fn legacy_table_row_count(
-    conn: &Connection,
-    table: LegacyClientStoreTable,
-) -> Result<u64, ClientStoreError> {
-    let count = match table {
-        LegacyClientStoreTable::Profiles => {
-            conn.query_row("SELECT COUNT(*) FROM client_profiles", [], |row| {
-                row.get::<_, u64>(0)
-            })?
-        }
-        LegacyClientStoreTable::Rooms => {
-            conn.query_row("SELECT COUNT(*) FROM client_rooms", [], |row| {
-                row.get::<_, u64>(0)
-            })?
-        }
-        LegacyClientStoreTable::OpenMlsStorage => {
-            conn.query_row("SELECT COUNT(*) FROM client_openmls_storage", [], |row| {
-                row.get::<_, u64>(0)
-            })?
-        }
-    };
-    Ok(count)
 }
 
 fn save_device_state_tx(
@@ -7112,7 +7126,9 @@ fn encrypt_app_outbox_metadata(
     let metadata = StoredOutboundMessageMetadataV1 {
         sender: message.sender.clone(),
         plaintext: message.plaintext.clone(),
-        delivery_state: message.delivery_state.clone(),
+        local_state: message.local_state.clone(),
+        server_delivery_state: message.server_delivery_state.clone(),
+        append_request: message.append_request.clone(),
         timestamp_unix_seconds: message.timestamp_unix_seconds,
     };
     let plaintext =
@@ -7218,6 +7234,7 @@ fn encrypt_app_state_metadata(
     state.validate_limits()?;
     let metadata = StoredAppStateMetadataV1 {
         selected_room_id: state.selected_room_id.clone(),
+        revoked_devices: state.revoked_devices.clone(),
     };
     let plaintext =
         serde_json::to_vec(&metadata).map_err(|_| ClientStoreError::EncodeAppStateMetadata)?;
@@ -7469,7 +7486,12 @@ fn decrypt_app_outbox_metadata(
         MAX_ENVELOPE_PAYLOAD_BYTES,
     )
     .map_err(ClientError::from)?;
-    metadata.delivery_state.validate_limits()?;
+    metadata.local_state.validate_limits()?;
+    metadata.server_delivery_state.validate_limits()?;
+    metadata
+        .append_request
+        .validate_limits()
+        .map_err(ClientError::from)?;
     Ok(metadata)
 }
 
@@ -7571,6 +7593,15 @@ fn decrypt_app_state_metadata(
         .map_err(|_| ClientStoreError::DecodeAppStateMetadata)?;
     if let Some(room_id) = &metadata.selected_room_id {
         validate_room_id(room_id).map_err(ClientError::from)?;
+    }
+    validate_item_count(
+        "app_state.revoked_devices",
+        metadata.revoked_devices.len(),
+        MAX_STORED_APP_REVOKED_DEVICES,
+    )
+    .map_err(ClientError::from)?;
+    for device in &metadata.revoked_devices {
+        device.validate_limits().map_err(ClientError::from)?;
     }
     Ok(metadata)
 }
@@ -9038,10 +9069,21 @@ mod tests {
         store
             .save_app_messages(&owner, &[first.clone(), second.clone()], 10)
             .unwrap();
-        assert!(!client_app_messages_has_column(&store.conn, "plaintext").unwrap());
-        assert!(client_app_messages_has_column(&store.conn, "ciphertext").unwrap());
-        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
-        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
+        assert!(!sqlite_table_has_column(&store.conn, "client_app_messages", "plaintext").unwrap());
+        assert!(sqlite_table_has_column(&store.conn, "client_app_messages", "ciphertext").unwrap());
+        assert!(
+            sqlite_table_has_column(&store.conn, "client_app_messages", "timestamp_unix_seconds")
+                .unwrap()
+        );
+        assert_eq!(
+            sqlite_table_column_default(
+                &store.conn,
+                "client_app_messages",
+                "timestamp_unix_seconds"
+            )
+            .unwrap(),
+            None
+        );
         assert_eq!(
             store.load_app_messages(&owner, 10).unwrap(),
             vec![first.clone(), second.clone()]
@@ -9105,6 +9147,11 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
+            sqlite_table_column_default(&store.conn, "client_app_events", "timestamp_unix_seconds")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
             store.load_app_events(&owner, 10).unwrap(),
             vec![first.clone(), second.clone()]
         );
@@ -9157,7 +9204,7 @@ mod tests {
 
         let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
         store.save_device_state(&device).unwrap();
-        let pending = outbound_message(&owner, "local-1", "pending body");
+        let pending = outbound_message(&owner, "pending body");
         store
             .save_app_outbox(&owner, std::slice::from_ref(&pending))
             .unwrap();
@@ -9174,7 +9221,7 @@ mod tests {
         );
 
         let failed = StoredOutboundMessage {
-            delivery_state: StoredOutboundDeliveryState::Failed {
+            server_delivery_state: StoredOutboundServerDeliveryState::Failed {
                 reason: "network unavailable".to_owned(),
             },
             ..pending.clone()
@@ -9185,27 +9232,102 @@ mod tests {
         assert_eq!(reopened.load_app_outbox(&owner).unwrap(), vec![failed]);
 
         reopened
-            .delete_app_outbox_message(&owner, "room-store", "local-1")
+            .delete_app_outbox_message(&owner, "room-store", &pending.message_id)
             .unwrap();
         assert!(reopened.load_app_outbox(&owner).unwrap().is_empty());
     }
 
     #[test]
-    fn sqlite_client_store_migrates_encrypted_app_rows_without_timestamps() {
+    fn sqlite_client_store_rejects_legacy_outbox_metadata_shapes() {
+        for case in ["missing timestamp", "legacy delivery state"] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([15; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let config = FiniteChatDeviceConfig {
+                account_secret_key: secret.clone(),
+                device_id: device_id.to_owned(),
+                now_unix_seconds: NOW,
+                credential_not_before_unix_seconds: NOW.saturating_sub(60),
+                credential_not_after_unix_seconds: NOW.saturating_add(60),
+            };
+            let device = FiniteChatDevice::new(config).unwrap();
+            let owner = device.device_ref().clone();
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let db_path = dir.path().join("client.sqlite3");
+            let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+            store.save_device_state(&device).unwrap();
+
+            let message = outbound_message(&owner, "legacy pending body");
+            let mut metadata = serde_json::to_value(StoredOutboundMessageMetadataV1 {
+                sender: message.sender.clone(),
+                plaintext: message.plaintext.clone(),
+                local_state: message.local_state.clone(),
+                server_delivery_state: message.server_delivery_state.clone(),
+                append_request: message.append_request.clone(),
+                timestamp_unix_seconds: message.timestamp_unix_seconds,
+            })
+            .unwrap();
+            let metadata_object = metadata.as_object_mut().unwrap();
+            match case {
+                "missing timestamp" => {
+                    metadata_object.remove("timestamp_unix_seconds");
+                }
+                "legacy delivery state" => {
+                    metadata_object.remove("local_state");
+                    metadata_object.remove("server_delivery_state");
+                    metadata_object.remove("append_request");
+                    metadata_object.insert(
+                        "delivery_state".to_owned(),
+                        serde_json::Value::String("Pending".to_owned()),
+                    );
+                }
+                other => panic!("unknown outbox metadata case {other}"),
+            }
+
+            let sealed = encrypt_app_outbox_metadata_json(
+                &options.encryption_key,
+                &owner,
+                &message.room_id,
+                &message.message_id,
+                &metadata,
+            );
+            store
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO client_app_outbox (
+                      account_id,
+                      device_id,
+                      room_id,
+                      message_id,
+                      nonce,
+                      ciphertext
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        &owner.account_id,
+                        &owner.device_id,
+                        &message.room_id,
+                        &message.message_id,
+                        &sealed.nonce,
+                        &sealed.ciphertext,
+                    ],
+                )
+                .unwrap();
+
+            let error = store.load_app_outbox(&owner).unwrap_err();
+            assert!(
+                matches!(error, ClientStoreError::DecodeAppOutboxMetadata),
+                "{case} should fail closed, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_encrypted_app_rows_without_timestamps() {
         let dir = tempfile::tempdir().unwrap();
         let secret = NostrSecretKey::from_bytes([12; NOSTR_SECRET_KEY_BYTES]).unwrap();
         let device_id = "phone";
-        let owner = DeviceRef {
-            account_id: hex_lower(secret.public_key().as_bytes()),
-            device_id: device_id.to_owned(),
-        };
-        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
-        let message = app_message(&owner, 7, "msg-old-encrypted", "old encrypted message");
-        let event = app_event(&owner, 8, "event-old-encrypted", "old encrypted event");
-        let sealed_message =
-            encrypt_app_message_plaintext(&options.encryption_key, &owner, &message).unwrap();
-        let sealed_event =
-            encrypt_app_event_plaintext(&options.encryption_key, &owner, &event).unwrap();
         let db_path = dir.path().join("client.sqlite3");
         {
             let conn = Connection::open(&db_path).unwrap();
@@ -9246,86 +9368,301 @@ mod tests {
                 "#,
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO client_device_states (account_id, device_id, nonce, ciphertext) VALUES (?1, ?2, X'00', X'00')",
-                params![&owner.account_id, &owner.device_id],
-            )
-            .unwrap();
-            conn.execute(
-                r#"
-                INSERT INTO client_app_messages (
-                  account_id,
-                  device_id,
-                  room_id,
-                  seq,
-                  message_id,
-                  sender_account_id,
-                  sender_device_id,
-                  nonce,
-                  ciphertext
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-                params![
-                    &owner.account_id,
-                    &owner.device_id,
-                    &message.room_id,
-                    sqlite_seq_from_u64(message.seq).unwrap(),
-                    &message.message_id,
-                    &message.sender.account_id,
-                    &message.sender.device_id,
-                    &sealed_message.nonce,
-                    &sealed_message.ciphertext,
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                r#"
-                INSERT INTO client_app_events (
-                  account_id,
-                  device_id,
-                  room_id,
-                  seq,
-                  message_id,
-                  sender_account_id,
-                  sender_device_id,
-                  nonce,
-                  ciphertext
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-                params![
-                    &owner.account_id,
-                    &owner.device_id,
-                    &event.room_id,
-                    sqlite_app_event_seq_from_u64(event.seq).unwrap(),
-                    &event.message_id,
-                    &event.sender.account_id,
-                    &event.sender.device_id,
-                    &sealed_event.nonce,
-                    &sealed_event.ciphertext,
-                ],
-            )
-            .unwrap();
         }
 
-        let store = SqliteClientStore::open(&db_path, options).unwrap();
-        assert!(client_app_messages_has_column(&store.conn, "timestamp_unix_seconds").unwrap());
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let error = match SqliteClientStore::open(&db_path, options) {
+            Ok(_) => panic!("pre-release app projection schema should be rejected"),
+            Err(error) => error,
+        };
         assert!(
-            sqlite_table_has_column(&store.conn, "client_app_events", "timestamp_unix_seconds")
-                .unwrap()
+            matches!(
+                error,
+                ClientStoreError::LegacyAppProjectionSchema { ref table, ref reason }
+                    if table == "client_app_messages"
+                        && reason == "missing required column timestamp_unix_seconds"
+            ),
+            "unexpected error: {error}"
         );
+    }
 
-        let mut expected_message = message;
-        expected_message.timestamp_unix_seconds = 0;
-        let mut expected_event = event;
-        expected_event.timestamp_unix_seconds = 0;
-        assert_eq!(
-            store.load_app_messages(&owner, 10).unwrap(),
-            vec![expected_message]
-        );
-        assert_eq!(
-            store.load_app_events(&owner, 10).unwrap(),
-            vec![expected_event]
-        );
+    #[test]
+    fn sqlite_client_store_rejects_defaulted_app_timestamps() {
+        for table in ["client_app_messages", "client_app_events"] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([18; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let db_path = dir.path().join("client.sqlite3");
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    r#"
+                    PRAGMA foreign_keys = ON;
+                    CREATE TABLE client_device_states (
+                      account_id TEXT NOT NULL,
+                      device_id TEXT NOT NULL,
+                      nonce BLOB NOT NULL,
+                      ciphertext BLOB NOT NULL,
+                      PRIMARY KEY (account_id, device_id)
+                    );
+                    CREATE TABLE {table} (
+                      account_id TEXT NOT NULL,
+                      device_id TEXT NOT NULL,
+                      room_id TEXT NOT NULL,
+                      seq INTEGER NOT NULL,
+                      message_id TEXT NOT NULL,
+                      sender_account_id TEXT NOT NULL,
+                      sender_device_id TEXT NOT NULL,
+                      timestamp_unix_seconds INTEGER NOT NULL DEFAULT 0,
+                      nonce BLOB NOT NULL,
+                      ciphertext BLOB NOT NULL,
+                      PRIMARY KEY (account_id, device_id, room_id, message_id)
+                    );
+                    "#
+                ))
+                .unwrap();
+            }
+
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let error = match SqliteClientStore::open(&db_path, options) {
+                Ok(_) => panic!("defaulted timestamp schema {table} should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    ClientStoreError::LegacyAppProjectionSchema { table: ref found, ref reason }
+                        if found == table
+                            && reason == "timestamp_unix_seconds default is unsupported"
+                ),
+                "unexpected error for {table}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_extra_app_projection_columns() {
+        for (table, columns, primary_key) in [
+            (
+                "client_app_messages",
+                &[
+                    "room_id TEXT NOT NULL",
+                    "seq INTEGER NOT NULL",
+                    "message_id TEXT NOT NULL",
+                    "sender_account_id TEXT NOT NULL",
+                    "sender_device_id TEXT NOT NULL",
+                    "timestamp_unix_seconds INTEGER NOT NULL",
+                ][..],
+                "account_id, device_id, room_id, message_id",
+            ),
+            (
+                "client_app_events",
+                &[
+                    "room_id TEXT NOT NULL",
+                    "seq INTEGER NOT NULL",
+                    "message_id TEXT NOT NULL",
+                    "sender_account_id TEXT NOT NULL",
+                    "sender_device_id TEXT NOT NULL",
+                    "timestamp_unix_seconds INTEGER NOT NULL",
+                ][..],
+                "account_id, device_id, room_id, message_id",
+            ),
+            (
+                "client_app_outbox",
+                &["room_id TEXT NOT NULL", "message_id TEXT NOT NULL"][..],
+                "account_id, device_id, room_id, message_id",
+            ),
+            (
+                "client_app_rooms",
+                &["room_id TEXT NOT NULL"][..],
+                "account_id, device_id, room_id",
+            ),
+            ("client_app_state", &[][..], "account_id, device_id"),
+            (
+                "client_app_profiles",
+                &["profile_account_id TEXT NOT NULL"][..],
+                "account_id, device_id, profile_account_id",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([19; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let db_path = dir.path().join("client.sqlite3");
+            let mut table_columns = vec!["account_id TEXT NOT NULL", "device_id TEXT NOT NULL"];
+            table_columns.extend_from_slice(columns);
+            table_columns.extend_from_slice(&[
+                "nonce BLOB NOT NULL",
+                "ciphertext BLOB NOT NULL",
+                "legacy_delivery_state TEXT",
+            ]);
+            let column_sql = table_columns.join(",\n                      ");
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    r#"
+                    PRAGMA foreign_keys = ON;
+                    CREATE TABLE client_device_states (
+                      account_id TEXT NOT NULL,
+                      device_id TEXT NOT NULL,
+                      nonce BLOB NOT NULL,
+                      ciphertext BLOB NOT NULL,
+                      PRIMARY KEY (account_id, device_id)
+                    );
+                    CREATE TABLE {table} (
+                      {column_sql},
+                      PRIMARY KEY ({primary_key})
+                    );
+                    "#
+                ))
+                .unwrap();
+            }
+
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let error = match SqliteClientStore::open(&db_path, options) {
+                Ok(_) => panic!("extra app projection column on {table} should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    ClientStoreError::LegacyAppProjectionSchema { table: ref found, ref reason }
+                        if found == table && reason == "unsupported column legacy_delivery_state"
+                ),
+                "unexpected error for {table}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_empty_legacy_unencrypted_tables() {
+        for table in [
+            LegacyClientStoreTable::OpenMlsStorage,
+            LegacyClientStoreTable::Rooms,
+            LegacyClientStoreTable::Profiles,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([13; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let db_path = dir.path().join("client.sqlite3");
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {} (id TEXT PRIMARY KEY);",
+                    table.name()
+                ))
+                .unwrap();
+            }
+
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let error = match SqliteClientStore::open(&db_path, options) {
+                Ok(_) => panic!("legacy unencrypted table {table:?} should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(
+                    error,
+                    ClientStoreError::LegacyUnencryptedStoreTable { table: found }
+                        if found == table
+                ),
+                "unexpected error for {table:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_legacy_room_metadata_shapes() {
+        for (case, metadata) in [
+            (
+                "missing state",
+                serde_json::json!({
+                    "display_name": "Legacy Room",
+                    "status": "connected",
+                    "local_read_seq": 0
+                }),
+            ),
+            (
+                "missing status",
+                serde_json::json!({
+                    "display_name": "Legacy Room",
+                    "state": "Connected",
+                    "local_read_seq": 0
+                }),
+            ),
+            (
+                "missing local_read_seq",
+                serde_json::json!({
+                    "display_name": "Legacy Room",
+                    "state": "Connected",
+                    "status": "connected"
+                }),
+            ),
+            (
+                "legacy needs attention state",
+                serde_json::json!({
+                    "display_name": "Legacy Room",
+                    "state": "NeedsAttention",
+                    "status": "needs attention",
+                    "local_read_seq": 0
+                }),
+            ),
+            (
+                "legacy offline state",
+                serde_json::json!({
+                    "display_name": "Legacy Room",
+                    "state": "Offline",
+                    "status": "offline",
+                    "local_read_seq": 0
+                }),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([14; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let config = FiniteChatDeviceConfig {
+                account_secret_key: secret.clone(),
+                device_id: device_id.to_owned(),
+                now_unix_seconds: NOW,
+                credential_not_before_unix_seconds: NOW.saturating_sub(60),
+                credential_not_after_unix_seconds: NOW.saturating_add(60),
+            };
+            let device = FiniteChatDevice::new(config).unwrap();
+            let owner = device.device_ref().clone();
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let db_path = dir.path().join("client.sqlite3");
+            let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+            store.save_device_state(&device).unwrap();
+
+            let room_id = "room-legacy";
+            let sealed =
+                encrypt_app_room_metadata_json(&options.encryption_key, &owner, room_id, &metadata);
+            store
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO client_app_rooms (
+                      account_id,
+                      device_id,
+                      room_id,
+                      nonce,
+                      ciphertext
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#,
+                    params![
+                        &owner.account_id,
+                        &owner.device_id,
+                        room_id,
+                        &sealed.nonce,
+                        &sealed.ciphertext,
+                    ],
+                )
+                .unwrap();
+
+            let error = store.load_app_rooms(&owner).unwrap_err();
+            assert!(
+                matches!(error, ClientStoreError::DecodeAppRoomMetadata),
+                "{case} should fail closed, got {error}"
+            );
+        }
     }
 
     #[test]
@@ -9409,6 +9746,12 @@ mod tests {
 
         let selected = StoredAppState {
             selected_room_id: Some("room-main".to_owned()),
+            revoked_devices: [DeviceRef {
+                account_id: owner.account_id.clone(),
+                device_id: "tablet".to_owned(),
+            }]
+            .into_iter()
+            .collect(),
         };
         store.save_app_state(&owner, &selected).unwrap();
         assert_eq!(store.load_app_state(&owner).unwrap(), selected);
@@ -9419,9 +9762,81 @@ mod tests {
 
         let cleared = StoredAppState {
             selected_room_id: None,
+            revoked_devices: BTreeSet::new(),
         };
         reopened.save_app_state(&owner, &cleared).unwrap();
         assert_eq!(reopened.load_app_state(&owner).unwrap(), cleared);
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_legacy_app_state_metadata_shapes() {
+        for case in ["missing selected room", "missing revoked devices"] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret = NostrSecretKey::from_bytes([16; NOSTR_SECRET_KEY_BYTES]).unwrap();
+            let device_id = "phone";
+            let config = FiniteChatDeviceConfig {
+                account_secret_key: secret.clone(),
+                device_id: device_id.to_owned(),
+                now_unix_seconds: NOW,
+                credential_not_before_unix_seconds: NOW.saturating_sub(60),
+                credential_not_after_unix_seconds: NOW.saturating_add(60),
+            };
+            let device = FiniteChatDevice::new(config).unwrap();
+            let owner = device.device_ref().clone();
+            let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+            let db_path = dir.path().join("client.sqlite3");
+            let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+            store.save_device_state(&device).unwrap();
+
+            let mut metadata = serde_json::to_value(StoredAppStateMetadataV1 {
+                selected_room_id: Some("room-main".to_owned()),
+                revoked_devices: [DeviceRef {
+                    account_id: owner.account_id.clone(),
+                    device_id: "tablet".to_owned(),
+                }]
+                .into_iter()
+                .collect(),
+            })
+            .unwrap();
+            let metadata_object = metadata.as_object_mut().unwrap();
+            match case {
+                "missing selected room" => {
+                    metadata_object.remove("selected_room_id");
+                }
+                "missing revoked devices" => {
+                    metadata_object.remove("revoked_devices");
+                }
+                other => panic!("unknown app-state metadata case {other}"),
+            }
+
+            let sealed =
+                encrypt_app_state_metadata_json(&options.encryption_key, &owner, &metadata);
+            store
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO client_app_state (
+                      account_id,
+                      device_id,
+                      nonce,
+                      ciphertext
+                    ) VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        &owner.account_id,
+                        &owner.device_id,
+                        &sealed.nonce,
+                        &sealed.ciphertext,
+                    ],
+                )
+                .unwrap();
+
+            let error = store.load_app_state(&owner).unwrap_err();
+            assert!(
+                matches!(error, ClientStoreError::DecodeAppStateMetadata),
+                "{case} should fail closed, got {error}"
+            );
+        }
     }
 
     #[test]
@@ -9482,7 +9897,68 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_client_store_migrates_plaintext_app_messages_to_encrypted_rows() {
+    fn sqlite_client_store_rejects_legacy_app_profile_metadata_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = NostrSecretKey::from_bytes([17; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let device_id = "phone";
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: secret.clone(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(60),
+        };
+        let device = FiniteChatDevice::new(config).unwrap();
+        let owner = device.device_ref().clone();
+        let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
+        let db_path = dir.path().join("client.sqlite3");
+        let mut store = SqliteClientStore::open(&db_path, options.clone()).unwrap();
+        store.save_device_state(&device).unwrap();
+
+        let profile = app_profile("alice", "Alice Finite");
+        let mut metadata = serde_json::to_value(StoredAppProfileMetadataV1 {
+            profile: profile.profile.clone(),
+            stale: profile.stale,
+        })
+        .unwrap();
+        metadata.as_object_mut().unwrap().remove("stale");
+        let sealed = encrypt_app_profile_metadata_json(
+            &options.encryption_key,
+            &owner,
+            &profile.profile.account_id,
+            &metadata,
+        );
+        store
+            .conn
+            .execute(
+                r#"
+                INSERT INTO client_app_profiles (
+                  account_id,
+                  device_id,
+                  profile_account_id,
+                  nonce,
+                  ciphertext
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    &owner.account_id,
+                    &owner.device_id,
+                    &profile.profile.account_id,
+                    &sealed.nonce,
+                    &sealed.ciphertext,
+                ],
+            )
+            .unwrap();
+
+        let error = store.load_app_profiles(&owner).unwrap_err();
+        assert!(
+            matches!(error, ClientStoreError::DecodeAppProfileMetadata),
+            "missing stale should fail closed, got {error}"
+        );
+    }
+
+    #[test]
+    fn sqlite_client_store_rejects_plaintext_app_messages() {
         let dir = tempfile::tempdir().unwrap();
         let secret = NostrSecretKey::from_bytes([9; NOSTR_SECRET_KEY_BYTES]).unwrap();
         let device_id = "phone";
@@ -9556,21 +10032,19 @@ mod tests {
         }
 
         let options = SqliteClientStoreOptions::from_nostr_secret(&secret, device_id).unwrap();
-        let store = SqliteClientStore::open(&db_path, options).unwrap();
-        assert!(!client_app_messages_has_column(&store.conn, "plaintext").unwrap());
-        assert!(client_app_messages_has_column(&store.conn, "ciphertext").unwrap());
-        assert_eq!(
-            store.load_app_messages(&owner, 10).unwrap(),
-            vec![StoredAppMessage {
-                room_id: "room-store".to_owned(),
-                seq: 7,
-                message_id: "msg-legacy".to_owned(),
-                sender: owner.clone(),
-                plaintext: b"legacy-message".to_vec(),
-                timestamp_unix_seconds: 0,
-            }]
+        let error = match SqliteClientStore::open(&db_path, options) {
+            Ok(_) => panic!("plaintext app projection schema should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ClientStoreError::LegacyAppProjectionSchema { ref table, ref reason }
+                    if table == "client_app_messages"
+                        && reason == "plaintext column is unsupported"
+            ),
+            "unexpected error: {error}"
         );
-        assert_eq!(store.load_app_events(&owner, 10).unwrap(), Vec::new());
     }
 
     fn app_message(
@@ -9605,18 +10079,64 @@ mod tests {
         }
     }
 
-    fn outbound_message(
-        sender: &DeviceRef,
-        message_id: &str,
-        plaintext: &str,
-    ) -> StoredOutboundMessage {
+    fn outbound_message(sender: &DeviceRef, plaintext: &str) -> StoredOutboundMessage {
+        let envelope = envelope(
+            "room-store".to_owned(),
+            "mls-store".to_owned(),
+            sender.clone(),
+            1,
+            LogEntryKind::Application,
+            plaintext.as_bytes().to_vec(),
+        );
+        let message_id = envelope.message_id().unwrap();
+        let append_request = AppendEventRequest {
+            room_id: "room-store".to_owned(),
+            sender: sender.clone(),
+            envelope,
+            idempotency_key: format!("idem-{message_id}"),
+            timestamp_unix_seconds: NOW,
+        };
         StoredOutboundMessage {
             room_id: "room-store".to_owned(),
-            message_id: message_id.to_owned(),
+            message_id,
             sender: sender.clone(),
             plaintext: plaintext.as_bytes().to_vec(),
-            delivery_state: StoredOutboundDeliveryState::Pending,
+            local_state: StoredOutboundLocalState::Sent,
+            server_delivery_state: StoredOutboundServerDeliveryState::Undelivered,
+            append_request,
             timestamp_unix_seconds: NOW,
+        }
+    }
+
+    fn encrypt_app_outbox_metadata_json(
+        encryption_key: &ClientStoreEncryptionKey,
+        owner: &DeviceRef,
+        room_id: &str,
+        message_id: &str,
+        metadata: &serde_json::Value,
+    ) -> SealedAppOutbox {
+        let plaintext = serde_json::to_vec(metadata).unwrap();
+        let aad = app_outbox_aad(AppOutboxIdentity {
+            owner,
+            room_id,
+            message_id,
+        })
+        .unwrap();
+        let provider = OpenMlsRustCrypto::default();
+        let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider.rand().random_array().unwrap();
+        let ciphertext = provider
+            .crypto()
+            .aead_encrypt(
+                AeadType::Aes256Gcm,
+                encryption_key.as_bytes(),
+                &plaintext,
+                &nonce,
+                &aad,
+            )
+            .unwrap();
+        SealedAppOutbox {
+            nonce: nonce.to_vec(),
+            ciphertext,
         }
     }
 
@@ -9629,6 +10149,57 @@ mod tests {
             local_read_seq: 0,
             pending_invite_url: None,
             owned_invite_url: None,
+        }
+    }
+
+    fn encrypt_app_room_metadata_json(
+        encryption_key: &ClientStoreEncryptionKey,
+        owner: &DeviceRef,
+        room_id: &str,
+        metadata: &serde_json::Value,
+    ) -> SealedAppRoom {
+        let plaintext = serde_json::to_vec(metadata).unwrap();
+        let aad = app_room_aad(AppRoomIdentity { owner, room_id }).unwrap();
+        let provider = OpenMlsRustCrypto::default();
+        let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider.rand().random_array().unwrap();
+        let ciphertext = provider
+            .crypto()
+            .aead_encrypt(
+                AeadType::Aes256Gcm,
+                encryption_key.as_bytes(),
+                &plaintext,
+                &nonce,
+                &aad,
+            )
+            .unwrap();
+        SealedAppRoom {
+            nonce: nonce.to_vec(),
+            ciphertext,
+        }
+    }
+
+    fn encrypt_app_state_metadata_json(
+        encryption_key: &ClientStoreEncryptionKey,
+        owner: &DeviceRef,
+        metadata: &serde_json::Value,
+    ) -> SealedAppState {
+        let plaintext = serde_json::to_vec(metadata).unwrap();
+        let aad = app_state_aad(AppStateIdentity { owner }).unwrap();
+        let provider = OpenMlsRustCrypto::default();
+        let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider.rand().random_array().unwrap();
+        let ciphertext = provider
+            .crypto()
+            .aead_encrypt(
+                AeadType::Aes256Gcm,
+                encryption_key.as_bytes(),
+                &plaintext,
+                &nonce,
+                &aad,
+            )
+            .unwrap();
+        SealedAppState {
+            nonce: nonce.to_vec(),
+            ciphertext,
         }
     }
 
@@ -9649,6 +10220,36 @@ mod tests {
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
             stale: false,
+        }
+    }
+
+    fn encrypt_app_profile_metadata_json(
+        encryption_key: &ClientStoreEncryptionKey,
+        owner: &DeviceRef,
+        profile_account_id: &str,
+        metadata: &serde_json::Value,
+    ) -> SealedAppProfile {
+        let plaintext = serde_json::to_vec(metadata).unwrap();
+        let aad = app_profile_aad(AppProfileIdentity {
+            owner,
+            profile_account_id,
+        })
+        .unwrap();
+        let provider = OpenMlsRustCrypto::default();
+        let nonce: [u8; CLIENT_STORE_NONCE_BYTES] = provider.rand().random_array().unwrap();
+        let ciphertext = provider
+            .crypto()
+            .aead_encrypt(
+                AeadType::Aes256Gcm,
+                encryption_key.as_bytes(),
+                &plaintext,
+                &nonce,
+                &aad,
+            )
+            .unwrap();
+        SealedAppProfile {
+            nonce: nonce.to_vec(),
+            ciphertext,
         }
     }
 }

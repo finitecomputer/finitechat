@@ -127,12 +127,17 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         coordinator.viewController = viewController
 
         let wasNearBottom = coordinator.isNearBottom()
+        let shouldPinToBottom = MessageCollectionLayout.shouldPinToBottom(
+            isNearBottom: wasNearBottom,
+            followsBottom: followsBottom,
+            isHoldingInitialBottomPin: coordinator.isHoldingInitialBottomPin
+        )
         let newIDs = rows.map(\.id)
         let updateKind = MessageCollectionLayout.classifyUpdate(
             oldIDs: coordinator.currentIDs,
             newIDs: newIDs
         )
-        let anchor = wasNearBottom ? nil : coordinator.captureTopAnchor()
+        let anchor = shouldPinToBottom ? nil : coordinator.captureTopAnchor()
         let contentChanged = coordinator.lastContentState != contentState
         coordinator.lastContentState = contentState
 
@@ -140,7 +145,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
             rootView: accessoryContent,
             keepVisible: !isInputFocused
         )
-        if accessoryHeightChanged, !wasNearBottom {
+        if accessoryHeightChanged, !shouldPinToBottom {
             coordinator.pendingViewportAnchor = anchor
         }
         viewController.setJumpButtonVisible(!followsBottom, animated: true)
@@ -148,7 +153,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         let viewportChanged = coordinator.applyViewportInsetsIfNeeded()
 
         let completion = {
-            if wasNearBottom {
+            if shouldPinToBottom {
                 coordinator.scrollToBottom(animated: updateKind == .tailMutation)
             } else if let anchor {
                 coordinator.restore(anchor: anchor)
@@ -166,7 +171,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         case .tailMutation, .structural:
             coordinator.applyRows(
                 rows,
-                animated: wasNearBottom && updateKind == .tailMutation,
+                animated: shouldPinToBottom && updateKind == .tailMutation,
                 completion: completion
             )
         }
@@ -202,7 +207,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         private var lastAppliedEffectiveInset: UIEdgeInsets?
         private var pendingInitialScrollPosition: SavedChatTranscriptPosition?
         private var hasAppliedInitialRows = false
-        private var isHoldingInitialBottomPin = false
+        fileprivate var isHoldingInitialBottomPin = false
         var lastContentState: ContentState?
         var pendingViewportAnchor: ScrollAnchor?
         let messageFrameRegistry = ChatMessageFrameRegistry()
@@ -280,6 +285,11 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
 
         func handleViewportGeometryChange() {
             let wasNearBottom = isNearBottom()
+            let shouldPinToBottom = MessageCollectionLayout.shouldPinToBottom(
+                isNearBottom: wasNearBottom,
+                followsBottom: parent.followsBottom,
+                isHoldingInitialBottomPin: isHoldingInitialBottomPin
+            )
             _ = applyEffectiveInsetsIfNeeded()
 
             if let pendingInitialScrollPosition {
@@ -298,7 +308,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                 return
             }
 
-            guard isHoldingInitialBottomPin || wasNearBottom else { return }
+            guard shouldPinToBottom else { return }
             scrollToBottom(animated: false)
         }
 
@@ -310,7 +320,12 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                 return
             }
 
-            guard isHoldingInitialBottomPin || parent.followsBottom || isNearBottom() else { return }
+            let shouldPinToBottom = MessageCollectionLayout.shouldPinToBottom(
+                isNearBottom: isNearBottom(),
+                followsBottom: parent.followsBottom,
+                isHoldingInitialBottomPin: isHoldingInitialBottomPin
+            )
+            guard shouldPinToBottom else { return }
             scrollToBottom(animated: false)
         }
 
@@ -594,7 +609,11 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
     var onJumpToBottomTap: (() -> Void)?
 
     var bottomViewportInset: CGFloat {
-        max(0, view.bounds.maxY - view.keyboardLayoutGuide.layoutFrame.minY)
+        let keyboardInset = max(0, view.bounds.maxY - view.keyboardLayoutGuide.layoutFrame.minY)
+        return MessageCollectionLayout.bottomViewportInset(
+            keyboardInset: keyboardInset,
+            accessoryHeight: accessoryContainerView.measuredHeight
+        )
     }
 
     var isViewportReadyForInitialBottomPin: Bool {
@@ -768,6 +787,9 @@ final class InputAccessoryHostingView<AccessoryContent: View>: UIInputView {
     private var hostedView: (UIView & UIContentView)?
     private var lastReportedHeight: CGFloat = 0
     var onHeightChange: (() -> Void)?
+    var measuredHeight: CGFloat {
+        lastReportedHeight
+    }
 
     init(rootView: AccessoryContent) {
         super.init(frame: .zero, inputViewStyle: .default)
