@@ -381,7 +381,7 @@ final class RuntimeConfigTests: XCTestCase {
             storageURL: url
         )
 
-        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
+        XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
         XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
@@ -404,7 +404,7 @@ final class RuntimeConfigTests: XCTestCase {
             storageURL: url
         )
 
-        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
+        XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
         XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
@@ -462,7 +462,7 @@ final class RuntimeConfigTests: XCTestCase {
             storageURL: url
         )
 
-        XCTAssertEqual(loaded.serverURL, "http://127.0.0.1:8787")
+        XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
         XCTAssertEqual(loaded.deviceID, "ios")
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }

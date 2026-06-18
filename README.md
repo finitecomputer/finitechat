@@ -41,6 +41,9 @@ Run the iOS simulator app against that server:
 FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run ios
 ```
 
+Without an override, the native app defaults to
+`https://chat.finite.computer`.
+
 The normal app flow is:
 
 1. Sign in with an `nsec` or create a local Nostr identity.

@@ -8,7 +8,7 @@ struct RuntimeConfig: Codable, Equatable {
     let usesTransientStore: Bool
     let persistsRuntimeIdentityUpdates: Bool
 
-    private static let defaultServerURL = "http://127.0.0.1:8787"
+    private static let defaultServerURL = "https://chat.finite.computer"
     private static let defaultDeviceID = "ios"
     private static let transientConfigArgument = "--finitechat-transient-config"
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
