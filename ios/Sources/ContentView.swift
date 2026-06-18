@@ -71,9 +71,6 @@ struct ContentView: View {
                             },
                             showScan: {
                                 sheet = .scan
-                            },
-                            showSettings: {
-                                sheet = .settings
                             }
                         )
                     }
@@ -175,70 +172,74 @@ private struct RoomListView: View {
     @ObservedObject var model: AppModel
     let present: (AppSheet) -> Void
     let open: (AppRoomSummary) -> Void
+    @State private var searchText = ""
+
+    private var filteredRooms: [AppRoomSummary] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return model.rooms }
+        return model.rooms.filter { room in
+            room.displayName.lowercased().contains(query)
+                || room.lastMessagePreview.lowercased().contains(query)
+                || room.userStatusText.lowercased().contains(query)
+        }
+    }
 
     var body: some View {
-        Group {
-            if model.rooms.isEmpty {
-                ContentUnavailableView {
-                    Label("FiniteChat", systemImage: "bubble.left.and.bubble.right")
-                } description: {
+        List {
+            Section {
+                ShellActionButtonGrid(columns: 3) {
+                    ShellActionButton(title: "New Room", systemImage: "square.and.pencil", primary: true) {
+                        present(.newRoom)
+                    }
+                    .accessibilityIdentifier("NewRoomButton")
+
+                    ShellActionButton(title: "Scan", systemImage: "qrcode.viewfinder") {
+                        present(.scan)
+                    }
+                    .accessibilityIdentifier("ScanButton")
+
+                    ShellActionButton(title: "Settings", systemImage: "gearshape") {
+                        present(.settings)
+                    }
+                    .accessibilityIdentifier("SettingsButton")
+                }
+            }
+
+            Section {
+                if model.rooms.isEmpty {
+                    ContentUnavailableView("FiniteChat", systemImage: "bubble.left.and.bubble.right")
+                        .padding(.vertical, 28)
+                        .frame(maxWidth: .infinity)
+                } else if filteredRooms.isEmpty {
+                    ContentUnavailableView("No matching chats", systemImage: "magnifyingglass")
+                        .padding(.vertical, 28)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    ForEach(filteredRooms, id: \.roomId) { room in
+                        Button {
+                            open(room)
+                        } label: {
+                            RoomRow(room: room)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("RoomRow-\(room.roomId)")
+                    }
+                }
+            } header: {
+                Text("Chats")
+            } footer: {
+                if model.rooms.isEmpty {
                     Text(model.roomListEmptyDescription)
-                } actions: {
-                    HStack {
-                        Button {
-                            present(.newRoom)
-                        } label: {
-                            Label("New Room", systemImage: "square.and.pencil")
-                        }
-                        Button {
-                            present(.scan)
-                        } label: {
-                            Label("Scan", systemImage: "qrcode.viewfinder")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
                 }
-            } else {
-                List(model.rooms, id: \.roomId) { room in
-                    Button {
-                        open(room)
-                    } label: {
-                        RoomRow(room: room)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("RoomRow-\(room.roomId)")
-                }
-                .listStyle(.plain)
             }
         }
+        .listStyle(.insetGrouped)
         .navigationTitle("Chats")
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    present(.scan)
-                } label: {
-                    Image(systemName: "qrcode.viewfinder")
-                }
-                .accessibilityLabel("Scan")
-                .accessibilityIdentifier("ScanButton")
-
-                Button {
-                    present(.newRoom)
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                }
-                .accessibilityLabel("New Room")
-                .accessibilityIdentifier("NewRoomButton")
-
-                Button {
-                    present(.settings)
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel("Settings")
-                .accessibilityIdentifier("SettingsButton")
-            }
-        }
+        .searchable(
+            text: $searchText,
+            placement: .navigationBarDrawer(displayMode: .automatic),
+            prompt: "Search chats"
+        )
         .safeAreaInset(edge: .bottom) {
             NoticeBar(text: model.userNoticeText)
         }
@@ -1578,10 +1579,34 @@ private struct InviteSheet: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    @State private var showingMyProfile = false
+    @State private var confirmingSignOut = false
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Account") {
+                    Button {
+                        showingMyProfile = true
+                    } label: {
+                        Label("My Profile", systemImage: "person.crop.circle")
+                    }
+
+                    if let npub = model.myNpub {
+                        Text(npub)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Button(role: .destructive) {
+                        confirmingSignOut = true
+                    } label: {
+                        Label("Sign Out and Delete Everything", systemImage: "trash")
+                    }
+                }
+
                 if let state = model.state {
                     Section("Profiles") {
                         if state.profiles.isEmpty {
@@ -1689,6 +1714,22 @@ private struct SettingsSheet: View {
             .navigationTitle("Settings")
             .task {
                 model.refreshDevices()
+            }
+            .sheet(isPresented: $showingMyProfile) {
+                MyNostrProfileSheet(identity: model.nostrIdentity, myNpub: model.myNpub)
+            }
+            .confirmationDialog(
+                "Delete this device's FiniteChat data?",
+                isPresented: $confirmingSignOut,
+                titleVisibility: .visible
+            ) {
+                Button("Delete Everything", role: .destructive) {
+                    model.signOutAndDeleteEverything()
+                    dismiss()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This removes local chats, config, and the saved nsec from this device.")
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

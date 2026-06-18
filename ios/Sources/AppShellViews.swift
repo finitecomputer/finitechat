@@ -104,15 +104,12 @@ struct PeopleView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
     let showScan: () -> Void
-    let showSettings: () -> Void
 
     @StateObject private var people = NostrPeopleModel()
     @State private var searchText = ""
     @State private var selectedFollow: NostrFollowProfile?
-    @State private var showingMyProfile = false
     @State private var showingManualLookup = false
     @State private var showingLookupProfile = false
-    @State private var confirmingSignOut = false
 
     private var filteredProfiles: [NostrFollowProfile] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -127,40 +124,21 @@ struct PeopleView: View {
 
     var body: some View {
         List {
-            identitySection
             quickActionsSection
             followsSection
-            accountSection
         }
         .listStyle(.insetGrouped)
         .navigationTitle("People")
-        .searchable(text: $searchText, prompt: "Search follows")
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    Task { await people.refresh(identity: model.nostrIdentity) }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .disabled(people.isLoading || model.nostrIdentity == nil)
-                .accessibilityLabel("Refresh follows")
-
-                Button {
-                    showSettings()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel("Settings")
-            }
-        }
+        .searchable(
+            text: $searchText,
+            placement: .navigationBarDrawer(displayMode: .automatic),
+            prompt: "Search follows"
+        )
         .task(id: model.nostrIdentity?.accountID) {
             await people.loadIfNeeded(identity: model.nostrIdentity)
         }
         .refreshable {
             await people.refresh(identity: model.nostrIdentity)
-        }
-        .sheet(isPresented: $showingMyProfile) {
-            MyNostrProfileSheet(identity: model.nostrIdentity, myNpub: model.myNpub)
         }
         .sheet(isPresented: $showingManualLookup) {
             ManualNpubLookupSheet { value in
@@ -187,56 +165,11 @@ struct PeopleView: View {
                 ContentUnavailableView("Profile unavailable", systemImage: "person.crop.circle.badge.questionmark")
             }
         }
-        .confirmationDialog(
-            "Delete this device's FiniteChat data?",
-            isPresented: $confirmingSignOut,
-            titleVisibility: .visible
-        ) {
-            Button("Delete Everything", role: .destructive) {
-                model.signOutAndDeleteEverything()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This removes local chats, config, and the saved nsec from this device.")
-        }
-    }
-
-    private var identitySection: some View {
-        Section {
-            HStack(spacing: 12) {
-                NostrAvatar(
-                    name: model.nostrIdentity?.npub ?? model.myNpub,
-                    pictureURL: nil,
-                    size: 48
-                )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("My Profile")
-                        .font(.body.weight(.semibold))
-                    Text(model.myNpub.map(shortenedNpub) ?? "No profile code")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 8)
-
-                Button {
-                    showingMyProfile = true
-                } label: {
-                    Image(systemName: "qrcode")
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Show my profile code")
-            }
-            .padding(.vertical, 4)
-        }
     }
 
     private var quickActionsSection: some View {
         Section {
-            HStack(spacing: 8) {
+            ShellActionButtonGrid(columns: 2) {
                 ShellActionButton(title: "Enter Code", systemImage: "keyboard", primary: true) {
                     showingManualLookup = true
                 }
@@ -248,6 +181,11 @@ struct PeopleView: View {
                 ShellActionButton(title: "Scan", systemImage: "qrcode.viewfinder") {
                     showScan()
                 }
+
+                ShellActionButton(title: "Refresh", systemImage: "arrow.clockwise") {
+                    Task { await people.refresh(identity: model.nostrIdentity) }
+                }
+                .disabled(people.isLoading || model.nostrIdentity == nil)
             }
             .padding(.vertical, 8)
         }
@@ -295,16 +233,6 @@ struct PeopleView: View {
         }
     }
 
-    private var accountSection: some View {
-        Section {
-            Button(role: .destructive) {
-                confirmingSignOut = true
-            } label: {
-                Label("Sign Out and Delete Everything", systemImage: "trash")
-            }
-        }
-    }
-
     private func lookupProfile(_ value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -327,6 +255,7 @@ struct AgentsView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
     let showScan: () -> Void
+    @State private var searchText = ""
 
     private var agentRooms: [AppRoomSummary] {
         model.rooms.filter { room in
@@ -335,29 +264,41 @@ struct AgentsView: View {
         }
     }
 
+    private var filteredAgentRooms: [AppRoomSummary] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return agentRooms }
+        return agentRooms.filter { room in
+            room.displayName.lowercased().contains(query)
+                || room.lastMessagePreview.lowercased().contains(query)
+                || room.userStatusText.lowercased().contains(query)
+        }
+    }
+
     var body: some View {
         List {
             Section {
-                Button {
-                    createFiniteAgentRoom()
-                } label: {
-                    Label("Create New Finite Agent", systemImage: "sparkles")
-                }
-                .accessibilityIdentifier("CreateFiniteAgentButton")
+                ShellActionButtonGrid(columns: 2) {
+                    ShellActionButton(title: "Create Agent", systemImage: "sparkles", primary: true) {
+                        createFiniteAgentRoom()
+                    }
+                    .accessibilityIdentifier("CreateFiniteAgentButton")
 
-                Button {
-                    showScan()
-                } label: {
-                    Label("Scan Hermes Invite", systemImage: "qrcode.viewfinder")
+                    ShellActionButton(title: "Scan Invite", systemImage: "qrcode.viewfinder") {
+                        showScan()
+                    }
                 }
+                .padding(.vertical, 8)
             }
 
             Section("Agent Chats") {
                 if agentRooms.isEmpty {
                     ContentUnavailableView("No agent chats yet", systemImage: "sparkles")
                         .padding(.vertical, 18)
+                } else if filteredAgentRooms.isEmpty {
+                    ContentUnavailableView("No matching agents", systemImage: "magnifyingglass")
+                        .padding(.vertical, 18)
                 } else {
-                    ForEach(agentRooms, id: \.roomId) { room in
+                    ForEach(filteredAgentRooms, id: \.roomId) { room in
                         Button {
                             openRoom(room)
                         } label: {
@@ -389,6 +330,11 @@ struct AgentsView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Agents")
+        .searchable(
+            text: $searchText,
+            placement: .navigationBarDrawer(displayMode: .automatic),
+            prompt: "Search agents"
+        )
     }
 
     private func createFiniteAgentRoom() {
@@ -400,7 +346,7 @@ struct AgentsView: View {
     }
 }
 
-private struct MyNostrProfileSheet: View {
+struct MyNostrProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     let identity: AppNostrIdentity?
     let myNpub: String?
@@ -707,7 +653,29 @@ private struct NostrAvatar: View {
     }
 }
 
-private struct ShellActionButton: View {
+struct ShellActionButtonGrid<Content: View>: View {
+    let columns: Int
+    let content: Content
+
+    init(columns: Int, @ViewBuilder content: () -> Content) {
+        self.columns = columns
+        self.content = content()
+    }
+
+    var body: some View {
+        LazyVGrid(
+            columns: Array(
+                repeating: GridItem(.flexible(minimum: 88), spacing: 8),
+                count: max(1, columns)
+            ),
+            spacing: 8
+        ) {
+            content
+        }
+    }
+}
+
+struct ShellActionButton: View {
     let title: String
     let systemImage: String
     var primary = false
