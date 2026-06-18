@@ -277,6 +277,15 @@ Landed before and during the first product-state harness slice:
   delivered message bubbles at `y=287.7` and `y=340.3`, the composer text area
   at `y=463`, and the keyboard starting at `y=517`, so the latest bubble is not
   covered by the composer or keyboard.
+- Native iOS now has a Nostr sign-in/create gate backed by Rust-owned
+  `nsec`/`npub` material, a keychain identity store, destructive sign-out that
+  deletes the local product store/config, and a bottom app shell with Chats,
+  People, and Agents tabs. The People tab fetches follows/profile metadata from
+  the same Nostr relays Pika used and exposes profile-code copy/share/lookup
+  surfaces; the Agents tab exposes Hermes invite scanning and "Create New
+  Finite Agent". The bounded shortcut is that People "Create Chat Room" still
+  creates an ordinary FiniteChat room rather than a Rust-owned npub-addressed
+  direct chat.
 
 Remaining delete conditions for the product-state debt rows:
 
@@ -290,6 +299,11 @@ Remaining delete conditions for the product-state debt rows:
 - Repeat the Hermes media round trip on the physical phone before first users,
   after the product harness phone matrix is passing on the same configured
   server URL.
+- Replace the People-tab ordinary-room fallback with a Rust-owned contact/chat
+  action that accepts an npub/account id, reuses an existing 1:1 room when one
+  exists, creates/provisions a new one through the product invite/contact flow
+  when none exists, and is covered by a spouse-profile E2E using real Nostr
+  profiles/follows.
 
 ## Review Rule
 

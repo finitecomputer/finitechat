@@ -19,6 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const INVITE_URL_SCHEME: &str = "finite";
 pub const INVITE_URL_PREFIX: &str = "finite://join?";
 pub const NOSTR_NPUB_HRP: &str = "npub";
+pub const NOSTR_NSEC_HRP: &str = "nsec";
 /// Accept proofs computed in nearby PIN windows to absorb clock skew and the
 /// human copy/paste delay in local/manual invite flows.
 pub const INVITE_PIN_WINDOW_SKEW: u64 = 10;
@@ -303,6 +304,28 @@ pub fn npub_decode(npub: &str) -> Result<String, String> {
     Ok(hex_lower(&bytes))
 }
 
+/// NIP-19 nsec display form of a 32-byte account secret.
+pub fn nsec_encode(secret_hex: &str) -> Result<String, String> {
+    let bytes = decode_hex(secret_hex)?;
+    if bytes.len() != 32 {
+        return Err("account secret must be 32 bytes of hex".to_owned());
+    }
+    let hrp = bech32::Hrp::parse(NOSTR_NSEC_HRP).expect("static hrp");
+    bech32::encode::<bech32::Bech32>(hrp, &bytes).map_err(|error| error.to_string())
+}
+
+/// Decode an nsec back to the 32-byte account secret hex.
+pub fn nsec_decode(nsec: &str) -> Result<String, String> {
+    let (hrp, bytes) = bech32::decode(nsec).map_err(|error| error.to_string())?;
+    if hrp.as_str() != NOSTR_NSEC_HRP {
+        return Err(format!("expected {NOSTR_NSEC_HRP}, got {hrp}"));
+    }
+    if bytes.len() != 32 {
+        return Err("nsec must decode to 32 bytes".to_owned());
+    }
+    Ok(hex_lower(&bytes))
+}
+
 fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -500,5 +523,14 @@ mod tests {
         assert!(npub.starts_with("npub1"));
         assert_eq!(npub_decode(&npub).expect("decode"), hex);
         assert!(npub_decode("nsec1qqqq").is_err());
+    }
+
+    #[test]
+    fn nsec_round_trips() {
+        let hex = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+        let nsec = nsec_encode(hex).expect("encode");
+        assert!(nsec.starts_with("nsec1"));
+        assert_eq!(nsec_decode(&nsec).expect("decode"), hex);
+        assert!(nsec_decode("npub1qqqq").is_err());
     }
 }

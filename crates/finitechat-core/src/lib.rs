@@ -34,7 +34,7 @@ use finitechat_proto::{
     EphemeralActivityProjection, EphemeralActivityProjectionEntry, FINITECHAT_ACTIVITY_KIND_TYPING,
     GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
     MAX_OBJECT_ID_BYTES, RoomProtocol, RuntimeActivityClearV1, invite_current_pin, npub_decode,
-    npub_encode, validate_item_count, validate_string_bytes,
+    npub_encode, nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,14 @@ pub struct Identity {
     pub account_id: String,
     pub device_id: String,
     pub account_secret_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct NostrIdentityMaterial {
+    pub account_secret_hex: String,
+    pub account_id: String,
+    pub npub: String,
+    pub nsec: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -571,6 +579,45 @@ struct ChatProjectionState {
     poll_votes: BTreeMap<(String, String, String), String>,
     delivered_through: BTreeMap<(String, String), u64>,
     read_through: BTreeMap<(String, String), u64>,
+}
+
+#[uniffi::export]
+pub fn create_nostr_identity() -> Result<NostrIdentityMaterial, FiniteChatCoreError> {
+    let secret = generate_account_secret().map_err(client_error)?;
+    nostr_identity_from_secret(secret)
+}
+
+#[uniffi::export]
+pub fn nostr_identity_from_nsec(
+    nsec: String,
+) -> Result<NostrIdentityMaterial, FiniteChatCoreError> {
+    let trimmed = nsec.trim();
+    let normalized = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
+    let secret_hex = nsec_decode(normalized).map_err(|reason| FiniteChatCoreError::Client {
+        reason: format!("invalid nsec: {reason}"),
+    })?;
+    let secret = parse_account_secret_hex(&secret_hex)?;
+    nostr_identity_from_secret(secret)
+}
+
+#[uniffi::export]
+pub fn nostr_identity_from_account_secret_hex(
+    account_secret_hex: String,
+) -> Result<NostrIdentityMaterial, FiniteChatCoreError> {
+    let secret = parse_account_secret_hex(account_secret_hex.trim())?;
+    nostr_identity_from_secret(secret)
+}
+
+#[uniffi::export]
+pub fn npub_from_account_id(account_id: String) -> Result<String, FiniteChatCoreError> {
+    npub_encode(account_id.trim()).map_err(invite_error)
+}
+
+#[uniffi::export]
+pub fn account_id_from_npub(npub: String) -> Result<String, FiniteChatCoreError> {
+    let trimmed = npub.trim();
+    let normalized = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
+    npub_decode(normalized).map_err(invite_error)
 }
 
 #[uniffi::export]
@@ -5046,6 +5093,21 @@ fn parse_account_secret_hex(secret: &str) -> Result<NostrSecretKey, FiniteChatCo
     NostrSecretKey::from_bytes(bytes).map_err(|_| FiniteChatCoreError::InvalidAccountSecret)
 }
 
+fn nostr_identity_from_secret(
+    secret: NostrSecretKey,
+) -> Result<NostrIdentityMaterial, FiniteChatCoreError> {
+    let account_secret_hex = hex::encode(secret.as_bytes());
+    let account_id = hex::encode(secret.public_key().as_bytes());
+    let npub = npub_encode(&account_id).map_err(invite_error)?;
+    let nsec = nsec_encode(&account_secret_hex).map_err(invite_error)?;
+    Ok(NostrIdentityMaterial {
+        account_secret_hex,
+        account_id,
+        npub,
+        nsec,
+    })
+}
+
 fn parse_invite(invite_url: &str) -> Result<InviteCodeV1, FiniteChatCoreError> {
     InviteCodeV1::parse(invite_url).map_err(invite_error)
 }
@@ -5159,6 +5221,30 @@ mod tests {
     use finitechat_server::{HttpServerState, http_router};
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn nostr_identity_helpers_round_trip_nsec_material() {
+        let created = create_nostr_identity().unwrap();
+        assert!(created.npub.starts_with("npub1"));
+        assert!(created.nsec.starts_with("nsec1"));
+        assert_eq!(created.account_secret_hex.len(), 64);
+        assert_eq!(created.account_id.len(), 64);
+
+        let restored = nostr_identity_from_nsec(created.nsec.clone()).unwrap();
+        assert_eq!(restored, created);
+
+        let restored_from_hex =
+            nostr_identity_from_account_secret_hex(created.account_secret_hex.clone()).unwrap();
+        assert_eq!(restored_from_hex, created);
+    }
+
+    #[test]
+    fn nostr_identity_helpers_accept_nostr_prefixed_nsec() {
+        let created = create_nostr_identity().unwrap();
+        let restored = nostr_identity_from_nsec(format!("nostr:{}", created.nsec)).unwrap();
+        assert_eq!(restored.account_id, created.account_id);
+        assert_eq!(restored.account_secret_hex, created.account_secret_hex);
+    }
 
     #[test]
     fn core_sessions_message_each_other_over_live_http() {

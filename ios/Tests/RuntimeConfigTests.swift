@@ -974,6 +974,88 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(model.runtimeStorePath)
     }
 
+    func testNostrNsecSignInOpensRuntimeWithAccountSecret() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = emptyChatState()
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore()
+        var openedOptions: [OpenOptions] = []
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return runtime
+        }
+
+        XCTAssertTrue(model.requiresNostrLogin)
+
+        XCTAssertTrue(model.signInWithNsec(material.nsec))
+
+        XCTAssertFalse(model.requiresNostrLogin)
+        XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
+        XCTAssertEqual(model.nostrIdentity?.npub, material.npub)
+        XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
+        XCTAssertEqual(openedOptions.count, 1)
+        XCTAssertEqual(openedOptions[0].accountSecretHex, material.accountSecretHex)
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+    }
+
+    func testSignOutDeletesSavedNostrIdentityAndReturnsToLoginGate() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = emptyChatState()
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore(identity: AppNostrIdentity(material: material))
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        XCTAssertFalse(model.requiresNostrLogin)
+        model.start()
+        XCTAssertNotNil(model.state)
+
+        model.signOutAndDeleteEverything()
+
+        XCTAssertTrue(model.requiresNostrLogin)
+        XCTAssertNil(model.nostrIdentity)
+        XCTAssertNil(identityStore.load())
+        XCTAssertNil(model.state)
+        XCTAssertNil(model.runtimeStorePath)
+    }
+
     func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",

@@ -27,46 +27,109 @@ private enum AppSheet: Identifiable {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @State private var selectedTab: AppTab = .chats
     @State private var sheet: AppSheet?
-    @State private var path: [String] = []
+    @State private var chatPath: [String] = []
     @State private var lastAppliedSelectedRoomID: String?
     @State private var scheduledRoomRouteID: String?
 
     var body: some View {
-        NavigationStack(path: $path) {
-            RoomListView(
-                model: model,
-                present: { destination in
-                    sheet = destination
-                },
-                open: { room in
-                    model.openRoom(room)
-                    routeSelectedRoom(room.roomId)
-                }
-            )
-            .navigationDestination(for: String.self) { roomID in
-                RoomThreadView(model: model, roomID: roomID) {
-                    sheet = .invite
+        Group {
+            if model.requiresNostrLogin {
+                NostrLoginView(model: model)
+            } else {
+                TabView(selection: $selectedTab) {
+                    NavigationStack(path: $chatPath) {
+                        RoomListView(
+                            model: model,
+                            present: { destination in
+                                sheet = destination
+                            },
+                            open: { room in
+                                model.openRoom(room)
+                                routeSelectedRoom(room.roomId)
+                            }
+                        )
+                        .navigationDestination(for: String.self) { roomID in
+                            RoomThreadView(model: model, roomID: roomID) {
+                                sheet = .invite
+                            }
+                        }
+                    }
+                    .tabItem {
+                        Label(AppTab.chats.title, systemImage: AppTab.chats.systemImage)
+                    }
+                    .tag(AppTab.chats)
+
+                    NavigationStack {
+                        PeopleView(
+                            model: model,
+                            openRoom: { room in
+                                selectedTab = .chats
+                                model.openRoom(room)
+                                routeSelectedRoom(room.roomId)
+                            },
+                            showScan: {
+                                sheet = .scan
+                            },
+                            showSettings: {
+                                sheet = .settings
+                            }
+                        )
+                    }
+                    .tabItem {
+                        Label(AppTab.people.title, systemImage: AppTab.people.systemImage)
+                    }
+                    .tag(AppTab.people)
+
+                    NavigationStack {
+                        AgentsView(
+                            model: model,
+                            openRoom: { room in
+                                selectedTab = .chats
+                                model.openRoom(room)
+                                routeSelectedRoom(room.roomId)
+                            },
+                            showScan: {
+                                sheet = .scan
+                            }
+                        )
+                    }
+                    .tabItem {
+                        Label(AppTab.agents.title, systemImage: AppTab.agents.systemImage)
+                    }
+                    .tag(AppTab.agents)
                 }
             }
-            .sheet(item: $sheet) { destination in
-                switch destination {
-                case .newRoom:
-                    NewRoomSheet(model: model)
-                case .scan:
-                    ScanSheet(model: model)
-                case .invite:
-                    InviteSheet(invite: model.state?.activeInvite)
-                case .settings:
-                    SettingsSheet(model: model)
-                }
+        }
+        .sheet(item: $sheet) { destination in
+            switch destination {
+            case .newRoom:
+                NewRoomSheet(model: model)
+            case .scan:
+                ScanSheet(model: model)
+            case .invite:
+                InviteSheet(invite: model.state?.activeInvite)
+            case .settings:
+                SettingsSheet(model: model)
             }
         }
         .task {
+            guard !model.requiresNostrLogin else { return }
             model.start()
             lastAppliedSelectedRoomID = model.state?.selectedRoomId
         }
+        .onChange(of: model.requiresNostrLogin) { _, requiresLogin in
+            if requiresLogin {
+                lastAppliedSelectedRoomID = nil
+                scheduledRoomRouteID = nil
+                schedulePathUpdate([])
+            } else {
+                lastAppliedSelectedRoomID = model.state?.selectedRoomId
+            }
+        }
         .onChange(of: model.state?.selectedRoomId) { _, selectedRoomID in
+            guard !model.requiresNostrLogin else { return }
             routeSelectedRoomIfNeeded(selectedRoomID)
         }
     }
@@ -81,12 +144,14 @@ struct ContentView: View {
         guard selectedRoomID != lastAppliedSelectedRoomID else { return }
         lastAppliedSelectedRoomID = selectedRoomID
         scheduledRoomRouteID = selectedRoomID
+        selectedTab = .chats
         schedulePathUpdate([selectedRoomID])
     }
 
     private func routeSelectedRoom(_ selectedRoomID: String) {
         lastAppliedSelectedRoomID = selectedRoomID
         scheduledRoomRouteID = selectedRoomID
+        selectedTab = .chats
         schedulePathUpdate([selectedRoomID])
     }
 
@@ -100,8 +165,8 @@ struct ContentView: View {
             if nextPath.isEmpty, scheduledRoomRouteID != nil {
                 return
             }
-            guard path != nextPath else { return }
-            path = nextPath
+            guard chatPath != nextPath else { return }
+            chatPath = nextPath
         }
     }
 }
@@ -1776,7 +1841,7 @@ private extension AppDeviceSummary {
     }
 }
 
-private struct QRCodeView: View {
+struct QRCodeView: View {
     let value: String
     private let context = CIContext()
     private let filter = CIFilter.qrCodeGenerator()

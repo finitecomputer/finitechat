@@ -240,6 +240,22 @@ struct RuntimeDataStore {
         return currentStoreURL.path
     }
 
+    static func deleteDataDir(
+        deviceID: String,
+        applicationSupportURL: URL? = nil,
+        transient: Bool = false
+    ) throws {
+        let path = try dataDir(
+            deviceID: deviceID,
+            applicationSupportURL: applicationSupportURL,
+            transient: transient
+        )
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
     private static func safeDeviceDirectoryName(_ deviceID: String) -> String {
         deviceID
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -329,6 +345,8 @@ final class AppModel: ObservableObject {
     @Published var outboundText: String = ""
     @Published private(set) var runtimeStorePath: String?
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
+    @Published private(set) var nostrIdentity: AppNostrIdentity?
+    @Published private(set) var requiresNostrLogin: Bool
 
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
@@ -339,6 +357,7 @@ final class AppModel: ObservableObject {
     private let args: [String]
     private let runtimeFactory: AppRuntimeFactory
     private let startsUpdateLoop: Bool
+    private let nostrIdentityStore: AppNostrIdentityStoring
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
@@ -357,6 +376,8 @@ final class AppModel: ObservableObject {
         applicationSupportURL: URL? = nil,
         configStorageURL: URL? = nil,
         args: [String] = CommandLine.arguments,
+        requiresNostrLogin: Bool = false,
+        nostrIdentityStore: AppNostrIdentityStoring = KeychainNostrIdentityStore(),
         startsUpdateLoop: Bool = true,
         runtimeFactory: @escaping AppRuntimeFactory = { options in
             try FiniteChatRuntime.open(options: options)
@@ -377,6 +398,12 @@ final class AppModel: ObservableObject {
         self.args = args
         self.runtimeFactory = runtimeFactory
         self.startsUpdateLoop = startsUpdateLoop
+        self.nostrIdentityStore = nostrIdentityStore
+        let storedNostrIdentity = nostrIdentityStore.load()
+        nostrIdentity = storedNostrIdentity
+        self.requiresNostrLogin = requiresNostrLogin
+            && storedNostrIdentity == nil
+            && !Self.hasLaunchAutomation(args: args)
         launchConfigurationError = productHarnessSupport.error
         appendDiagnostic(
             category: "persistence",
@@ -385,6 +412,7 @@ final class AppModel: ObservableObject {
                 "store_mode": usesTransientStore ? "transient" : "stable",
                 "has_explicit_support_root": resolvedApplicationSupportURL == nil ? "false" : "true",
                 "has_launch_configuration_error": launchConfigurationError == nil ? "false" : "true",
+                "requires_nostr_login": self.requiresNostrLogin ? "true" : "false",
             ]
         )
     }
@@ -456,6 +484,57 @@ final class AppModel: ObservableObject {
     var activeProfile: AppProfileSummary? {
         guard let state, let activeProfileId = state.activeProfileId else { return nil }
         return state.profiles.first { $0.accountId == activeProfileId }
+    }
+
+    var myNpub: String? {
+        if let npub = nostrIdentity?.npub {
+            return npub
+        }
+        guard let accountID = state?.identity.accountId.nonEmptyTrimmed else {
+            return nil
+        }
+        return try? npubFromAccountId(accountId: accountID)
+    }
+
+    @discardableResult
+    func createAndSignInNostrIdentity() -> Bool {
+        do {
+            let material = try createNostrIdentity()
+            try applyNostrIdentity(AppNostrIdentity(material: material), resetStore: true)
+            return true
+        } catch {
+            errorText = String(describing: error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func signInWithNsec(_ nsec: String) -> Bool {
+        do {
+            let material = try nostrIdentityFromNsec(nsec: nsec)
+            try applyNostrIdentity(AppNostrIdentity(material: material), resetStore: true)
+            return true
+        } catch {
+            errorText = String(describing: error)
+            return false
+        }
+    }
+
+    func signOutAndDeleteEverything() {
+        appendDiagnostic(category: "persistence", event: "signout.delete_all.requested")
+        nostrIdentityStore.clear()
+        closeRuntime()
+        try? RuntimeDataStore.deleteDataDir(
+            deviceID: deviceID,
+            applicationSupportURL: applicationSupportURL,
+            transient: usesTransientStore
+        )
+        if let configStorageURL {
+            try? FileManager.default.removeItem(at: configStorageURL)
+        }
+        nostrIdentity = nil
+        requiresNostrLogin = true
+        errorText = nil
     }
 
     var canSend: Bool {
@@ -823,6 +902,25 @@ final class AppModel: ObservableObject {
         start()
     }
 
+    private func applyNostrIdentity(
+        _ identity: AppNostrIdentity,
+        resetStore: Bool
+    ) throws {
+        closeRuntime()
+        if resetStore {
+            try? RuntimeDataStore.deleteDataDir(
+                deviceID: deviceID,
+                applicationSupportURL: applicationSupportURL,
+                transient: usesTransientStore
+            )
+        }
+        nostrIdentityStore.save(identity)
+        nostrIdentity = identity
+        requiresNostrLogin = false
+        appendDiagnostic(category: "persistence", event: "nostr_identity.applied")
+        start()
+    }
+
     private func startUpdateLoop() {
         updateTask?.cancel()
         guard let runtime else { return }
@@ -896,7 +994,11 @@ final class AppModel: ObservableObject {
         if let launchConfigurationError {
             throw AppLaunchConfigurationError(message: launchConfigurationError)
         }
-        let key = "\(serverURL)|\(deviceID)"
+        if requiresNostrLogin {
+            throw AppLaunchConfigurationError(message: "Create or sign in to a Nostr account first.")
+        }
+        let accountSecretHex = nostrIdentity?.accountSecretHex
+        let key = "\(serverURL)|\(deviceID)|\(accountSecretHex ?? "stored")"
         if let runtime, openKey == key {
             return runtime
         }
@@ -919,11 +1021,12 @@ final class AppModel: ObservableObject {
                 dataDir: dataDir,
                 serverUrl: serverURL,
                 deviceId: deviceID,
-                accountSecretHex: nil,
+                accountSecretHex: accountSecretHex,
                 nowUnixSeconds: nil
             )
         )
         let openedState = try opened.state()
+        syncNostrIdentityFromRuntime(openedState.identity)
         let resolvedDeviceID = openedState.identity.deviceId
         if resolvedDeviceID != deviceID {
             appendDiagnostic(
@@ -939,9 +1042,22 @@ final class AppModel: ObservableObject {
             )
         }
         runtime = opened
-        openKey = "\(serverURL)|\(deviceID)"
+        let resolvedAccountSecretHex = nostrIdentity?.accountSecretHex ?? accountSecretHex
+        openKey = "\(serverURL)|\(deviceID)|\(resolvedAccountSecretHex ?? "stored")"
         appendDiagnostic(category: "runtime", event: "open.succeeded")
         return opened
+    }
+
+    private func syncNostrIdentityFromRuntime(_ identity: Identity) {
+        guard nostrIdentity == nil else { return }
+        guard let material = try? nostrIdentityFromAccountSecretHex(
+            accountSecretHex: identity.accountSecretHex
+        ) else {
+            return
+        }
+        let appIdentity = AppNostrIdentity(material: material)
+        nostrIdentityStore.save(appIdentity)
+        nostrIdentity = appIdentity
     }
 
     private func closeRuntime() {
@@ -1478,6 +1594,17 @@ final class AppModel: ObservableObject {
             return nil
         }
         return args[valueIndex]
+    }
+
+    private static func hasLaunchAutomation(args: [String]) -> Bool {
+        [
+            "--finitechat-auto-join",
+            "--finitechat-auto-create-room",
+            "--finitechat-auto-send",
+            "--finitechat-auto-send-attachment-text",
+            "--finitechat-auto-send-attachment-file",
+            "--finitechat-auto-send-attachment-base64",
+        ].contains { args.contains($0) }
     }
 
     private static func productHarnessApplicationSupportURL(
