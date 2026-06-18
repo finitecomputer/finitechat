@@ -134,7 +134,7 @@ struct PeopleView: View {
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .automatic),
-            prompt: "Search follows"
+            prompt: "Search people"
         )
         .task(id: model.nostrIdentity?.accountID) {
             await people.loadIfNeeded(identity: model.nostrIdentity)
@@ -166,42 +166,31 @@ struct PeopleView: View {
 
     @ViewBuilder
     private var followsSection: some View {
-        Section {
-            if people.isLoading && people.profiles.isEmpty {
-                HStack {
-                    Spacer()
-                    ProgressView("Loading follows...")
-                    Spacer()
-                }
-                .padding(.vertical, 16)
-            } else if people.profiles.isEmpty {
-                ContentUnavailableView("No follows found", systemImage: "person.crop.circle.badge.questionmark")
-                    .padding(.vertical, 18)
-            } else if filteredProfiles.isEmpty {
-                ContentUnavailableView("No matches", systemImage: "magnifyingglass")
-                    .padding(.vertical, 18)
-            } else {
-                ForEach(filteredProfiles) { profile in
-                    Button {
-                        selectedFollow = profile
-                    } label: {
-                        NostrProfileRow(profile: profile)
-                            .padding(.vertical, 6)
-                    }
-                    .buttonStyle(.plain)
-                }
+        if people.isLoading && people.profiles.isEmpty {
+            HStack {
+                Spacer()
+                ProgressView("Loading people...")
+                Spacer()
             }
-        } header: {
-            HStack(spacing: 6) {
-                Text("Follows")
-                if people.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
+            .padding(.vertical, 16)
+            .listRowSeparator(.hidden)
+        } else if people.profiles.isEmpty {
+            ContentUnavailableView("No people yet", systemImage: "person.crop.circle.badge.questionmark")
+                .padding(.vertical, 18)
+                .listRowSeparator(.hidden)
+        } else if filteredProfiles.isEmpty {
+            ContentUnavailableView("No matches", systemImage: "magnifyingglass")
+                .padding(.vertical, 18)
+                .listRowSeparator(.hidden)
+        } else {
+            ForEach(filteredProfiles) { profile in
+                Button {
+                    selectedFollow = profile
+                } label: {
+                    NostrProfileRow(profile: profile)
+                        .padding(.vertical, 6)
                 }
-            }
-        } footer: {
-            if let status = people.statusText {
-                Text(status)
+                .buttonStyle(.plain)
             }
         }
     }
@@ -250,34 +239,34 @@ struct AgentsView: View {
 
     var body: some View {
         List {
-            Section("Agent Chats") {
-                if agentRooms.isEmpty {
-                    ContentUnavailableView("No agent chats yet", systemImage: "sparkles")
-                        .padding(.vertical, 18)
-                } else if filteredAgentRooms.isEmpty {
-                    ContentUnavailableView("No matching agents", systemImage: "magnifyingglass")
-                        .padding(.vertical, 18)
-                } else {
-                    ForEach(filteredAgentRooms, id: \.roomId) { room in
-                        Button {
-                            openRoom(room)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: "sparkles")
-                                    .frame(width: 40, height: 40)
-                                    .background(Color(.tertiarySystemFill), in: Circle())
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(room.displayName)
-                                        .foregroundStyle(.primary)
-                                    Text(room.lastMessagePreview.isEmpty ? room.userStatusText : room.lastMessagePreview)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
+            if agentRooms.isEmpty {
+                ContentUnavailableView("No agents yet", systemImage: "sparkles")
+                    .padding(.vertical, 18)
+                    .listRowSeparator(.hidden)
+            } else if filteredAgentRooms.isEmpty {
+                ContentUnavailableView("No matching agents", systemImage: "magnifyingglass")
+                    .padding(.vertical, 18)
+                    .listRowSeparator(.hidden)
+            } else {
+                ForEach(filteredAgentRooms, id: \.roomId) { room in
+                    Button {
+                        openRoom(room)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "sparkles")
+                                .frame(width: 40, height: 40)
+                                .background(Color(.tertiarySystemFill), in: Circle())
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(room.displayName)
+                                    .foregroundStyle(.primary)
+                                Text(room.lastMessagePreview.isEmpty ? room.userStatusText : room.lastMessagePreview)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                         }
-                        .buttonStyle(.plain)
                     }
+                    .buttonStyle(.plain)
                 }
             }
         }

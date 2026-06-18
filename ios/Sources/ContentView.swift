@@ -187,31 +187,25 @@ private struct RoomListView: View {
 
     var body: some View {
         List {
-            Section {
-                if model.rooms.isEmpty {
-                    ContentUnavailableView("FiniteChat", systemImage: "bubble.left.and.bubble.right")
-                        .padding(.vertical, 28)
-                        .frame(maxWidth: .infinity)
-                } else if filteredRooms.isEmpty {
-                    ContentUnavailableView("No matching chats", systemImage: "magnifyingglass")
-                        .padding(.vertical, 28)
-                        .frame(maxWidth: .infinity)
-                } else {
-                    ForEach(filteredRooms, id: \.roomId) { room in
-                        Button {
-                            open(room)
-                        } label: {
-                            RoomRow(room: room)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityIdentifier("RoomRow-\(room.roomId)")
+            if model.rooms.isEmpty {
+                ContentUnavailableView("FiniteChat", systemImage: "bubble.left.and.bubble.right")
+                    .padding(.vertical, 28)
+                    .frame(maxWidth: .infinity)
+                    .listRowSeparator(.hidden)
+            } else if filteredRooms.isEmpty {
+                ContentUnavailableView("No matching chats", systemImage: "magnifyingglass")
+                    .padding(.vertical, 28)
+                    .frame(maxWidth: .infinity)
+                    .listRowSeparator(.hidden)
+            } else {
+                ForEach(filteredRooms, id: \.roomId) { room in
+                    Button {
+                        open(room)
+                    } label: {
+                        RoomRow(room: room)
                     }
-                }
-            } header: {
-                Text("Chats")
-            } footer: {
-                if model.rooms.isEmpty {
-                    Text(model.roomListEmptyDescription)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("RoomRow-\(room.roomId)")
                 }
             }
         }
