@@ -23,6 +23,17 @@ struct NostrFollowProfile: Identifiable, Equatable, Sendable {
         return shortenedNpub
     }
 
+    var hasProfileName: Bool {
+        for candidate in [name, username] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty
+            {
+                return true
+            }
+        }
+        return false
+    }
+
     var shortenedNpub: String {
         guard npub.count > 18 else { return npub }
         return "\(npub.prefix(10))...\(npub.suffix(4))"
@@ -84,6 +95,13 @@ final class NostrPeopleModel: ObservableObject {
 }
 
 final class NostrRelayProfileService: Sendable {
+    typealias EventLoader = @Sendable (
+        _ relay: String,
+        _ filter: NostrRelayFilter,
+        _ subscriptionPrefix: String,
+        _ timeoutNanoseconds: UInt64
+    ) async throws -> [NostrRelayEvent]
+
     static let pikaProfileRelays = [
         "wss://relay.primal.net",
         "wss://nos.lol",
@@ -94,17 +112,27 @@ final class NostrRelayProfileService: Sendable {
 
     private let relays: [String]
     private let timeoutNanoseconds: UInt64
+    private let eventLoader: EventLoader
 
     init(
         relays: [String] = NostrRelayProfileService.pikaProfileRelays,
-        timeoutSeconds: Double = 5
+        timeoutSeconds: Double = 5,
+        eventLoader: @escaping EventLoader = { relay, filter, subscriptionPrefix, timeoutNanoseconds in
+            try await NostrRelayProfileService.fetchEventsFromRelay(
+                from: relay,
+                filter: filter,
+                subscriptionPrefix: subscriptionPrefix,
+                timeoutNanoseconds: timeoutNanoseconds
+            )
+        }
     ) {
         self.relays = relays
         timeoutNanoseconds = UInt64(max(timeoutSeconds, 1) * 1_000_000_000)
+        self.eventLoader = eventLoader
     }
 
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
-        let contacts = try await fetchContacts(forAccountID: accountID)
+        let contacts = await fetchContacts(forAccountID: accountID)
         let followed = contacts.values.sorted { left, right in
             left.pubkey < right.pubkey
         }
@@ -115,7 +143,7 @@ final class NostrRelayProfileService: Sendable {
                 followedPubkeyCount: 0
             )
         }
-        let metadata = try await fetchMetadata(forPubkeys: followed.map(\.pubkey))
+        let metadata = await fetchMetadata(forPubkeys: followed.map(\.pubkey))
         let profiles = followed.compactMap { contact -> NostrFollowProfile? in
             guard let npub = try? npubFromAccountId(accountId: contact.pubkey) else { return nil }
             let profile = metadata[contact.pubkey]
@@ -130,7 +158,12 @@ final class NostrRelayProfileService: Sendable {
             )
         }
         .sorted { left, right in
-            left.displayName.localizedCaseInsensitiveCompare(right.displayName) == .orderedAscending
+            let leftNamed = left.hasProfileName
+            let rightNamed = right.hasProfileName
+            if leftNamed != rightNamed {
+                return leftNamed
+            }
+            return left.displayName.localizedCaseInsensitiveCompare(right.displayName) == .orderedAscending
         }
         return NostrFollowFetchResult(
             profiles: profiles,
@@ -139,11 +172,12 @@ final class NostrRelayProfileService: Sendable {
         )
     }
 
-    private func fetchContacts(forAccountID accountID: String) async throws -> [String: NostrContact] {
-        let filter = NostrRelayFilter(kinds: [3], authors: [accountID], limit: 1)
-        let events = try await fetchEvents(filter: filter, subscriptionPrefix: "finite-contacts")
+    private func fetchContacts(forAccountID accountID: String) async -> [String: NostrContact] {
+        let normalizedAccountID = accountID.lowercased()
+        let filter = NostrRelayFilter(kinds: [3], authors: [normalizedAccountID], limit: 1)
+        let events = await fetchEvents(filter: filter, subscriptionPrefix: "finite-contacts")
         guard let latest = events
-            .filter({ $0.kind == 3 && $0.pubkey == accountID })
+            .filter({ $0.kind == 3 && $0.pubkey.lowercased() == normalizedAccountID })
             .max(by: { $0.createdAt < $1.createdAt })
         else {
             return [:]
@@ -151,22 +185,24 @@ final class NostrRelayProfileService: Sendable {
         var contacts: [String: NostrContact] = [:]
         for tag in latest.tags {
             guard tag.count >= 2, tag[0] == "p", Self.isHexPubkey(tag[1]) else { continue }
+            let pubkey = tag[1].lowercased()
             let relayHint = tag.count >= 3 ? tag[2].nostrNonEmptyTrimmed : nil
             let petname = tag.count >= 4 ? tag[3].nostrNonEmptyTrimmed : nil
-            contacts[tag[1]] = NostrContact(pubkey: tag[1], relayHint: relayHint, petname: petname)
+            contacts[pubkey] = NostrContact(pubkey: pubkey, relayHint: relayHint, petname: petname)
         }
         return contacts
     }
 
-    private func fetchMetadata(forPubkeys pubkeys: [String]) async throws -> [String: NostrProfileMetadata] {
+    private func fetchMetadata(forPubkeys pubkeys: [String]) async -> [String: NostrProfileMetadata] {
         var metadata: [String: NostrProfileMetadata] = [:]
         for chunk in pubkeys.chunked(into: 80) {
-            let filter = NostrRelayFilter(kinds: [0], authors: chunk, limit: nil)
-            let events = try await fetchEvents(filter: filter, subscriptionPrefix: "finite-profiles")
+            let filter = NostrRelayFilter(kinds: [0], authors: chunk, limit: chunk.count)
+            let events = await fetchEvents(filter: filter, subscriptionPrefix: "finite-profiles")
             for event in events where event.kind == 0 {
                 guard Self.isHexPubkey(event.pubkey) else { continue }
-                guard metadata[event.pubkey]?.createdAt ?? 0 <= event.createdAt else { continue }
-                metadata[event.pubkey] = NostrProfileMetadata(event: event)
+                let pubkey = event.pubkey.lowercased()
+                guard metadata[pubkey]?.createdAt ?? 0 <= event.createdAt else { continue }
+                metadata[pubkey] = NostrProfileMetadata(event: event)
             }
         }
         return metadata
@@ -175,25 +211,35 @@ final class NostrRelayProfileService: Sendable {
     private func fetchEvents(
         filter: NostrRelayFilter,
         subscriptionPrefix: String
-    ) async throws -> [NostrRelayEvent] {
-        try await withThrowingTaskGroup(of: [NostrRelayEvent].self) { group in
+    ) async -> [NostrRelayEvent] {
+        await withTaskGroup(of: [NostrRelayEvent].self) { group in
             for relay in relays {
                 group.addTask {
-                    try await self.fetchEvents(from: relay, filter: filter, subscriptionPrefix: subscriptionPrefix)
+                    do {
+                        return try await self.eventLoader(
+                            relay,
+                            filter,
+                            subscriptionPrefix,
+                            self.timeoutNanoseconds
+                        )
+                    } catch {
+                        return []
+                    }
                 }
             }
             var events: [NostrRelayEvent] = []
-            for try await relayEvents in group {
+            for await relayEvents in group {
                 events.append(contentsOf: relayEvents)
             }
             return events
         }
     }
 
-    private func fetchEvents(
+    private static func fetchEventsFromRelay(
         from relay: String,
         filter: NostrRelayFilter,
-        subscriptionPrefix: String
+        subscriptionPrefix: String,
+        timeoutNanoseconds: UInt64
     ) async throws -> [NostrRelayEvent] {
         guard let url = URL(string: relay) else { return [] }
         let task = URLSession.shared.webSocketTask(with: url)
@@ -214,7 +260,7 @@ final class NostrRelayProfileService: Sendable {
         while !Task.isCancelled {
             let received: URLSessionWebSocketTask.Message
             do {
-                received = try await receiveWithTimeout(task)
+                received = try await receiveWithTimeout(task, timeoutNanoseconds: timeoutNanoseconds)
             } catch is NostrRelayTimeout {
                 break
             }
@@ -239,8 +285,9 @@ final class NostrRelayProfileService: Sendable {
         return events
     }
 
-    private func receiveWithTimeout(
-        _ task: URLSessionWebSocketTask
+    private static func receiveWithTimeout(
+        _ task: URLSessionWebSocketTask,
+        timeoutNanoseconds: UInt64
     ) async throws -> URLSessionWebSocketTask.Message {
         try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
             group.addTask {
@@ -289,7 +336,7 @@ final class NostrRelayProfileService: Sendable {
     }
 }
 
-private struct NostrRelayFilter: Encodable, Sendable {
+struct NostrRelayFilter: Encodable, Sendable {
     let kinds: [Int]
     let authors: [String]
     let limit: Int?
@@ -303,12 +350,26 @@ private struct NostrRelayMessage: Sendable {
     var event: NostrRelayEvent?
 }
 
-private struct NostrRelayEvent: Sendable {
+struct NostrRelayEvent: Sendable {
     let pubkey: String
     let createdAt: Int
     let kind: Int
     let tags: [[String]]
     let content: String
+
+    init(
+        pubkey: String,
+        createdAt: Int,
+        kind: Int,
+        tags: [[String]],
+        content: String
+    ) {
+        self.pubkey = pubkey
+        self.createdAt = createdAt
+        self.kind = kind
+        self.tags = tags
+        self.content = content
+    }
 
     init?(object: [String: Any]) {
         guard let pubkey = object["pubkey"] as? String,

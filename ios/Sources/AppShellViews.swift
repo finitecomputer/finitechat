@@ -175,7 +175,11 @@ struct PeopleView: View {
             .padding(.vertical, 16)
             .listRowSeparator(.hidden)
         } else if people.profiles.isEmpty {
-            ContentUnavailableView("No people yet", systemImage: "person.crop.circle.badge.questionmark")
+            ContentUnavailableView(
+                "No people yet",
+                systemImage: "person.crop.circle.badge.questionmark",
+                description: Text(people.statusText ?? "Pull to refresh.")
+            )
                 .padding(.vertical, 18)
                 .listRowSeparator(.hidden)
         } else if filteredProfiles.isEmpty {
