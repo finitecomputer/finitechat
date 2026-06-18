@@ -24,7 +24,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 hmac = "0.12"
 bech32 = "0.11"
