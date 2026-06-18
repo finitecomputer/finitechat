@@ -6,15 +6,12 @@ import UIKit
 import UniformTypeIdentifiers
 
 private enum AppSheet: Identifiable {
-    case newRoom
     case scan
     case invite
     case settings
 
     var id: String {
         switch self {
-        case .newRoom:
-            "new-room"
         case .scan:
             "scan"
         case .invite:
@@ -71,6 +68,9 @@ struct ContentView: View {
                             },
                             showScan: {
                                 sheet = .scan
+                            },
+                            showSettings: {
+                                sheet = .settings
                             }
                         )
                     }
@@ -89,6 +89,9 @@ struct ContentView: View {
                             },
                             showScan: {
                                 sheet = .scan
+                            },
+                            showSettings: {
+                                sheet = .settings
                             }
                         )
                     }
@@ -101,8 +104,6 @@ struct ContentView: View {
         }
         .sheet(item: $sheet) { destination in
             switch destination {
-            case .newRoom:
-                NewRoomSheet(model: model)
             case .scan:
                 ScanSheet(model: model)
             case .invite:
@@ -187,25 +188,6 @@ private struct RoomListView: View {
     var body: some View {
         List {
             Section {
-                ShellActionButtonGrid(columns: 3) {
-                    ShellActionButton(title: "New Room", systemImage: "square.and.pencil", primary: true) {
-                        present(.newRoom)
-                    }
-                    .accessibilityIdentifier("NewRoomButton")
-
-                    ShellActionButton(title: "Scan", systemImage: "qrcode.viewfinder") {
-                        present(.scan)
-                    }
-                    .accessibilityIdentifier("ScanButton")
-
-                    ShellActionButton(title: "Settings", systemImage: "gearshape") {
-                        present(.settings)
-                    }
-                    .accessibilityIdentifier("SettingsButton")
-                }
-            }
-
-            Section {
                 if model.rooms.isEmpty {
                     ContentUnavailableView("FiniteChat", systemImage: "bubble.left.and.bubble.right")
                         .padding(.vertical, 28)
@@ -233,8 +215,14 @@ private struct RoomListView: View {
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .navigationTitle("Chats")
+        .toolbar {
+            ShellToolbarActions(
+                showScan: { present(.scan) },
+                showSettings: { present(.settings) }
+            )
+        }
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .automatic),
@@ -1469,48 +1457,48 @@ private struct UnavailableOnDeviceView: View {
     }
 }
 
-private struct NewRoomSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                TextField("Room name", text: $model.roomDraft)
-                    .textInputAutocapitalization(.words)
-                    .accessibilityLabel("Room name")
-            }
-            .navigationTitle("New Room")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
-                        model.createRoom()
-                        dismiss()
-                    }
-                    .disabled(model.roomDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
-        }
-    }
-}
-
 private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    @State private var showingCameraScanner = false
 
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Invite URL or npub", text: $model.scanDraft, axis: .vertical)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .lineLimit(3...6)
-                    .accessibilityLabel("Invite URL or npub")
+                Section {
+                    if QRCodeScannerSheet.canUseCamera {
+                        Button {
+                            showingCameraScanner = true
+                        } label: {
+                            Label("Scan with Camera", systemImage: "qrcode.viewfinder")
+                        }
+                    }
+
+                    Button {
+                        model.scanDraft = UIPasteboard.general.string ?? ""
+                    } label: {
+                        Label("Paste", systemImage: "doc.on.clipboard")
+                    }
+
+                    TextField("Invite URL or npub", text: $model.scanDraft, axis: .vertical)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .lineLimit(3...6)
+                        .accessibilityLabel("Invite URL or npub")
+                } header: {
+                    Text("Invite or Profile Code")
+                }
+
+                Section {
+                    Label("Create New Finite Agent", systemImage: "sparkles")
+                        .foregroundStyle(.secondary)
+                    Label("Clawi, Maple, Codex, and Claude sessions", systemImage: "ellipsis.bubble")
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Agents")
+                } footer: {
+                    Text("Coming soon")
+                }
 
                 if let profile = model.activeProfile {
                     Section("Profile") {
@@ -1519,6 +1507,14 @@ private struct ScanSheet: View {
                 }
             }
             .navigationTitle("Scan")
+            .sheet(isPresented: $showingCameraScanner) {
+                QRCodeScannerSheet { value in
+                    model.scanDraft = value
+                    if model.scanTarget() {
+                        dismiss()
+                    }
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {

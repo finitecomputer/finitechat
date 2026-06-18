@@ -104,11 +104,11 @@ struct PeopleView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
     let showScan: () -> Void
+    let showSettings: () -> Void
 
     @StateObject private var people = NostrPeopleModel()
     @State private var searchText = ""
     @State private var selectedFollow: NostrFollowProfile?
-    @State private var showingManualLookup = false
     @State private var showingLookupProfile = false
 
     private var filteredProfiles: [NostrFollowProfile] {
@@ -124,11 +124,13 @@ struct PeopleView: View {
 
     var body: some View {
         List {
-            quickActionsSection
             followsSection
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .navigationTitle("People")
+        .toolbar {
+            ShellToolbarActions(showScan: showScan, showSettings: showSettings)
+        }
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .automatic),
@@ -139,11 +141,6 @@ struct PeopleView: View {
         }
         .refreshable {
             await people.refresh(identity: model.nostrIdentity)
-        }
-        .sheet(isPresented: $showingManualLookup) {
-            ManualNpubLookupSheet { value in
-                lookupProfile(value)
-            }
         }
         .sheet(item: $selectedFollow) { profile in
             NostrFollowProfileSheet(
@@ -164,30 +161,6 @@ struct PeopleView: View {
             } else {
                 ContentUnavailableView("Profile unavailable", systemImage: "person.crop.circle.badge.questionmark")
             }
-        }
-    }
-
-    private var quickActionsSection: some View {
-        Section {
-            ShellActionButtonGrid(columns: 2) {
-                ShellActionButton(title: "Enter Code", systemImage: "keyboard", primary: true) {
-                    showingManualLookup = true
-                }
-
-                ShellActionButton(title: "Paste", systemImage: "doc.on.clipboard") {
-                    lookupProfile(UIPasteboard.general.string ?? "")
-                }
-
-                ShellActionButton(title: "Scan", systemImage: "qrcode.viewfinder") {
-                    showScan()
-                }
-
-                ShellActionButton(title: "Refresh", systemImage: "arrow.clockwise") {
-                    Task { await people.refresh(identity: model.nostrIdentity) }
-                }
-                .disabled(people.isLoading || model.nostrIdentity == nil)
-            }
-            .padding(.vertical, 8)
         }
     }
 
@@ -255,6 +228,7 @@ struct AgentsView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
     let showScan: () -> Void
+    let showSettings: () -> Void
     @State private var searchText = ""
 
     private var agentRooms: [AppRoomSummary] {
@@ -276,20 +250,6 @@ struct AgentsView: View {
 
     var body: some View {
         List {
-            Section {
-                ShellActionButtonGrid(columns: 2) {
-                    ShellActionButton(title: "Create Agent", systemImage: "sparkles", primary: true) {
-                        createFiniteAgentRoom()
-                    }
-                    .accessibilityIdentifier("CreateFiniteAgentButton")
-
-                    ShellActionButton(title: "Scan Invite", systemImage: "qrcode.viewfinder") {
-                        showScan()
-                    }
-                }
-                .padding(.vertical, 8)
-            }
-
             Section("Agent Chats") {
                 if agentRooms.isEmpty {
                     ContentUnavailableView("No agent chats yet", systemImage: "sparkles")
@@ -320,28 +280,37 @@ struct AgentsView: View {
                     }
                 }
             }
-
-            Section("Coming Soon") {
-                AgentComingSoonRow(title: "Clawi Agent", systemImage: "terminal")
-                AgentComingSoonRow(title: "Maple Agent", systemImage: "leaf")
-                AgentComingSoonRow(title: "Codex Session", systemImage: "laptopcomputer")
-                AgentComingSoonRow(title: "Claude Session", systemImage: "text.bubble")
-            }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .navigationTitle("Agents")
+        .toolbar {
+            ShellToolbarActions(showScan: showScan, showSettings: showSettings)
+        }
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .automatic),
             prompt: "Search agents"
         )
     }
+}
 
-    private func createFiniteAgentRoom() {
-        model.roomDraft = "Finite Agent"
-        model.createRoom()
-        if let room = model.selectedRoom {
-            openRoom(room)
+struct ShellToolbarActions: ToolbarContent {
+    let showScan: () -> Void
+    let showSettings: () -> Void
+
+    var body: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button(action: showScan) {
+                Image(systemName: "qrcode.viewfinder")
+            }
+            .accessibilityLabel("Scan")
+            .accessibilityIdentifier("TopScanButton")
+
+            Button(action: showSettings) {
+                Image(systemName: "gearshape")
+            }
+            .accessibilityLabel("Settings")
+            .accessibilityIdentifier("TopSettingsButton")
         }
     }
 }
@@ -397,47 +366,6 @@ struct MyNostrProfileSheet: View {
                     Button("Done") {
                         dismiss()
                     }
-                }
-            }
-        }
-    }
-}
-
-private struct ManualNpubLookupSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var value = ""
-    let onLookup: (String) -> Void
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("npub1...", text: $value, axis: .vertical)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .lineLimit(3...6)
-
-                    Button {
-                        value = UIPasteboard.general.string ?? ""
-                    } label: {
-                        Label("Paste", systemImage: "doc.on.clipboard")
-                    }
-                }
-            }
-            .navigationTitle("Profile Code")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Lookup") {
-                        onLookup(value)
-                        dismiss()
-                    }
-                    .disabled(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }
@@ -653,55 +581,6 @@ private struct NostrAvatar: View {
     }
 }
 
-struct ShellActionButtonGrid<Content: View>: View {
-    let columns: Int
-    let content: Content
-
-    init(columns: Int, @ViewBuilder content: () -> Content) {
-        self.columns = columns
-        self.content = content()
-    }
-
-    var body: some View {
-        LazyVGrid(
-            columns: Array(
-                repeating: GridItem(.flexible(minimum: 88), spacing: 8),
-                count: max(1, columns)
-            ),
-            spacing: 8
-        ) {
-            content
-        }
-    }
-}
-
-struct ShellActionButton: View {
-    let title: String
-    let systemImage: String
-    var primary = false
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .font(.body.weight(.semibold))
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-            }
-            .frame(maxWidth: .infinity, minHeight: 58)
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(primary ? .white : .primary)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(primary ? Color.accentColor : Color(.tertiarySystemGroupedBackground))
-        )
-    }
-}
-
 private struct CopyableValueRow: View {
     let title: String
     let value: String
@@ -736,24 +615,6 @@ private struct CopyableValueRow: View {
             }
             .buttonStyle(.borderless)
             .accessibilityLabel(copiedField == title ? "Copied \(title)" : "Copy \(title)")
-        }
-    }
-}
-
-private struct AgentComingSoonRow: View {
-    let title: String
-    let systemImage: String
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: systemImage)
-                .frame(width: 32, height: 32)
-                .foregroundStyle(.secondary)
-            Text(title)
-            Spacer()
-            Text("Soon")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
         }
     }
 }
