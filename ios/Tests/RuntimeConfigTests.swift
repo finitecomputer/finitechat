@@ -1054,6 +1054,8 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(identityStore.load())
         XCTAssertNil(model.state)
         XCTAssertNil(model.runtimeStorePath)
+        XCTAssertEqual(model.serverURL, "https://chat.finite.computer")
+        XCTAssertEqual(model.deviceID, "ios")
     }
 
     func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {

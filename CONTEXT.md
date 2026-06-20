@@ -26,6 +26,11 @@ _Avoid_: Profile, account settings
 A shareable Room entry credential that lets another device request admission to a Room.
 _Avoid_: QR, link
 
+**Invite Availability**:
+An account-level readiness signal saying a Nostr account currently has Finite
+Chat invitation material available, so it can be invited to a Room.
+_Avoid_: Online, presence, device liveness, profile status
+
 **Pending Room**:
 A Room row created from a Scan Target before the local device can send messages in that Room.
 _Avoid_: Half-joined room, unfinalized room
@@ -142,6 +147,10 @@ _Avoid_: Unit fixture, row-level cleanup, transient diagnostics
   person are **Topics** inside a Room, or separate named Rooms — both legal.
 - A **Nostr Profile** describes an account, not an individual device.
 - A **Device List** belongs to an account and is where users revoke devices.
+- **Invite Availability** describes whether an account can be invited to a
+  **Room** now; it is not onlineness, presence, or device liveness.
+- **Invite Availability** is not a ranking or grouping category; it does not
+  change People list identity or ordering.
 - A **Pending Room** is a **Room** from the user's point of view, but its
   local device is still waiting for admission to complete.
 - **Unavailable on Device** is a repair state, not an expected product path; a

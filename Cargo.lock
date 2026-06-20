@@ -712,6 +712,7 @@ name = "finitechat-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "finitechat-blob",
  "finitechat-client",
  "finitechat-core",
  "finitechat-delivery",

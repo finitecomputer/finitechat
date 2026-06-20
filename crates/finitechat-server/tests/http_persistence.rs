@@ -16,22 +16,22 @@ use finitechat_http::{
     CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
     ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
-    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetLinkSessionRequest,
-    GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
-    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
-    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
-    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
-    InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
-    LeaveRoomRequest, LeaveRoomResponse, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
-    ListInviteJoinRequestsResponse, NostrProfileRecord, ObserveDeviceLivenessRequest,
-    PublishKeyPackageResponse, PublishMessageRequest, PushPlatform, PutNostrProfileRequest,
-    RegisterPushTokenRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
-    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
-    SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest, SyncHintEvent,
-    SyncStreamRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse, SyncWaitRoom,
-    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetInviteAvailabilityRequest,
+    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HttpApplicationDeliveryEffect, HttpClaimedWelcome,
+    HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
+    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, InviteJoinStatusRequest, InviteJoinStatusResponse,
+    KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
+    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileRecord,
+    ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest, PushPlatform,
+    PutNostrProfileRequest, RegisterPushTokenRequest, ReleaseLinkClaimRequest,
+    ReleaseLinkClaimResponse, RemovePushTokenRequest, RemovePushTokenResponse,
+    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RespondInviteJoinRequest,
+    RevokeDeviceRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
+    SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse,
+    SyncWaitRoom, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
@@ -320,6 +320,99 @@ async fn sqlite_key_package_claim_uses_route_owner_and_preserves_opaque_payload(
     assert_eq!(response.status(), StatusCode::OK);
     let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
     assert_eq!(claimed, None);
+}
+
+#[tokio::test]
+async fn sqlite_invite_availability_batches_accounts_without_claiming_key_packages() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new(String::from_utf8(vec![b'a'; 64]).unwrap(), "phone");
+    let bob = DeviceRef::new(String::from_utf8(vec![b'b'; 64]).unwrap(), "phone");
+    let carol = DeviceRef::new(String::from_utf8(vec![b'c'; 64]).unwrap(), "phone");
+    let dave = DeviceRef::new(String::from_utf8(vec![b'd'; 64]).unwrap(), "phone");
+
+    let alice_owner = member_for_device(&alice);
+    let carol_owner = member_for_device(&carol);
+    let dave_owner = member_for_device(&dave);
+
+    let app = persistent_app(&db_path);
+    for publication in [
+        key_package_publication("kp-alice-available", alice_owner.clone(), b"alice"),
+        key_package_publication("kp-carol-claimed", carol_owner.clone(), b"carol"),
+        key_package_publication("kp-dave-revoked", dave_owner.clone(), b"dave"),
+    ] {
+        assert_eq!(
+            post_json(app.clone(), "/key-packages", &publication)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim",
+        &ClaimKeyPackageRequest {
+            owner: carol_owner.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert!(claimed.is_some());
+    revoke_device(&app, &dave).await;
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/invite-availability",
+        &GetInviteAvailabilityRequest {
+            account_ids: vec![
+                alice.account_id.clone(),
+                bob.account_id.clone(),
+                carol.account_id.clone(),
+                dave.account_id.clone(),
+            ],
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let availability: GetInviteAvailabilityResponse = read_json(response).await;
+    assert_eq!(
+        availability
+            .accounts
+            .into_iter()
+            .map(|entry| (entry.account_id, entry.available))
+            .collect::<Vec<_>>(),
+        vec![
+            (alice.account_id.clone(), true),
+            (bob.account_id.clone(), false),
+            (carol.account_id.clone(), false),
+            (dave.account_id.clone(), false),
+        ]
+    );
+
+    assert_inventory(app.clone(), alice_owner.clone(), 1, 0).await;
+    assert_inventory(app.clone(), carol_owner, 0, 1).await;
+    assert_inventory(app, dave_owner, 1, 0).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/key-packages/invite-availability",
+        &GetInviteAvailabilityRequest {
+            account_ids: vec![alice.account_id.clone(), dave.account_id.clone()],
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let availability: GetInviteAvailabilityResponse = read_json(response).await;
+    assert_eq!(
+        availability
+            .accounts
+            .into_iter()
+            .map(|entry| (entry.account_id, entry.available))
+            .collect::<Vec<_>>(),
+        vec![(alice.account_id, true), (dave.account_id, false)]
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,12 @@
 import Foundation
 import SwiftUI
 
+enum InviteAvailability: String, Equatable, Sendable {
+    case unknown
+    case available
+    case unavailable
+}
+
 struct NostrFollowProfile: Identifiable, Equatable, Sendable {
     let pubkey: String
     let npub: String
@@ -9,6 +15,27 @@ struct NostrFollowProfile: Identifiable, Equatable, Sendable {
     let about: String?
     let pictureURL: String?
     let relayHint: String?
+    let inviteAvailability: InviteAvailability
+
+    init(
+        pubkey: String,
+        npub: String,
+        name: String?,
+        username: String?,
+        about: String?,
+        pictureURL: String?,
+        relayHint: String?,
+        inviteAvailability: InviteAvailability = .unknown
+    ) {
+        self.pubkey = pubkey
+        self.npub = npub
+        self.name = name
+        self.username = username
+        self.about = about
+        self.pictureURL = pictureURL
+        self.relayHint = relayHint
+        self.inviteAvailability = inviteAvailability
+    }
 
     var id: String { pubkey }
 
@@ -38,6 +65,19 @@ struct NostrFollowProfile: Identifiable, Equatable, Sendable {
         guard npub.count > 18 else { return npub }
         return "\(npub.prefix(10))...\(npub.suffix(4))"
     }
+
+    func withInviteAvailability(_ availability: InviteAvailability) -> NostrFollowProfile {
+        NostrFollowProfile(
+            pubkey: pubkey,
+            npub: npub,
+            name: name,
+            username: username,
+            about: about,
+            pictureURL: pictureURL,
+            relayHint: relayHint,
+            inviteAvailability: availability
+        )
+    }
 }
 
 struct NostrFollowFetchResult: Equatable, Sendable {
@@ -49,36 +89,50 @@ struct NostrFollowFetchResult: Equatable, Sendable {
 final class NostrPeopleModel: ObservableObject {
     @Published private(set) var profiles: [NostrFollowProfile] = []
     @Published private(set) var isLoading = false
+    @Published private(set) var isCheckingInviteAvailability = false
     @Published private(set) var statusText: String?
 
     private let service: NostrRelayProfileService
+    private let inviteAvailabilityService: FiniteInviteAvailabilityService
     private var lastLoadedAccountID: String?
+    private var lastLoadedServerURL: String?
 
-    init(service: NostrRelayProfileService = NostrRelayProfileService()) {
+    init(
+        service: NostrRelayProfileService = NostrRelayProfileService(),
+        inviteAvailabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService()
+    ) {
         self.service = service
+        self.inviteAvailabilityService = inviteAvailabilityService
     }
 
     @MainActor
-    func loadIfNeeded(identity: AppNostrIdentity?) async {
+    func loadIfNeeded(identity: AppNostrIdentity?, serverURL: String) async {
         guard let identity else {
             profiles = []
             statusText = nil
             lastLoadedAccountID = nil
+            lastLoadedServerURL = nil
             return
         }
-        guard lastLoadedAccountID != identity.accountID || profiles.isEmpty else { return }
-        await refresh(identity: identity)
+        guard lastLoadedAccountID != identity.accountID
+            || lastLoadedServerURL != serverURL
+            || profiles.isEmpty
+        else { return }
+        await refresh(identity: identity, serverURL: serverURL)
     }
 
     @MainActor
-    func refresh(identity: AppNostrIdentity?) async {
+    func refresh(identity: AppNostrIdentity?, serverURL: String) async {
         guard let identity else { return }
         lastLoadedAccountID = identity.accountID
+        lastLoadedServerURL = serverURL
         isLoading = true
+        defer { isLoading = false }
         statusText = nil
         do {
             let result = try await service.fetchFollowProfiles(forAccountID: identity.accountID)
             profiles = result.profiles
+            await refreshInviteAvailability(serverURL: serverURL)
             if result.followedPubkeyCount == 0 {
                 statusText = "No follows found on the configured Nostr relays."
             } else {
@@ -90,7 +144,141 @@ final class NostrPeopleModel: ObservableObject {
             profiles = []
             statusText = "Could not load follows: \(error.localizedDescription)"
         }
-        isLoading = false
+    }
+
+    @MainActor
+    func recheckInviteAvailability(
+        for profile: NostrFollowProfile,
+        serverURL: String
+    ) async throws -> NostrFollowProfile {
+        let availability = try await inviteAvailabilityService.fetchAvailability(
+            serverURL: serverURL,
+            accountIDs: [profile.pubkey]
+        )
+        let nextAvailability: InviteAvailability = availability[profile.pubkey] == true
+            ? .available
+            : .unavailable
+        let updated = profile.withInviteAvailability(nextAvailability)
+        if let index = profiles.firstIndex(where: { $0.pubkey == profile.pubkey }) {
+            profiles[index] = profiles[index].withInviteAvailability(nextAvailability)
+            return profiles[index]
+        }
+        return updated
+    }
+
+    @MainActor
+    private func refreshInviteAvailability(serverURL: String) async {
+        let accountIDs = profiles.map(\.pubkey)
+        guard !accountIDs.isEmpty else { return }
+        isCheckingInviteAvailability = true
+        defer { isCheckingInviteAvailability = false }
+        do {
+            let availability = try await inviteAvailabilityService.fetchAvailability(
+                serverURL: serverURL,
+                accountIDs: accountIDs
+            )
+            profiles = profiles.map { profile in
+                let nextAvailability: InviteAvailability = availability[profile.pubkey] == true
+                    ? .available
+                    : .unavailable
+                return profile.withInviteAvailability(nextAvailability)
+            }
+        } catch {
+            // Leave rows in the neutral unknown state. A failed availability
+            // check is not evidence that a person lacks invite material.
+        }
+    }
+}
+
+final class FiniteInviteAvailabilityService: Sendable {
+    typealias AvailabilityLoader = @Sendable (
+        _ serverURL: String,
+        _ accountIDs: [String]
+    ) async throws -> [String: Bool]
+
+    private let chunkSize: Int
+    private let availabilityLoader: AvailabilityLoader
+
+    init(
+        chunkSize: Int = 100,
+        availabilityLoader: @escaping AvailabilityLoader = { serverURL, accountIDs in
+            try await FiniteInviteAvailabilityService.fetchAvailabilityFromServer(
+                serverURL: serverURL,
+                accountIDs: accountIDs
+            )
+        }
+    ) {
+        self.chunkSize = max(1, chunkSize)
+        self.availabilityLoader = availabilityLoader
+    }
+
+    func fetchAvailability(serverURL: String, accountIDs: [String]) async throws -> [String: Bool] {
+        let normalized = accountIDs.compactMap { accountID -> String? in
+            let trimmed = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !normalized.isEmpty else { return [:] }
+        var availability: [String: Bool] = [:]
+        for chunk in normalized.chunked(into: chunkSize) {
+            let chunkAvailability = try await availabilityLoader(serverURL, chunk)
+            availability.merge(chunkAvailability) { _, new in new }
+        }
+        return availability
+    }
+
+    private static func fetchAvailabilityFromServer(
+        serverURL: String,
+        accountIDs: [String]
+    ) async throws -> [String: Bool] {
+        let trimmedServerURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL = URL(string: trimmedServerURL) else {
+            throw InviteAvailabilityError.invalidServerURL
+        }
+        let url = baseURL.appendingPathComponent("key-packages/invite-availability")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try JSONEncoder().encode(
+            InviteAvailabilityRequestBody(accountIDs: accountIDs)
+        )
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode)
+        else {
+            throw InviteAvailabilityError.serverRejected
+        }
+        let decoded = try JSONDecoder().decode(InviteAvailabilityResponseBody.self, from: data)
+        return Dictionary(uniqueKeysWithValues: decoded.accounts.map { account in
+            (account.accountID, account.available)
+        })
+    }
+}
+
+private enum InviteAvailabilityError: Error {
+    case invalidServerURL
+    case serverRejected
+}
+
+private struct InviteAvailabilityRequestBody: Encodable {
+    let accountIDs: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case accountIDs = "account_ids"
+    }
+}
+
+private struct InviteAvailabilityResponseBody: Decodable {
+    let accounts: [InviteAvailabilityAccountBody]
+}
+
+private struct InviteAvailabilityAccountBody: Decodable {
+    let accountID: String
+    let available: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case available
     }
 }
 
@@ -132,18 +320,23 @@ final class NostrRelayProfileService: Sendable {
     }
 
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
-        let contacts = await fetchContacts(forAccountID: accountID)
+        let contactRelays = await contactListRelays(forAccountID: accountID)
+        let contacts = await fetchContacts(forAccountID: accountID, relays: contactRelays)
         let followed = contacts.values.sorted { left, right in
             left.pubkey < right.pubkey
         }
         guard !followed.isEmpty else {
             return NostrFollowFetchResult(
                 profiles: [],
-                relayCount: relays.count,
+                relayCount: contactRelays.count,
                 followedPubkeyCount: 0
             )
         }
-        let metadata = await fetchMetadata(forPubkeys: followed.map(\.pubkey))
+        let metadataRelays = mergedRelays(relays + followed.compactMap(\.relayHint))
+        let metadata = await fetchMetadata(
+            forPubkeys: followed.map(\.pubkey),
+            relays: metadataRelays
+        )
         let profiles = followed.compactMap { contact -> NostrFollowProfile? in
             guard let npub = try? npubFromAccountId(accountId: contact.pubkey) else { return nil }
             let profile = metadata[contact.pubkey]
@@ -167,15 +360,43 @@ final class NostrRelayProfileService: Sendable {
         }
         return NostrFollowFetchResult(
             profiles: profiles,
-            relayCount: relays.count,
+            relayCount: contactRelays.count,
             followedPubkeyCount: followed.count
         )
     }
 
-    private func fetchContacts(forAccountID accountID: String) async -> [String: NostrContact] {
+    private func contactListRelays(forAccountID accountID: String) async -> [String] {
+        let normalizedAccountID = accountID.lowercased()
+        let filter = NostrRelayFilter(kinds: [10_002], authors: [normalizedAccountID], limit: 1)
+        let events = await fetchEvents(
+            filter: filter,
+            subscriptionPrefix: "finite-relays",
+            relays: relays
+        )
+        guard let latest = events
+            .filter({ $0.kind == 10_002 && $0.pubkey.lowercased() == normalizedAccountID })
+            .max(by: { $0.createdAt < $1.createdAt })
+        else {
+            return relays
+        }
+
+        let writeRelays = latest.tags.compactMap { tag -> String? in
+            guard tag.count >= 2, tag[0] == "r" else { return nil }
+            let marker = tag.count >= 3 ? tag[2].lowercased() : ""
+            guard marker.isEmpty || marker == "write" else { return nil }
+            return tag[1].nostrNonEmptyTrimmed
+        }
+        return mergedRelays(relays + writeRelays)
+    }
+
+    private func fetchContacts(forAccountID accountID: String, relays: [String]) async -> [String: NostrContact] {
         let normalizedAccountID = accountID.lowercased()
         let filter = NostrRelayFilter(kinds: [3], authors: [normalizedAccountID], limit: 1)
-        let events = await fetchEvents(filter: filter, subscriptionPrefix: "finite-contacts")
+        let events = await fetchEvents(
+            filter: filter,
+            subscriptionPrefix: "finite-contacts",
+            relays: relays
+        )
         guard let latest = events
             .filter({ $0.kind == 3 && $0.pubkey.lowercased() == normalizedAccountID })
             .max(by: { $0.createdAt < $1.createdAt })
@@ -193,11 +414,15 @@ final class NostrRelayProfileService: Sendable {
         return contacts
     }
 
-    private func fetchMetadata(forPubkeys pubkeys: [String]) async -> [String: NostrProfileMetadata] {
+    private func fetchMetadata(forPubkeys pubkeys: [String], relays: [String]) async -> [String: NostrProfileMetadata] {
         var metadata: [String: NostrProfileMetadata] = [:]
         for chunk in pubkeys.chunked(into: 80) {
             let filter = NostrRelayFilter(kinds: [0], authors: chunk, limit: chunk.count)
-            let events = await fetchEvents(filter: filter, subscriptionPrefix: "finite-profiles")
+            let events = await fetchEvents(
+                filter: filter,
+                subscriptionPrefix: "finite-profiles",
+                relays: relays
+            )
             for event in events where event.kind == 0 {
                 guard Self.isHexPubkey(event.pubkey) else { continue }
                 let pubkey = event.pubkey.lowercased()
@@ -210,7 +435,8 @@ final class NostrRelayProfileService: Sendable {
 
     private func fetchEvents(
         filter: NostrRelayFilter,
-        subscriptionPrefix: String
+        subscriptionPrefix: String,
+        relays: [String]
     ) async -> [NostrRelayEvent] {
         await withTaskGroup(of: [NostrRelayEvent].self) { group in
             for relay in relays {
@@ -235,6 +461,19 @@ final class NostrRelayProfileService: Sendable {
         }
     }
 
+    private func mergedRelays(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var merged: [String] = []
+        for value in values {
+            guard let relay = value.nostrNonEmptyTrimmed else { continue }
+            let key = relay.lowercased()
+            guard !seen.contains(key), URL(string: relay) != nil else { continue }
+            seen.insert(key)
+            merged.append(relay)
+        }
+        return merged
+    }
+
     private static func fetchEventsFromRelay(
         from relay: String,
         filter: NostrRelayFilter,
@@ -242,7 +481,12 @@ final class NostrRelayProfileService: Sendable {
         timeoutNanoseconds: UInt64
     ) async throws -> [NostrRelayEvent] {
         guard let url = URL(string: relay) else { return [] }
-        let task = URLSession.shared.webSocketTask(with: url)
+        let configuration = URLSessionConfiguration.ephemeral
+        let timeoutSeconds = max(1, Double(timeoutNanoseconds) / 1_000_000_000)
+        configuration.timeoutIntervalForRequest = timeoutSeconds
+        configuration.timeoutIntervalForResource = timeoutSeconds
+        let session = URLSession(configuration: configuration)
+        let task = session.webSocketTask(with: url)
         let subscriptionID = "\(subscriptionPrefix)-\(UUID().uuidString)"
         let filterData = try JSONEncoder().encode(filter)
         let filterObject = try JSONSerialization.jsonObject(with: filterData)
@@ -253,8 +497,13 @@ final class NostrRelayProfileService: Sendable {
         task.resume()
         defer {
             task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
         }
-        try await task.send(.string(message))
+        try await sendWithTimeout(
+            task,
+            message: message,
+            timeoutNanoseconds: timeoutNanoseconds
+        )
 
         var events: [NostrRelayEvent] = []
         while !Task.isCancelled {
@@ -285,6 +534,27 @@ final class NostrRelayProfileService: Sendable {
         return events
     }
 
+    private static func sendWithTimeout(
+        _ task: URLSessionWebSocketTask,
+        message: String,
+        timeoutNanoseconds: UInt64
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await task.send(.string(message))
+            }
+            group.addTask { [timeoutNanoseconds] in
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                task.cancel(with: .goingAway, reason: nil)
+                throw NostrRelayTimeout()
+            }
+            defer { group.cancelAll() }
+            guard let _ = try await group.next() else {
+                throw NostrRelayTimeout()
+            }
+        }
+    }
+
     private static func receiveWithTimeout(
         _ task: URLSessionWebSocketTask,
         timeoutNanoseconds: UInt64
@@ -295,12 +565,13 @@ final class NostrRelayProfileService: Sendable {
             }
             group.addTask { [timeoutNanoseconds] in
                 try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                task.cancel(with: .goingAway, reason: nil)
                 throw NostrRelayTimeout()
             }
+            defer { group.cancelAll() }
             guard let first = try await group.next() else {
                 throw NostrRelayTimeout()
             }
-            group.cancelAll()
             return first
         }
     }

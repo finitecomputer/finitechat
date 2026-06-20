@@ -26,23 +26,23 @@ pub use finitechat_http::{
     ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
     FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetLinkSessionRequest,
-    GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest, HealthResponse,
-    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
-    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
-    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
-    InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
-    LeaveRoomRequest, LeaveRoomResponse, ListAccountRoomDirectoryRequest,
-    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
-    ListInviteJoinRequestsResponse, NostrProfileCacheEntry, NostrProfileRecord,
-    ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest,
-    PushTokenRecord, PutNostrProfileRequest, PutNostrProfileResponse, RegisterPushTokenRequest,
-    RegisterPushTokenResponse, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
-    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
-    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
-    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse, UpdateRoomAdminsRequest,
-    UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest,
+    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
+    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
+    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, InviteAvailabilityEntry, InviteJoinStatusRequest,
+    InviteJoinStatusResponse, KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
+    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileCacheEntry,
+    NostrProfileRecord, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
+    PublishMessageRequest, PushTokenRecord, PutNostrProfileRequest, PutNostrProfileResponse,
+    RegisterPushTokenRequest, RegisterPushTokenResponse, ReleaseLinkClaimRequest,
+    ReleaseLinkClaimResponse, RemovePushTokenRequest, RemovePushTokenResponse,
+    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RespondInviteJoinRequest,
+    RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
+    SubmitInviteJoinRequest, SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
@@ -72,6 +72,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
+const MAX_INVITE_AVAILABILITY_BATCH: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
 const MAX_NOSTR_PROFILE_BATCH: usize = 64;
 const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
 const MAX_NOSTR_PROFILE_ABOUT_BYTES: usize = 4 * 1024;
@@ -716,6 +717,44 @@ impl HttpServerState {
             }
         }
         Ok(GetNostrProfilesResponse { profiles: response })
+    }
+
+    fn get_invite_availability(
+        &self,
+        request: GetInviteAvailabilityRequest,
+    ) -> Result<GetInviteAvailabilityResponse, ServerHttpError> {
+        validate_invite_availability_batch(&request.account_ids)?;
+        let requested: BTreeSet<&str> = request.account_ids.iter().map(String::as_str).collect();
+        let revoked_devices = self.revoked_devices.lock().expect("HTTP device mutex");
+        let inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let mut available_accounts = BTreeSet::<String>::new();
+        for record in inventory.values() {
+            if record.state != KeyPackageInventoryState::Available {
+                continue;
+            }
+            let Some(device) = finite_device_for_member_id(&record.owner) else {
+                continue;
+            };
+            if !requested.contains(device.account_id.as_str()) {
+                continue;
+            }
+            if revoked_devices.contains(&DeviceMembership::key(&device)) {
+                continue;
+            }
+            available_accounts.insert(device.account_id);
+        }
+        let accounts = request
+            .account_ids
+            .into_iter()
+            .map(|account_id| InviteAvailabilityEntry {
+                available: available_accounts.contains(&account_id),
+                account_id,
+            })
+            .collect();
+        Ok(GetInviteAvailabilityResponse { accounts })
     }
 
     fn device_active_in_any_room(&self, device: &DeviceRef) -> bool {
@@ -2923,6 +2962,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/devices/liveness/get", post(get_device_liveness))
         .route("/profiles/nostr", post(put_nostr_profile))
         .route("/profiles/nostr/get", post(get_nostr_profiles))
+        .route(
+            "/key-packages/invite-availability",
+            post(get_invite_availability),
+        )
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
@@ -3193,6 +3236,14 @@ async fn get_nostr_profiles(
     Json(request): Json<GetNostrProfilesRequest>,
 ) -> Result<Json<GetNostrProfilesResponse>, ServerHttpError> {
     let response = state.get_nostr_profiles(request)?;
+    Ok(Json(response))
+}
+
+async fn get_invite_availability(
+    State(state): State<HttpServerState>,
+    Json(request): Json<GetInviteAvailabilityRequest>,
+) -> Result<Json<GetInviteAvailabilityResponse>, ServerHttpError> {
+    let response = state.get_invite_availability(request)?;
     Ok(Json(response))
 }
 
@@ -5480,6 +5531,19 @@ fn validate_nostr_profile_batch(account_ids: &[String]) -> Result<(), ServerHttp
     Ok(())
 }
 
+fn validate_invite_availability_batch(account_ids: &[String]) -> Result<(), ServerHttpError> {
+    if account_ids.is_empty() || account_ids.len() > MAX_INVITE_AVAILABILITY_BATCH {
+        return Err(ServerHttpError::InvalidInviteAvailabilityBatch {
+            actual: account_ids.len(),
+            max: MAX_INVITE_AVAILABILITY_BATCH,
+        });
+    }
+    for account_id in account_ids {
+        validate_invite_availability_account_id(account_id)?;
+    }
+    Ok(())
+}
+
 fn validate_nostr_account_id(account_id: &str) -> Result<(), ServerHttpError> {
     if account_id.len() != 64
         || !account_id
@@ -5488,6 +5552,19 @@ fn validate_nostr_account_id(account_id: &str) -> Result<(), ServerHttpError> {
     {
         return Err(ServerHttpError::InvalidNostrProfileRequest {
             reason: "profile.account_id must be 64 lowercase hex characters".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_invite_availability_account_id(account_id: &str) -> Result<(), ServerHttpError> {
+    if account_id.len() != 64
+        || !account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ServerHttpError::InvalidInviteAvailabilityRequest {
+            reason: "invite_availability.account_id must be 64 lowercase hex characters".to_owned(),
         });
     }
     Ok(())
@@ -6129,6 +6206,13 @@ pub enum ServerHttpError {
         actual: usize,
         max: usize,
     },
+    InvalidInviteAvailabilityRequest {
+        reason: String,
+    },
+    InvalidInviteAvailabilityBatch {
+        actual: usize,
+        max: usize,
+    },
     DeviceNotActive {
         device: DeviceRef,
     },
@@ -6364,6 +6448,18 @@ impl IntoResponse for ServerHttpError {
                 "invalid_nostr_profile_batch".to_owned(),
                 format!(
                     "Nostr profile batch must contain between 1 and {max} accounts, got {actual}"
+                ),
+            ),
+            Self::InvalidInviteAvailabilityRequest { reason } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_invite_availability_request".to_owned(),
+                reason,
+            ),
+            Self::InvalidInviteAvailabilityBatch { actual, max } => (
+                StatusCode::BAD_REQUEST,
+                "invalid_invite_availability_batch".to_owned(),
+                format!(
+                    "Invite availability batch must contain between 1 and {max} accounts, got {actual}"
                 ),
             ),
             Self::DeviceNotActive { device } => (

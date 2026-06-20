@@ -26,6 +26,7 @@ FINITE_PLATFORM_NAME = "finite"
 DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
 DEFAULT_ACTIVITY_REFRESH_SECS = 30.0
+ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 1000
 
 
 def check_requirements() -> bool:
@@ -77,7 +78,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         )
         self._poll_task: asyncio.Task | None = None
         self._finitechat_cmd = _resolve_finitechat_command(str(extra.get("finitechat_bin") or ""))
-        self._activity_conversation_by_room: dict[str, str | None] = {}
+        self._finitechat_lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         if not self.home:
@@ -87,6 +88,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             logger.error("[finite] finitechat CLI is not configured")
             return False
 
+        await self._recover_interrupted_turns()
         await self._surface_invite()
         self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
@@ -119,6 +121,15 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 f"{result.data.get('pin_window_seconds') or 30}s): {pin}",
                 flush=True,
             )
+
+    async def _recover_interrupted_turns(self) -> None:
+        result = await self._finitechat_json("recover", {}, timeout=60)
+        if not result.ok:
+            logger.warning("[finite] could not recover interrupted turns: %s", result.error)
+            return
+        recovered = result.data.get("recovered") or 0
+        if recovered:
+            logger.info("[finite] recovered %s interrupted Hermes turn(s)", recovered)
 
     async def disconnect(self) -> None:
         if self._poll_task:
@@ -174,18 +185,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        room_id = self._room_id(chat_id)
-        self._activity_conversation_by_room[room_id] = self._conversation_id(
-            self._message_metadata(metadata)
-        )
         payload = self._activity_payload(chat_id, metadata, action="set")
         await self._finitechat_json("activity", payload, timeout=15)
 
     async def stop_typing(self, chat_id: str) -> None:
-        room_id = self._room_id(chat_id)
-        conversation_id = self._activity_conversation_by_room.pop(room_id, None)
-        metadata = {"thread_id": conversation_id} if conversation_id else None
-        payload = self._activity_payload(chat_id, metadata, action="clear")
+        payload = self._activity_payload(chat_id, None, action="clear")
         await self._finitechat_json("activity", payload, timeout=15)
 
     async def _keep_typing(
@@ -299,9 +303,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def _poll_loop(self) -> None:
         while self.is_connected:
+            timeout_millis = self.poll_timeout_secs * 1000
+            if self._has_active_turn():
+                timeout_millis = min(timeout_millis, ACTIVE_TURN_POLL_TIMEOUT_MILLIS)
             payload: dict[str, Any] = {
                 "limit": self.poll_limit,
-                "timeout_millis": self.poll_timeout_secs * 1000,
+                "timeout_millis": timeout_millis,
             }
             if self.room_id:
                 payload["room_id"] = self.room_id
@@ -371,6 +378,14 @@ class FiniteChatAdapter(BasePlatformAdapter):
             internal=bool(raw_event.get("internal") or False),
         )
         await self.handle_message(event)
+        if isinstance(seq, int):
+            ack = await self._finitechat_json(
+                "ack",
+                {"room_id": room_id, "seq": seq, "message_id": message_id},
+                timeout=15,
+            )
+            if not ack.ok:
+                logger.warning("[finite] failed to ack %s/%s: %s", room_id, seq, ack.error)
 
     async def _send_media(
         self,
@@ -398,8 +413,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
         meta = self._message_metadata(metadata)
         conversation_id = self._conversation_id(meta)
         attachments = meta.pop("attachments", [])
-        kind = str(meta.pop("_finitechat_kind", "media" if attachments else "message"))
-        status = str(meta.pop("_finitechat_status", "complete"))
+        explicit_kind = meta.pop("_finitechat_kind", None)
+        explicit_status = meta.pop("_finitechat_status", None)
+        kind = str(explicit_kind or ("media" if attachments else _infer_finitechat_kind(content)))
+        status = str(explicit_status or _infer_finitechat_status(content))
         return {
             "room_id": self._room_id(chat_id),
             "conversation_id": conversation_id,
@@ -418,16 +435,19 @@ class FiniteChatAdapter(BasePlatformAdapter):
         *,
         action: str,
     ) -> dict[str, Any]:
-        meta = self._message_metadata(metadata)
         return {
             "room_id": self._room_id(chat_id),
-            "conversation_id": self._conversation_id(meta),
+            "conversation_id": None,
             "activity_kind": "working",
             "activity_id": None,
             "action": action,
             "payload": None,
             "expires_in_millis": 60 * 1000,
         }
+
+    def _has_active_turn(self) -> bool:
+        active_sessions = getattr(self, "_active_sessions", None)
+        return bool(active_sessions)
 
     def _room_id(self, chat_id: str | None) -> str:
         return str(chat_id or self.room_id).strip() or self.room_id
@@ -460,15 +480,16 @@ class FiniteChatAdapter(BasePlatformAdapter):
             command += ["--home", self.home]
         command += [action, "--json"]
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                env=os.environ.copy(),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             stdin = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
-            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
+            async with self._finitechat_lock:
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
+                    env=os.environ.copy(),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
         except TimeoutError:
             return _FiniteChatResult(False, {}, "finitechat timed out", True)
         except FileNotFoundError as exc:
@@ -553,6 +574,22 @@ def _message_type(raw: str, media_types: list[str]) -> MessageType:
     if first.startswith("audio/"):
         return MessageType.AUDIO
     return MessageType.DOCUMENT
+
+
+def _infer_finitechat_kind(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return "message"
+    if text == "Hermes is working":
+        return "status"
+    first_line = text.splitlines()[0].lstrip()
+    if first_line.startswith(("⚙", "🔧", "🛠", "🔍", "🔎", "📖", "💻", "🌐", "⚡")):
+        return "tool"
+    return "message"
+
+
+def _infer_finitechat_status(content: str) -> str:
+    return "running" if "▉" in str(content or "") else "complete"
 
 
 def _local_attachment(path: str, kind: str) -> dict[str, Any]:

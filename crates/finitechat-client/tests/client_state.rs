@@ -1034,7 +1034,7 @@ fn runtime_removed_device_processes_removal_but_not_future_http_ciphertext() {
     assert_eq!(bob_post_page.entries.len(), 1);
     assert!(matches!(
         stale_charlie.decrypt_application_entry(room_id, &bob_post_page.entries[0]),
-        Err(ClientError::ProcessMessage)
+        Err(ClientError::ProcessMessage { .. })
     ));
     let stale_future_page = delivery
         .sync_events(room_id, stale_charlie.device_ref(), remove_acceptance.seq)
@@ -2843,6 +2843,7 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
     let home_report =
         run_runtime_sync_tick(&mut bob_store, &mut bob, &mut delivery, &options).unwrap();
     assert!(home_report.applied_entries.is_empty());
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
     let room_report = run_room_server_sync_tick(
         &mut bob_store,
         &mut bob,
@@ -2856,6 +2857,90 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
         room_report.applied_entries[0].entry,
         AppliedLogEntry::Application {
             plaintext: b"hello from your agent".to_vec(),
+            sender: agent.device_ref().clone(),
+        }
+    );
+
+    let bob_receipt = bob
+        .create_application_request(ROOM_ID, b"read receipt from phone", "phone_receipt_1")
+        .unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    delivery
+        .append_event(
+            &bob_receipt,
+            DurableAppEventKind::ChatReceipt.delivery_policy(),
+        )
+        .unwrap();
+    let bob_media = bob
+        .create_application_request(ROOM_ID, b"media from phone", "phone_media_1")
+        .unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    delivery
+        .append_event(
+            &bob_media,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
+    let mut agent = agent_store.load_device(agent_config.clone()).unwrap();
+    let agent_report =
+        run_runtime_sync_tick(&mut agent_store, &mut agent, &mut delivery, &options).unwrap();
+    assert_eq!(agent_report.applied_entries.len(), 2);
+
+    // Hermes bridge sends are separate CLI invocations: each send opens the
+    // encrypted store, creates one MLS application message, saves, and exits.
+    // The sender ratchet must survive that round trip or the next send reuses
+    // an MLS generation and recipients reject it with SecretReuseError.
+    let mut agent = agent_store.load_device(agent_config.clone()).unwrap();
+    let second_message = agent
+        .create_application_request(
+            ROOM_ID,
+            b"second hello from your agent",
+            "app_invite_hello_2",
+        )
+        .unwrap();
+    agent_store.save_device_state(&agent).unwrap();
+    delivery
+        .append_event(
+            &second_message,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
+    let mut agent = agent_store.load_device(agent_config.clone()).unwrap();
+    let third_message = agent
+        .create_application_request(
+            ROOM_ID,
+            b"third hello from your agent",
+            "app_invite_hello_3",
+        )
+        .unwrap();
+    agent_store.save_device_state(&agent).unwrap();
+    delivery
+        .append_event(
+            &third_message,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
+    let mut bob = bob_store.load_device(bob_config.clone()).unwrap();
+    let room_report = run_room_server_sync_tick(
+        &mut bob_store,
+        &mut bob,
+        &mut delivery,
+        &options,
+        room_server_url,
+    )
+    .unwrap();
+    assert_eq!(room_report.applied_entries.len(), 2);
+    assert_eq!(
+        room_report.applied_entries[0].entry,
+        AppliedLogEntry::Application {
+            plaintext: b"second hello from your agent".to_vec(),
+            sender: agent.device_ref().clone(),
+        }
+    );
+    assert_eq!(
+        room_report.applied_entries[1].entry,
+        AppliedLogEntry::Application {
+            plaintext: b"third hello from your agent".to_vec(),
             sender: agent.device_ref().clone(),
         }
     );

@@ -1584,7 +1584,9 @@ impl FiniteChatDevice {
                 provider,
                 protocol_message_from_bytes(&entry.envelope.payload)?,
             )
-            .map_err(|_| ClientError::ProcessMessage)?;
+            .map_err(|error| ClientError::ProcessMessage {
+                reason: format!("{error:?}"),
+            })?;
         let ProcessedMessageContent::StagedCommitMessage(staged_commit) = processed.into_content()
         else {
             return Err(ClientError::UnexpectedMessage);
@@ -2312,7 +2314,9 @@ impl FiniteChatDevice {
                 provider,
                 protocol_message_from_bytes(&entry.envelope.payload)?,
             )
-            .map_err(|_| ClientError::ProcessMessage)?;
+            .map_err(|error| ClientError::ProcessMessage {
+                reason: format!("{error:?}"),
+            })?;
         let credential = FiniteDeviceCredentialV1::from_credential(processed.credential().clone())?;
         let sender = DeviceRef {
             account_id: hex_lower(credential.account_public_key().as_bytes()),
@@ -5539,8 +5543,8 @@ pub enum ClientError {
     CreateApplicationMessage,
     #[error("failed to parse protocol message")]
     ParseProtocolMessage,
-    #[error("failed to process MLS message")]
-    ProcessMessage,
+    #[error("failed to process MLS message: {reason}")]
+    ProcessMessage { reason: String },
     #[error("unexpected MLS message content")]
     UnexpectedMessage,
     #[error("group already exists: {0}")]

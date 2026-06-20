@@ -11,6 +11,7 @@ name = "finitechat"
 path = "src/main.rs"
 
 [dependencies]
+finitechat-blob = { path = "../finitechat-blob" }
 finitechat-transport.workspace = true
 finitechat-client = { path = "../finitechat-client" }
 finitechat-core = { path = "../finitechat-core" }

@@ -360,6 +360,7 @@ final class AppModel: ObservableObject {
     private let nostrIdentityStore: AppNostrIdentityStoring
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
+    private var postSendCatchUpTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
     private var lastTypingIntentByRoom: [String: Bool] = [:]
@@ -369,6 +370,7 @@ final class AppModel: ObservableObject {
     deinit {
         updateTask?.cancel()
         launchAutomationTask?.cancel()
+        postSendCatchUpTask?.cancel()
     }
 
     init(
@@ -532,6 +534,9 @@ final class AppModel: ObservableObject {
         if let configStorageURL {
             try? FileManager.default.removeItem(at: configStorageURL)
         }
+        let resetConfig = RuntimeConfig.load(args: args, storageURL: configStorageURL)
+        serverURL = resetConfig.serverURL
+        deviceID = resetConfig.deviceID
         nostrIdentity = nil
         requiresNostrLogin = true
         errorText = nil
@@ -688,6 +693,7 @@ final class AppModel: ObservableObject {
         let sent = dispatch(action)
         if sent {
             outboundText = ""
+            schedulePostSendCatchUp()
         }
         return sent
     }
@@ -733,6 +739,7 @@ final class AppModel: ObservableObject {
                 errorText = nil
                 onSuccess?()
                 restartUpdateLoopIfEnabled()
+                schedulePostSendCatchUp()
             } catch {
                 errorText = String(describing: error)
             }
@@ -774,6 +781,7 @@ final class AppModel: ObservableObject {
                 errorText = nil
                 onSuccess?()
                 restartUpdateLoopIfEnabled()
+                schedulePostSendCatchUp()
             } catch {
                 errorText = String(describing: error)
             }
@@ -928,13 +936,15 @@ final class AppModel: ObservableObject {
         updateTask = Task { [weak self, runtime, runtimeKey] in
             while !Task.isCancelled {
                 do {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled else { return }
                     let nextState = try await Task.detached(priority: .background) {
-                        try runtime.waitForUpdate(timeoutMillis: 30_000)
+                        try runtime.dispatch(action: .startRuntime)
                     }.value
                     guard !Task.isCancelled else { return }
                     guard let self, self.openKey == runtimeKey else { return }
                     self.state = nextState
-                    self.appendDiagnostic(category: "runtime", event: "update.received")
+                    self.appendDiagnostic(category: "runtime", event: "update.polled")
                     self.errorText = nil
                 } catch {
                     guard !Task.isCancelled else { return }
@@ -987,6 +997,36 @@ final class AppModel: ObservableObject {
     private func restartUpdateLoopIfEnabled() {
         if startsUpdateLoop {
             startUpdateLoop()
+        }
+    }
+
+    private func schedulePostSendCatchUp() {
+        postSendCatchUpTask?.cancel()
+        guard runtime != nil else { return }
+        let runtimeKey = openKey
+        postSendCatchUpTask = Task { [weak self, runtimeKey] in
+            for delay in [1_000_000_000, 3_000_000_000, 6_000_000_000, 12_000_000_000] as [UInt64] {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled else { return }
+                guard let self, self.openKey == runtimeKey else { return }
+                do {
+                    let runtime = try currentRuntime()
+                    let nextState = try await Task.detached(priority: .utility) {
+                        try runtime.dispatch(action: .startRuntime)
+                    }.value
+                    guard !Task.isCancelled, openKey == runtimeKey else { return }
+                    state = nextState
+                    errorText = nil
+                    appendDiagnostic(category: "runtime", event: "post_send_catchup.succeeded")
+                    restartUpdateLoopIfEnabled()
+                } catch {
+                    appendDiagnostic(
+                        category: "runtime",
+                        event: "post_send_catchup.failed",
+                        details: diagnosticErrorDetails(error)
+                    )
+                }
+            }
         }
     }
 
@@ -1063,8 +1103,10 @@ final class AppModel: ObservableObject {
     private func closeRuntime() {
         updateTask?.cancel()
         launchAutomationTask?.cancel()
+        postSendCatchUpTask?.cancel()
         updateTask = nil
         launchAutomationTask = nil
+        postSendCatchUpTask = nil
         attachmentDownloadsInFlight.removeAll()
         messageRetriesInFlight.removeAll()
         lastTypingIntentByRoom.removeAll()

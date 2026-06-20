@@ -247,7 +247,8 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
             guard !visibleIDs.isEmpty else { return false }
 
             var snapshot = dataSource.snapshot()
-            snapshot.reconfigureItems(visibleIDs)
+            snapshot.reloadItems(visibleIDs)
+            collectionView?.collectionViewLayout.invalidateLayout()
             dataSource.apply(snapshot, animatingDifferences: false) {
                 completion?()
             }

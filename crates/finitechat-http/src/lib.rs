@@ -229,6 +229,22 @@ pub struct GetNostrProfilesResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetInviteAvailabilityRequest {
+    pub account_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteAvailabilityEntry {
+    pub account_id: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetInviteAvailabilityResponse {
+    pub accounts: Vec<InviteAvailabilityEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimKeyPackageRequest {
     pub owner: MemberId,
 }

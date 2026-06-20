@@ -270,6 +270,7 @@ material while room removals fan out.
 KeyPackages:
 
 - `POST /v1/key-packages`
+- `POST /v1/key-packages/invite-availability`
 - `GET /v1/devices/{account_id}/{device_id}/key-packages/inventory`
 - `POST /v1/key-packages/claim`
 - `POST /v1/accounts/{account_id}/key-packages/claim`
@@ -298,6 +299,14 @@ device for the target account, ordered deterministically by device id and
 KeyPackage id. This is the invite primitive for multi-device users: the server
 routes packages to devices, but the adding client still verifies every
 Nostr-rooted MLS credential before constructing the Commit.
+
+Invite availability is a read-only batch projection over account KeyPackage
+inventory. Given account ids, the home server returns whether each account has
+at least one available KeyPackage for a non-revoked device. It never returns
+device ids, KeyPackage ids, or KeyPackage bytes, and it never claims or leases
+inventory. Product UI uses this to distinguish people who can currently be
+invited to a Room from Nostr follows who do not yet have Finite Chat invite
+material.
 
 Device fanout claim returns one available KeyPackage for a specific target
 device, ordered deterministically by KeyPackage id. The runtime link-fanout

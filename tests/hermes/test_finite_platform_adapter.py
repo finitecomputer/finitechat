@@ -221,7 +221,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(payload["attachments"][0]["kind"], "file")
         self.assertEqual(payload["attachments"][0]["mime_type"], "application/pdf")
 
-    def test_poll_event_maps_room_to_chat_and_conversation_to_thread(self):
+    def test_poll_event_maps_room_to_chat_and_conversation_to_thread_then_acks(self):
         adapter = self.adapter()
         calls = []
 
@@ -271,21 +271,27 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.source.chat_topic, "Builds")
         self.assertEqual(event.media_urls, ["/tmp/screenshot.png"])
         self.assertEqual(event.reply_to_message_id, "msg-11")
-        # The CLI owns the durable cursor; the adapter never acks.
-        self.assertEqual(calls, [])
+        self.assertEqual(calls[-1][0], "ack")
+        self.assertEqual(
+            calls[-1][1],
+            {"room_id": "room-agent-1", "seq": 12, "message_id": "msg-12"},
+        )
 
     def test_room_filter_drops_other_rooms_but_unfiltered_serves_all(self):
         filtered = self.adapter(room_id="room-agent-1")
-        filtered._finitechat_json = self._record_json([])
+        filtered_calls = []
+        filtered._finitechat_json = self._record_json(filtered_calls)
         asyncio.run(
             filtered._handle_finitechat_event(
                 {"room_id": "other-room", "seq": 1, "message_id": "msg-1", "text": "nope"}
             )
         )
         self.assertEqual(filtered.handled_messages, [])
+        self.assertEqual(filtered_calls, [])
 
         unfiltered = self.adapter(room_id=None)
-        unfiltered._finitechat_json = self._record_json([])
+        unfiltered_calls = []
+        unfiltered._finitechat_json = self._record_json(unfiltered_calls)
         asyncio.run(
             unfiltered._handle_finitechat_event(
                 {"room_id": "any-room", "seq": 2, "message_id": "msg-2", "text": "hello"}
@@ -293,6 +299,11 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(unfiltered.handled_messages), 1)
         self.assertEqual(unfiltered.handled_messages[0].source.chat_id, "any-room")
+        self.assertEqual(unfiltered_calls[0][0], "ack")
+        self.assertEqual(
+            unfiltered_calls[0][1],
+            {"room_id": "any-room", "seq": 2, "message_id": "msg-2"},
+        )
 
     def test_home_is_required_and_room_is_optional(self):
         self.assertTrue(
@@ -339,6 +350,37 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
         return fake_json
 
+    def test_send_infers_tool_status_when_hermes_metadata_is_missing(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            return self.module._FiniteChatResult(True, {"message_id": "tool-1"}, None, False)
+
+        adapter._finitechat_json = fake_json
+        result = asyncio.run(adapter.send("room-agent-1", "💻 shell\ncargo test ▉"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls[0][0], "send")
+        self.assertEqual(calls[0][1]["kind"], "tool")
+        self.assertEqual(calls[0][1]["status"], "running")
+
+    def test_send_infers_status_kind_for_working_message(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            return self.module._FiniteChatResult(True, {"message_id": "status-1"}, None, False)
+
+        adapter._finitechat_json = fake_json
+        result = asyncio.run(adapter.send("room-agent-1", "Hermes is working"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls[0][1]["kind"], "status")
+        self.assertEqual(calls[0][1]["status"], "complete")
+
     def test_typing_activity_uses_ephemeral_bridge_not_status_messages(self):
         adapter = self.adapter()
         calls = []
@@ -353,11 +395,66 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
         self.assertEqual(calls[0][0], "activity")
         self.assertEqual(calls[0][1]["action"], "set")
-        self.assertEqual(calls[0][1]["conversation_id"], "topic-build")
+        self.assertIsNone(calls[0][1]["conversation_id"])
         self.assertEqual(calls[0][1]["expires_in_millis"], 60 * 1000)
         self.assertEqual(calls[1][0], "activity")
         self.assertEqual(calls[1][1]["action"], "clear")
-        self.assertEqual(calls[1][1]["conversation_id"], "topic-build")
+        self.assertIsNone(calls[1][1]["conversation_id"])
+
+    def test_poll_loop_uses_short_poll_while_agent_turn_is_active(self):
+        adapter = self.adapter()
+        adapter._mark_connected()
+        adapter._active_sessions = {"room-agent-1": asyncio.Event()}
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            adapter._mark_disconnected()
+            return self.module._FiniteChatResult(True, {"events": []}, None, False)
+
+        adapter._finitechat_json = fake_json
+        asyncio.run(adapter._poll_loop())
+
+        self.assertEqual(calls[0][0], "poll")
+        self.assertEqual(
+            calls[0][1]["timeout_millis"],
+            self.module.ACTIVE_TURN_POLL_TIMEOUT_MILLIS,
+        )
+
+    def test_finitechat_json_serializes_cli_access_per_adapter(self):
+        adapter = self.adapter()
+        original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+        active = 0
+        max_active = 0
+
+        class FakeProcess:
+            returncode = 0
+
+            async def communicate(self, stdin):
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.01)
+                active -= 1
+                return b'{"accepted":true}', b""
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return FakeProcess()
+
+        async def run_calls():
+            return await asyncio.gather(
+                adapter._finitechat_json("poll", {}, timeout=5),
+                adapter._finitechat_json("send", {"text": "hello"}, timeout=5),
+            )
+
+        try:
+            self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+            results = asyncio.run(run_calls())
+        finally:
+            self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+        self.assertEqual([result.ok for result in results], [True, True])
+        self.assertEqual(max_active, 1)
 
 
 if __name__ == "__main__":

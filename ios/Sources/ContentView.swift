@@ -495,12 +495,6 @@ private struct RoomThreadView: View {
         .onAppear {
             if let room {
                 model.openRoom(room)
-                model.markRoomRead(room)
-            }
-        }
-        .onChange(of: latestMessageID) {
-            if let room {
-                model.markRoomRead(room)
             }
         }
         .fileImporter(

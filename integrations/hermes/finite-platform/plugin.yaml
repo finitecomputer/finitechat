@@ -16,6 +16,6 @@ requires_env:
       store, and stored invites).
 optional_env:
   - name: FINITECHAT_BIN
-    description: Path to the finitechat binary (default: found on PATH).
+    description: "Path to the finitechat binary (default: found on PATH)."
   - name: FINITECHAT_ROOM_ID
-    description: Optional room filter; by default all invited rooms are served.
+    description: "Optional room filter; by default all invited rooms are served."

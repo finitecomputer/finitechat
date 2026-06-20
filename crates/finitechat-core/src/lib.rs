@@ -31,10 +31,12 @@ use finitechat_proto::{
     AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1,
     CreateRoomRequest, DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DeviceRef,
     DurableAppEventKind, EphemeralActivityActionV1, EphemeralActivityIngressContext,
-    EphemeralActivityProjection, EphemeralActivityProjectionEntry, FINITECHAT_ACTIVITY_KIND_TYPING,
-    GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
-    MAX_OBJECT_ID_BYTES, RoomProtocol, RuntimeActivityClearV1, invite_current_pin, npub_decode,
-    npub_encode, nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
+    EphemeralActivityProjection, EphemeralActivityProjectionEntry,
+    FINITECHAT_ACTIVITY_KIND_THINKING, FINITECHAT_ACTIVITY_KIND_TYPING,
+    FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest,
+    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, RoomProtocol, RuntimeActivityClearV1,
+    invite_current_pin, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
+    validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -805,7 +807,7 @@ impl FiniteChatRuntime {
 }
 
 impl AppRuntimeState {
-    fn new(core: CoreState) -> Result<Self, FiniteChatCoreError> {
+    fn new(mut core: CoreState) -> Result<Self, FiniteChatCoreError> {
         let identity = core.identity();
         let owner = core.device.device_ref().clone();
         let stored_messages = core
@@ -816,12 +818,29 @@ impl AppRuntimeState {
             .store
             .load_app_events(&owner, MAX_APP_MESSAGES_U32)
             .map_err(store_error)?;
+        let delivered_local_messages = stored_messages
+            .iter()
+            .filter(|message| message.sender == owner)
+            .map(|message| (message.room_id.clone(), message.message_id.clone()))
+            .collect::<BTreeSet<_>>();
         let chat_projection =
             ChatProjectionState::from_stored(stored_messages, stored_events, &owner);
         let stored_outbox = core.store.load_app_outbox(&owner).map_err(store_error)?;
+        let mut visible_outbox = Vec::new();
+        for message in stored_outbox {
+            if delivered_local_messages
+                .contains(&(message.room_id.clone(), message.message_id.clone()))
+            {
+                core.store
+                    .delete_app_outbox_message(&owner, &message.room_id, &message.message_id)
+                    .map_err(store_error)?;
+            } else {
+                visible_outbox.push(message);
+            }
+        }
         let mut chat_projection = chat_projection;
         chat_projection.append_messages(
-            stored_outbox
+            visible_outbox
                 .into_iter()
                 .filter_map(|message| chat_message_from_outbox(message, &owner))
                 .collect(),
@@ -1019,7 +1038,10 @@ impl AppRuntimeState {
     fn start_runtime(&mut self) -> Result<(), FiniteChatCoreError> {
         match self.runtime_tick() {
             Ok(()) => Ok(()),
-            Err(FiniteChatCoreError::Delivery { .. }) => {
+            Err(error @ FiniteChatCoreError::Delivery { .. }) => {
+                if std::env::var_os("FINITECHAT_DEBUG_START_RUNTIME_DELIVERY").is_some() {
+                    eprintln!("finitechat start_runtime delivery error: {error:?}");
+                }
                 self.app.status = "offline".to_owned();
                 self.app.toast = Some("Showing saved chats. Connection will retry.".to_owned());
                 Ok(())
@@ -2314,7 +2336,7 @@ impl AppRuntimeState {
             .entries()
             .filter(|entry| connected_rooms.contains(entry.room_id.as_str()))
             .filter(|entry| entry.conversation_id.is_none())
-            .filter(|entry| entry.activity_kind == FINITECHAT_ACTIVITY_KIND_TYPING)
+            .filter(|entry| is_chat_live_indicator_activity(&entry.activity_kind))
             .filter(|entry| entry.sender != *owner)
             .map(|entry| typing_member_from_activity(entry, &self.profile_cache))
             .collect::<Vec<_>>();
@@ -3073,7 +3095,11 @@ impl CoreState {
             reason: "sent chat message did not project as a transcript row".to_owned(),
         })?;
         self.persist_chat_messages_and_events(std::slice::from_ref(&message))?;
-        let mut result = self.sync()?;
+        let mut result = match self.sync() {
+            Ok(result) => result,
+            Err(FiniteChatCoreError::Delivery { .. }) => SyncResult::default(),
+            Err(error) => return Err(error),
+        };
         result.messages.insert(0, message);
         Ok(result)
     }
@@ -3367,6 +3393,10 @@ impl CoreState {
                 MAX_APP_MESSAGES_U32,
             )
             .map_err(store_error)?;
+        match self.sync() {
+            Ok(_) | Err(FiniteChatCoreError::Delivery { .. }) => {}
+            Err(error) => return Err(error),
+        }
         Ok(event)
     }
 
@@ -4240,6 +4270,12 @@ fn typing_member_from_activity(
         display_name: sender_display_name(&entry.sender, profile_name, false),
         npub,
     }
+}
+
+fn is_chat_live_indicator_activity(activity_kind: &str) -> bool {
+    activity_kind == FINITECHAT_ACTIVITY_KIND_TYPING
+        || activity_kind == FINITECHAT_ACTIVITY_KIND_THINKING
+        || activity_kind == FINITECHAT_ACTIVITY_KIND_WORKING
 }
 
 fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Option<ChatMessage> {
@@ -6369,6 +6405,78 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_projects_hermes_working_as_live_indicator_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let hermes = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("hermes").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "hermes-agent".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch(AppAction::CreateRoom {
+                display_name: "Hermes Room".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state.rooms.first().unwrap().room_id.clone();
+        let invite = alice
+            .dispatch(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .unwrap();
+        hermes
+            .dispatch(AppAction::ScanTarget {
+                value: invite.invite_url,
+            })
+            .unwrap();
+        hermes
+            .dispatch(AppAction::SubmitInvitePin {
+                pending_room_id: room_id.clone(),
+                pin: invite.pin,
+            })
+            .unwrap();
+        alice.dispatch(AppAction::StartRuntime).unwrap();
+        hermes.dispatch(AppAction::StartRuntime).unwrap();
+
+        append_test_activity(
+            &hermes,
+            &room_id,
+            FINITECHAT_ACTIVITY_KIND_WORKING,
+            EphemeralActivityActionV1::Set,
+        );
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(alice_state.typing_members.len(), 1);
+        assert_eq!(alice_state.typing_members[0].room_id, room_id);
+        assert_eq!(alice_state.typing_members[0].device_id, "hermes-agent");
+
+        append_test_activity(
+            &hermes,
+            &room_id,
+            FINITECHAT_ACTIVITY_KIND_WORKING,
+            EphemeralActivityActionV1::Clear,
+        );
+        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            alice_state.typing_members.is_empty(),
+            "Hermes working clears should remove the live indicator"
+        );
+    }
+
+    #[test]
     fn app_start_runtime_returns_durable_chat_when_delivery_is_offline() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -6645,6 +6753,10 @@ mod tests {
             .expect("undelivered local message projects immediately")
             .message_id
             .clone();
+        let stale_outbox_row = runtime_outbox(&offline)
+            .into_iter()
+            .find(|message| message.message_id == local_message_id)
+            .expect("offline send should persist the outbox row");
         drop(offline);
 
         let reopened = FiniteChatRuntime::open(OpenOptions {
@@ -6673,18 +6785,35 @@ mod tests {
         let accepted = accepted_messages[0];
         assert_eq!(accepted.message_id, local_message_id);
         assert_outbound_delivered(accepted);
+        assert!(
+            runtime_outbox(&reopened).is_empty(),
+            "successful drain removes the exact undelivered outbox row"
+        );
+        {
+            let mut state = reopened.state.lock().unwrap();
+            let owner = state.core.device.device_ref().clone();
+            state
+                .core
+                .store
+                .save_app_outbox(&owner, std::slice::from_ref(&stale_outbox_row))
+                .unwrap();
+        }
+        assert_eq!(
+            runtime_outbox(&reopened).len(),
+            1,
+            "test setup should recreate the stale accepted outbox row observed in the demo"
+        );
         drop(reopened);
 
-        let persisted = FiniteChatRuntime::open(OpenOptions {
+        let persisted_runtime = FiniteChatRuntime::open(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
         })
-        .unwrap()
-        .state()
         .unwrap();
+        let persisted = persisted_runtime.state().unwrap();
         let persisted_message = persisted
             .messages
             .iter()
@@ -6692,6 +6821,10 @@ mod tests {
             .expect("accepted retry survives force-close reopen");
         assert_eq!(persisted_message.message_id, local_message_id);
         assert_outbound_delivered(persisted_message);
+        assert!(
+            runtime_outbox(&persisted_runtime).is_empty(),
+            "force-close reopen deletes stale outbox rows once the same local message id is delivered"
+        );
     }
 
     #[test]
@@ -9193,6 +9326,50 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    fn append_test_activity(
+        runtime: &FiniteChatRuntime,
+        room_id: &str,
+        activity_kind: &str,
+        action: EphemeralActivityActionV1,
+    ) {
+        let state = runtime.state.lock().unwrap();
+        let now_ms = state.core.now_millis().unwrap();
+        let is_set = matches!(action, EphemeralActivityActionV1::Set);
+        let activity = DecryptedEphemeralActivityV1 {
+            activity_kind: activity_kind.to_owned(),
+            activity_id: None,
+            action,
+            payload: if is_set {
+                br#"{}"#.to_vec()
+            } else {
+                Vec::new()
+            },
+        };
+        activity.validate_limits().unwrap();
+        let plaintext = serde_json::to_vec(&activity).unwrap();
+        let request = AppendEphemeralActivityRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: state.core.device.room_mls_group_id(room_id).unwrap(),
+            epoch: state.core.device.group_epoch(room_id).unwrap(),
+            sender: state.core.device.device_ref().clone(),
+            conversation_id: None,
+            payload: state
+                .core
+                .device
+                .encrypt_activity_payload(room_id, &plaintext)
+                .unwrap(),
+            received_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(
+                GenericActivityKindV1::from_activity_kind(activity_kind)
+                    .map(|kind| kind.recommended_expiry_millis())
+                    .unwrap_or(60_000),
+            ),
+        };
+        let room_server_url = state.core.room_server_url(room_id);
+        let mut delivery = delivery_for(&room_server_url);
+        delivery.append_activity(&request).unwrap();
     }
 
     fn spawn_live_http_server(path: impl AsRef<Path>) -> String {

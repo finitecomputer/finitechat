@@ -10,8 +10,11 @@ use finitechat_client::{
 };
 use finitechat_core::{AppAction, AppRoomState, ChatMediaKind, FiniteChatRuntime, OpenOptions};
 use finitechat_hermes::{HermesMessagePayloadV1, HermesMessageStatusV1, HermesSendKindV1};
+use finitechat_http::GetEphemeralActivitiesRequest;
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{DurableAppEventKind, InviteCodeV1, invite_current_pin};
+use finitechat_proto::{
+    DecryptedEphemeralActivityV1, DurableAppEventKind, InviteCodeV1, invite_current_pin,
+};
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,6 +56,22 @@ fn hermes(args: &[&str]) -> Value {
         .unwrap_or_else(|error| panic!("hermes {args:?} failed: {error}"));
     serde_json::from_slice(&output)
         .unwrap_or_else(|error| panic!("hermes {args:?} produced invalid JSON: {error}"))
+}
+
+fn hermes_ack(home_arg: &str, event: &Value) -> Value {
+    hermes(&[
+        "hermes",
+        "--home",
+        home_arg,
+        "ack",
+        "--request-json",
+        &json!({
+            "room_id": event["room_id"].clone(),
+            "seq": event["seq"].clone(),
+            "message_id": event["message_id"].clone(),
+        })
+        .to_string(),
+    ])
 }
 
 fn now_ms() -> u64 {
@@ -213,6 +232,65 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let payload = HermesMessagePayloadV1::decode(plaintext).unwrap().unwrap();
     assert_eq!(payload.text, "hello from your agent");
 
+    // A running Hermes message is tracked locally and recovered after a
+    // gateway restart as a final edit on the same visible bubble.
+    let running_send = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "working on it ▉",
+            "kind": "tool",
+            "status": "running",
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
+    let running_message_id = running_send["message_id"].as_str().unwrap().to_owned();
+    let recovered = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "recover",
+        "--request-json",
+        "{}",
+    ]);
+    assert_eq!(recovered["recovered"], 1);
+    let recovered_again = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "recover",
+        "--request-json",
+        "{}",
+    ]);
+    assert_eq!(recovered_again["recovered"], 0);
+    let report = finitechat_client::run_room_server_sync_tick(
+        &mut user_store,
+        &mut user,
+        &mut user_delivery,
+        &options,
+        &server_url,
+    )
+    .unwrap();
+    let recovered_payload = report
+        .applied_entries
+        .iter()
+        .find_map(|entry| match &entry.entry {
+            AppliedLogEntry::Application { plaintext, .. } => {
+                let payload = HermesMessagePayloadV1::decode(plaintext).unwrap()?;
+                (payload.edit_of.as_deref() == Some(running_message_id.as_str())).then_some(payload)
+            }
+            _ => None,
+        })
+        .expect("recovery edit payload");
+    assert_eq!(recovered_payload.status, HermesMessageStatusV1::Complete);
+    assert!(recovered_payload.text.contains("gateway restarted"));
+
     // The user replies; the bridge polls it out with the authenticated
     // sender identity.
     let reply = HermesMessagePayloadV1 {
@@ -251,6 +329,35 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         user.device_ref().account_id
     );
     assert_eq!(events[0]["source"]["user_name"], "Paul");
+    let first_inbound = events[0].clone();
+
+    let redelivered = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":0}"#,
+    ]);
+    let redelivered_events = redelivered["events"].as_array().unwrap();
+    assert_eq!(redelivered_events.len(), 1);
+    assert_eq!(
+        redelivered_events[0]["message_id"],
+        first_inbound["message_id"]
+    );
+    assert_eq!(redelivered_events[0]["text"], "hi agent");
+
+    let ack = hermes_ack(&home_arg, &first_inbound);
+    assert_eq!(ack["acked"], true);
+    let after_ack = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":0}"#,
+    ]);
+    assert_eq!(after_ack["events"].as_array().unwrap().len(), 0);
 
     // The iOS app sends ordinary UTF-8 chat text, not a Hermes JSON
     // envelope. The bridge still surfaces it as an authenticated inbound
@@ -280,6 +387,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     );
     assert_eq!(events[0]["source"]["user_id_alt"], "user_phone");
     assert_eq!(events[0]["source"]["user_name"], Value::Null);
+    hermes_ack(&home_arg, &events[0]);
 
     // Streaming edit finalization lands as a new payload superseding the
     // original message id.
@@ -339,6 +447,22 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         &activity_request.to_string(),
     ]);
     assert_eq!(activity["accepted"], true);
+
+    let records = user_delivery
+        .get_ephemeral_activities(&GetEphemeralActivitiesRequest {
+            room_id: code.room_id.clone(),
+            conversation_id: None,
+            requester: user.device_ref().clone(),
+            now_ms: now_ms(),
+        })
+        .unwrap()
+        .records;
+    assert_eq!(records.len(), 1);
+    let plaintext = user
+        .decrypt_activity_payload(&code.room_id, &records[0].payload)
+        .expect("joined user decrypts Hermes activity");
+    let projected: DecryptedEphemeralActivityV1 = serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(projected.activity_kind, "working");
 }
 
 #[test]
@@ -452,6 +576,17 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
             .unwrap()
             .contains("/blobs/")
     );
+    let materialized_path = hermes_attachment["path"]
+        .as_str()
+        .expect("Hermes poll materializes blob attachment to a local path");
+    assert!(materialized_path.starts_with(&home_arg));
+    assert_eq!(
+        std::fs::read(materialized_path).unwrap(),
+        b"finitechat encrypted media fixture"
+    );
+
+    let mut returned_attachment = hermes_attachment;
+    returned_attachment["path"] = Value::Null;
 
     hermes(&[
         "hermes",
@@ -465,7 +600,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
             "text": "agent media",
             "kind": "media",
             "status": "complete",
-            "attachments": [hermes_attachment],
+            "attachments": [returned_attachment],
             "reply_to_message_id": null,
         })
         .to_string(),

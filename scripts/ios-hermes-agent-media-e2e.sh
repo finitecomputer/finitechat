@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Real iOS Simulator + real pip hermes-agent + finite-platform plugin.
+# Real iOS Simulator + real pip hermes-agent package + finite-platform plugin.
 # The app joins the agent invite, sends an image attachment with a caption,
 # then receives agent text and image replies.
+# This test installs an echo set_message_handler callback. It proves adapter
+# transport/media wiring through iOS, not real Hermes gateway/model behavior.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

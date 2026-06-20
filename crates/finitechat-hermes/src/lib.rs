@@ -102,6 +102,7 @@ pub enum HermesAttachmentKindV1 {
 #[serde(rename_all = "snake_case")]
 pub enum HermesSendKindV1 {
     Message,
+    Status,
     Tool,
     Media,
 }
@@ -110,6 +111,7 @@ impl HermesSendKindV1 {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "message" => Some(Self::Message),
+            "status" => Some(Self::Status),
             "tool" => Some(Self::Tool),
             "media" => Some(Self::Media),
             _ => None,
@@ -961,6 +963,25 @@ mod tests {
         assert!(!request.metadata.contains_key(HERMES_METADATA_THREAD_ID));
         assert!(!request.metadata.contains_key(HERMES_METADATA_KIND));
         assert!(!request.metadata.contains_key(HERMES_METADATA_STATUS));
+    }
+
+    #[test]
+    fn send_request_accepts_status_kind() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            HERMES_METADATA_KIND.to_string(),
+            Value::String("status".to_string()),
+        );
+
+        let request = HermesSendRequestV1::from_hermes_send(
+            "room-agent-1",
+            "Hermes is working",
+            None::<String>,
+            metadata,
+        )
+        .expect("status kind is valid");
+
+        assert_eq!(request.kind, HermesSendKindV1::Status);
     }
 
     #[test]
