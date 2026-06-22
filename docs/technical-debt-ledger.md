@@ -279,10 +279,9 @@ Landed before and during the first product-state harness slice:
 - Native iOS now has a Nostr sign-in/create gate backed by Rust-owned
   `nsec`/`npub` material, a keychain identity store, destructive sign-out that
   deletes the local product store/config, and a Home-first shell with a
-  floating intention composer. Chats, People, and Agents remain the persistent
-  native tabs; on iOS 26 the New/Home action is hosted as a system
-  `tabViewBottomAccessory` glass button rather than a custom tab bar. The
-  People tab fetches follows/profile metadata from
+  floating intention composer. Chats, People, Agents, and New are native
+  `TabView` items; selecting New routes to the Home surface instead of using a
+  custom tab bar. The People tab fetches follows/profile metadata from
   the same Nostr relays Pika used, checks batched server-backed Invite
   Availability from Finite Chat KeyPackage inventory, dims follows without
   available invite material, and exposes profile-code copy/share/lookup

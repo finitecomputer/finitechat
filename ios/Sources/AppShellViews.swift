@@ -317,9 +317,13 @@ private struct HomeIntentionComposer: View {
 
                 Spacer()
 
-                Image(systemName: "mic")
-                    .font(.title3.weight(.regular))
-                    .frame(width: 34, height: 34)
+                Button {
+                } label: {
+                    Image(systemName: "mic")
+                        .font(.title3.weight(.regular))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Circle())
+                }
                 .accessibilityLabel("Voice message")
 
                 if canSubmit {

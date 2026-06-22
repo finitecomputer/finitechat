@@ -95,10 +95,9 @@ iOS UI:
   as vector SwiftUI geometry, a floating glass intention composer, and compact
   suggestion chips for "Message someone" and "Chat with Agent" directly above
   the composer so those suggestions can later become type/speech-driven.
-- Chats, People, and Agents use native SwiftUI `TabView` navigation. On iOS
-  26+, the New action is a native `tabViewBottomAccessory` glass-prominent
-  button instead of a custom/fake tab bar; older OS versions fall back to a
-  bordered-prominent bottom inset action.
+- Chats, People, Agents, and New use native SwiftUI `TabView` navigation. The
+  New tab is a real fourth tab item that routes to the Home surface rather than
+  a custom/fake tab bar or separate accessory.
 - The app icon is now supplied by `Sources/Assets.xcassets/AppIcon.appiconset`
   and configured through XcodeGen's
   `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon`.

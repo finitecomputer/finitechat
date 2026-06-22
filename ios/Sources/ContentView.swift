@@ -78,32 +78,7 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
     private var tabbedShell: some View {
-        if #available(iOS 26.0, *) {
-            secondaryTabView
-                .tabBarMinimizeBehavior(.onScrollDown)
-                .tabViewBottomAccessory {
-                    NewTabAccessory(selectedTab: $selectedTab)
-                }
-        } else {
-            secondaryTabView
-                .safeAreaInset(edge: .bottom) {
-                    Button {
-                        selectedTab = .home
-                    } label: {
-                        Label(AppTab.home.title, systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.large)
-                    .padding(.bottom, 8)
-                    .accessibilityIdentifier("BottomNavigationNewButton")
-                }
-        }
-    }
-
-    private var secondaryTabView: some View {
         TabView(selection: $selectedTab) {
             chatsStack
                 .tabItem {
@@ -122,6 +97,13 @@ struct ContentView: View {
                     Label(AppTab.agents.title, systemImage: AppTab.agents.systemImage)
                 }
                 .tag(AppTab.agents)
+
+            Color.clear
+                .accessibilityHidden(true)
+                .tabItem {
+                    Label(AppTab.home.title, systemImage: AppTab.home.systemImage)
+                }
+                .tag(AppTab.home)
         }
     }
 
@@ -198,28 +180,6 @@ struct ContentView: View {
                     sheet = .settings
                 }
             )
-        }
-    }
-
-    @available(iOS 26.0, *)
-    private struct NewTabAccessory: View {
-        @Binding var selectedTab: AppTab
-        @Environment(\.tabViewBottomAccessoryPlacement) private var placement
-
-        var body: some View {
-            Button {
-                selectedTab = .home
-            } label: {
-                if placement == .inline {
-                    Image(systemName: "plus")
-                } else {
-                    Label(AppTab.home.title, systemImage: "plus")
-                }
-            }
-            .buttonStyle(.glassProminent)
-            .controlSize(.large)
-            .accessibilityLabel(AppTab.home.title)
-            .accessibilityIdentifier("BottomNavigationNewButton")
         }
     }
 
