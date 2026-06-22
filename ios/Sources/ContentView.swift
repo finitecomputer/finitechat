@@ -24,7 +24,7 @@ private enum AppSheet: Identifiable {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
-    @State private var selectedTab: AppTab = .chats
+    @State private var selectedTab: AppTab = .home
     @State private var sheet: AppSheet?
     @State private var chatPath: [String] = []
     @State private var lastAppliedSelectedRoomID: String?
@@ -35,71 +35,7 @@ struct ContentView: View {
             if model.requiresNostrLogin {
                 NostrLoginView(model: model)
             } else {
-                TabView(selection: $selectedTab) {
-                    NavigationStack(path: $chatPath) {
-                        RoomListView(
-                            model: model,
-                            present: { destination in
-                                sheet = destination
-                            },
-                            open: { room in
-                                model.openRoom(room)
-                                routeSelectedRoom(room.roomId)
-                            }
-                        )
-                        .navigationDestination(for: String.self) { roomID in
-                            RoomThreadView(model: model, roomID: roomID) {
-                                sheet = .invite
-                            }
-                        }
-                    }
-                    .tabItem {
-                        Label(AppTab.chats.title, systemImage: AppTab.chats.systemImage)
-                    }
-                    .tag(AppTab.chats)
-
-                    NavigationStack {
-                        PeopleView(
-                            model: model,
-                            openRoom: { room in
-                                selectedTab = .chats
-                                model.openRoom(room)
-                                routeSelectedRoom(room.roomId)
-                            },
-                            showScan: {
-                                sheet = .scan
-                            },
-                            showSettings: {
-                                sheet = .settings
-                            }
-                        )
-                    }
-                    .tabItem {
-                        Label(AppTab.people.title, systemImage: AppTab.people.systemImage)
-                    }
-                    .tag(AppTab.people)
-
-                    NavigationStack {
-                        AgentsView(
-                            model: model,
-                            openRoom: { room in
-                                selectedTab = .chats
-                                model.openRoom(room)
-                                routeSelectedRoom(room.roomId)
-                            },
-                            showScan: {
-                                sheet = .scan
-                            },
-                            showSettings: {
-                                sheet = .settings
-                            }
-                        )
-                    }
-                    .tabItem {
-                        Label(AppTab.agents.title, systemImage: AppTab.agents.systemImage)
-                    }
-                    .tag(AppTab.agents)
-                }
+                authenticatedShell
             }
         }
         .sheet(item: $sheet) { destination in
@@ -129,6 +65,161 @@ struct ContentView: View {
         .onChange(of: model.state?.selectedRoomId) { _, selectedRoomID in
             guard !model.requiresNostrLogin else { return }
             routeSelectedRoomIfNeeded(selectedRoomID)
+        }
+    }
+
+    @ViewBuilder
+    private var authenticatedShell: some View {
+        switch selectedTab {
+        case .home:
+            homeStack
+        case .chats, .people, .agents:
+            tabbedShell
+        }
+    }
+
+    @ViewBuilder
+    private var tabbedShell: some View {
+        if #available(iOS 26.0, *) {
+            secondaryTabView
+                .tabBarMinimizeBehavior(.onScrollDown)
+                .tabViewBottomAccessory {
+                    NewTabAccessory(selectedTab: $selectedTab)
+                }
+        } else {
+            secondaryTabView
+                .safeAreaInset(edge: .bottom) {
+                    Button {
+                        selectedTab = .home
+                    } label: {
+                        Label(AppTab.home.title, systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.large)
+                    .padding(.bottom, 8)
+                    .accessibilityIdentifier("BottomNavigationNewButton")
+                }
+        }
+    }
+
+    private var secondaryTabView: some View {
+        TabView(selection: $selectedTab) {
+            chatsStack
+                .tabItem {
+                    Label(AppTab.chats.title, systemImage: AppTab.chats.systemImage)
+                }
+                .tag(AppTab.chats)
+
+            peopleStack
+                .tabItem {
+                    Label(AppTab.people.title, systemImage: AppTab.people.systemImage)
+                }
+                .tag(AppTab.people)
+
+            agentsStack
+                .tabItem {
+                    Label(AppTab.agents.title, systemImage: AppTab.agents.systemImage)
+                }
+                .tag(AppTab.agents)
+        }
+    }
+
+    private var chatsStack: some View {
+        NavigationStack(path: $chatPath) {
+            RoomListView(
+                model: model,
+                present: { destination in
+                    sheet = destination
+                },
+                open: { room in
+                    model.openRoom(room)
+                    routeSelectedRoom(room.roomId)
+                }
+            )
+            .navigationDestination(for: String.self) { roomID in
+                RoomThreadView(model: model, roomID: roomID) {
+                    sheet = .invite
+                }
+            }
+        }
+    }
+
+    private var peopleStack: some View {
+        NavigationStack {
+            PeopleView(
+                model: model,
+                openRoom: { room in
+                    selectedTab = .chats
+                    model.openRoom(room)
+                    routeSelectedRoom(room.roomId)
+                },
+                showSettings: {
+                    sheet = .settings
+                }
+            )
+        }
+    }
+
+    private var agentsStack: some View {
+        NavigationStack {
+            AgentsView(
+                model: model,
+                openRoom: { room in
+                    selectedTab = .chats
+                    model.openRoom(room)
+                    routeSelectedRoom(room.roomId)
+                },
+                showSettings: {
+                    sheet = .settings
+                }
+            )
+        }
+    }
+
+    private var homeStack: some View {
+        NavigationStack {
+            HomeView(
+                model: model,
+                openChats: {
+                    selectedTab = .chats
+                },
+                openAgents: {
+                    selectedTab = .agents
+                },
+                openRoom: { room in
+                    model.openRoom(room)
+                    routeSelectedRoom(room.roomId)
+                },
+                showScan: {
+                    sheet = .scan
+                },
+                showSettings: {
+                    sheet = .settings
+                }
+            )
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private struct NewTabAccessory: View {
+        @Binding var selectedTab: AppTab
+        @Environment(\.tabViewBottomAccessoryPlacement) private var placement
+
+        var body: some View {
+            Button {
+                selectedTab = .home
+            } label: {
+                if placement == .inline {
+                    Image(systemName: "plus")
+                } else {
+                    Label(AppTab.home.title, systemImage: "plus")
+                }
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+            .accessibilityLabel(AppTab.home.title)
+            .accessibilityIdentifier("BottomNavigationNewButton")
         }
     }
 
@@ -188,7 +279,7 @@ private struct RoomListView: View {
     var body: some View {
         List {
             if model.rooms.isEmpty {
-                ContentUnavailableView("FiniteChat", systemImage: "bubble.left.and.bubble.right")
+                ContentUnavailableView("No chats yet", systemImage: "bubble.left.and.text.bubble")
                     .padding(.vertical, 28)
                     .frame(maxWidth: .infinity)
                     .listRowSeparator(.hidden)
@@ -212,10 +303,7 @@ private struct RoomListView: View {
         .listStyle(.plain)
         .navigationTitle("Chats")
         .toolbar {
-            ShellToolbarActions(
-                showScan: { present(.scan) },
-                showSettings: { present(.settings) }
-            )
+            ShellToolbarActions(showSettings: { present(.settings) })
         }
         .searchable(
             text: $searchText,
@@ -238,7 +326,7 @@ private struct RoomRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(room.displayName)
-                        .font(.body)
+                        .font(.body.weight(.semibold))
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     if room.unreadCount > 0 {
@@ -285,12 +373,10 @@ private struct RoomAvatar: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            if room.state != .connected {
-                Circle()
-                    .fill(room.state.tint)
-                    .frame(width: 10, height: 10)
-                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
-            }
+            Circle()
+                .fill(room.state.tint)
+                .frame(width: 10, height: 10)
+                .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
         }
         .frame(width: 40, height: 40)
         .accessibilityHidden(true)
@@ -300,6 +386,51 @@ private struct RoomAvatar: View {
         let trimmed = room.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = trimmed.first else { return "#" }
         return String(first).uppercased()
+    }
+}
+
+private struct RoomOptionsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let showRoomDetails: () -> Void
+    let showMediaGallery: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Button {
+                        dismiss()
+                        showRoomDetails()
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Room info",
+                            subtitle: nil,
+                            systemImage: "info.circle"
+                        )
+                    }
+
+                    Button {
+                        dismiss()
+                        showMediaGallery()
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Media gallery",
+                            subtitle: nil,
+                            systemImage: "photo.on.rectangle.angled"
+                        )
+                    }
+                }
+            }
+            .navigationTitle("Room")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -320,6 +451,7 @@ private struct RoomThreadView: View {
     @State private var documentPreviewItem: ChatAttachmentPreviewItem?
     @State private var showMediaGallery = false
     @State private var showRoomDetails = false
+    @State private var showRoomOptions = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
@@ -426,33 +558,33 @@ private struct RoomThreadView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if let room, room.state == .connected {
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        showRoomDetails = true
+                        showRoomOptions = true
                     } label: {
-                        Image(systemName: "info.circle")
+                        Image(systemName: "ellipsis.circle")
                     }
-                    .accessibilityLabel("Details")
-                    .accessibilityIdentifier("RoomDetailsButton")
-
-                    Button {
-                        showMediaGallery = true
-                    } label: {
-                        Image(systemName: "photo.on.rectangle.angled")
-                    }
-                    .accessibilityLabel("Photos and Videos")
-                    .accessibilityIdentifier("MediaGalleryButton")
-
-                    Button {
-                        _ = model.createInvite(for: room)
-                        showInvite()
-                    } label: {
-                        Image(systemName: "qrcode")
-                    }
-                    .accessibilityLabel("Invite")
-                    .accessibilityIdentifier("InviteButton")
+                    .accessibilityLabel("Room options")
+                    .accessibilityIdentifier("RoomOptionsButton")
                 }
             }
+        }
+        .sheet(isPresented: $showRoomOptions) {
+            RoomOptionsSheet(
+                showRoomDetails: {
+                    showRoomOptions = false
+                    Task { @MainActor in
+                        showRoomDetails = true
+                    }
+                },
+                showMediaGallery: {
+                    showRoomOptions = false
+                    Task { @MainActor in
+                        showMediaGallery = true
+                    }
+                }
+            )
+            .presentationDetents([.medium])
         }
         .navigationDestination(isPresented: $showRoomDetails) {
             RoomDetailsView(
@@ -1564,134 +1696,172 @@ private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
     @State private var showingMyProfile = false
+    @State private var showingScan = false
     @State private var confirmingSignOut = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Account") {
+                Section("Profile") {
                     Button {
                         showingMyProfile = true
                     } label: {
-                        Label("My Profile", systemImage: "person.crop.circle")
-                    }
+                        HStack(spacing: 12) {
+                            if let profile = model.activeProfile {
+                                ProfileAvatar(profile: profile)
+                            } else {
+                                Image(systemName: "person.crop.circle")
+                                    .font(.title2)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 40, height: 40)
+                            }
 
-                    if let npub = model.myNpub {
-                        Text(npub)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(model.activeProfile?.displayName ?? "My Profile")
+                                    .foregroundStyle(.primary)
+                                Text(profileSubtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Section("Server") {
+                    Button {
+                        showingScan = true
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Scan code",
+                            subtitle: "Invite, profile, or agent code",
+                            systemImage: "qrcode.viewfinder"
+                        )
+                    }
+                    .buttonStyle(.plain)
+
+                    SettingsRowLabel(
+                        title: "Configured server",
+                        subtitle: model.serverURL,
+                        systemImage: "server.rack"
+                    )
+                }
+
+                Section {
+                    DisclosureGroup {
+                        TextField("Server", text: $model.serverURL)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.URL)
+                            .accessibilityLabel("Server")
+                        TextField("Device", text: $model.deviceID)
+                            .textInputAutocapitalization(.never)
+                            .accessibilityLabel("Device")
+
+                        if let state = model.state {
+                            LabeledContent("Account", value: state.identity.accountId)
+                            LabeledContent("Runtime Device", value: state.identity.deviceId)
+                            LabeledContent("Revision", value: "\(state.rev)")
+                            LabeledContent("Persistence", value: model.developerPersistenceSummary)
+                        }
+                        if let status = model.developerRuntimeStatus {
+                            LabeledContent("Runtime Status", value: status)
+                        }
+                        if let notice = model.userNoticeText {
+                            LabeledContent("Last Notice", value: notice)
+                        }
+                        if let storePath = model.runtimeStorePath {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Client Store")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(storePath)
+                                    .font(.caption)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        if let errorText = model.developerErrorText {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Last Error")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(errorText)
+                                    .font(.caption)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        if let state = model.state {
+                            if !state.profiles.isEmpty {
+                                Text("Profiles")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                ForEach(state.profiles, id: \.accountId) { profile in
+                                    ProfileRow(profile: profile)
+                                }
+                            }
+
+                            Text("Devices")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            if state.devices.isEmpty {
+                                Text("No devices found")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(state.devices, id: \.listID) { device in
+                                    DeviceRow(device: device) {
+                                        model.revokeDevice(device)
+                                    }
+                                }
+                            }
+
+                            Button {
+                                model.refreshDevices()
+                            } label: {
+                                Label("Refresh Devices", systemImage: "arrow.clockwise")
+                            }
+                            .accessibilityIdentifier("RefreshDevicesButton")
+                        }
+                        if !model.developerDiagnostics.isEmpty {
+                            LabeledContent(
+                                "Debug Events",
+                                value: "\(model.developerDiagnostics.count)"
+                            )
+                            HStack {
+                                Button {
+                                    UIPasteboard.general.string = model.developerDiagnosticsExport
+                                } label: {
+                                    Label("Copy Logs", systemImage: "doc.on.doc")
+                                }
+                                ShareLink(item: model.developerDiagnosticsExport) {
+                                    Label("Share Logs", systemImage: "square.and.arrow.up")
+                                }
+                            }
+                            ForEach(model.developerDiagnosticsPreview) { entry in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("\(entry.category) / \(entry.event)")
+                                        .font(.caption.weight(.medium))
+                                    if !entry.details.isEmpty {
+                                        Text(developerDiagnosticDetails(entry.details))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Developer diagnostics",
+                            subtitle: "Redacted local copy and share only",
+                            systemImage: "doc.text.magnifyingglass"
+                        )
                     }
 
                     Button(role: .destructive) {
                         confirmingSignOut = true
                     } label: {
-                        Label("Sign Out and Delete Everything", systemImage: "trash")
-                    }
-                }
-
-                if let state = model.state {
-                    Section("Profiles") {
-                        if state.profiles.isEmpty {
-                            Text("No profiles cached")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(state.profiles, id: \.accountId) { profile in
-                                ProfileRow(profile: profile)
-                            }
-                        }
-                    }
-
-                    Section("Devices") {
-                        if state.devices.isEmpty {
-                            Text("No devices found")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(state.devices, id: \.listID) { device in
-                                DeviceRow(device: device) {
-                                    model.revokeDevice(device)
-                                }
-                            }
-                        }
-
-                        Button {
-                            model.refreshDevices()
-                        } label: {
-                            Label("Refresh", systemImage: "arrow.clockwise")
-                        }
-                        .accessibilityIdentifier("RefreshDevicesButton")
-                    }
-                }
-
-                DisclosureGroup("Developer") {
-                    TextField("Server", text: $model.serverURL)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                        .accessibilityLabel("Server")
-                    TextField("Device", text: $model.deviceID)
-                        .textInputAutocapitalization(.never)
-                        .accessibilityLabel("Device")
-
-                    if let state = model.state {
-                        LabeledContent("Account", value: state.identity.accountId)
-                        LabeledContent("Runtime Device", value: state.identity.deviceId)
-                        LabeledContent("Revision", value: "\(state.rev)")
-                        LabeledContent("Persistence", value: model.developerPersistenceSummary)
-                    }
-                    if let status = model.developerRuntimeStatus {
-                        LabeledContent("Runtime Status", value: status)
-                    }
-                    if let notice = model.userNoticeText {
-                        LabeledContent("Last Notice", value: notice)
-                    }
-                    if let storePath = model.runtimeStorePath {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Client Store")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(storePath)
-                                .font(.caption)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    if let errorText = model.developerErrorText {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Last Error")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(errorText)
-                                .font(.caption)
-                                .textSelection(.enabled)
-                        }
-                    }
-                    if !model.developerDiagnostics.isEmpty {
-                        LabeledContent(
-                            "Debug Events",
-                            value: "\(model.developerDiagnostics.count)"
-                        )
-                        HStack {
-                            Button {
-                                UIPasteboard.general.string = model.developerDiagnosticsExport
-                            } label: {
-                                Label("Copy Logs", systemImage: "doc.on.doc")
-                            }
-                            ShareLink(item: model.developerDiagnosticsExport) {
-                                Label("Share Logs", systemImage: "square.and.arrow.up")
-                            }
-                        }
-                        ForEach(model.developerDiagnosticsPreview) { entry in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("\(entry.category) / \(entry.event)")
-                                    .font(.caption.weight(.medium))
-                                if !entry.details.isEmpty {
-                                    Text(developerDiagnosticDetails(entry.details))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .textSelection(.enabled)
-                                }
-                            }
-                        }
+                        Label("Sign Out and Delete Local Data", systemImage: "rectangle.portrait.and.arrow.right")
                     }
                 }
             }
@@ -1701,6 +1871,9 @@ private struct SettingsSheet: View {
             }
             .sheet(isPresented: $showingMyProfile) {
                 MyNostrProfileSheet(identity: model.nostrIdentity, myNpub: model.myNpub)
+            }
+            .sheet(isPresented: $showingScan) {
+                ScanSheet(model: model)
             }
             .confirmationDialog(
                 "Delete this device's FiniteChat data?",
@@ -1730,6 +1903,44 @@ private struct SettingsSheet: View {
             }
         }
     }
+
+    private var profileSubtitle: String {
+        if let npub = model.myNpub {
+            return shortenedDisplayNpub(npub)
+        }
+        return "Signed in on this phone"
+    }
+}
+
+private struct SettingsRowLabel: View {
+    let title: String
+    let subtitle: String?
+    let systemImage: String
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .foregroundStyle(.primary)
+                if let subtitle, !subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        } icon: {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+                .frame(width: 28)
+        }
+    }
+}
+
+private func shortenedDisplayNpub(_ npub: String) -> String {
+    guard npub.count > 18 else { return npub }
+    return "\(npub.prefix(10))...\(npub.suffix(4))"
 }
 
 private func developerDiagnosticDetails(_ details: [String: String]) -> String {

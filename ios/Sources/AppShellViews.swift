@@ -5,6 +5,7 @@ enum AppTab: Hashable {
     case chats
     case people
     case agents
+    case home
 
     var title: String {
         switch self {
@@ -14,6 +15,8 @@ enum AppTab: Hashable {
             "People"
         case .agents:
             "Agents"
+        case .home:
+            "New"
         }
     }
 
@@ -25,6 +28,343 @@ enum AppTab: Hashable {
             "person.2"
         case .agents:
             "sparkles"
+        case .home:
+            "plus.circle.fill"
+        }
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var model: AppModel
+    let openChats: () -> Void
+    let openAgents: () -> Void
+    let openRoom: (AppRoomSummary) -> Void
+    let showScan: () -> Void
+    let showSettings: () -> Void
+
+    @State private var intentionText = ""
+    @FocusState private var intentionFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 28) {
+                    Spacer(minLength: 96)
+
+                    VStack(spacing: 16) {
+                        FiniteLogoMark()
+                            .fill(.tint)
+                            .frame(width: 104, height: 104)
+                            .accessibilityLabel("Finite logo")
+
+                        Text("It's time to build")
+                            .font(.title2.weight(.semibold))
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    Spacer(minLength: 220)
+                }
+                .padding(.horizontal)
+                .padding(.top, 24)
+                .padding(.bottom, 32)
+            }
+            .scrollDismissesKeyboard(.interactively)
+
+            HomeInputDock(
+                text: $intentionText,
+                isFocused: $intentionFocused,
+                canSubmit: canSubmitIntention,
+                openChats: openChats,
+                openAgents: openAgents,
+                showScan: showScan,
+                submit: submitIntention
+            )
+        }
+        .navigationTitle("Home")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: showSettings) {
+                    Image(systemName: "person.crop.circle")
+                }
+                .accessibilityLabel("Profile")
+                .accessibilityIdentifier("HomeProfileButton")
+            }
+        }
+    }
+
+    private var canSubmitIntention: Bool {
+        !intentionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submitIntention() {
+        let name = intentionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let existingRoomIDs = Set(model.rooms.map(\.roomId))
+        model.roomDraft = name
+        model.createRoom()
+        intentionFocused = false
+        if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
+            intentionText = ""
+            openRoom(room)
+        } else {
+            openChats()
+        }
+    }
+}
+
+private struct FiniteLogoMark: Shape {
+    private struct Bar {
+        let x: CGFloat
+        let y: CGFloat
+        let width: CGFloat
+        let height: CGFloat
+        let radius: CGFloat
+    }
+
+    private static let bars: [Bar] = [
+        Bar(x: 45.3336, y: 69.3335, width: 10.6667, height: 2.66668, radius: 1.33334),
+        Bar(x: 15.9998, y: 69.3335, width: 10.6667, height: 2.66668, radius: 1.33334),
+        Bar(x: 5.33289, y: 63.999, width: 21.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 45.3336, y: 63.999, width: 21.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 47.1108, y: 58.6675, width: 23.1112, height: 2.66668, radius: 1.33334),
+        Bar(x: 1.77722, y: 58.6675, width: 22.2223, height: 2.66668, radius: 1.33334),
+        Bar(x: 48.8887, y: 53.3335, width: 23.1112, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 53.3335, width: 18.6667, height: 2.66668, radius: 1.33334),
+        Bar(x: 49.7778, y: 47.9995, width: 22.2223, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 47.9995, width: 13.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 50.6665, y: 42.6655, width: 21.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 42.6655, width: 9.77782, height: 2.66668, radius: 1.33334),
+        Bar(x: 18.6669, y: 42.6655, width: 6.22225, height: 2.66668, radius: 1.33334),
+        Bar(x: 52.4449, y: 37.334, width: 19.5556, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 37.334, width: 24.889, height: 2.66668, radius: 1.33334),
+        Bar(x: 29.3331, y: 31.9995, width: 3.55557, height: 2.66668, radius: 1.33334),
+        Bar(x: 38.2223, y: 31.9995, width: 2.66668, height: 2.66668, radius: 1.33334),
+        Bar(x: 45.3336, y: 31.9995, width: 3.55557, height: 2.66668, radius: 1.33334),
+        Bar(x: 54.2222, y: 31.9995, width: 17.7779, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 31.9995, width: 24.0001, height: 2.66668, radius: 1.33334),
+        Bar(x: 56.0006, y: 26.668, width: 16.0001, height: 2.66668, radius: 1.33334),
+        Bar(x: 46.2222, y: 26.668, width: 5.33336, height: 2.66668, radius: 1.33334),
+        Bar(x: 37.3337, y: 26.668, width: 4.44446, height: 2.66668, radius: 1.33334),
+        Bar(x: 28.4452, y: 26.668, width: 3.55557, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 26.668, width: 22.2223, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 21.334, width: 21.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 47.1115, y: 21.334, width: 24.889, height: 2.66668, radius: 1.33334),
+        Bar(x: 26.6667, y: 21.334, width: 5.33336, height: 2.66668, radius: 1.33334),
+        Bar(x: 37.3337, y: 21.334, width: 5.33336, height: 2.66668, radius: 1.33334),
+        Bar(x: 0, y: 16.0005, width: 21.3334, height: 2.66668, radius: 1.33334),
+        Bar(x: 25.3334, y: 16.0005, width: 7.11114, height: 2.66668, radius: 1.33334),
+        Bar(x: 37.3337, y: 16.0005, width: 6.22225, height: 2.66668, radius: 1.33334),
+        Bar(x: 48, y: 16.0005, width: 24.0001, height: 2.66668, radius: 1.33334),
+        Bar(x: 37.3337, y: 10.6655, width: 32.889, height: 2.66668, radius: 1.33334),
+        Bar(x: 1.77783, y: 10.6655, width: 30.889, height: 2.66668, radius: 1.33334),
+        Bar(x: 5.33289, y: 5.33154, width: 61.3336, height: 2.66668, radius: 1.33334),
+        Bar(x: 15.9998, y: 0, width: 40.0002, height: 2.66668, radius: 1.33334)
+    ]
+
+    func path(in rect: CGRect) -> Path {
+        let side = min(rect.width, rect.height)
+        let scale = side / 72
+        let origin = CGPoint(
+            x: rect.midX - side / 2,
+            y: rect.midY - side / 2
+        )
+        var path = Path()
+
+        for bar in Self.bars {
+            path.addRoundedRect(
+                in: CGRect(
+                    x: origin.x + bar.x * scale,
+                    y: origin.y + bar.y * scale,
+                    width: bar.width * scale,
+                    height: bar.height * scale
+                ),
+                cornerSize: CGSize(
+                    width: bar.radius * scale,
+                    height: bar.radius * scale
+                )
+            )
+        }
+
+        return path
+    }
+}
+
+private struct HomeInputDock: View {
+    @Binding var text: String
+    let isFocused: FocusState<Bool>.Binding
+    let canSubmit: Bool
+    let openChats: () -> Void
+    let openAgents: () -> Void
+    let showScan: () -> Void
+    let submit: () -> Void
+
+    var body: some View {
+        glassContainer {
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    HomeSuggestionButton(
+                        title: "Message someone",
+                        systemImage: "person",
+                        action: openChats
+                    )
+
+                    HomeSuggestionButton(
+                        title: "Chat with Agent",
+                        systemImage: "sparkles",
+                        action: openAgents
+                    )
+                }
+
+                HomeIntentionComposer(
+                    text: $text,
+                    isFocused: isFocused,
+                    canSubmit: canSubmit,
+                    showScan: showScan,
+                    submit: submit
+                )
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 10)
+        }
+    }
+
+    @ViewBuilder
+    private func glassContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: 10) {
+                content()
+            }
+        } else {
+            content()
+        }
+    }
+}
+
+private struct HomeSuggestionButton: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            button
+                .buttonStyle(.glass)
+                .controlSize(.small)
+        } else {
+            button
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+        }
+    }
+
+    private var button: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .padding(.horizontal, 4)
+        }
+        .accessibilityIdentifier("HomeSuggestion\(title.replacingOccurrences(of: " ", with: ""))")
+    }
+}
+
+private struct HomeIntentionComposer: View {
+    @Binding var text: String
+    let isFocused: FocusState<Bool>.Binding
+    let canSubmit: Bool
+    let showScan: () -> Void
+    let submit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack(alignment: .topLeading) {
+                if text.isEmpty {
+                    Text("What's your intention?")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 8)
+                }
+
+                TextEditor(text: $text)
+                    .font(.body)
+                    .frame(height: editorHeight)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
+                    .focused(isFocused)
+                    .accessibilityIdentifier("HomeIntentionField")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+
+            HStack(spacing: 12) {
+                Menu {
+                    Button {
+                        showScan()
+                    } label: {
+                        Label("Scan code", systemImage: "qrcode.viewfinder")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.title3.weight(.regular))
+                        .frame(width: 34, height: 34)
+                        .contentShape(Circle())
+                }
+                .accessibilityLabel("Add attachment")
+
+                Spacer()
+
+                Image(systemName: "mic")
+                    .font(.title3.weight(.regular))
+                    .frame(width: 34, height: 34)
+                .accessibilityLabel("Voice message")
+
+                if canSubmit {
+                    Button(action: submit) {
+                        Image(systemName: "arrow.up")
+                            .font(.body.weight(.bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(Circle().fill(Color.accentColor))
+                    }
+                    .accessibilityLabel("Send")
+                    .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
+        }
+        .frame(maxWidth: .infinity, minHeight: 92, alignment: .topLeading)
+        .modifier(HomeComposerSurface())
+        .animation(.snappy(duration: 0.18), value: canSubmit)
+        .animation(.snappy(duration: 0.18), value: editorHeight)
+    }
+
+    private var editorHeight: CGFloat {
+        let explicitLineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        let wrappedLineEstimate = Int(ceil(Double(text.count) / 34.0))
+        let lineCount = min(5, max(1, explicitLineCount, wrappedLineEstimate))
+        return CGFloat(lineCount) * 22 + 18
+    }
+}
+
+private struct HomeComposerSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 28))
+        } else {
+            content
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .strokeBorder(Color(.separator).opacity(0.18), lineWidth: 0.5)
+                }
+                .shadow(color: .black.opacity(0.08), radius: 18, x: 0, y: 8)
         }
     }
 }
@@ -103,7 +443,6 @@ struct NostrLoginView: View {
 struct PeopleView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
-    let showScan: () -> Void
     let showSettings: () -> Void
 
     @StateObject private var people = NostrPeopleModel()
@@ -132,7 +471,7 @@ struct PeopleView: View {
         .listStyle(.plain)
         .navigationTitle("People")
         .toolbar {
-            ShellToolbarActions(showScan: showScan, showSettings: showSettings)
+            ShellToolbarActions(showSettings: showSettings)
         }
         .searchable(
             text: $searchText,
@@ -258,7 +597,6 @@ struct PeopleView: View {
 struct AgentsView: View {
     @ObservedObject var model: AppModel
     let openRoom: (AppRoomSummary) -> Void
-    let showScan: () -> Void
     let showSettings: () -> Void
     @State private var searchText = ""
 
@@ -294,19 +632,7 @@ struct AgentsView: View {
                     Button {
                         openRoom(room)
                     } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "sparkles")
-                                .frame(width: 40, height: 40)
-                                .background(Color(.tertiarySystemFill), in: Circle())
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(room.displayName)
-                                    .foregroundStyle(.primary)
-                                Text(room.lastMessagePreview.isEmpty ? room.userStatusText : room.lastMessagePreview)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
+                        AgentRoomRow(room: room)
                     }
                     .buttonStyle(.plain)
                 }
@@ -315,7 +641,7 @@ struct AgentsView: View {
         .listStyle(.plain)
         .navigationTitle("Agents")
         .toolbar {
-            ShellToolbarActions(showScan: showScan, showSettings: showSettings)
+            ShellToolbarActions(showSettings: showSettings)
         }
         .searchable(
             text: $searchText,
@@ -326,23 +652,71 @@ struct AgentsView: View {
 }
 
 struct ShellToolbarActions: ToolbarContent {
-    let showScan: () -> Void
     let showSettings: () -> Void
 
     var body: some ToolbarContent {
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            Button(action: showScan) {
-                Image(systemName: "qrcode.viewfinder")
-            }
-            .accessibilityLabel("Scan")
-            .accessibilityIdentifier("TopScanButton")
-
+        ToolbarItem(placement: .topBarTrailing) {
             Button(action: showSettings) {
                 Image(systemName: "gearshape")
             }
             .accessibilityLabel("Settings")
             .accessibilityIdentifier("TopSettingsButton")
         }
+    }
+}
+
+private struct AgentRoomRow: View {
+    let room: AppRoomSummary
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(.tertiarySystemFill))
+                Text(initial)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Circle()
+                    .fill(room.state.tint)
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
+                    .offset(x: 1, y: 1)
+            }
+            .frame(width: 42, height: 42)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(room.displayName)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(room.lastMessagePreview.isEmpty ? room.userStatusText : room.lastMessagePreview)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            if room.unreadCount > 0 {
+                Text("\(room.unreadCount)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.accentColor))
+            }
+        }
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+
+    private var initial: String {
+        let trimmed = room.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "#" }
+        return String(first).uppercased()
     }
 }
 
@@ -427,8 +801,9 @@ private struct NostrFollowProfileSheet: View {
                         onCreateRoom()
                         dismiss()
                     } label: {
-                        Label("Create Chat Room", systemImage: "bubble.left.and.bubble.right")
+                        Label("Message", systemImage: "bubble.left.and.bubble.right")
                     }
+                    .buttonStyle(.borderedProminent)
 
                     Button {
                         dismiss()
@@ -451,7 +826,7 @@ private struct NostrFollowProfileSheet: View {
                     }
                 }
             }
-            .navigationTitle("Profile")
+            .navigationTitle(profile.displayName)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -614,6 +989,12 @@ private struct NostrProfileRow: View {
             if isChecking {
                 ProgressView()
                     .controlSize(.small)
+            } else {
+                Text(profile.shortenedNpub)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
         .opacity(isUnavailable ? 0.45 : 1)
@@ -711,4 +1092,17 @@ private func finiteChatInstallInviteURL(for profile: NostrFollowProfile) -> URL 
         URLQueryItem(name: "npub", value: profile.npub),
     ]
     return components.url!
+}
+
+private extension AppRoomState {
+    var tint: Color {
+        switch self {
+        case .connected:
+            .green
+        case .waitingForApproval, .joining:
+            .orange
+        case .unavailableOnDevice:
+            .red
+        }
+    }
 }

@@ -91,6 +91,17 @@ Rust-owned app/runtime state:
 
 iOS UI:
 
+- Home is now the default authenticated surface. It uses the real Finite mark
+  as vector SwiftUI geometry, a floating glass intention composer, and compact
+  suggestion chips for "Message someone" and "Chat with Agent" directly above
+  the composer so those suggestions can later become type/speech-driven.
+- Chats, People, and Agents use native SwiftUI `TabView` navigation. On iOS
+  26+, the New action is a native `tabViewBottomAccessory` glass-prominent
+  button instead of a custom/fake tab bar; older OS versions fall back to a
+  bordered-prominent bottom inset action.
+- The app icon is now supplied by `Sources/Assets.xcassets/AppIcon.appiconset`
+  and configured through XcodeGen's
+  `ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon`.
 - chat list rows instead of protocol controls;
 - room transcript with performant collection-backed rows;
 - input accessory composer behavior;
@@ -109,7 +120,8 @@ iOS UI:
 
 Protocol/product flow:
 
-- user-facing flow is New Room, Invite, Scan/Paste, PIN, Chat;
+- user-facing flow starts on Home with an intention composer, then routes into
+  Message someone, Chat with Agent, Invite, Scan/Paste, PIN, and Chat;
 - no user-facing manual sync, accept, or finalize action;
 - SSE hint loop is behind Rust `wait_for_update`;
 - server-backed Nostr profiles are the v1 profile source, with local cache;
@@ -401,6 +413,8 @@ Primary debt rows:
 
 Deferred decisions or still-open work:
 
+- dynamic Home suggestions backed by typed contact/agent intent projection
+  instead of static buttons;
 - live outbound upload progress;
 - durable offline attachment send is deferred beyond v1; the product harness now
   attempts an in-memory attachment send while the same configured server is
