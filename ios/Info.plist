@@ -10,8 +10,10 @@
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleDisplayName</key>
+	<string>Finite Chat</string>
 	<key>CFBundleName</key>
-	<string>FiniteChat</string>
+	<string>Finite Chat</string>
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
@@ -24,15 +26,15 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>FiniteChat uses the camera to scan invite and profile QR codes you choose to open.</string>
+	<string>Finite Chat uses the camera to scan invite and profile QR codes you choose to open.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>FiniteChat connects to your development server on the local network.</string>
+	<string>Finite Chat connects to your development server on the local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>FiniteChat uses the microphone to record voice messages you choose to send.</string>
+	<string>Finite Chat uses the microphone to record voice messages you choose to send.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>FiniteChat saves photos from chats to your photo library when you choose Save Photo.</string>
+	<string>Finite Chat saves photos from chats to your photo library when you choose Save Photo.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>FiniteChat uses speech recognition to transcribe voice messages you choose to send.</string>
+	<string>Finite Chat uses speech recognition to transcribe voice messages you choose to send.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

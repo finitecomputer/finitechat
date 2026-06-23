@@ -1,10 +1,10 @@
-# FiniteChat TestFlight Runbook
+# Finite Chat TestFlight Runbook
 
-FiniteChat ships as its own App Store Connect app record.
+Finite Chat ships as its own App Store Connect app record.
 
 ## Product Identity
 
-- App name: `FiniteChat`
+- App name: `Finite Chat`
 - Bundle ID: `computer.finite.finitechat`
 - SKU: `computer.finite.finitechat` or `finitechat-ios`
 - Primary language: English
@@ -19,14 +19,16 @@ keychain/runtime naming, and product metadata.
 
 1. In App Store Connect, create a new iOS app record.
 2. Select or create the Bundle ID `computer.finite.finitechat`.
-3. Use `FiniteChat` as the app name if available for the account/localization.
+3. Use `Finite Chat` as the app name.
 4. Add beta test information before external testing:
    - beta app description
    - feedback email
    - contact information
    - "What to Test" notes
 5. Complete required compliance metadata:
-   - encryption/export compliance
+   - encryption/export compliance: answer that the app uses encryption, then
+     follow Apple's questionnaire for standard/open encryption where no
+     documentation is required
    - privacy nutrition labels
    - age rating
    - content rights
@@ -44,7 +46,7 @@ record exists.
 
 Suggested first workflow:
 
-- Repository branch: `main` or the release branch used for FiniteChat builds
+- Repository branch: `main` or the release branch used for Finite Chat builds
 - Project: `ios/FiniteChat.xcodeproj`
 - Scheme: `FiniteChat`
 - Actions:
@@ -86,6 +88,6 @@ Also verify:
 - Production server configuration is intentional; the TestFlight build should
   not depend on a local development server unless the beta scope explicitly says
   so.
-- Review notes explain that FiniteChat uses end-to-end encryption, Nostr
+- Review notes explain that Finite Chat uses end-to-end encryption, Nostr
   identity material, camera QR scanning, microphone recording, speech
   transcription, and optional photo-library saves initiated by the user.

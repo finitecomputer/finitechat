@@ -1836,7 +1836,7 @@ private struct SettingsSheet: View {
                 ScanSheet(model: model)
             }
             .confirmationDialog(
-                "Delete this device's FiniteChat data?",
+                "Delete this device's Finite Chat data?",
                 isPresented: $confirmingSignOut,
                 titleVisibility: .visible
             ) {

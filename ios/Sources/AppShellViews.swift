@@ -422,7 +422,7 @@ struct NostrLoginView: View {
                     }
                 }
             }
-            .navigationTitle("FiniteChat")
+            .navigationTitle("Finite Chat")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Apply") {
@@ -505,7 +505,7 @@ struct PeopleView: View {
         .alert("Could not check invite availability", isPresented: $inviteAvailabilityCheckFailed) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Try again when the FiniteChat server is reachable.")
+            Text("Try again when the Finite Chat server is reachable.")
         }
         .sheet(isPresented: $showingLookupProfile) {
             if let profile = model.activeProfile {
@@ -913,7 +913,7 @@ private struct InviteUnavailableSheet: View {
                 .listRowBackground(Color.clear)
 
                 Section {
-                    Text("This person doesn't have FiniteChat yet.")
+                    Text("This person doesn't have Finite Chat yet.")
                         .foregroundStyle(.secondary)
 
                     ShareLink(item: finiteChatInstallInviteURL(for: profile)) {

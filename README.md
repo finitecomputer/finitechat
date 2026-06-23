@@ -1,6 +1,6 @@
-# FiniteChat
+# Finite Chat
 
-FiniteChat is the native encrypted chat stack for Finite Computer. Rust owns
+Finite Chat is the native encrypted chat stack for Finite Computer. Rust owns
 protocol state, persistence, networking, and product policy; SwiftUI renders the
 Rust-owned app state and dispatches typed actions.
 
@@ -118,9 +118,9 @@ first.
 
 ## Deployment
 
-This repo owns FiniteChat source. Production rollout mechanics belong in
+This repo owns Finite Chat source. Production rollout mechanics belong in
 `../finitecomputer`, which owns host sync, backups, Nix/k3s deployment,
 `finited`, and runtime health checks.
 
-For iOS beta distribution, see `docs/testflight-runbook.md`. FiniteChat uses
+For iOS beta distribution, see `docs/testflight-runbook.md`. Finite Chat uses
 bundle ID `computer.finite.finitechat`.

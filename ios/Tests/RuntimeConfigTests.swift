@@ -2450,7 +2450,7 @@ final class SaveMediaActionTests: XCTestCase {
 
         XCTAssertEqual(
             value,
-            "FiniteChat saves photos from chats to your photo library when you choose Save Photo."
+            "Finite Chat saves photos from chats to your photo library when you choose Save Photo."
         )
     }
 
