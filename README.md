@@ -44,6 +44,25 @@ FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run i
 Without an override, the native app defaults to
 `https://chat.finite.computer`.
 
+To test the iOS app surface with a real local Hermes gateway, use the bundled
+runner instead of the plain server command:
+
+```sh
+scripts/hermes-real-gateway-demo.sh
+```
+
+In another terminal, point the simulator app at the runner's local server:
+
+```sh
+FINITECHAT_SERVER_URL=http://127.0.0.1:18788 cargo run -p finitechat-rmp -- run ios
+```
+
+The Hermes runner needs a prepared Hermes checkout with a `.venv`; set
+`FINITECHAT_HERMES_REPO=/path/to/hermes-agent` if it is not in the default
+finitecomputer checkout location. It also needs the model provider key used by
+the Hermes profile. The runner loads `.env` when present, or set
+`FINITECHAT_HERMES_ENV_FILE=/path/to/provider.env`.
+
 The normal app flow is:
 
 1. Sign in with an `nsec` or create a local Nostr identity.
@@ -102,3 +121,6 @@ first.
 This repo owns FiniteChat source. Production rollout mechanics belong in
 `../finitecomputer`, which owns host sync, backups, Nix/k3s deployment,
 `finited`, and runtime health checks.
+
+For iOS beta distribution, see `docs/testflight-runbook.md`. FiniteChat uses
+bundle ID `computer.finite.finitechat`.
