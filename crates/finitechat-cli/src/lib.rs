@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8787";
+const DEFAULT_SERVER_URL: &str = "https://chat.finite.computer";
 const DEFAULT_SYNC_LIMIT: usize = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -931,7 +931,7 @@ mod tests {
             prepare_http_request(["sync-group", "--group-id", "room-a"]).expect("prepared request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/sync/group");
+        assert_eq!(request.url, "https://chat.finite.computer/sync/group");
         let body: GroupSyncRequest =
             serde_json::from_value(request.json.expect("json")).expect("sync request");
         assert_eq!(body.group_id.as_slice(), b"room-a");
@@ -994,7 +994,7 @@ mod tests {
         .expect("event request");
 
         assert_eq!(event.method, HttpMethod::Post);
-        assert_eq!(event.url, "http://127.0.0.1:8787/events");
+        assert_eq!(event.url, "https://chat.finite.computer/events");
         let body = event.json.expect("json");
         assert_eq!(body["event"]["room_id"], "room-a");
         assert_eq!(body["event"]["sender"], "alice-phone");
@@ -1008,7 +1008,7 @@ mod tests {
         .expect("effect request");
 
         assert_eq!(effect.method, HttpMethod::Post);
-        assert_eq!(effect.url, "http://127.0.0.1:8787/application-effects/get");
+        assert_eq!(effect.url, "https://chat.finite.computer/application-effects/get");
         let body: ApplicationEffectRequest =
             serde_json::from_value(effect.json.expect("json")).expect("effect request body");
         assert_eq!(body.message_id, "application-message-a");
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(counts.method, HttpMethod::Post);
         assert_eq!(
             counts.url,
-            "http://127.0.0.1:8787/application-effects/counts"
+            "https://chat.finite.computer/application-effects/counts"
         );
         assert_eq!(counts.json.expect("json"), serde_json::json!({}));
 
@@ -1030,7 +1030,7 @@ mod tests {
         .expect("activity request");
 
         assert_eq!(activity.method, HttpMethod::Post);
-        assert_eq!(activity.url, "http://127.0.0.1:8787/activities");
+        assert_eq!(activity.url, "https://chat.finite.computer/activities");
         let body = activity.json.expect("json");
         assert_eq!(body["room_id"], "room-a");
         assert_eq!(body["sender"], "alice-phone");
@@ -1049,7 +1049,7 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/devices/revoke");
+        assert_eq!(request.url, "https://chat.finite.computer/devices/revoke");
         let body: RevokeDeviceRequest =
             serde_json::from_value(request.json.expect("json")).expect("revoke request");
         assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
@@ -1071,7 +1071,7 @@ mod tests {
         .expect("observe request");
 
         assert_eq!(observe.method, HttpMethod::Post);
-        assert_eq!(observe.url, "http://127.0.0.1:8787/devices/liveness");
+        assert_eq!(observe.url, "https://chat.finite.computer/devices/liveness");
         let body: ObserveDeviceLivenessRequest =
             serde_json::from_value(observe.json.expect("json")).expect("liveness observe request");
         assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
@@ -1090,7 +1090,7 @@ mod tests {
         .expect("get request");
 
         assert_eq!(get.method, HttpMethod::Post);
-        assert_eq!(get.url, "http://127.0.0.1:8787/devices/liveness/get");
+        assert_eq!(get.url, "https://chat.finite.computer/devices/liveness/get");
         let body: GetDeviceLivenessRequest =
             serde_json::from_value(get.json.expect("json")).expect("liveness get request");
         assert_eq!(body.device, DeviceRef::new("alice", "alice-phone"));
@@ -1103,7 +1103,7 @@ mod tests {
             prepare_http_request(["claim-key-package", "--owner", "alice"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/key-packages/claim");
+        assert_eq!(request.url, "https://chat.finite.computer/key-packages/claim");
         let body: ClaimKeyPackageRequest =
             serde_json::from_value(request.json.expect("json")).expect("claim request");
         assert_eq!(body.owner.as_slice(), b"alice");
@@ -1115,7 +1115,7 @@ mod tests {
             prepare_http_request(["key-package-inventory", "--owner", "alice"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/key-packages/inventory");
+        assert_eq!(request.url, "https://chat.finite.computer/key-packages/inventory");
         let body: KeyPackageInventoryRequest =
             serde_json::from_value(request.json.expect("json")).expect("inventory request");
         assert_eq!(body.owner.as_slice(), b"alice");
@@ -1135,7 +1135,7 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/key-packages/claims");
+        assert_eq!(request.url, "https://chat.finite.computer/key-packages/claims");
         let body: ClaimKeyPackagesRequest =
             serde_json::from_value(request.json.expect("json")).expect("batch claim request");
         assert_eq!(body.owners.len(), 2);
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(request.method, HttpMethod::Post);
         assert_eq!(
             request.url,
-            "http://127.0.0.1:8787/key-packages/leases/expire"
+            "https://chat.finite.computer/key-packages/leases/expire"
         );
         let body: ExpireKeyPackageLeaseRequest =
             serde_json::from_value(request.json.expect("json")).expect("expiry request");
@@ -1175,7 +1175,7 @@ mod tests {
         .expect("create request");
 
         assert_eq!(create.method, HttpMethod::Post);
-        assert_eq!(create.url, "http://127.0.0.1:8787/link-sessions");
+        assert_eq!(create.url, "https://chat.finite.computer/link-sessions");
         let body: CreateLinkSessionRequest =
             serde_json::from_value(create.json.expect("json")).expect("create body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1183,7 +1183,7 @@ mod tests {
 
         let get = prepare_http_request(["link-session-get", "--link-session-id", "link-a"])
             .expect("get request");
-        assert_eq!(get.url, "http://127.0.0.1:8787/link-sessions/get");
+        assert_eq!(get.url, "https://chat.finite.computer/link-sessions/get");
         let body: GetLinkSessionRequest =
             serde_json::from_value(get.json.expect("json")).expect("get body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1196,7 +1196,7 @@ mod tests {
             "ciphertext",
         ])
         .expect("upload request");
-        assert_eq!(upload.url, "http://127.0.0.1:8787/link-sessions/payload");
+        assert_eq!(upload.url, "https://chat.finite.computer/link-sessions/payload");
         let body: UploadLinkPayloadRequest =
             serde_json::from_value(upload.json.expect("json")).expect("upload body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1204,14 +1204,14 @@ mod tests {
 
         let claim = prepare_http_request(["link-session-claim", "--link-session-id", "link-a"])
             .expect("claim request");
-        assert_eq!(claim.url, "http://127.0.0.1:8787/link-sessions/claim");
+        assert_eq!(claim.url, "https://chat.finite.computer/link-sessions/claim");
         let body: ClaimLinkPayloadRequest =
             serde_json::from_value(claim.json.expect("json")).expect("claim body");
         assert_eq!(body.link_session_id, "link-a");
 
         let release = prepare_http_request(["link-session-release", "--link-session-id", "link-a"])
             .expect("release request");
-        assert_eq!(release.url, "http://127.0.0.1:8787/link-sessions/release");
+        assert_eq!(release.url, "https://chat.finite.computer/link-sessions/release");
         let body: ReleaseLinkClaimRequest =
             serde_json::from_value(release.json.expect("json")).expect("release body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1224,7 +1224,7 @@ mod tests {
             "token-a",
         ])
         .expect("ack request");
-        assert_eq!(ack.url, "http://127.0.0.1:8787/link-sessions/ack");
+        assert_eq!(ack.url, "https://chat.finite.computer/link-sessions/ack");
         let body: AckLinkPayloadRequest =
             serde_json::from_value(ack.json.expect("json")).expect("ack body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1232,7 +1232,7 @@ mod tests {
 
         let expire = prepare_http_request(["link-session-expire", "--link-session-id", "link-a"])
             .expect("expire request");
-        assert_eq!(expire.url, "http://127.0.0.1:8787/link-sessions/expire");
+        assert_eq!(expire.url, "https://chat.finite.computer/link-sessions/expire");
         let body: ExpireLinkSessionRequest =
             serde_json::from_value(expire.json.expect("json")).expect("expire body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(bootstrap.method, HttpMethod::Post);
         assert_eq!(
             bootstrap.url,
-            "http://127.0.0.1:8787/account-rooms/bootstrap"
+            "https://chat.finite.computer/account-rooms/bootstrap"
         );
         let body: BootstrapAccountRoomRequest =
             serde_json::from_value(bootstrap.json.expect("json"))
@@ -1278,7 +1278,7 @@ mod tests {
         .expect("save request");
 
         assert_eq!(save.method, HttpMethod::Post);
-        assert_eq!(save.url, "http://127.0.0.1:8787/account-rooms");
+        assert_eq!(save.url, "https://chat.finite.computer/account-rooms");
         let body: SaveAccountRoomRequest =
             serde_json::from_value(save.json.expect("json")).expect("account-room save request");
         assert_eq!(body.account_id, "alice");
@@ -1297,7 +1297,7 @@ mod tests {
         .expect("list request");
 
         assert_eq!(list.method, HttpMethod::Post);
-        assert_eq!(list.url, "http://127.0.0.1:8787/account-rooms/list");
+        assert_eq!(list.url, "https://chat.finite.computer/account-rooms/list");
         let body: ListAccountRoomDirectoryRequest =
             serde_json::from_value(list.json.expect("json")).expect("account-room list request");
         assert_eq!(body.account_id, "alice");
@@ -1323,7 +1323,7 @@ mod tests {
         assert_eq!(request.method, HttpMethod::Post);
         assert_eq!(
             request.url,
-            "http://127.0.0.1:8787/rooms/report-invalid-commit"
+            "https://chat.finite.computer/rooms/report-invalid-commit"
         );
         let body: ReportInvalidCommitRequest =
             serde_json::from_value(request.json.expect("json")).expect("report body");
@@ -1344,7 +1344,7 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/claim");
+        assert_eq!(request.url, "https://chat.finite.computer/welcomes/claim");
         let body: ClaimWelcomesRequest =
             serde_json::from_value(request.json.expect("json")).expect("claim welcomes request");
         assert_eq!(body.recipient.as_slice(), b"bob-device");
@@ -1357,7 +1357,7 @@ mod tests {
             prepare_http_request(["ack-welcome", "--message-id", "welcome-bob"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "http://127.0.0.1:8787/welcomes/ack");
+        assert_eq!(request.url, "https://chat.finite.computer/welcomes/ack");
         let body: AckWelcomeRequest =
             serde_json::from_value(request.json.expect("json")).expect("ack welcome request");
         assert_eq!(body.message_id.as_slice(), b"welcome-bob");

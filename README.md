@@ -29,20 +29,20 @@ The v1 product shape is a phone chat app for people and agents:
 
 ## Local Loop
 
-Start a local delivery server:
+The production/default app server is `https://chat.finite.computer`. Local
+server URLs are explicit development and test overrides only.
+
+For server iteration or local automated testing, start a local delivery server:
 
 ```sh
 cargo run -p finitechat-server -- serve 127.0.0.1:8787 --sqlite .state/finitechat.sqlite3
 ```
 
-Run the iOS simulator app against that server:
+Run the iOS simulator app against that server with an explicit override:
 
 ```sh
 FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run ios
 ```
-
-Without an override, the native app defaults to
-`https://chat.finite.computer`.
 
 To test the iOS app surface with a real local Hermes gateway, use the bundled
 runner instead of the plain server command:

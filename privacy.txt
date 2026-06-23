@@ -40,8 +40,6 @@ Finite Chat asks for access only when you choose to use a related feature:
 - Microphone access is used to record voice messages.
 - Speech recognition is used to transcribe voice messages you choose to send.
 - Photo library add access is used when you choose to save media from a chat.
-- Local network access may be used for development or self-hosted server
-  connections.
 
 Third-party services
 

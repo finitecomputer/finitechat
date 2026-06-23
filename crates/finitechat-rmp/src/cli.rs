@@ -234,7 +234,7 @@ pub struct ProductHarnessArgs {
     pub device: String,
 
     /// Configured server URL. Offline phases toggle reachability of this same URL.
-    #[arg(long, default_value = "http://127.0.0.1:8787")]
+    #[arg(long)]
     pub server_url: String,
 
     /// Server bind address. Simulator defaults to the host:port parsed from --server-url.

@@ -20,15 +20,8 @@
 	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
-	</dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Finite Chat uses the camera to scan invite and profile QR codes you choose to open.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Finite Chat connects to your development server on the local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Finite Chat uses the microphone to record voice messages you choose to send.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

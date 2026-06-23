@@ -85,9 +85,10 @@ Also verify:
 - App icon assets are present in
   `ios/Sources/Assets.xcassets/AppIcon.appiconset`.
 - Privacy permission copy in `ios/Info.plist` matches actual behavior.
-- Production server configuration is intentional; the TestFlight build should
-  not depend on a local development server unless the beta scope explicitly says
-  so.
+- The default app server is `https://chat.finite.computer`; local server URLs
+  are explicit development/test overrides only.
+- `ios/Info.plist` does not declare `NSLocalNetworkUsageDescription` or
+  `NSAllowsLocalNetworking` for TestFlight/App Store builds.
 - Review notes explain that Finite Chat uses end-to-end encryption, Nostr
   identity material, camera QR scanning, microphone recording, speech
   transcription, and optional photo-library saves initiated by the user.
