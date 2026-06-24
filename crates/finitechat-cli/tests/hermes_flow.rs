@@ -21,6 +21,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [41; NOSTR_SECRET_KEY_BYTES];
+const USER2_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [42; NOSTR_SECRET_KEY_BYTES];
 
 fn spawn_live_http_server(path: &std::path::Path) -> String {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -202,6 +203,18 @@ fn hermes_serve_reports_process_health() {
             .and_then(|response| response.json::<Value>().map_err(|error| error.to_string())),
         Err(error) => Err(error.clone()),
     };
+    let home_channel_result = match &started_result {
+        Ok(started) => reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1/hermes/home-channel-show",
+                started["url"].as_str().unwrap()
+            ))
+            .json(&json!({}))
+            .send()
+            .map_err(|error| error.to_string())
+            .and_then(|response| response.json::<Value>().map_err(|error| error.to_string())),
+        Err(error) => Err(error.clone()),
+    };
     let _ = child.kill();
     child.wait().expect("wait hermes service");
 
@@ -213,6 +226,8 @@ fn hermes_serve_reports_process_health() {
     assert_eq!(response["account_id"], started["account_id"]);
     let recover = recover_result.expect("Hermes service handled bridge action");
     assert_eq!(recover["recovered"], 0);
+    let home_channel = home_channel_result.expect("Hermes service handled home-channel action");
+    assert_eq!(home_channel["home_channel"], Value::Null);
 }
 
 fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {
@@ -609,6 +624,288 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .expect("joined user decrypts Hermes activity");
     let projected: DecryptedEphemeralActivityV1 = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(projected.activity_kind, "working");
+}
+
+#[test]
+fn hermes_cli_group_room_preserves_two_human_sender_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("server.sqlite3");
+    let server_url = spawn_live_http_server(&server_db);
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+
+    let init = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+    ]);
+    let agent_account = init["account_id"].as_str().unwrap().to_owned();
+    let invite = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "invite",
+        "--room-name",
+        "Friends Alpha Group",
+        "--max-joins",
+        "2",
+        "--json",
+    ]);
+    let code = InviteCodeV1::parse(invite["url"].as_str().unwrap()).unwrap();
+    let room_id = code.room_id.clone();
+    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
+    let home_channel_before = hermes(&["hermes", "--home", &home_arg, "home-channel", "show"]);
+    assert_eq!(home_channel_before["home_channel"], Value::Null);
+    let home_channel_set = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "home-channel",
+        "set",
+        "--room-id",
+        &room_id,
+    ]);
+    assert_eq!(home_channel_set["home_channel"]["room_id"], room_id);
+    let home_channel_show = hermes(&["hermes", "--home", &home_arg, "home-channel", "show"]);
+    assert_eq!(home_channel_show["home_channel"]["room_id"], room_id);
+
+    let alice_config = FiniteChatDeviceConfig {
+        account_secret_key: NostrSecretKey::from_bytes(USER_SECRET).unwrap(),
+        device_id: "alice_phone".to_owned(),
+        now_unix_seconds: now_ms() / 1000,
+        credential_not_before_unix_seconds: now_ms() / 1000 - 3600,
+        credential_not_after_unix_seconds: now_ms() / 1000 + 86400,
+    };
+    let bob_config = FiniteChatDeviceConfig {
+        account_secret_key: NostrSecretKey::from_bytes(USER2_SECRET).unwrap(),
+        device_id: "bob_phone".to_owned(),
+        now_unix_seconds: now_ms() / 1000,
+        credential_not_before_unix_seconds: now_ms() / 1000 - 3600,
+        credential_not_after_unix_seconds: now_ms() / 1000 + 86400,
+    };
+    let mut alice_store = SqliteClientStore::open(
+        dir.path().join("alice.sqlite3"),
+        SqliteClientStoreOptions::from_nostr_secret(
+            &alice_config.account_secret_key,
+            &alice_config.device_id,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut bob_store = SqliteClientStore::open(
+        dir.path().join("bob.sqlite3"),
+        SqliteClientStoreOptions::from_nostr_secret(
+            &bob_config.account_secret_key,
+            &bob_config.device_id,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut alice = FiniteChatDevice::new(alice_config).unwrap();
+    let mut bob = FiniteChatDevice::new(bob_config).unwrap();
+    alice_store.save_device_state(&alice).unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    let mut alice_delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+    let mut bob_delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+
+    submit_invite_join_request(
+        &mut alice_store,
+        &mut alice,
+        &mut alice_delivery,
+        &code,
+        &pin,
+        Some("Alice".to_owned()),
+        now_ms(),
+    )
+    .unwrap();
+    submit_invite_join_request(
+        &mut bob_store,
+        &mut bob,
+        &mut bob_delivery,
+        &code,
+        &pin,
+        Some("Bob".to_owned()),
+        now_ms(),
+    )
+    .unwrap();
+
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":5000}"#,
+    ]);
+    let joined = poll["joined"].as_array().unwrap();
+    assert_eq!(joined.len(), 2);
+    assert!(joined.contains(&Value::String(alice.device_ref().account_id.clone())));
+    assert!(joined.contains(&Value::String(bob.device_ref().account_id.clone())));
+
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+    run_runtime_sync_tick(&mut alice_store, &mut alice, &mut alice_delivery, &options).unwrap();
+    finalize_invited_room(&mut alice_store, &mut alice, &code).unwrap();
+    run_runtime_sync_tick(&mut bob_store, &mut bob, &mut bob_delivery, &options).unwrap();
+    finalize_invited_room(&mut bob_store, &mut bob, &code).unwrap();
+
+    let alice_payload = HermesMessagePayloadV1 {
+        payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+        conversation_id: None,
+        text: "alice checking in".to_owned(),
+        kind: HermesSendKindV1::Message,
+        status: HermesMessageStatusV1::Complete,
+        edit_of: None,
+        attachments: Vec::new(),
+        reply_to_message_id: None,
+        sender_name: Some("Alice".to_owned()),
+        metadata: Default::default(),
+    };
+    let alice_request = alice
+        .create_application_request(&room_id, &alice_payload.encode().unwrap(), "alice-group-1")
+        .unwrap();
+    alice_store.save_device_state(&alice).unwrap();
+    alice_delivery
+        .append_event(
+            &alice_request,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
+
+    let bob_payload = HermesMessagePayloadV1 {
+        payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+        conversation_id: None,
+        text: "bob checking in".to_owned(),
+        kind: HermesSendKindV1::Message,
+        status: HermesMessageStatusV1::Complete,
+        edit_of: None,
+        attachments: Vec::new(),
+        reply_to_message_id: None,
+        sender_name: Some("Bob".to_owned()),
+        metadata: Default::default(),
+    };
+    let bob_request = bob
+        .create_application_request(&room_id, &bob_payload.encode().unwrap(), "bob-group-1")
+        .unwrap();
+    bob_store.save_device_state(&bob).unwrap();
+    bob_delivery
+        .append_event(
+            &bob_request,
+            DurableAppEventKind::ChatMessage.delivery_policy(),
+        )
+        .unwrap();
+
+    let poll = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":5000}"#,
+    ]);
+    let events = poll["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    let alice_event = events
+        .iter()
+        .find(|event| event["text"] == "alice checking in")
+        .expect("Alice event");
+    assert_eq!(alice_event["source"]["chat_type"], "group");
+    assert_eq!(
+        alice_event["source"]["user_id"].as_str().unwrap(),
+        alice.device_ref().account_id
+    );
+    assert_eq!(alice_event["source"]["user_id_alt"], "alice_phone");
+    assert_eq!(alice_event["source"]["user_name"], "Alice");
+    let bob_event = events
+        .iter()
+        .find(|event| event["text"] == "bob checking in")
+        .expect("Bob event");
+    assert_eq!(bob_event["source"]["chat_type"], "group");
+    assert_eq!(
+        bob_event["source"]["user_id"].as_str().unwrap(),
+        bob.device_ref().account_id
+    );
+    assert_eq!(bob_event["source"]["user_id_alt"], "bob_phone");
+    assert_eq!(bob_event["source"]["user_name"], "Bob");
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": "hello group from the agent",
+            "kind": "message",
+            "status": "complete",
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ]);
+    let alice_report = finitechat_client::run_room_server_sync_tick(
+        &mut alice_store,
+        &mut alice,
+        &mut alice_delivery,
+        &options,
+        &server_url,
+    )
+    .unwrap();
+    let alice_saw_reply = alice_report
+        .applied_entries
+        .iter()
+        .any(|entry| match &entry.entry {
+            AppliedLogEntry::Application { plaintext, sender }
+                if sender.account_id == agent_account =>
+            {
+                HermesMessagePayloadV1::decode(plaintext)
+                    .unwrap()
+                    .map(|payload| payload.text == "hello group from the agent")
+                    .unwrap_or(false)
+            }
+            _ => false,
+        });
+    assert!(
+        alice_saw_reply,
+        "Alice should receive the group agent reply"
+    );
+
+    let bob_report = finitechat_client::run_room_server_sync_tick(
+        &mut bob_store,
+        &mut bob,
+        &mut bob_delivery,
+        &options,
+        &server_url,
+    )
+    .unwrap();
+    let bob_saw_reply = bob_report
+        .applied_entries
+        .iter()
+        .any(|entry| match &entry.entry {
+            AppliedLogEntry::Application { plaintext, sender }
+                if sender.account_id == agent_account =>
+            {
+                HermesMessagePayloadV1::decode(plaintext)
+                    .unwrap()
+                    .map(|payload| payload.text == "hello group from the agent")
+                    .unwrap_or(false)
+            }
+            _ => false,
+        });
+    assert!(bob_saw_reply, "Bob should receive the group agent reply");
+
+    let home_channel_cleared = hermes(&["hermes", "--home", &home_arg, "home-channel", "clear"]);
+    assert_eq!(home_channel_cleared["cleared"], true);
+    let home_channel_after_clear = hermes(&["hermes", "--home", &home_arg, "home-channel", "show"]);
+    assert_eq!(home_channel_after_clear["home_channel"], Value::Null);
 }
 
 #[test]

@@ -36,6 +36,20 @@ ready file, and uses that loopback URL. If a service is unreachable it falls
 back to the CLI bridge. Action errors returned by the service are not retried
 through the CLI, avoiding duplicate sends.
 
+Hermes home channel is persisted in Agent Home with:
+
+```text
+finitechat hermes --agent-home DIR home-channel show
+finitechat hermes --agent-home DIR home-channel set --room-id ROOM_ID
+finitechat hermes --agent-home DIR home-channel clear
+```
+
+The loopback service exposes matching `home-channel-show`,
+`home-channel-set`, and `home-channel-clear` actions. The setting is only a
+Hermes routing preference; it does not add, remove, or reinterpret Finite Chat
+room membership. A room must already be available to the agent before it can
+be stored as home.
+
 The plugin calls a Finite Chat CLI/daemon boundary:
 
 ```text

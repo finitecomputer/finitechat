@@ -53,6 +53,7 @@ const NSEC_FILE: &str = "agent.nsec";
 const INVITES_FILE: &str = "invites.json";
 const HERMES_INBOX_FILE: &str = "hermes-inbox.json";
 const HERMES_RUNNING_FILE: &str = "hermes-running.json";
+const HERMES_HOME_CHANNEL_FILE: &str = "hermes-home-channel.json";
 const STORE_FILE: &str = "client.sqlite3";
 const ATTACHMENT_CACHE_DIR: &str = "attachments";
 const HERMES_PLUGIN_INSTALL_NAME: &str = "finite";
@@ -99,6 +100,7 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "init" => cmd_init(&home_dir, rest, output),
         "install" => cmd_install(&home_dir, rest, json_mode, output),
         "serve" => cmd_serve(&home_dir, rest, json_mode, output),
+        "home-channel" => cmd_home_channel(&home_dir, rest, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "pin" => cmd_pin(&home_dir, rest, output),
         "join" => cmd_join(&home_dir, rest, output),
@@ -392,6 +394,24 @@ fn handle_hermes_bridge_action(
         "edit" => cmd_edit(home_dir, payload, &mut output)?,
         "recover" => cmd_recover(home_dir, payload, &mut output)?,
         "activity" => cmd_activity(home_dir, payload, &mut output)?,
+        "home-channel-show" => write_home_channel_show(home_dir, &mut output)?,
+        "home-channel-set" => {
+            let request: HermesHomeChannelSetRequest =
+                serde_json::from_value(payload).map_err(CliError::Json)?;
+            set_home_channel(
+                home_dir,
+                request.room_id,
+                request.conversation_id,
+                &mut output,
+            )?;
+        }
+        "home-channel-clear" => {
+            clear_home_channel(home_dir)?;
+            crate::write_pretty_json(
+                &mut output,
+                &json!({ "cleared": true, "home_channel": null }),
+            )?;
+        }
         _ => {
             return Err(CliError::Usage(format!(
                 "unknown Hermes service action {action:?}"
@@ -415,6 +435,125 @@ fn status_for_cli_error(error: &CliError) -> StatusCode {
 
 fn service_error(status: StatusCode, error: String) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "ok": false, "error": error })))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HermesHomeChannel {
+    room_id: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    set_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HermesHomeChannelSetRequest {
+    room_id: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+fn cmd_home_channel<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let Some(command) = args.first().cloned() else {
+        return Err(CliError::Usage(hermes_usage()));
+    };
+    let rest = args.split_off(1);
+    match command.as_str() {
+        "show" => {
+            crate::reject_extra_args(&rest)?;
+            write_home_channel_show(home_dir, output)
+        }
+        "set" => cmd_home_channel_set(home_dir, rest, output),
+        "clear" => {
+            crate::reject_extra_args(&rest)?;
+            clear_home_channel(home_dir)?;
+            crate::write_pretty_json(output, &json!({ "cleared": true, "home_channel": null }))
+        }
+        _ => Err(CliError::Usage(hermes_usage())),
+    }
+}
+
+fn cmd_home_channel_set<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let room_id = crate::required_option(&mut args, "--room-id")?;
+    let conversation_id = crate::take_option(&mut args, "--conversation-id")?;
+    crate::reject_extra_args(&args)?;
+    set_home_channel(home_dir, room_id, conversation_id, output)
+}
+
+fn set_home_channel<W: Write>(
+    home_dir: &Path,
+    room_id: String,
+    conversation_id: Option<String>,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let room_id = non_empty_home_channel_value("room_id", room_id)?;
+    let conversation_id = conversation_id
+        .map(|value| non_empty_home_channel_value("conversation_id", value))
+        .transpose()?;
+    ensure_agent_room_available(home_dir, &room_id)?;
+    let channel = HermesHomeChannel {
+        room_id,
+        conversation_id,
+        set_at_ms: now_ms(),
+    };
+    save_home_channel(home_dir, &channel)?;
+    crate::write_pretty_json(output, &json!({ "home_channel": channel }))
+}
+
+fn write_home_channel_show<W: Write>(home_dir: &Path, output: &mut W) -> Result<(), CliError> {
+    let channel = load_home_channel(home_dir)?;
+    crate::write_pretty_json(output, &json!({ "home_channel": channel }))
+}
+
+fn non_empty_home_channel_value(name: &str, value: String) -> Result<String, CliError> {
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(CliError::Hermes(format!("{name} cannot be empty")));
+    }
+    Ok(trimmed)
+}
+
+fn ensure_agent_room_available(home_dir: &Path, room_id: &str) -> Result<(), CliError> {
+    let home = load_home(home_dir)?;
+    let (_store, device, _delivery) = open_agent(&home)?;
+    if device.group_epoch(room_id).is_ok() || device.room_server_url(room_id).is_some() {
+        return Ok(());
+    }
+    Err(CliError::Hermes(format!(
+        "home channel room {room_id} is not available to this agent"
+    )))
+}
+
+fn load_home_channel(home_dir: &Path) -> Result<Option<HermesHomeChannel>, CliError> {
+    let path = home_dir.join(HERMES_HOME_CHANNEL_FILE);
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::Hermes(error.to_string())),
+    };
+    serde_json::from_str(&raw).map(Some).map_err(CliError::Json)
+}
+
+fn save_home_channel(home_dir: &Path, channel: &HermesHomeChannel) -> Result<(), CliError> {
+    write_private(
+        home_dir.join(HERMES_HOME_CHANNEL_FILE),
+        &serde_json::to_string_pretty(channel).map_err(CliError::Serialize)?,
+    )
+}
+
+fn clear_home_channel(home_dir: &Path) -> Result<(), CliError> {
+    match fs::remove_file(home_dir.join(HERMES_HOME_CHANNEL_FILE)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::Hermes(error.to_string())),
+    }
 }
 
 fn cmd_init<W: Write>(
@@ -1750,7 +1889,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]
@@ -1848,6 +1987,28 @@ mod tests {
         .expect_err("missing identity fails");
         assert!(error.to_string().contains("Agent Principal Key"));
         assert!(!plugin_dir.exists());
+    }
+
+    #[test]
+    fn home_channel_rejects_room_not_available_to_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let mut output = Vec::new();
+        cmd_init(
+            &home,
+            vec!["--server".to_owned(), "http://127.0.0.1:1".to_owned()],
+            &mut output,
+        )
+        .expect("init");
+        output.clear();
+
+        let error = cmd_home_channel_set(
+            &home,
+            vec!["--room-id".to_owned(), "missing-room".to_owned()],
+            &mut output,
+        )
+        .expect_err("unknown room cannot become home channel");
+        assert!(error.to_string().contains("not available"));
     }
 
     #[test]
