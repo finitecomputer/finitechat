@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::TryFromIntError;
 
 use finitechat_proto::{
@@ -21,6 +21,13 @@ pub const BLOB_CIPHERTEXT_CONTENT_TYPE: &str = "application/octet-stream";
 pub const BLOSSOM_UPLOAD_METHOD: &str = "PUT";
 pub const BLOSSOM_UPLOAD_PATH: &str = "/upload";
 pub const BLOSSOM_DOWNLOAD_METHOD: &str = "GET";
+pub const FINITE_BLOB_UPLOAD_METHOD: &str = "PUT";
+pub const FINITE_BLOB_DOWNLOAD_METHOD: &str = "GET";
+pub const MAX_FINITE_BLOB_PRINCIPAL_BYTES: u32 = 128;
+pub const MAX_FINITE_BLOB_NAMESPACE_BYTES: u32 = 128;
+pub const MAX_FINITE_BLOB_CONTENT_TYPE_BYTES: u32 = 256;
+pub const MAX_FINITE_BLOB_CAPABILITY_PATH_BYTES: u32 = 512;
+pub const MAX_FINITE_BLOB_NONCE_BYTES: u32 = 128;
 
 const ATTACHMENT_AAD_DOMAIN: &[u8] = b"finitechat.attachment-blob.aad.v1";
 
@@ -81,6 +88,322 @@ pub enum BlobStoreError {
     Missing { url: String },
     #[error("blob object hash collision for {sha256}")]
     ObjectHashCollision { sha256: String },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FiniteBlobCapabilityError {
+    #[error(transparent)]
+    Protocol(#[from] ProtocolLimitError),
+    #[error(transparent)]
+    Attachment(#[from] AttachmentBlobError),
+    #[error("unknown blob principal: {0}")]
+    UnknownPrincipal(String),
+    #[error("blob product {product:?} is not enabled for principal {principal}")]
+    ProductDisabled {
+        principal: String,
+        product: FiniteBlobProduct,
+    },
+    #[error("blob principal {0} is expired")]
+    PrincipalExpired(String),
+    #[error("blob capability expiry must be greater than now")]
+    CapabilityExpired,
+    #[error("blob capability expiry exceeds principal allowlist expiry")]
+    ExpiryBeyondPrincipal,
+    #[error("blob size {size_bytes} exceeds limit {limit_bytes}")]
+    ByteLimitExceeded { size_bytes: u64, limit_bytes: u64 },
+    #[error("blob capability nonce was already used")]
+    NonceReplay,
+    #[error("blob ref product or namespace does not match request scope")]
+    BlobRefScopeMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiniteBlobProduct {
+    Chat,
+    Sites,
+    Brain,
+    Blob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiniteBlobCapabilityKind {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteBlobRef {
+    pub product: FiniteBlobProduct,
+    pub namespace: String,
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+}
+
+impl FiniteBlobRef {
+    pub fn validate_limits(&self) -> Result<(), FiniteBlobCapabilityError> {
+        validate_string_bytes(
+            "blob_ref.namespace",
+            &self.namespace,
+            MAX_FINITE_BLOB_NAMESPACE_BYTES,
+        )?;
+        validate_string_bytes(
+            "blob_ref.url",
+            &self.url,
+            finitechat_proto::MAX_ATTACHMENT_BLOB_URL_BYTES,
+        )?;
+        decode_hex_fixed::<32>("blob_ref.sha256", &self.sha256)?;
+        validate_bytes_non_empty("blob_ref.bytes", self.size_bytes as usize)?;
+        validate_string_bytes(
+            "blob_ref.content_type",
+            &self.content_type,
+            MAX_FINITE_BLOB_CONTENT_TYPE_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteBlobCapability {
+    pub capability_id: String,
+    pub kind: FiniteBlobCapabilityKind,
+    pub principal: String,
+    pub product: FiniteBlobProduct,
+    pub namespace: String,
+    pub method: String,
+    pub path: String,
+    pub expires_at_ms: u64,
+    pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteBlobAllowlistEntry {
+    pub principal: String,
+    pub products: BTreeSet<FiniteBlobProduct>,
+    pub max_upload_bytes: u64,
+    pub max_download_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteBlobUploadCapabilityRequest {
+    pub principal: String,
+    pub product: FiniteBlobProduct,
+    pub namespace: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub now_ms: u64,
+    pub expires_at_ms: u64,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiniteBlobDownloadCapabilityRequest {
+    pub principal: String,
+    pub product: FiniteBlobProduct,
+    pub namespace: String,
+    pub blob: FiniteBlobRef,
+    pub now_ms: u64,
+    pub expires_at_ms: u64,
+    pub nonce: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FiniteBlobCapabilityIssuer {
+    allowlist: BTreeMap<String, FiniteBlobAllowlistEntry>,
+    used_nonces: BTreeSet<String>,
+}
+
+impl FiniteBlobCapabilityIssuer {
+    pub fn new(entries: Vec<FiniteBlobAllowlistEntry>) -> Result<Self, FiniteBlobCapabilityError> {
+        let mut allowlist = BTreeMap::new();
+        for entry in entries {
+            entry.validate_limits()?;
+            allowlist.insert(entry.principal.clone(), entry);
+        }
+        Ok(Self {
+            allowlist,
+            used_nonces: BTreeSet::new(),
+        })
+    }
+
+    pub fn issue_upload_capability(
+        &mut self,
+        request: FiniteBlobUploadCapabilityRequest,
+    ) -> Result<FiniteBlobCapability, FiniteBlobCapabilityError> {
+        request.validate_limits()?;
+        let entry = self.allowed_entry(
+            &request.principal,
+            request.product,
+            request.now_ms,
+            request.expires_at_ms,
+        )?;
+        if request.size_bytes > entry.max_upload_bytes {
+            return Err(FiniteBlobCapabilityError::ByteLimitExceeded {
+                size_bytes: request.size_bytes,
+                limit_bytes: entry.max_upload_bytes,
+            });
+        }
+        self.consume_nonce(&request.principal, request.product, &request.nonce)?;
+        let capability_id = capability_id(
+            FiniteBlobCapabilityKind::Upload,
+            &request.principal,
+            request.product,
+            &request.namespace,
+            &request.nonce,
+            request.sha256.as_deref(),
+        );
+        Ok(FiniteBlobCapability {
+            path: format!("/finite-blob/v1/upload/{capability_id}"),
+            capability_id,
+            kind: FiniteBlobCapabilityKind::Upload,
+            principal: request.principal,
+            product: request.product,
+            namespace: request.namespace,
+            method: FINITE_BLOB_UPLOAD_METHOD.to_owned(),
+            expires_at_ms: request.expires_at_ms,
+            max_bytes: request.size_bytes,
+            sha256: request.sha256,
+        })
+    }
+
+    pub fn issue_download_capability(
+        &mut self,
+        request: FiniteBlobDownloadCapabilityRequest,
+    ) -> Result<FiniteBlobCapability, FiniteBlobCapabilityError> {
+        request.validate_limits()?;
+        if request.blob.product != request.product || request.blob.namespace != request.namespace {
+            return Err(FiniteBlobCapabilityError::BlobRefScopeMismatch);
+        }
+        let entry = self.allowed_entry(
+            &request.principal,
+            request.product,
+            request.now_ms,
+            request.expires_at_ms,
+        )?;
+        if request.blob.size_bytes > entry.max_download_bytes {
+            return Err(FiniteBlobCapabilityError::ByteLimitExceeded {
+                size_bytes: request.blob.size_bytes,
+                limit_bytes: entry.max_download_bytes,
+            });
+        }
+        self.consume_nonce(&request.principal, request.product, &request.nonce)?;
+        let capability_id = capability_id(
+            FiniteBlobCapabilityKind::Download,
+            &request.principal,
+            request.product,
+            &request.namespace,
+            &request.nonce,
+            Some(&request.blob.sha256),
+        );
+        Ok(FiniteBlobCapability {
+            path: format!(
+                "/finite-blob/v1/download/{}?cap={capability_id}",
+                request.blob.sha256
+            ),
+            capability_id,
+            kind: FiniteBlobCapabilityKind::Download,
+            principal: request.principal,
+            product: request.product,
+            namespace: request.namespace,
+            method: FINITE_BLOB_DOWNLOAD_METHOD.to_owned(),
+            expires_at_ms: request.expires_at_ms,
+            max_bytes: request.blob.size_bytes,
+            sha256: Some(request.blob.sha256),
+        })
+    }
+
+    fn allowed_entry(
+        &self,
+        principal: &str,
+        product: FiniteBlobProduct,
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<FiniteBlobAllowlistEntry, FiniteBlobCapabilityError> {
+        let entry = self
+            .allowlist
+            .get(principal)
+            .cloned()
+            .ok_or_else(|| FiniteBlobCapabilityError::UnknownPrincipal(principal.to_owned()))?;
+        if !entry.products.contains(&product) {
+            return Err(FiniteBlobCapabilityError::ProductDisabled {
+                principal: principal.to_owned(),
+                product,
+            });
+        }
+        if let Some(entry_expiry) = entry.expires_at_ms {
+            if now_ms >= entry_expiry {
+                return Err(FiniteBlobCapabilityError::PrincipalExpired(
+                    principal.to_owned(),
+                ));
+            }
+            if expires_at_ms > entry_expiry {
+                return Err(FiniteBlobCapabilityError::ExpiryBeyondPrincipal);
+            }
+        }
+        Ok(entry)
+    }
+
+    fn consume_nonce(
+        &mut self,
+        principal: &str,
+        product: FiniteBlobProduct,
+        nonce: &str,
+    ) -> Result<(), FiniteBlobCapabilityError> {
+        let nonce_key = format!("{principal}\0{product:?}\0{nonce}");
+        if !self.used_nonces.insert(nonce_key) {
+            return Err(FiniteBlobCapabilityError::NonceReplay);
+        }
+        Ok(())
+    }
+}
+
+impl FiniteBlobAllowlistEntry {
+    pub fn validate_limits(&self) -> Result<(), FiniteBlobCapabilityError> {
+        validate_principal(&self.principal)?;
+        validate_bytes_non_empty("blob.products", self.products.len())?;
+        validate_bytes_non_empty("blob.max_upload_bytes", self.max_upload_bytes as usize)?;
+        validate_bytes_non_empty("blob.max_download_bytes", self.max_download_bytes as usize)?;
+        Ok(())
+    }
+}
+
+impl FiniteBlobUploadCapabilityRequest {
+    pub fn validate_limits(&self) -> Result<(), FiniteBlobCapabilityError> {
+        validate_principal(&self.principal)?;
+        validate_namespace(&self.namespace)?;
+        validate_string_bytes(
+            "blob.content_type",
+            &self.content_type,
+            MAX_FINITE_BLOB_CONTENT_TYPE_BYTES,
+        )?;
+        validate_bytes_non_empty("blob.size_bytes", self.size_bytes as usize)?;
+        if let Some(sha256) = &self.sha256 {
+            decode_hex_fixed::<32>("blob.sha256", sha256)?;
+        }
+        validate_expiry(self.now_ms, self.expires_at_ms)?;
+        validate_nonce(&self.nonce)?;
+        Ok(())
+    }
+}
+
+impl FiniteBlobDownloadCapabilityRequest {
+    pub fn validate_limits(&self) -> Result<(), FiniteBlobCapabilityError> {
+        validate_principal(&self.principal)?;
+        validate_namespace(&self.namespace)?;
+        self.blob.validate_limits()?;
+        validate_expiry(self.now_ms, self.expires_at_ms)?;
+        validate_nonce(&self.nonce)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,6 +835,54 @@ fn validate_http_success(status: u16) -> Result<(), AttachmentBlobError> {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_lower(&digest)
+}
+
+fn validate_principal(principal: &str) -> Result<(), FiniteBlobCapabilityError> {
+    validate_string_bytes("blob.principal", principal, MAX_FINITE_BLOB_PRINCIPAL_BYTES)?;
+    validate_bytes_non_empty("blob.principal", principal.len())?;
+    Ok(())
+}
+
+fn validate_namespace(namespace: &str) -> Result<(), FiniteBlobCapabilityError> {
+    validate_string_bytes("blob.namespace", namespace, MAX_FINITE_BLOB_NAMESPACE_BYTES)?;
+    validate_bytes_non_empty("blob.namespace", namespace.len())?;
+    Ok(())
+}
+
+fn validate_nonce(nonce: &str) -> Result<(), FiniteBlobCapabilityError> {
+    validate_string_bytes("blob.nonce", nonce, MAX_FINITE_BLOB_NONCE_BYTES)?;
+    validate_bytes_non_empty("blob.nonce", nonce.len())?;
+    Ok(())
+}
+
+fn validate_expiry(now_ms: u64, expires_at_ms: u64) -> Result<(), FiniteBlobCapabilityError> {
+    if expires_at_ms <= now_ms {
+        return Err(FiniteBlobCapabilityError::CapabilityExpired);
+    }
+    Ok(())
+}
+
+fn capability_id(
+    kind: FiniteBlobCapabilityKind,
+    principal: &str,
+    product: FiniteBlobProduct,
+    namespace: &str,
+    nonce: &str,
+    sha256: Option<&str>,
+) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"finite-blob-capability-v1\0");
+    input.extend_from_slice(format!("{kind:?}\0{product:?}\0").as_bytes());
+    input.extend_from_slice(principal.as_bytes());
+    input.push(0);
+    input.extend_from_slice(namespace.as_bytes());
+    input.push(0);
+    input.extend_from_slice(nonce.as_bytes());
+    input.push(0);
+    if let Some(sha256) = sha256 {
+        input.extend_from_slice(sha256.as_bytes());
+    }
+    sha256_hex(&input)
 }
 
 struct DecodedReference {
@@ -1040,5 +1411,230 @@ mod tests {
 
         let err = download_attachment(&store, &reference).expect_err("uppercase hex");
         assert!(matches!(err, AttachmentBlobError::InvalidHexByte { .. }));
+    }
+
+    #[test]
+    fn finite_blob_upload_capability_binds_principal_product_and_scope() {
+        let mut issuer = capability_issuer();
+
+        let capability = issuer
+            .issue_upload_capability(FiniteBlobUploadCapabilityRequest {
+                principal: "npub-alice".to_owned(),
+                product: FiniteBlobProduct::Brain,
+                namespace: "brain/artifacts".to_owned(),
+                content_type: "application/json".to_owned(),
+                size_bytes: 512,
+                sha256: Some(sha256_hex(b"artifact")),
+                now_ms: 1_000,
+                expires_at_ms: 2_000,
+                nonce: "nonce-upload-1".to_owned(),
+            })
+            .expect("upload capability");
+
+        assert_eq!(capability.kind, FiniteBlobCapabilityKind::Upload);
+        assert_eq!(capability.principal, "npub-alice");
+        assert_eq!(capability.product, FiniteBlobProduct::Brain);
+        assert_eq!(capability.namespace, "brain/artifacts");
+        assert_eq!(capability.method, FINITE_BLOB_UPLOAD_METHOD);
+        assert!(capability.path.starts_with("/finite-blob/v1/upload/"));
+        assert_eq!(capability.max_bytes, 512);
+        assert_eq!(
+            capability.sha256.as_deref(),
+            Some(sha256_hex(b"artifact").as_str())
+        );
+    }
+
+    #[test]
+    fn finite_blob_capability_rejects_wrong_principal_product_expiry_quota_and_replay() {
+        let mut issuer = capability_issuer();
+
+        let wrong_principal = issuer
+            .issue_upload_capability(upload_request(
+                "npub-mallory",
+                FiniteBlobProduct::Brain,
+                512,
+                1_000,
+                2_000,
+                "nonce-missing",
+            ))
+            .expect_err("unknown principal");
+        assert!(matches!(
+            wrong_principal,
+            FiniteBlobCapabilityError::UnknownPrincipal(_)
+        ));
+
+        let wrong_product = issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Sites,
+                512,
+                1_000,
+                2_000,
+                "nonce-product",
+            ))
+            .expect_err("disabled product");
+        assert!(matches!(
+            wrong_product,
+            FiniteBlobCapabilityError::ProductDisabled { .. }
+        ));
+
+        let expired_capability = issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Brain,
+                512,
+                2_000,
+                2_000,
+                "nonce-expired-cap",
+            ))
+            .expect_err("capability expiry");
+        assert_eq!(
+            expired_capability,
+            FiniteBlobCapabilityError::CapabilityExpired
+        );
+
+        let beyond_principal = issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Brain,
+                512,
+                1_000,
+                20_000,
+                "nonce-beyond",
+            ))
+            .expect_err("principal expiry caps capability");
+        assert_eq!(
+            beyond_principal,
+            FiniteBlobCapabilityError::ExpiryBeyondPrincipal
+        );
+
+        let oversized = issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Brain,
+                2_048,
+                1_000,
+                2_000,
+                "nonce-quota",
+            ))
+            .expect_err("quota rejects");
+        assert_eq!(
+            oversized,
+            FiniteBlobCapabilityError::ByteLimitExceeded {
+                size_bytes: 2_048,
+                limit_bytes: 1_024
+            }
+        );
+
+        issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Brain,
+                512,
+                1_000,
+                2_000,
+                "nonce-replay",
+            ))
+            .expect("first nonce use");
+        let replay = issuer
+            .issue_upload_capability(upload_request(
+                "npub-alice",
+                FiniteBlobProduct::Brain,
+                512,
+                1_000,
+                2_000,
+                "nonce-replay",
+            ))
+            .expect_err("nonce replay");
+        assert_eq!(replay, FiniteBlobCapabilityError::NonceReplay);
+    }
+
+    #[test]
+    fn finite_blob_download_capability_rejects_product_scope_mismatch() {
+        let mut issuer = capability_issuer();
+        let mut blob = finite_blob_ref(FiniteBlobProduct::Brain, "brain/artifacts");
+        blob.product = FiniteBlobProduct::Sites;
+
+        let mismatch = issuer
+            .issue_download_capability(FiniteBlobDownloadCapabilityRequest {
+                principal: "npub-alice".to_owned(),
+                product: FiniteBlobProduct::Brain,
+                namespace: "brain/artifacts".to_owned(),
+                blob,
+                now_ms: 1_000,
+                expires_at_ms: 2_000,
+                nonce: "nonce-download-mismatch".to_owned(),
+            })
+            .expect_err("product mismatch");
+
+        assert_eq!(mismatch, FiniteBlobCapabilityError::BlobRefScopeMismatch);
+    }
+
+    #[test]
+    fn finite_blob_download_capability_binds_ref_without_bucket_details() {
+        let mut issuer = capability_issuer();
+        let blob = finite_blob_ref(FiniteBlobProduct::Brain, "brain/artifacts");
+
+        let capability = issuer
+            .issue_download_capability(FiniteBlobDownloadCapabilityRequest {
+                principal: "npub-alice".to_owned(),
+                product: FiniteBlobProduct::Brain,
+                namespace: "brain/artifacts".to_owned(),
+                blob: blob.clone(),
+                now_ms: 1_000,
+                expires_at_ms: 2_000,
+                nonce: "nonce-download-1".to_owned(),
+            })
+            .expect("download capability");
+
+        assert_eq!(capability.kind, FiniteBlobCapabilityKind::Download);
+        assert_eq!(capability.method, FINITE_BLOB_DOWNLOAD_METHOD);
+        assert!(capability.path.starts_with("/finite-blob/v1/download/"));
+        assert!(capability.path.contains("?cap="));
+        assert_eq!(capability.sha256.as_deref(), Some(blob.sha256.as_str()));
+        assert_eq!(capability.max_bytes, blob.size_bytes);
+    }
+
+    fn capability_issuer() -> FiniteBlobCapabilityIssuer {
+        FiniteBlobCapabilityIssuer::new(vec![FiniteBlobAllowlistEntry {
+            principal: "npub-alice".to_owned(),
+            products: BTreeSet::from([FiniteBlobProduct::Chat, FiniteBlobProduct::Brain]),
+            max_upload_bytes: 1_024,
+            max_download_bytes: 4_096,
+            expires_at_ms: Some(10_000),
+        }])
+        .expect("allowlist")
+    }
+
+    fn upload_request(
+        principal: &str,
+        product: FiniteBlobProduct,
+        size_bytes: u64,
+        now_ms: u64,
+        expires_at_ms: u64,
+        nonce: &str,
+    ) -> FiniteBlobUploadCapabilityRequest {
+        FiniteBlobUploadCapabilityRequest {
+            principal: principal.to_owned(),
+            product,
+            namespace: "brain/artifacts".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            size_bytes,
+            sha256: None,
+            now_ms,
+            expires_at_ms,
+            nonce: nonce.to_owned(),
+        }
+    }
+
+    fn finite_blob_ref(product: FiniteBlobProduct, namespace: &str) -> FiniteBlobRef {
+        FiniteBlobRef {
+            product,
+            namespace: namespace.to_owned(),
+            url: "finite-blob://local/sha256/artifact".to_owned(),
+            sha256: sha256_hex(b"artifact"),
+            size_bytes: 2_048,
+            content_type: "application/json".to_owned(),
+        }
     }
 }
