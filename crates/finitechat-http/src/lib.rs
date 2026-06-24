@@ -625,6 +625,8 @@ pub struct RegisterPushTokenResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovePushTokenRequest {
     pub device: DeviceRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

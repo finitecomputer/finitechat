@@ -2929,9 +2929,18 @@ impl HttpServerState {
         &self,
         request: RemovePushTokenRequest,
     ) -> Result<RemovePushTokenResponse, ServerHttpError> {
+        request.device.validate_limits().map_err(|error| {
+            ServerHttpError::InvalidDeviceRequest {
+                reason: error.to_string(),
+            }
+        })?;
         let key = DeviceMembership::key(&request.device);
         let mut tokens = self.push_tokens.lock().expect("HTTP push-token mutex");
-        let removed = tokens.remove(&key).is_some();
+        let removed = match (tokens.get(&key), request.token.as_deref()) {
+            (None, _) => false,
+            (Some(record), Some(expected_token)) if record.token != expected_token => false,
+            (Some(_), _) => tokens.remove(&key).is_some(),
+        };
         if removed && let Some(store) = &self.store {
             store.delete_push_token(&key)?;
         }

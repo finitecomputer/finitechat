@@ -4173,6 +4173,7 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
             "/push-tokens/remove",
             &RemovePushTokenRequest {
                 device: device.clone(),
+                token: None,
             },
         )
     }

@@ -5,17 +5,24 @@ use std::path::Path;
 
 use finitechat_server::{HttpServerState, http_router};
 
+mod push;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]).await,
+        Some("push-drain") => {
+            let command = push::parse_push_drain_command(&args[1..])?;
+            push::run_push_drain(command)?;
+            Ok(())
+        }
         Some("smoke") | None => {
             smoke();
             Ok(())
         }
         Some(command) => Err(format!(
-            "unknown command '{command}'; expected 'serve [addr] [--sqlite PATH]' or 'smoke'"
+            "unknown command '{command}'; expected 'serve [addr] [--sqlite PATH]', 'push-drain [options]', or 'smoke'"
         )
         .into()),
     }

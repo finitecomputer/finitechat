@@ -6373,6 +6373,22 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
         "/push-tokens/remove",
         &RemovePushTokenRequest {
             device: alice.clone(),
+            token: Some("apns-token-alice".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let removed: RemovePushTokenResponse = read_json(response).await;
+    assert!(
+        !removed.removed,
+        "stale token guard must not remove a rotated push token"
+    );
+    let response = post_json(
+        app.clone(),
+        "/push-tokens/remove",
+        &RemovePushTokenRequest {
+            device: alice.clone(),
+            token: None,
         },
     )
     .await;
@@ -6384,6 +6400,7 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
         "/push-tokens/remove",
         &RemovePushTokenRequest {
             device: alice.clone(),
+            token: None,
         },
     )
     .await;
@@ -6408,6 +6425,7 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
         "/push-tokens/remove",
         &RemovePushTokenRequest {
             device: bob.clone(),
+            token: None,
         },
     )
     .await;
