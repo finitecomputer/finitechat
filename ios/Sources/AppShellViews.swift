@@ -1019,7 +1019,7 @@ private struct NostrAvatar: View {
                 .fill(Color(.tertiarySystemFill))
 
             if let url = pictureURL.flatMap(URL.init(string:)) {
-                AsyncImage(url: url) { image in
+                CachedRemoteImage(url: url) { image in
                     image
                         .resizable()
                         .scaledToFill()

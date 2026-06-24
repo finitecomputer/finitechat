@@ -1,13 +1,13 @@
 import Foundation
 import SwiftUI
 
-enum InviteAvailability: String, Equatable, Sendable {
+enum InviteAvailability: String, Codable, Equatable, Sendable {
     case unknown
     case available
     case unavailable
 }
 
-struct NostrFollowProfile: Identifiable, Equatable, Sendable {
+struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
     let pubkey: String
     let npub: String
     let name: String?
@@ -86,6 +86,84 @@ struct NostrFollowFetchResult: Equatable, Sendable {
     let followedPubkeyCount: Int
 }
 
+actor NostrPeopleCache: Sendable {
+    static let shared = NostrPeopleCache()
+
+    private let directory: URL
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    init(directory: URL? = nil) {
+        if let directory {
+            self.directory = directory
+        } else {
+            let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first ?? FileManager.default.temporaryDirectory
+            self.directory = root
+                .appendingPathComponent("FiniteChat", isDirectory: true)
+                .appendingPathComponent("PeopleCache", isDirectory: true)
+        }
+    }
+
+    func load(accountID: String, serverURL: String) -> NostrFollowFetchResult? {
+        let url = cacheURL(accountID: accountID, serverURL: serverURL)
+        guard let data = try? Data(contentsOf: url),
+              let envelope = try? decoder.decode(NostrPeopleCacheEnvelope.self, from: data)
+        else {
+            return nil
+        }
+        return NostrFollowFetchResult(
+            profiles: envelope.profiles,
+            relayCount: envelope.relayCount,
+            followedPubkeyCount: envelope.followedPubkeyCount
+        )
+    }
+
+    func save(
+        _ result: NostrFollowFetchResult,
+        accountID: String,
+        serverURL: String
+    ) {
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let envelope = NostrPeopleCacheEnvelope(
+                profiles: result.profiles,
+                relayCount: result.relayCount,
+                followedPubkeyCount: result.followedPubkeyCount,
+                cachedAt: Date()
+            )
+            let data = try encoder.encode(envelope)
+            try data.write(
+                to: cacheURL(accountID: accountID, serverURL: serverURL),
+                options: [.atomic]
+            )
+        } catch {
+            // Cache failures must not block the People surface.
+        }
+    }
+
+    private func cacheURL(accountID: String, serverURL: String) -> URL {
+        let accountKey = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let serverKey = serverURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .utf8
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return directory.appendingPathComponent("\(accountKey)-\(serverKey).json")
+    }
+}
+
+private struct NostrPeopleCacheEnvelope: Codable {
+    let profiles: [NostrFollowProfile]
+    let relayCount: Int
+    let followedPubkeyCount: Int
+    let cachedAt: Date
+}
+
 final class NostrPeopleModel: ObservableObject {
     @Published private(set) var profiles: [NostrFollowProfile] = []
     @Published private(set) var isLoading = false
@@ -94,15 +172,18 @@ final class NostrPeopleModel: ObservableObject {
 
     private let service: NostrRelayProfileService
     private let inviteAvailabilityService: FiniteInviteAvailabilityService
+    private let cache: NostrPeopleCache?
     private var lastLoadedAccountID: String?
     private var lastLoadedServerURL: String?
 
     init(
         service: NostrRelayProfileService = NostrRelayProfileService(),
-        inviteAvailabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService()
+        inviteAvailabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService(),
+        cache: NostrPeopleCache? = .shared
     ) {
         self.service = service
         self.inviteAvailabilityService = inviteAvailabilityService
+        self.cache = cache
     }
 
     @MainActor
@@ -118,6 +199,13 @@ final class NostrPeopleModel: ObservableObject {
             || lastLoadedServerURL != serverURL
             || profiles.isEmpty
         else { return }
+        if let cached = await cache?.load(accountID: identity.accountID, serverURL: serverURL) {
+            applyCached(cached, identity: identity, serverURL: serverURL)
+            Task { [weak self] in
+                await self?.refresh(identity: identity, serverURL: serverURL)
+            }
+            return
+        }
         await refresh(identity: identity, serverURL: serverURL)
     }
 
@@ -131,8 +219,18 @@ final class NostrPeopleModel: ObservableObject {
         statusText = nil
         do {
             let result = try await service.fetchFollowProfiles(forAccountID: identity.accountID)
+            guard isCurrent(identity: identity, serverURL: serverURL) else { return }
             profiles = result.profiles
             await refreshInviteAvailability(serverURL: serverURL)
+            await cache?.save(
+                NostrFollowFetchResult(
+                    profiles: profiles,
+                    relayCount: result.relayCount,
+                    followedPubkeyCount: result.followedPubkeyCount
+                ),
+                accountID: identity.accountID,
+                serverURL: serverURL
+            )
             if result.followedPubkeyCount == 0 {
                 statusText = "No follows found on the configured Nostr relays."
             } else {
@@ -141,9 +239,38 @@ final class NostrPeopleModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
-            profiles = []
-            statusText = "Could not load follows: \(error.localizedDescription)"
+            guard isCurrent(identity: identity, serverURL: serverURL) else { return }
+            if profiles.isEmpty,
+               let cached = await cache?.load(accountID: identity.accountID, serverURL: serverURL)
+            {
+                applyCached(cached, identity: identity, serverURL: serverURL)
+                statusText = "Showing cached people. Refresh failed: \(error.localizedDescription)"
+            } else if profiles.isEmpty {
+                profiles = []
+                statusText = "Could not load follows: \(error.localizedDescription)"
+            } else {
+                statusText = "Could not refresh people: \(error.localizedDescription)"
+            }
         }
+    }
+
+    @MainActor
+    private func applyCached(
+        _ result: NostrFollowFetchResult,
+        identity: AppNostrIdentity,
+        serverURL: String
+    ) {
+        lastLoadedAccountID = identity.accountID
+        lastLoadedServerURL = serverURL
+        profiles = result.profiles
+        statusText = result.followedPubkeyCount == 0
+            ? "No cached follows found."
+            : "Showing cached people. Refreshing..."
+    }
+
+    @MainActor
+    private func isCurrent(identity: AppNostrIdentity, serverURL: String) -> Bool {
+        lastLoadedAccountID == identity.accountID && lastLoadedServerURL == serverURL
     }
 
     @MainActor
@@ -321,8 +448,11 @@ final class NostrRelayProfileService: Sendable {
 
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
         let contactRelays = await contactListRelays(forAccountID: accountID)
-        let contacts = await fetchContacts(forAccountID: accountID, relays: contactRelays)
-        let followed = contacts.values.sorted { left, right in
+        let contactResult = await fetchContacts(forAccountID: accountID, relays: contactRelays)
+        if contactResult.allRelayAttemptsFailed {
+            throw NostrPeopleFetchError.allContactRelaysFailed
+        }
+        let followed = contactResult.contacts.values.sorted { left, right in
             left.pubkey < right.pubkey
         }
         guard !followed.isEmpty else {
@@ -368,12 +498,12 @@ final class NostrRelayProfileService: Sendable {
     private func contactListRelays(forAccountID accountID: String) async -> [String] {
         let normalizedAccountID = accountID.lowercased()
         let filter = NostrRelayFilter(kinds: [10_002], authors: [normalizedAccountID], limit: 1)
-        let events = await fetchEvents(
+        let batch = await fetchEvents(
             filter: filter,
             subscriptionPrefix: "finite-relays",
             relays: relays
         )
-        guard let latest = events
+        guard let latest = batch.events
             .filter({ $0.kind == 10_002 && $0.pubkey.lowercased() == normalizedAccountID })
             .max(by: { $0.createdAt < $1.createdAt })
         else {
@@ -389,19 +519,22 @@ final class NostrRelayProfileService: Sendable {
         return mergedRelays(relays + writeRelays)
     }
 
-    private func fetchContacts(forAccountID accountID: String, relays: [String]) async -> [String: NostrContact] {
+    private func fetchContacts(forAccountID accountID: String, relays: [String]) async -> NostrContactFetchResult {
         let normalizedAccountID = accountID.lowercased()
         let filter = NostrRelayFilter(kinds: [3], authors: [normalizedAccountID], limit: 1)
-        let events = await fetchEvents(
+        let batch = await fetchEvents(
             filter: filter,
             subscriptionPrefix: "finite-contacts",
             relays: relays
         )
-        guard let latest = events
+        guard let latest = batch.events
             .filter({ $0.kind == 3 && $0.pubkey.lowercased() == normalizedAccountID })
             .max(by: { $0.createdAt < $1.createdAt })
         else {
-            return [:]
+            return NostrContactFetchResult(
+                contacts: [:],
+                allRelayAttemptsFailed: batch.allAttemptsFailed
+            )
         }
         var contacts: [String: NostrContact] = [:]
         for tag in latest.tags {
@@ -411,19 +544,22 @@ final class NostrRelayProfileService: Sendable {
             let petname = tag.count >= 4 ? tag[3].nostrNonEmptyTrimmed : nil
             contacts[pubkey] = NostrContact(pubkey: pubkey, relayHint: relayHint, petname: petname)
         }
-        return contacts
+        return NostrContactFetchResult(
+            contacts: contacts,
+            allRelayAttemptsFailed: batch.allAttemptsFailed
+        )
     }
 
     private func fetchMetadata(forPubkeys pubkeys: [String], relays: [String]) async -> [String: NostrProfileMetadata] {
         var metadata: [String: NostrProfileMetadata] = [:]
         for chunk in pubkeys.chunked(into: 80) {
             let filter = NostrRelayFilter(kinds: [0], authors: chunk, limit: chunk.count)
-            let events = await fetchEvents(
+            let batch = await fetchEvents(
                 filter: filter,
                 subscriptionPrefix: "finite-profiles",
                 relays: relays
             )
-            for event in events where event.kind == 0 {
+            for event in batch.events where event.kind == 0 {
                 guard Self.isHexPubkey(event.pubkey) else { continue }
                 let pubkey = event.pubkey.lowercased()
                 guard metadata[pubkey]?.createdAt ?? 0 <= event.createdAt else { continue }
@@ -437,27 +573,40 @@ final class NostrRelayProfileService: Sendable {
         filter: NostrRelayFilter,
         subscriptionPrefix: String,
         relays: [String]
-    ) async -> [NostrRelayEvent] {
-        await withTaskGroup(of: [NostrRelayEvent].self) { group in
+    ) async -> NostrRelayEventBatch {
+        await withTaskGroup(of: NostrRelayAttemptResult.self) { group in
             for relay in relays {
                 group.addTask {
                     do {
-                        return try await self.eventLoader(
-                            relay,
-                            filter,
-                            subscriptionPrefix,
-                            self.timeoutNanoseconds
+                        return NostrRelayAttemptResult(
+                            events: try await self.eventLoader(
+                                relay,
+                                filter,
+                                subscriptionPrefix,
+                                self.timeoutNanoseconds
+                            ),
+                            failed: false
                         )
                     } catch {
-                        return []
+                        return NostrRelayAttemptResult(events: [], failed: true)
                     }
                 }
             }
             var events: [NostrRelayEvent] = []
-            for await relayEvents in group {
-                events.append(contentsOf: relayEvents)
+            var attemptedRelayCount = 0
+            var failedRelayCount = 0
+            for await relayResult in group {
+                attemptedRelayCount += 1
+                if relayResult.failed {
+                    failedRelayCount += 1
+                }
+                events.append(contentsOf: relayResult.events)
             }
-            return events
+            return NostrRelayEventBatch(
+                events: events,
+                attemptedRelayCount: attemptedRelayCount,
+                failedRelayCount: failedRelayCount
+            )
         }
     }
 
@@ -605,6 +754,37 @@ final class NostrRelayProfileService: Sendable {
             hexCharacters.contains(character)
         }
     }
+}
+
+private enum NostrPeopleFetchError: LocalizedError, Sendable {
+    case allContactRelaysFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .allContactRelaysFailed:
+            return "All contact-list relay requests failed."
+        }
+    }
+}
+
+private struct NostrContactFetchResult: Sendable {
+    let contacts: [String: NostrContact]
+    let allRelayAttemptsFailed: Bool
+}
+
+private struct NostrRelayEventBatch: Sendable {
+    let events: [NostrRelayEvent]
+    let attemptedRelayCount: Int
+    let failedRelayCount: Int
+
+    var allAttemptsFailed: Bool {
+        attemptedRelayCount > 0 && failedRelayCount == attemptedRelayCount
+    }
+}
+
+private struct NostrRelayAttemptResult: Sendable {
+    let events: [NostrRelayEvent]
+    let failed: Bool
 }
 
 struct NostrRelayFilter: Encodable, Sendable {

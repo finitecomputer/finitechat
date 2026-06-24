@@ -1950,7 +1950,7 @@ private struct ProfileAvatar: View {
                 .fill(Color(.tertiarySystemFill))
 
             if let url = profile.picture.flatMap(URL.init(string:)) {
-                AsyncImage(url: url) { image in
+                CachedRemoteImage(url: url) { image in
                     image
                         .resizable()
                         .scaledToFill()

@@ -142,6 +142,133 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(model.profiles[0].inviteAvailability, .available)
     }
 
+    func testPeopleModelShowsCachedProfilesBeforeBackgroundRefresh() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: "cachedbob",
+                        about: "cached",
+                        pictureURL: "https://example.com/cached.jpg",
+                        relayHint: nil,
+                        inviteAvailability: .available
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            eventLoader: { _, filter, _, _ in
+                try await Task.sleep(nanoseconds: 250_000_000)
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1,
+                            kind: 3,
+                            tags: [["p", bob]],
+                            content: ""
+                        ),
+                    ]
+                }
+                if filter.kinds == [0] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: bob,
+                            createdAt: 2,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Fresh Bob"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let availabilityService = FiniteInviteAvailabilityService(
+            availabilityLoader: { _, accountIDs in
+                Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: availabilityService,
+            cache: cache
+        )
+
+        await model.loadIfNeeded(
+            identity: AppNostrIdentity(material: material),
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Cached Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+
+        try await Task.sleep(nanoseconds: 1_100_000_000)
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+    }
+
+    func testPeopleModelUsesCachedProfilesWhenRefreshFails() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: nil,
+                        about: nil,
+                        pictureURL: nil,
+                        relayHint: nil,
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            eventLoader: { _, _, _, _ in
+                throw URLError(.cannotConnectToHost)
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: FiniteInviteAvailabilityService(
+                availabilityLoader: { _, _ in [:] }
+            ),
+            cache: cache
+        )
+
+        await model.refresh(
+            identity: AppNostrIdentity(material: material),
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Cached Bob"])
+        XCTAssertTrue(model.statusText?.contains("Showing cached people") == true)
+    }
+
     func testFetchFollowProfilesUsesContactListAndToleratesRelayFailure() async throws {
         let owner = String(repeating: "a", count: 64)
         let bob = String(repeating: "b", count: 64)
@@ -370,6 +497,21 @@ final class NostrPeopleTests: XCTestCase {
         throw XCTSkip("Pass OTHER_SWIFT_FLAGS='$(inherited) -D FINITECHAT_LIVE_NOSTR_TESTS' to run the live Nostr relay fixture test.")
 #endif
     }
+}
+
+private func temporaryCacheDirectory(
+    file: StaticString = #filePath,
+    line: UInt = #line
+) -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("FiniteChatTests", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    } catch {
+        XCTFail("failed to create temp cache directory: \(error)", file: file, line: line)
+    }
+    return url
 }
 
 private actor InviteAvailabilityChunkRecorder {
