@@ -50,12 +50,16 @@ fn spawn_live_http_server(path: &std::path::Path) -> String {
     panic!("live HTTP server did not become healthy");
 }
 
-fn hermes(args: &[&str]) -> Value {
+fn cli_json(args: &[&str]) -> Value {
     let mut output = Vec::new();
     finitechat_cli::run(args.iter().map(|arg| arg.to_string()), &mut output)
-        .unwrap_or_else(|error| panic!("hermes {args:?} failed: {error}"));
+        .unwrap_or_else(|error| panic!("finitechat {args:?} failed: {error}"));
     serde_json::from_slice(&output)
-        .unwrap_or_else(|error| panic!("hermes {args:?} produced invalid JSON: {error}"))
+        .unwrap_or_else(|error| panic!("finitechat {args:?} produced invalid JSON: {error}"))
+}
+
+fn hermes(args: &[&str]) -> Value {
+    cli_json(args)
 }
 
 fn hermes_ack(home_arg: &str, event: &Value) -> Value {
@@ -79,6 +83,32 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[test]
+fn hermes_init_reuses_existing_agent_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+
+    let identity = cli_json(&["identity", "--agent-home", &home_arg, "init"]);
+    assert!(home.join("identity.env").exists());
+    assert!(home.join("agent.nsec").exists());
+
+    let hermes_init = hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "init",
+        "--server",
+        "http://127.0.0.1:1",
+    ]);
+    assert_eq!(hermes_init["account_id"], identity["account_id"]);
+    assert_eq!(hermes_init["npub"], identity["npub"]);
+
+    let shown = cli_json(&["identity", "--agent-home", &home_arg, "show"]);
+    assert_eq!(shown["account_id"], identity["account_id"]);
+    assert_eq!(shown["npub"], identity["npub"]);
 }
 
 #[test]

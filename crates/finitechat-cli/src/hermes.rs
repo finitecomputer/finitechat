@@ -111,7 +111,11 @@ fn cmd_init<W: Write>(
     }
     fs::create_dir_all(home_dir).map_err(|error| CliError::Hermes(error.to_string()))?;
 
-    let secret = generate_account_secret().map_err(|error| CliError::Hermes(error.to_string()))?;
+    let secret = if crate::identity::agent_identity_exists(home_dir) {
+        crate::identity::load_agent_secret(home_dir)?
+    } else {
+        generate_account_secret().map_err(|error| CliError::Hermes(error.to_string()))?
+    };
     let device = FiniteChatDevice::new(device_config(&secret, &device_id, now_secs()))
         .map_err(|error| CliError::Hermes(error.to_string()))?;
     let mut store = open_store(home_dir, &secret, &device_id)?;
@@ -124,7 +128,7 @@ fn cmd_init<W: Write>(
         device_id,
         account_id: device.device_ref().account_id.clone(),
     };
-    write_private(home_dir.join(NSEC_FILE), &hex_lower(secret.as_bytes()))?;
+    crate::identity::persist_agent_identity(home_dir, &secret)?;
     write_private(
         home_dir.join(CONFIG_FILE),
         &serde_json::to_string_pretty(&config).map_err(CliError::Serialize)?,
@@ -1162,12 +1166,7 @@ fn cmd_activity<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Re
 // --- agent home plumbing ---
 
 fn resolve_home(args: &mut Vec<String>) -> Result<PathBuf, CliError> {
-    if let Some(home) = crate::take_option(args, "--home")? {
-        return Ok(PathBuf::from(home));
-    }
-    std::env::var("FINITECHAT_HOME")
-        .map(PathBuf::from)
-        .map_err(|_| CliError::Usage("pass --home DIR or set FINITECHAT_HOME".to_owned()))
+    crate::identity::resolve_agent_home(args).map(|resolved| resolved.path)
 }
 
 fn load_home(dir: &Path) -> Result<AgentHome, CliError> {
@@ -1310,14 +1309,6 @@ fn now_secs() -> u64 {
     now_ms() / 1000
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
     if let Some(index) = args.iter().position(|arg| arg == name) {
         args.remove(index);
@@ -1327,7 +1318,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--home DIR] pin [--invite-id ID]\n  finitechat hermes [--home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--home DIR] recover --json\n  finitechat hermes [--home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (FINITECHAT_HOME may replace --home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]

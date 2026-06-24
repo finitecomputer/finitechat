@@ -3,6 +3,7 @@ use std::io::Write;
 mod app;
 mod core;
 mod hermes;
+mod identity;
 
 use finitechat_delivery::{HttpKeyPackageId, HttpKeyPackagePublication};
 use finitechat_http::{
@@ -59,6 +60,8 @@ pub enum CliError {
     Output(std::io::Error),
     #[error("hermes: {0}")]
     Hermes(String),
+    #[error("identity: {0}")]
+    Identity(String),
     #[error("core: {0}")]
     Core(String),
 }
@@ -73,6 +76,7 @@ impl CliError {
             | Self::Server { .. }
             | Self::Output(_)
             | Self::Hermes(_)
+            | Self::Identity(_)
             | Self::Core(_) => 1,
         }
     }
@@ -97,6 +101,7 @@ where
             .map_err(CliError::Output)
         }
         Some("app") => app::run(args.into_iter().skip(1).collect(), output),
+        Some("identity") => identity::run(args.into_iter().skip(1).collect(), output),
         Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
         Some("core") => core::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
@@ -892,7 +897,8 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat <http-smoke|http|hermes|core|app>\n\n{}\n\n{}\n\n{}",
+        "usage: finitechat <http-smoke|http|identity|hermes|core|app>\n\n{}\n\n{}\n\n{}\n\n{}",
+        identity::usage(),
         app::usage(),
         core::usage(),
         http_usage()
@@ -1008,7 +1014,10 @@ mod tests {
         .expect("effect request");
 
         assert_eq!(effect.method, HttpMethod::Post);
-        assert_eq!(effect.url, "https://chat.finite.computer/application-effects/get");
+        assert_eq!(
+            effect.url,
+            "https://chat.finite.computer/application-effects/get"
+        );
         let body: ApplicationEffectRequest =
             serde_json::from_value(effect.json.expect("json")).expect("effect request body");
         assert_eq!(body.message_id, "application-message-a");
@@ -1103,7 +1112,10 @@ mod tests {
             prepare_http_request(["claim-key-package", "--owner", "alice"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "https://chat.finite.computer/key-packages/claim");
+        assert_eq!(
+            request.url,
+            "https://chat.finite.computer/key-packages/claim"
+        );
         let body: ClaimKeyPackageRequest =
             serde_json::from_value(request.json.expect("json")).expect("claim request");
         assert_eq!(body.owner.as_slice(), b"alice");
@@ -1115,7 +1127,10 @@ mod tests {
             prepare_http_request(["key-package-inventory", "--owner", "alice"]).expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "https://chat.finite.computer/key-packages/inventory");
+        assert_eq!(
+            request.url,
+            "https://chat.finite.computer/key-packages/inventory"
+        );
         let body: KeyPackageInventoryRequest =
             serde_json::from_value(request.json.expect("json")).expect("inventory request");
         assert_eq!(body.owner.as_slice(), b"alice");
@@ -1135,7 +1150,10 @@ mod tests {
         .expect("request");
 
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.url, "https://chat.finite.computer/key-packages/claims");
+        assert_eq!(
+            request.url,
+            "https://chat.finite.computer/key-packages/claims"
+        );
         let body: ClaimKeyPackagesRequest =
             serde_json::from_value(request.json.expect("json")).expect("batch claim request");
         assert_eq!(body.owners.len(), 2);
@@ -1196,7 +1214,10 @@ mod tests {
             "ciphertext",
         ])
         .expect("upload request");
-        assert_eq!(upload.url, "https://chat.finite.computer/link-sessions/payload");
+        assert_eq!(
+            upload.url,
+            "https://chat.finite.computer/link-sessions/payload"
+        );
         let body: UploadLinkPayloadRequest =
             serde_json::from_value(upload.json.expect("json")).expect("upload body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1204,14 +1225,20 @@ mod tests {
 
         let claim = prepare_http_request(["link-session-claim", "--link-session-id", "link-a"])
             .expect("claim request");
-        assert_eq!(claim.url, "https://chat.finite.computer/link-sessions/claim");
+        assert_eq!(
+            claim.url,
+            "https://chat.finite.computer/link-sessions/claim"
+        );
         let body: ClaimLinkPayloadRequest =
             serde_json::from_value(claim.json.expect("json")).expect("claim body");
         assert_eq!(body.link_session_id, "link-a");
 
         let release = prepare_http_request(["link-session-release", "--link-session-id", "link-a"])
             .expect("release request");
-        assert_eq!(release.url, "https://chat.finite.computer/link-sessions/release");
+        assert_eq!(
+            release.url,
+            "https://chat.finite.computer/link-sessions/release"
+        );
         let body: ReleaseLinkClaimRequest =
             serde_json::from_value(release.json.expect("json")).expect("release body");
         assert_eq!(body.link_session_id, "link-a");
@@ -1232,7 +1259,10 @@ mod tests {
 
         let expire = prepare_http_request(["link-session-expire", "--link-session-id", "link-a"])
             .expect("expire request");
-        assert_eq!(expire.url, "https://chat.finite.computer/link-sessions/expire");
+        assert_eq!(
+            expire.url,
+            "https://chat.finite.computer/link-sessions/expire"
+        );
         let body: ExpireLinkSessionRequest =
             serde_json::from_value(expire.json.expect("json")).expect("expire body");
         assert_eq!(body.link_session_id, "link-a");
