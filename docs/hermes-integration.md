@@ -30,9 +30,11 @@ initialized Agent Home and reports the agent account, device id, server URL,
 bound URL, and process id through the ready file or startup JSON.
 
 When `FINITECHAT_HERMES_SERVICE_URL` or platform `extra.service_url` is set,
-the Python plugin posts bridge actions to the service first. If the service is
-unreachable it falls back to the CLI bridge. Action errors returned by the
-service are not retried through the CLI, avoiding duplicate sends.
+the Python plugin posts bridge actions to that service first. Without a
+configured URL, the plugin starts `finitechat hermes serve` itself, reads the
+ready file, and uses that loopback URL. If a service is unreachable it falls
+back to the CLI bridge. Action errors returned by the service are not retried
+through the CLI, avoiding duplicate sends.
 
 The plugin calls a Finite Chat CLI/daemon boundary:
 

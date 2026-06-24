@@ -566,6 +566,57 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(calls[0][0:2], ("/bin/finitechat", "hermes"))
         self.assertEqual(calls[0][-2:], ("recover", "--json"))
 
+    def test_ensure_service_starts_finitechat_serve_and_reads_ready_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = self.module.FiniteChatAdapter(
+                PlatformConfig(
+                    extra={
+                        "home": temp_dir,
+                        "finitechat_bin": "/bin/finitechat",
+                        "service_addr": "127.0.0.1:0",
+                    }
+                )
+            )
+            original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+            calls = []
+
+            class FakeProcess:
+                returncode = None
+                terminated = False
+                killed = False
+
+                def terminate(self):
+                    self.terminated = True
+                    self.returncode = 0
+
+                def kill(self):
+                    self.killed = True
+                    self.returncode = -9
+
+                async def wait(self):
+                    return self.returncode
+
+            fake_process = FakeProcess()
+
+            async def fake_create_subprocess_exec(*args, **kwargs):
+                calls.append(args)
+                ready_file = Path(args[args.index("--ready-file") + 1])
+                ready_file.write_text('{"url":"http://127.0.0.1:7777"}', encoding="utf-8")
+                return fake_process
+
+            try:
+                self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+                started = asyncio.run(adapter._ensure_service())
+                asyncio.run(adapter._stop_service())
+            finally:
+                self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+        self.assertTrue(started)
+        self.assertEqual(adapter.service_url, "http://127.0.0.1:7777")
+        self.assertEqual(calls[0][0:2], ("/bin/finitechat", "hermes"))
+        self.assertIn("serve", calls[0])
+        self.assertTrue(fake_process.terminated)
+
 
 if __name__ == "__main__":
     unittest.main()

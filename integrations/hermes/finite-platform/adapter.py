@@ -31,6 +31,9 @@ DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
 DEFAULT_ACTIVITY_REFRESH_SECS = 30.0
 ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 1000
+DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
+SERVICE_READY_FILE = "hermes-service.json"
+SERVICE_START_TIMEOUT_SECS = 5.0
 
 
 def _load_local_env_defaults(path: Path | None = None) -> None:
@@ -107,7 +110,13 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self.service_url = str(
             extra.get("service_url") or os.getenv("FINITECHAT_HERMES_SERVICE_URL") or ""
         ).strip().rstrip("/")
+        self.service_addr = str(
+            extra.get("service_addr")
+            or os.getenv("FINITECHAT_HERMES_SERVICE_ADDR")
+            or DEFAULT_SERVICE_ADDR
+        ).strip()
         self._poll_task: asyncio.Task | None = None
+        self._service_proc: asyncio.subprocess.Process | None = None
         self._finitechat_cmd = _resolve_finitechat_command(str(extra.get("finitechat_bin") or ""))
         self._finitechat_lock = asyncio.Lock()
 
@@ -119,6 +128,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             logger.error("[finite] finitechat CLI is not configured")
             return False
 
+        await self._ensure_service()
         await self._recover_interrupted_turns()
         await self._surface_invite()
         self._mark_connected()
@@ -168,6 +178,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
             self._poll_task = None
+        await self._stop_service()
         await self.cancel_background_tasks()
         self._mark_disconnected()
         logger.info("[finite] disconnected")
@@ -504,6 +515,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
         *,
         timeout: int,
     ) -> _FiniteChatResult:
+        if (
+            self._service_proc is not None
+            and self._service_proc.returncode is not None
+        ):
+            self.service_url = ""
+            await self._ensure_service()
         if self.service_url:
             result = await asyncio.to_thread(
                 _finitechat_service_json,
@@ -561,6 +578,76 @@ class FiniteChatAdapter(BasePlatformAdapter):
             except json.JSONDecodeError:
                 return _FiniteChatResult(False, {}, f"finitechat returned invalid JSON: {exc}", False)
 
+    async def _ensure_service(self) -> bool:
+        if self.service_url:
+            healthy = await asyncio.to_thread(_finitechat_service_health, self.service_url, 2)
+            if healthy:
+                return True
+            if self._service_proc is None:
+                return False
+            self.service_url = ""
+        if self._service_proc is not None and self._service_proc.returncode is None:
+            return bool(self.service_url)
+        if not self.home or not self._finitechat_cmd:
+            return False
+
+        ready_file = Path(self.home) / SERVICE_READY_FILE
+        with contextlib.suppress(FileNotFoundError):
+            ready_file.unlink()
+        command = [
+            *self._finitechat_cmd,
+            "hermes",
+            "--home",
+            self.home,
+            "serve",
+            "--addr",
+            self.service_addr,
+            "--ready-file",
+            str(ready_file),
+            "--json",
+        ]
+        try:
+            self._service_proc = await asyncio.create_subprocess_exec(
+                *command,
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.warning("[finite] could not start Hermes service: %s", exc)
+            return False
+
+        deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT_SECS
+        while asyncio.get_running_loop().time() < deadline:
+            if self._service_proc.returncode is not None:
+                logger.warning(
+                    "[finite] Hermes service exited during startup (%s)",
+                    self._service_proc.returncode,
+                )
+                self._service_proc = None
+                return False
+            started = _read_service_ready_file(ready_file)
+            if started.get("url"):
+                self.service_url = str(started["url"]).rstrip("/")
+                logger.info("[finite] Hermes service ready at %s", self.service_url)
+                return True
+            await asyncio.sleep(0.05)
+
+        logger.warning("[finite] Hermes service did not become ready; using CLI bridge")
+        return False
+
+    async def _stop_service(self) -> None:
+        proc = self._service_proc
+        self._service_proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+
 
 class _FiniteChatResult:
     def __init__(
@@ -616,7 +703,9 @@ def _finitechat_service_json(
             _is_retryable_cli_error(body),
             False,
         )
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+    except TimeoutError as exc:
+        return _FiniteChatResult(False, {}, str(exc), True, False)
+    except (urllib.error.URLError, OSError) as exc:
         return _FiniteChatResult(False, {}, str(exc), True, True)
 
     if not body:
@@ -637,6 +726,35 @@ def _service_error_body(body: str) -> str | None:
         if error:
             return str(error)
     return body or None
+
+
+def _finitechat_service_health(service_url: str, timeout: int) -> bool:
+    try:
+        request = urllib.request.Request(
+            f"{service_url.rstrip('/')}/healthz",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    return isinstance(data, dict) and data.get("status") == "ok"
+
+
+def _read_service_ready_file(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        logger.warning("[finite] could not read Hermes service ready file %s: %s", path, exc)
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _event_media(attachments: list[Any]) -> tuple[list[str], list[str]]:

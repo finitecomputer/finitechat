@@ -51,8 +51,8 @@ supervisor-managed `finitechat hermes serve` process.
 
 For the supervised Rust bridge work, `finitechat hermes serve` starts the
 loopback service boundary and exposes `GET /healthz`. The current plugin still
-falls back to the CLI-per-call bridge when `FINITECHAT_HERMES_SERVICE_URL` is
-unset or unreachable.
+starts that service itself when no `FINITECHAT_HERMES_SERVICE_URL` is set, and
+falls back to the CLI-per-call bridge when the service is unreachable.
 
 ## How the pieces divide (ADR 0002)
 
