@@ -18,6 +18,38 @@ _Avoid_: Direct room (retired server concept)
 Public user profile metadata attached to a Nostr account identity.
 _Avoid_: Device identity, Room metadata
 
+**Principal**:
+The identity permissions attach to across Finite products. In native Finite
+surfaces, a Principal is usually represented by a Nostr account id or npub.
+_Avoid_: device, profile metadata, email-only viewer
+
+**User Key**:
+The human user's personal Nostr key. It may live in a native app keychain and
+sign local user actions, but it is not shared with an agent.
+_Avoid_: Agent principal, device key
+
+**Agent Home**:
+The filesystem root for one agent/runtime identity and local product state.
+Agent-side tools use it to find the Agent Principal Key and product-specific
+state.
+_Avoid_: User home, project directory, Hermes plugin directory
+
+**Agent Principal Key**:
+The Nostr key controlled by an agent or runtime. It is the key shared by
+agent-side tools such as `fchat`, `fsite`, and future `finite-brain` for that
+agent. It does not make the agent the human user.
+_Avoid_: User Key, device key, Nostr Profile
+
+**Delegation**:
+A Principal-approved authorization that lets an Agent Principal Key act with
+bounded capabilities on behalf of that Principal.
+_Avoid_: sharing a User Key, implicit trust
+
+**Direct Agent Principal**:
+An agent invited or shared with as its own visible Principal, similar to a
+human participant in a Room.
+_Avoid_: delegated personal assistant
+
 **Device List**:
 The user-facing list of a user's active and revoked Finite Chat devices.
 _Avoid_: Profile, account settings
@@ -111,6 +143,11 @@ _Avoid_: Command, message, activity
 The local or runtime-resident control surface that owns a Finite Chat device.
 _Avoid_: Hermes, agent, inference provider
 
+**Finite Blob**:
+A provider-neutral blob service contract used by Finite Chat, Finite Sites,
+and future Finite Brain through scoped upload/download capabilities.
+_Avoid_: chat attachment policy, direct bucket credentials, profile avatar cache
+
 **Dev Diagnostics**:
 A hidden surface for protocol, server, device, and local-state inspection.
 _Avoid_: Settings, profile
@@ -146,6 +183,18 @@ _Avoid_: Unit fixture, row-level cleanup, transient diagnostics
 - A **DM** is a **Room**, not a separate kind; per-topic lanes with one
   person are **Topics** inside a Room, or separate named Rooms — both legal.
 - A **Nostr Profile** describes an account, not an individual device.
+- A **Principal** is the identity resource permissions attach to; a
+  **Nostr Profile** is display metadata about one possible Principal identity.
+- A **User Key** belongs to the human user. It is not copied into an
+  **Agent Home** and is not used as an **Agent Principal Key**.
+- An **Agent Home** contains one agent/runtime's **Agent Principal Key** and
+  local state. Multiple Agent Homes imply separate Agent Principal Keys unless
+  explicitly configured otherwise.
+- A **Delegation** grants bounded authority from a human-facing Principal to an
+  **Agent Principal Key**. It is different from directly sharing with a
+  **Direct Agent Principal**.
+- A **Direct Agent Principal** is appropriate for bots or shared agents that
+  should appear as their own participant or resource principal.
 - A **Device List** belongs to an account and is where users revoke devices.
 - **Invite Availability** describes whether an account can be invited to a
   **Room** now; it is not onlineness, presence, or device liveness.
@@ -206,6 +255,9 @@ _Avoid_: Unit fixture, row-level cleanup, transient diagnostics
 - **Runtime State** belongs to one agent runtime device and is projected by key.
 - A **Finite Chat Daemon** owns one or more **Devices** and may observe an
   agent runtime, but it is not the agent or its inference provider.
+- **Finite Blob** stores bytes behind scoped capabilities. Products own their
+  own blob policy: encrypted chat attachments, site assets, brain artifacts,
+  and profile avatars are not interchangeable authorization surfaces.
 - **Dev Diagnostics** may expose server and device details; normal users should
   not need those details to use Rooms.
 - A **Debug Log** belongs in **Dev Diagnostics**, not normal chat UI. It is
