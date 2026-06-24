@@ -406,14 +406,6 @@ struct NostrLoginView: View {
                     Text("Nostr Account")
                 }
 
-                Section("Server") {
-                    TextField("Server", text: $model.serverURL)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                    TextField("Device", text: $model.deviceID)
-                        .textInputAutocapitalization(.never)
-                }
-
                 if let error = model.developerErrorText {
                     Section {
                         Text(error)
@@ -423,13 +415,6 @@ struct NostrLoginView: View {
                 }
             }
             .navigationTitle("Finite Chat")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Apply") {
-                        model.applyDevSettings()
-                    }
-                }
-            }
         }
     }
 

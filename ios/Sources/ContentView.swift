@@ -1707,7 +1707,7 @@ private struct SettingsSheet: View {
                     .buttonStyle(.plain)
                 }
 
-                Section("Server") {
+                Section("Codes") {
                     Button {
                         showingScan = true
                     } label: {
@@ -1718,23 +1718,12 @@ private struct SettingsSheet: View {
                         )
                     }
                     .buttonStyle(.plain)
-
-                    SettingsRowLabel(
-                        title: "Configured server",
-                        subtitle: model.serverURL,
-                        systemImage: "server.rack"
-                    )
                 }
 
                 Section {
                     DisclosureGroup {
-                        TextField("Server", text: $model.serverURL)
-                            .textInputAutocapitalization(.never)
-                            .keyboardType(.URL)
-                            .accessibilityLabel("Server")
-                        TextField("Device", text: $model.deviceID)
-                            .textInputAutocapitalization(.never)
-                            .accessibilityLabel("Device")
+                        LabeledContent("Server", value: model.serverURL)
+                        LabeledContent("Configured Device", value: model.deviceID)
 
                         if let state = model.state {
                             LabeledContent("Account", value: state.identity.accountId)
@@ -1868,12 +1857,6 @@ private struct SettingsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
-                        dismiss()
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Apply") {
-                        model.applyDevSettings()
                         dismiss()
                     }
                 }

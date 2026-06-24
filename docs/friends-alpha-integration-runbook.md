@@ -9,6 +9,9 @@ fixtures, transient stores, or manual database edits as product proof.
 - Finite Chat branch: `codex/friends-alpha-hardening`.
 - Finite Sites branch: `codex/native-viewer-auth`, or equivalent merged code
   with `POST /_finite/auth/native-session`.
+- Deployed chat server: `https://chat.finite.computer`. The native app should
+  use this by default. Local or staging servers are branch-validation tools,
+  not normal phone-test UX.
 - A physical iPhone signed with the Friends Alpha bundle identifier and push
   entitlement.
 - APNs token key, key id, team id, bundle topic, and sandbox/production choice.
@@ -40,22 +43,30 @@ live-relay tests skipped.
 
 ## Clean Chat And Agent Setup
 
-Use a scratch root and make every path explicit:
+Use the deployed chat server unless this run is explicitly validating an
+unmerged server branch. A fresh app install should not require server entry on
+the phone.
 
 ```sh
 export FRIENDS_ALPHA_ROOT="$PWD/.state/friends-alpha"
-export FINITECHAT_SERVER_URL="http://127.0.0.1:8787"
+export FINITECHAT_SERVER_URL="https://chat.finite.computer"
 export AGENT_HOME="$FRIENDS_ALPHA_ROOT/agent-home"
 rm -rf "$FRIENDS_ALPHA_ROOT"
 mkdir -p "$FRIENDS_ALPHA_ROOT"
 ```
 
-Start a fresh home/room server:
+If a local server is genuinely required for branch validation, keep it out of
+the human app UX. Start it explicitly and pass the URL through Xcode launch
+arguments or harness commands:
 
 ```sh
-cargo run -p finitechat-server -- serve 127.0.0.1:8787 \
+cargo run -p finitechat-server -- serve 0.0.0.0:8787 \
   --sqlite "$FRIENDS_ALPHA_ROOT/server.sqlite3"
 ```
+
+For a physical phone, expose that local server through a reachable HTTPS
+staging URL before using it. Do not ask friends to type server URLs into the
+app.
 
 Initialize the agent principal and Hermes runtime:
 

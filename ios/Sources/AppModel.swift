@@ -956,25 +956,6 @@ final class AppModel: ObservableObject {
         dispatch(.setTyping(roomId: roomID, isTyping: isTyping))
     }
 
-    func applyDevSettings() {
-        appendDiagnostic(category: "persistence", event: "settings.apply.requested")
-        do {
-            try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
-                storageURL: configStorageURL
-            )
-        } catch {
-            appendDiagnostic(
-                category: "persistence",
-                event: "settings.apply.failed",
-                details: diagnosticErrorDetails(error)
-            )
-            errorText = String(describing: error)
-            return
-        }
-        closeRuntime()
-        start()
-    }
-
     private func applyNostrIdentity(
         _ identity: AppNostrIdentity,
         resetStore: Bool
