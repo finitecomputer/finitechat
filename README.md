@@ -118,9 +118,25 @@ first.
 
 ## Deployment
 
-This repo owns Finite Chat source. Production rollout mechanics belong in
+This repo owns the Finite Chat server source, HTTP contract, and release gate
+for `https://chat.finite.computer`. Production rollout mechanics belong in
 `../finitecomputer`, which owns host sync, backups, Nix/k3s deployment,
-`finited`, and runtime health checks.
+`finited`, and runtime health checks. Do not ship a native app/TestFlight build
+that depends on server behavior until the deployed chat server has been
+verified against the finite-chat commit being shipped.
+
+The production health endpoint must identify the deployed server build:
+
+```sh
+cargo run -q -p finitechat-cli -- http --server https://chat.finite.computer health
+```
+
+Expected production output includes `status: "ok"`, `server_version`,
+`source_commit`, and `source_dirty: false`. If `source_commit` is missing,
+the production server is an old build and the app release is blocked until
+`../finitecomputer` deploys a compatible finite-chat commit. See
+`docs/server-deployment-gate.md` for the required handoff and verification
+steps.
 
 For iOS beta distribution, see `docs/testflight-runbook.md`. Finite Chat uses
 bundle ID `computer.finite.finitechat`.

@@ -28,6 +28,14 @@ async fn health_reports_ok() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: HealthResponse = read_json(response).await;
     assert_eq!(body.status, "ok");
+    assert_eq!(body.server_version.as_deref(), Some("0.1.0"));
+    assert_non_empty(body.source_commit.as_deref());
+    assert_non_empty(body.source_branch.as_deref());
+    assert!(body.source_dirty.is_some());
+}
+
+fn assert_non_empty(value: Option<&str>) {
+    assert!(value.is_some_and(|value| !value.trim().is_empty()));
 }
 
 #[tokio::test]

@@ -41,6 +41,27 @@ derived data: .state/xcode-derived-data
 Expected result: all simulator unit tests pass, with only intentionally skipped
 live-relay tests skipped.
 
+## Server Sync Gate
+
+Friends Alpha phone testing uses the deployed server by default. Before handing
+the app to a tester, run the release gate in
+`docs/server-deployment-gate.md`:
+
+```sh
+cargo run -q -p finitechat-cli -- http --server https://chat.finite.computer health
+```
+
+The production response must include `server_version`, `source_commit`, and
+`source_dirty: false`. The `source_commit` must be the finite-chat commit that
+the app build expects. If those fields are missing, production is an old server
+build and Friends Alpha is blocked until `../finitecomputer` deploys a
+compatible commit.
+
+If the app change requires server-side work, do not continue with native app
+proof until Paul has the finite-chat commit, the server/worker list to deploy,
+and the expected post-deploy `/health` payload for the
+`../finitecomputer` chat server deploy lane.
+
 ## Clean Chat And Agent Setup
 
 Use the deployed chat server unless this run is explicitly validating an
@@ -153,6 +174,7 @@ Record:
 | Rust baseline | `cargo test -p finitechat-mls -p finitechat-core` | Passed 2026-06-24 | 51 core tests, 14 MLS tests |
 | Rust lint | `cargo clippy -p finitechat-mls -p finitechat-core --all-targets -- -D warnings` | Passed 2026-06-24 | no warnings |
 | iOS simulator | XcodeBuildMCP `test_sim` for `FiniteChat` | Passed 2026-06-24 | 98 passed, 1 live-relay test skipped |
+| Deployed server sync | production `/health` with `source_commit`, `source_dirty: false` | Pending | Blocks phone testing if missing or stale |
 | Clean Agent Home | identity init/show output, no reused state | Pending | |
 | Hermes service | ready file, health, restart behavior | Pending | |
 | 1:1 agent chat | transcript/video or logs | Pending | |

@@ -3152,7 +3152,18 @@ pub fn http_router(state: HttpServerState) -> Router {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
+        server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        source_commit: non_empty_build_value(option_env!("FINITECHAT_BUILD_COMMIT")),
+        source_branch: non_empty_build_value(option_env!("FINITECHAT_BUILD_BRANCH")),
+        source_dirty: option_env!("FINITECHAT_BUILD_DIRTY").map(|value| value == "true"),
     })
+}
+
+fn non_empty_build_value(value: Option<&'static str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 async fn append_application_event(

@@ -80,6 +80,10 @@ xcodebuild -project ios/FiniteChat.xcodeproj -scheme FiniteChat -configuration R
 
 Also verify:
 
+- The deployed server passes `docs/server-deployment-gate.md`; do not upload or
+  distribute a build that depends on server changes until
+  `https://chat.finite.computer/health` reports the expected finite-chat
+  `source_commit` and `source_dirty: false`.
 - `CFBundleShortVersionString` and `CFBundleVersion` are bumped in
   `ios/Info.plist`.
 - App icon assets are present in
