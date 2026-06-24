@@ -32,6 +32,12 @@ The v1 product shape is a phone chat app for people and agents:
 The production/default app server is `https://chat.finite.computer`. Local
 server URLs are explicit development and test overrides only.
 
+For a friend self-building the native app on their own Mac and phone, start
+with `docs/friends-alpha-self-build.md`. That runbook covers branch checkout,
+generated iOS bindings/project files, Apple signing, clean physical-device
+install, and confirming the app is using the deployed server instead of a local
+development override.
+
 For server iteration or local automated testing, start a local delivery server:
 
 ```sh

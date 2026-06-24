@@ -69,6 +69,9 @@ the same level as the Xcode project or workspace. Because the project path is
 
 ## Preflight Checks
 
+For direct physical-device debug builds before TestFlight, use
+`docs/friends-alpha-self-build.md`.
+
 Before the first uploaded build:
 
 ```sh

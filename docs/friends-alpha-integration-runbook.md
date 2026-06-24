@@ -14,6 +14,7 @@ fixtures, transient stores, or manual database edits as product proof.
   not normal phone-test UX.
 - A physical iPhone signed with the Friends Alpha bundle identifier and push
   entitlement.
+- Friend self-build path: `docs/friends-alpha-self-build.md`.
 - APNs token key, key id, team id, bundle topic, and sandbox/production choice.
 - One deployed or locally routed private Finite Site shared to the user's
   native npub.
