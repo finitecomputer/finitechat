@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use finitechat_blob::{
     BlobDescriptor, BlossomDownloadHttpResponse, BlossomUploadHttpResponse,
     finish_blossom_download_http_response, finish_blossom_upload_http_response,
@@ -72,6 +74,16 @@ const MAX_POLL_OPTIONS: u32 = 10;
 const MAX_POLL_QUESTION_BYTES: u32 = 512;
 const MAX_POLL_OPTION_BYTES: u32 = 160;
 const TYPING_REFRESH_MIN_MILLIS: u64 = 10_000;
+const FINITE_SITES_NATIVE_SESSION_PURPOSE: &str = "finite_site_view_session";
+const FINITE_SITES_NATIVE_SESSION_PATH: &str = "/_finite/auth/native-session";
+const FINITE_SITES_NATIVE_SESSION_METHOD: &str = "POST";
+const FINITE_SITES_NIP98_KIND: u32 = 27235;
+const FINITE_SITES_NIP98_AUTH_SCHEME: &str = "Nostr ";
+const MAX_FINITE_SITES_NATIVE_SESSION_BODY_BYTES: usize = 4 * 1024;
+const MAX_FINITE_SITES_NATIVE_RETURN_TO_BYTES: usize = 1024;
+const MIN_FINITE_SITES_NATIVE_NONCE_BYTES: usize = 16;
+const MAX_FINITE_SITES_NATIVE_NONCE_BYTES: usize = 128;
+const MAX_FINITE_SITES_NATIVE_CLIENT_BYTES: usize = 64;
 
 const _: () = {
     assert!(MAX_APP_MESSAGES > 0);
@@ -127,6 +139,31 @@ pub struct NostrIdentityMaterial {
     pub account_id: String,
     pub npub: String,
     pub nsec: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct FiniteSitesNativeSessionProof {
+    pub body_json: String,
+    pub authorization_header: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FiniteSitesNativeSessionRequest {
+    purpose: String,
+    return_to: String,
+    client: String,
+    nonce: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct NostrHttpAuthEvent {
+    id: String,
+    pubkey: String,
+    created_at: u64,
+    kind: u32,
+    tags: Vec<Vec<String>>,
+    content: String,
+    sig: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -625,6 +662,44 @@ pub fn account_id_from_npub(npub: String) -> Result<String, FiniteChatCoreError>
     let trimmed = npub.trim();
     let normalized = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
     npub_decode(normalized).map_err(invite_error)
+}
+
+#[uniffi::export]
+pub fn finite_sites_native_viewer_session_proof(
+    account_secret_hex: String,
+    url: String,
+    return_to: String,
+    client: String,
+    nonce: String,
+    now_unix_seconds: u64,
+) -> Result<FiniteSitesNativeSessionProof, FiniteChatCoreError> {
+    let secret = parse_account_secret_hex(account_secret_hex.trim())?;
+    validate_finite_sites_native_session_fields(&url, &return_to, &client, &nonce)?;
+    let body = FiniteSitesNativeSessionRequest {
+        purpose: FINITE_SITES_NATIVE_SESSION_PURPOSE.to_owned(),
+        return_to,
+        client,
+        nonce,
+    };
+    let body_json = serde_json::to_string(&body).map_err(|error| FiniteChatCoreError::Client {
+        reason: format!("failed to serialize finite-sites native session body: {error}"),
+    })?;
+    if body_json.len() > MAX_FINITE_SITES_NATIVE_SESSION_BODY_BYTES {
+        return Err(FiniteChatCoreError::Client {
+            reason: "finite-sites native session body is too large".to_owned(),
+        });
+    }
+    let authorization_header = build_nip98_auth_header(
+        &secret,
+        &url,
+        FINITE_SITES_NATIVE_SESSION_METHOD,
+        Some(body_json.as_bytes()),
+        now_unix_seconds,
+    )?;
+    Ok(FiniteSitesNativeSessionProof {
+        body_json,
+        authorization_header,
+    })
 }
 
 #[uniffi::export]
@@ -5153,6 +5228,143 @@ fn parse_account_secret_hex(secret: &str) -> Result<NostrSecretKey, FiniteChatCo
     NostrSecretKey::from_bytes(bytes).map_err(|_| FiniteChatCoreError::InvalidAccountSecret)
 }
 
+fn validate_finite_sites_native_session_fields(
+    url: &str,
+    return_to: &str,
+    client: &str,
+    nonce: &str,
+) -> Result<(), FiniteChatCoreError> {
+    validate_finite_sites_native_session_url(url)?;
+    if !valid_finite_sites_return_to(return_to) {
+        return Err(FiniteChatCoreError::Client {
+            reason: "invalid finite-sites return path".to_owned(),
+        });
+    }
+    if !valid_finite_sites_token_like(client, 1, MAX_FINITE_SITES_NATIVE_CLIENT_BYTES) {
+        return Err(FiniteChatCoreError::Client {
+            reason: "invalid finite-sites client id".to_owned(),
+        });
+    }
+    if !valid_finite_sites_token_like(
+        nonce,
+        MIN_FINITE_SITES_NATIVE_NONCE_BYTES,
+        MAX_FINITE_SITES_NATIVE_NONCE_BYTES,
+    ) {
+        return Err(FiniteChatCoreError::Client {
+            reason: "invalid finite-sites native auth nonce".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_finite_sites_native_session_url(url: &str) -> Result<(), FiniteChatCoreError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| FiniteChatCoreError::Client {
+        reason: "invalid finite-sites native auth URL".to_owned(),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(FiniteChatCoreError::Client {
+            reason: "finite-sites native auth URL must be absolute HTTP(S)".to_owned(),
+        });
+    }
+    if parsed.path() != FINITE_SITES_NATIVE_SESSION_PATH
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(FiniteChatCoreError::Client {
+            reason: "finite-sites native auth URL must target the native session endpoint"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn valid_finite_sites_return_to(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_FINITE_SITES_NATIVE_RETURN_TO_BYTES {
+        return false;
+    }
+    if !value.starts_with('/') || value.starts_with("//") {
+        return false;
+    }
+    !bytes.iter().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_finite_sites_token_like(value: &str, min_len: usize, max_len: usize) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < min_len || bytes.len() > max_len {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+}
+
+fn build_nip98_auth_header(
+    secret: &NostrSecretKey,
+    url: &str,
+    method: &str,
+    body: Option<&[u8]>,
+    now_unix_seconds: u64,
+) -> Result<String, FiniteChatCoreError> {
+    let mut tags = vec![
+        vec!["u".to_owned(), url.to_owned()],
+        vec!["method".to_owned(), method.to_owned()],
+    ];
+    if let Some(body) = body {
+        let digest = Sha256::digest(body);
+        tags.push(vec!["payload".to_owned(), hex::encode(digest)]);
+    }
+    let event = sign_nostr_auth_event(
+        secret,
+        now_unix_seconds,
+        FINITE_SITES_NIP98_KIND,
+        tags,
+        String::new(),
+    )?;
+    let encoded =
+        BASE64.encode(serde_json::to_vec(&event).expect("nostr auth event always serializes"));
+    Ok(format!("{FINITE_SITES_NIP98_AUTH_SCHEME}{encoded}"))
+}
+
+fn sign_nostr_auth_event(
+    secret: &NostrSecretKey,
+    created_at: u64,
+    kind: u32,
+    tags: Vec<Vec<String>>,
+    content: String,
+) -> Result<NostrHttpAuthEvent, FiniteChatCoreError> {
+    let pubkey = hex::encode(secret.public_key().as_bytes());
+    let id_digest = nostr_event_id_digest(&pubkey, created_at, kind, &tags, &content)?;
+    let signature = secret.sign_schnorr_digest(id_digest);
+    Ok(NostrHttpAuthEvent {
+        id: hex::encode(id_digest),
+        pubkey,
+        created_at,
+        kind,
+        tags,
+        content,
+        sig: hex::encode(signature),
+    })
+}
+
+fn nostr_event_id_digest(
+    pubkey: &str,
+    created_at: u64,
+    kind: u32,
+    tags: &[Vec<String>],
+    content: &str,
+) -> Result<[u8; 32], FiniteChatCoreError> {
+    let canonical = serde_json::json!([0, pubkey, created_at, kind, tags, content]);
+    let serialized =
+        serde_json::to_string(&canonical).map_err(|error| FiniteChatCoreError::Client {
+            reason: format!("failed to serialize nostr auth event id: {error}"),
+        })?;
+    let digest = Sha256::digest(serialized.as_bytes());
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(bytes)
+}
+
 fn nostr_identity_from_secret(
     secret: NostrSecretKey,
 ) -> Result<NostrIdentityMaterial, FiniteChatCoreError> {
@@ -5304,6 +5516,92 @@ mod tests {
         let restored = nostr_identity_from_nsec(format!("nostr:{}", created.nsec)).unwrap();
         assert_eq!(restored.account_id, created.account_id);
         assert_eq!(restored.account_secret_hex, created.account_secret_hex);
+    }
+
+    #[test]
+    fn finite_sites_native_viewer_session_proof_matches_endpoint_contract() {
+        let identity = create_nostr_identity().unwrap();
+        let url = "https://finitechat-native-mockup.sites.test/_finite/auth/native-session";
+        let proof = finite_sites_native_viewer_session_proof(
+            identity.account_secret_hex.clone(),
+            url.to_owned(),
+            "/draft?view=full#top".to_owned(),
+            "finite-chat-ios".to_owned(),
+            "native-nonce-0000001".to_owned(),
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(
+            proof.body_json,
+            r#"{"purpose":"finite_site_view_session","return_to":"/draft?view=full#top","client":"finite-chat-ios","nonce":"native-nonce-0000001"}"#
+        );
+
+        let event = decode_nip98_event(&proof.authorization_header);
+        assert_eq!(event.pubkey, identity.account_id);
+        assert_eq!(event.created_at, NOW);
+        assert_eq!(event.kind, FINITE_SITES_NIP98_KIND);
+        assert_eq!(event.content, "");
+        assert_eq!(tag_value(&event, "u"), Some(url));
+        assert_eq!(tag_value(&event, "method"), Some("POST"));
+        let expected_payload = hex::encode(Sha256::digest(proof.body_json.as_bytes()));
+        assert_eq!(
+            tag_value(&event, "payload"),
+            Some(expected_payload.as_str())
+        );
+
+        let expected_digest =
+            nostr_event_id_digest(&event.pubkey, event.created_at, event.kind, &event.tags, "")
+                .unwrap();
+        assert_eq!(event.id, hex::encode(expected_digest));
+        let signature: [u8; 64] = hex::decode(&event.sig).unwrap().try_into().unwrap();
+        parse_account_secret_hex(&identity.account_secret_hex)
+            .unwrap()
+            .public_key()
+            .verify_schnorr_digest(expected_digest, &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn finite_sites_native_viewer_session_proof_rejects_non_endpoint_or_external_redirects() {
+        let identity = create_nostr_identity().unwrap();
+        let valid_url = "https://site.test/_finite/auth/native-session".to_owned();
+        let valid_return_to = "/".to_owned();
+        let valid_client = "finite-chat-ios".to_owned();
+        let valid_nonce = "native-nonce-0000001".to_owned();
+
+        let wrong_path = finite_sites_native_viewer_session_proof(
+            identity.account_secret_hex.clone(),
+            "https://site.test/".to_owned(),
+            valid_return_to.clone(),
+            valid_client.clone(),
+            valid_nonce.clone(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(wrong_path.to_string().contains("native session endpoint"));
+
+        let bad_return = finite_sites_native_viewer_session_proof(
+            identity.account_secret_hex.clone(),
+            valid_url.clone(),
+            "https://evil.test/".to_owned(),
+            valid_client.clone(),
+            valid_nonce.clone(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(bad_return.to_string().contains("return path"));
+
+        let bad_nonce = finite_sites_native_viewer_session_proof(
+            identity.account_secret_hex,
+            valid_url,
+            valid_return_to,
+            valid_client,
+            "short".to_owned(),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(bad_nonce.to_string().contains("nonce"));
     }
 
     #[test]
@@ -9428,6 +9726,21 @@ mod tests {
         let room_server_url = state.core.room_server_url(room_id);
         let mut delivery = delivery_for(&room_server_url);
         delivery.append_activity(&request).unwrap();
+    }
+
+    fn decode_nip98_event(header: &str) -> NostrHttpAuthEvent {
+        let encoded = header.strip_prefix(FINITE_SITES_NIP98_AUTH_SCHEME).unwrap();
+        let raw = BASE64.decode(encoded).unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    fn tag_value<'a>(event: &'a NostrHttpAuthEvent, name: &str) -> Option<&'a str> {
+        for tag in &event.tags {
+            if tag.len() >= 2 && tag[0] == name {
+                return Some(tag[1].as_str());
+            }
+        }
+        None
     }
 
     fn spawn_live_http_server(path: impl AsRef<Path>) -> String {

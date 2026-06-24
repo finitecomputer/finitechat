@@ -16,6 +16,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
     let onVotePoll: (ChatMessage, ChatPollOption) -> Void
     let onRetryMessage: (ChatMessage) -> Void
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
+    let onOpenURL: (URL) -> OpenURLAction.Result
     let accessoryContent: AccessoryContent
     let isInputFocused: Bool
     var canLoadOlder = false
@@ -92,6 +93,9 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                     },
                     onLongPressMessage: coordinator.parent.onLongPressMessage
                 )
+                .environment(\.openURL, OpenURLAction { url in
+                    coordinator.parent.onOpenURL(url)
+                })
             }
             .minSize(width: 0, height: 0)
             .margins(.all, 0)

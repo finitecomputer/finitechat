@@ -416,6 +416,7 @@ private struct RoomThreadView: View {
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
     @State private var pollComposerDraft: PollComposerDraft?
+    @State private var siteBrowserItem: FiniteSiteBrowserItem?
     @StateObject private var voiceRecorder = VoiceRecorder()
     @State private var voiceSendInFlight = false
 
@@ -622,6 +623,9 @@ private struct RoomThreadView: View {
             }
             .presentationDetents([.medium, .large])
         }
+        .sheet(item: $siteBrowserItem) { item in
+            FiniteSiteBrowserView(url: item.url, identity: model.nostrIdentity)
+        }
         .onDisappear {
             model.setTyping(roomID: roomID, isTyping: false)
             dismissFocusedMessage(animated: false)
@@ -678,6 +682,9 @@ private struct RoomThreadView: View {
             onLongPressMessage: { message, frame in
                 presentFocusedMessage(message, frame: frame)
             },
+            onOpenURL: { url in
+                handleOpenURL(url)
+            },
             accessoryContent: accessoryContent(),
             isInputFocused: room.state == .connected && composerFocused,
             canLoadOlder: room.canLoadOlder,
@@ -689,6 +696,16 @@ private struct RoomThreadView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.systemGroupedBackground))
         .accessibilityLabel("Messages")
+    }
+
+    private func handleOpenURL(_ url: URL) -> OpenURLAction.Result {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https"
+        else {
+            return .systemAction
+        }
+        siteBrowserItem = FiniteSiteBrowserItem(url: url)
+        return .handled
     }
 
     private func messageCanRetry(_ message: ChatMessage) -> Bool {

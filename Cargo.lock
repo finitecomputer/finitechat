@@ -761,6 +761,7 @@ name = "finitechat-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "finitechat-blob",
  "finitechat-client",
  "finitechat-hermes",

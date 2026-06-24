@@ -91,6 +91,13 @@ impl NostrSecretKey {
         Ok(output)
     }
 
+    pub fn sign_schnorr_digest(&self, digest: [u8; 32]) -> [u8; NOSTR_SCHNORR_SIGNATURE_BYTES] {
+        let message = Message::from_digest(digest);
+        let secp = Secp256k1::new();
+        secp.sign_schnorr_no_aux_rand(&message, &self.keypair())
+            .serialize()
+    }
+
     fn keypair(&self) -> Keypair {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&self.0)
@@ -128,6 +135,19 @@ impl NostrPublicKey {
     fn xonly(&self) -> XOnlyPublicKey {
         XOnlyPublicKey::from_slice(&self.0)
             .expect("NostrPublicKey is validated before construction")
+    }
+
+    pub fn verify_schnorr_digest(
+        &self,
+        digest: [u8; 32],
+        signature: &[u8; NOSTR_SCHNORR_SIGNATURE_BYTES],
+    ) -> Result<(), MlsCredentialError> {
+        let signature =
+            Signature::from_slice(signature).map_err(|_| MlsCredentialError::MalformedSignature)?;
+        let message = Message::from_digest(digest);
+        let secp = Secp256k1::verification_only();
+        secp.verify_schnorr(&signature, &message, &self.xonly())
+            .map_err(|_| MlsCredentialError::InvalidAccountSignature)
     }
 }
 

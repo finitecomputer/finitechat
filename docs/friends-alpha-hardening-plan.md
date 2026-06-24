@@ -381,6 +381,17 @@ Commit checkpoint:
 - Commit finite-sites RFC/doc first.
 - Commit server endpoint and tests before iOS browser wiring.
 
+Progress:
+
+- Done in `../finite-sites` branch `codex/native-viewer-auth`: RFC/docs,
+  native viewer session endpoint, Principal viewer cookies, nonce replay
+  checks, sharing by native pubkey, and endpoint/e2e tests.
+- Done in `finite-chat`: UniFFI helper for exact finite-sites native-session
+  NIP-98 proof generation, in-app WebKit browser sheet, URL interception from
+  chat transcript links, invisible cookie preflight, and public-site fallback.
+- Still pending for the Phase 8 gate: manual proof against a deployed/shared
+  private site with relay access disabled.
+
 ## Phase 8 - Friends Alpha Integration Gate
 
 Goal: prove the whole path works together before inviting friends.
