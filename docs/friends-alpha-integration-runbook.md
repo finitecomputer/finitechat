@@ -174,7 +174,7 @@ Record:
 | Rust baseline | `cargo test -p finitechat-mls -p finitechat-core` | Passed 2026-06-24 | 51 core tests, 14 MLS tests |
 | Rust lint | `cargo clippy -p finitechat-mls -p finitechat-core --all-targets -- -D warnings` | Passed 2026-06-24 | no warnings |
 | iOS simulator | XcodeBuildMCP `test_sim` for `FiniteChat` | Passed 2026-06-24 | 98 passed, 1 live-relay test skipped |
-| Deployed server sync | production `/health` with `source_commit`, `source_dirty: false` | Pending | Blocks phone testing if missing or stale |
+| Deployed server sync | production `/health` with `source_commit`, `source_dirty: false` | Passed 2026-06-24 | `02dff50a97e0`, clean deploy on box1 |
 | Clean Agent Home | identity init/show output, no reused state | Pending | |
 | Hermes service | ready file, health, restart behavior | Pending | |
 | 1:1 agent chat | transcript/video or logs | Pending | |
