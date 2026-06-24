@@ -1,0 +1,157 @@
+# Friends Alpha Integration Runbook
+
+This runbook is the Phase 8 gate for `docs/friends-alpha-hardening-plan.md`.
+Use it to collect evidence before inviting friends. Do not count dev-only
+fixtures, transient stores, or manual database edits as product proof.
+
+## Required Inputs
+
+- Finite Chat branch: `codex/friends-alpha-hardening`.
+- Finite Sites branch: `codex/native-viewer-auth`, or equivalent merged code
+  with `POST /_finite/auth/native-session`.
+- A physical iPhone signed with the Friends Alpha bundle identifier and push
+  entitlement.
+- APNs token key, key id, team id, bundle topic, and sandbox/production choice.
+- One deployed or locally routed private Finite Site shared to the user's
+  native npub.
+- One clean Agent Home path that has not been used by prior tests.
+
+## Automated Baseline
+
+Run these before manual proof:
+
+```sh
+cargo test -p finitechat-mls -p finitechat-core
+cargo clippy -p finitechat-mls -p finitechat-core --all-targets -- -D warnings
+```
+
+Then run the iOS simulator unit suite for scheme `FiniteChat`. The current
+XcodeBuildMCP profile uses:
+
+```text
+project: ios/FiniteChat.xcodeproj
+scheme: FiniteChat
+simulator: iPhone 17 Pro
+derived data: .state/xcode-derived-data
+```
+
+Expected result: all simulator unit tests pass, with only intentionally skipped
+live-relay tests skipped.
+
+## Clean Chat And Agent Setup
+
+Use a scratch root and make every path explicit:
+
+```sh
+export FRIENDS_ALPHA_ROOT="$PWD/.state/friends-alpha"
+export FINITECHAT_SERVER_URL="http://127.0.0.1:8787"
+export AGENT_HOME="$FRIENDS_ALPHA_ROOT/agent-home"
+rm -rf "$FRIENDS_ALPHA_ROOT"
+mkdir -p "$FRIENDS_ALPHA_ROOT"
+```
+
+Start a fresh home/room server:
+
+```sh
+cargo run -p finitechat-server -- serve 127.0.0.1:8787 \
+  --sqlite "$FRIENDS_ALPHA_ROOT/server.sqlite3"
+```
+
+Initialize the agent principal and Hermes runtime:
+
+```sh
+cargo run -p finitechat-cli -- identity --agent-home "$AGENT_HOME" init
+cargo run -p finitechat-cli -- identity --agent-home "$AGENT_HOME" show
+cargo run -p finitechat-cli -- hermes --agent-home "$AGENT_HOME" init \
+  --server "$FINITECHAT_SERVER_URL" \
+  --device-id friends-alpha-agent
+cargo run -p finitechat-cli -- hermes --agent-home "$AGENT_HOME" install --force
+```
+
+Start the Hermes service boundary:
+
+```sh
+cargo run -p finitechat-cli -- hermes --agent-home "$AGENT_HOME" serve \
+  --addr 127.0.0.1:0 \
+  --ready-file "$FRIENDS_ALPHA_ROOT/hermes.ready" \
+  --json
+```
+
+Record the service URL from the ready file, then confirm health from
+`finitecomputer` or `finitec` once that supervisor is wired into the run.
+
+## Native App Chat Proof
+
+On the physical iPhone and one simulator or second physical device:
+
+- Sign in with the user's User Key in the native app.
+- Join or create a 1:1 room with the agent.
+- Send user-to-agent and agent-to-user text.
+- Send encrypted media both directions.
+- Create a group room with two users plus one directly invited agent.
+- Confirm Hermes sender identity distinguishes both humans.
+- Set Hermes home channel to the 1:1 room, restart the Hermes service, and
+  confirm the setting survives.
+- If Hermes permits it, set a group room as home and verify routing remains
+  explicit.
+- Kill and restart the Hermes service; confirm no duplicated acknowledged
+  messages and no lost pending turn.
+
+## Native Finite Sites Proof
+
+Use a Finite Site served by the native viewer auth branch or merged equivalent.
+
+- Share a private site to the user's native npub.
+- Disable relay network access for this test environment.
+- Send the site URL in a Finite Chat message.
+- Tap the link in the native app.
+- Confirm the in-app browser opens the site without email login.
+- Confirm the site page never receives the nsec or signed NIP-98 event.
+- Revoke the share and reload; confirm access is removed on the next request.
+- Open a public site; confirm it still loads when native auth is rejected or
+  unnecessary.
+- Open an unshared private site; confirm it shows the normal unauthorized/login
+  surface.
+
+## Wake-Only Push Proof
+
+Follow `docs/push-notifications-apple-runbook.md` from clean Apple state.
+Record:
+
+- Bundle id, APNs environment, team id, and key id.
+- Device token registration diagnostic from the app.
+- `push-drain` command and server URL.
+- Claimed/sent/acked counts from the pusher.
+- Confirmation that APNs payload contains only wake metadata.
+- Locked-phone observation: phone wakes, app syncs after open, and plaintext
+  appears only after app sync.
+
+## Finite Blob Proof
+
+- Upload/download a normal encrypted chat attachment.
+- Exercise one non-chat caller using the shared Finite Blob capability model
+  once finite-brain or finite-sites is wired to that capability path.
+- Confirm provider details and direct bucket credentials are not visible to the
+  product caller.
+- Confirm capability scope rejects wrong principal/product and expired tokens.
+
+## Evidence Log
+
+| Gate | Evidence | Result | Notes |
+| --- | --- | --- | --- |
+| Rust baseline | `cargo test -p finitechat-mls -p finitechat-core` | Passed 2026-06-24 | 51 core tests, 14 MLS tests |
+| Rust lint | `cargo clippy -p finitechat-mls -p finitechat-core --all-targets -- -D warnings` | Passed 2026-06-24 | no warnings |
+| iOS simulator | XcodeBuildMCP `test_sim` for `FiniteChat` | Passed 2026-06-24 | 98 passed, 1 live-relay test skipped |
+| Clean Agent Home | identity init/show output, no reused state | Pending | |
+| Hermes service | ready file, health, restart behavior | Pending | |
+| 1:1 agent chat | transcript/video or logs | Pending | |
+| two-user + agent group | transcript/video or logs | Pending | |
+| Hermes home channel | show/set/restart evidence | Pending | |
+| Native fsite private share | no email flow, no relays | Pending | |
+| Native fsite revocation | reload loses access | Pending | |
+| APNs wake | locked physical iPhone proof | Pending | |
+| Blob shared substrate | chat plus one other product caller | Pending | |
+
+Commit final evidence after the first full pass. If a shortcut is used to
+unblock Friends Alpha, add it to `docs/technical-debt-ledger.md` with source,
+risk, first proof, and delete condition before calling the gate passed.

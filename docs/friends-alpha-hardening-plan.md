@@ -423,6 +423,8 @@ Evaluation:
 - One physical iPhone run for push and real device behavior.
 - One finitecomputer runtime run for supervised agent behavior.
 - One failure drill: kill/restart Hermes service, pusher, and app runtime.
+- Execution checklist and evidence table:
+  `docs/friends-alpha-integration-runbook.md`.
 
 Commit checkpoint:
 
