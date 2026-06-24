@@ -48,6 +48,14 @@ const HERMES_INBOX_FILE: &str = "hermes-inbox.json";
 const HERMES_RUNNING_FILE: &str = "hermes-running.json";
 const STORE_FILE: &str = "client.sqlite3";
 const ATTACHMENT_CACHE_DIR: &str = "attachments";
+const HERMES_PLUGIN_INSTALL_NAME: &str = "finite";
+const HERMES_PLUGIN_INIT: &str =
+    include_str!("../../../integrations/hermes/finite-platform/__init__.py");
+const HERMES_PLUGIN_ADAPTER: &str =
+    include_str!("../../../integrations/hermes/finite-platform/adapter.py");
+const HERMES_PLUGIN_YAML: &str =
+    include_str!("../../../integrations/hermes/finite-platform/plugin.yaml");
+const HERMES_PLUGIN_ENV_FILE: &str = "finitechat.env";
 const DEFAULT_DEVICE_ID: &str = "agent";
 const DEFAULT_MAX_JOINS: u32 = 8;
 const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -81,6 +89,7 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
 
     match command.as_str() {
         "init" => cmd_init(&home_dir, rest, output),
+        "install" => cmd_install(&home_dir, rest, json_mode, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "pin" => cmd_pin(&home_dir, rest, output),
         "join" => cmd_join(&home_dir, rest, output),
@@ -91,6 +100,108 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "recover" => cmd_recover(&home_dir, read_request(request_json)?, output),
         "activity" => cmd_activity(&home_dir, read_request(request_json)?, output),
         _ => Err(CliError::Usage(hermes_usage())),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HermesInstallSummary {
+    plugin_name: String,
+    plugin_dir: String,
+    agent_home: String,
+    finitechat_bin: String,
+    files: Vec<String>,
+}
+
+fn cmd_install<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    json_mode: bool,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let plugin_dir_arg = crate::take_option(&mut args, "--plugin-dir")?;
+    let plugins_dir_arg = crate::take_option(&mut args, "--plugins-dir")?;
+    let plugin_name = crate::take_option(&mut args, "--plugin-name")?
+        .unwrap_or_else(|| HERMES_PLUGIN_INSTALL_NAME.to_owned());
+    let finitechat_bin_arg = crate::take_option(&mut args, "--finitechat-bin")?;
+    let force = take_flag(&mut args, "--force");
+    crate::reject_extra_args(&args)?;
+
+    validate_plugin_name(&plugin_name)?;
+    if plugin_dir_arg.is_some() && plugins_dir_arg.is_some() {
+        return Err(CliError::Usage(
+            "pass either --plugin-dir or --plugins-dir, not both".to_owned(),
+        ));
+    }
+    if !crate::identity::agent_identity_exists(home_dir) {
+        return Err(CliError::Hermes(format!(
+            "agent home {} is missing an Agent Principal Key (run finitechat identity init or finitechat hermes init first)",
+            home_dir.display()
+        )));
+    }
+
+    let plugin_dir = match plugin_dir_arg {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let plugins_dir = plugins_dir_arg
+                .map(PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(default_hermes_plugins_dir)?;
+            plugins_dir.join(&plugin_name)
+        }
+    };
+    let finitechat_bin = match finitechat_bin_arg {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe().map_err(|error| {
+            CliError::Hermes(format!("could not resolve current executable: {error}"))
+        })?,
+    };
+
+    fs::create_dir_all(&plugin_dir).map_err(|error| CliError::Hermes(error.to_string()))?;
+    let mut installed = Vec::new();
+    write_managed_plugin_file(
+        &plugin_dir.join("__init__.py"),
+        HERMES_PLUGIN_INIT,
+        force,
+        &mut installed,
+    )?;
+    write_managed_plugin_file(
+        &plugin_dir.join("adapter.py"),
+        HERMES_PLUGIN_ADAPTER,
+        force,
+        &mut installed,
+    )?;
+    write_managed_plugin_file(
+        &plugin_dir.join("plugin.yaml"),
+        HERMES_PLUGIN_YAML,
+        force,
+        &mut installed,
+    )?;
+    let env_contents = hermes_plugin_env_contents(home_dir, &finitechat_bin)?;
+    write_managed_private_file(
+        &plugin_dir.join(HERMES_PLUGIN_ENV_FILE),
+        &env_contents,
+        force,
+        &mut installed,
+    )?;
+
+    let summary = HermesInstallSummary {
+        plugin_name,
+        plugin_dir: plugin_dir.display().to_string(),
+        agent_home: home_dir.display().to_string(),
+        finitechat_bin: finitechat_bin.display().to_string(),
+        files: installed,
+    };
+    if json_mode {
+        crate::write_pretty_json(output, &summary)
+    } else {
+        writeln!(
+            output,
+            "Installed Finite Chat Hermes plugin '{}' at {}",
+            summary.plugin_name, summary.plugin_dir
+        )
+        .map_err(CliError::Output)?;
+        writeln!(output, "Agent home: {}", summary.agent_home).map_err(CliError::Output)?;
+        writeln!(output, "finitechat binary: {}", summary.finitechat_bin).map_err(CliError::Output)
     }
 }
 
@@ -1169,6 +1280,101 @@ fn resolve_home(args: &mut Vec<String>) -> Result<PathBuf, CliError> {
     crate::identity::resolve_agent_home(args).map(|resolved| resolved.path)
 }
 
+fn default_hermes_plugins_dir() -> Result<PathBuf, CliError> {
+    if let Some(path) = std::env::var_os("HERMES_PLUGINS_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("HERMES_HOME") {
+        return Ok(PathBuf::from(path).join("plugins"));
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(path).join(".hermes").join("plugins"));
+    }
+    Err(CliError::Usage(
+        "pass --plugins-dir DIR, --plugin-dir DIR, set HERMES_HOME, or set HOME".to_owned(),
+    ))
+}
+
+fn validate_plugin_name(name: &str) -> Result<(), CliError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err(CliError::Usage(format!(
+            "--plugin-name must be a single directory name, got {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn hermes_plugin_env_contents(home_dir: &Path, finitechat_bin: &Path) -> Result<String, CliError> {
+    let home = env_file_value("FINITECHAT_HOME", home_dir)?;
+    let bin = env_file_value("FINITECHAT_BIN", finitechat_bin)?;
+    Ok(format!("FINITECHAT_HOME={home}\nFINITECHAT_BIN={bin}\n"))
+}
+
+fn env_file_value(name: &str, path: &Path) -> Result<String, CliError> {
+    let value = path.display().to_string();
+    if value.contains('\n') || value.contains('\r') || value.contains('\0') {
+        return Err(CliError::Hermes(format!(
+            "{name} path contains a character that cannot be written to finitechat.env"
+        )));
+    }
+    Ok(value)
+}
+
+fn write_managed_plugin_file(
+    path: &Path,
+    contents: &str,
+    force: bool,
+    installed: &mut Vec<String>,
+) -> Result<(), CliError> {
+    write_managed_file(path, contents, force, false, installed)
+}
+
+fn write_managed_private_file(
+    path: &Path,
+    contents: &str,
+    force: bool,
+    installed: &mut Vec<String>,
+) -> Result<(), CliError> {
+    write_managed_file(path, contents, force, true, installed)
+}
+
+fn write_managed_file(
+    path: &Path,
+    contents: &str,
+    force: bool,
+    private: bool,
+    installed: &mut Vec<String>,
+) -> Result<(), CliError> {
+    match fs::read(path) {
+        Ok(existing) if existing == contents.as_bytes() => {
+            installed.push(path.display().to_string());
+            return Ok(());
+        }
+        Ok(_) if !force => {
+            return Err(CliError::Hermes(format!(
+                "{} already exists with different contents; pass --force to overwrite the managed Hermes plugin file",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(CliError::Hermes(error.to_string())),
+    }
+    if private {
+        write_private(path.to_path_buf(), contents)?;
+    } else {
+        fs::write(path, contents).map_err(|error| CliError::Hermes(error.to_string()))?;
+    }
+    installed.push(path.display().to_string());
+    Ok(())
+}
+
 fn load_home(dir: &Path) -> Result<AgentHome, CliError> {
     let config: AgentConfig =
         serde_json::from_str(&fs::read_to_string(dir.join(CONFIG_FILE)).map_err(|_| {
@@ -1318,13 +1524,102 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--force] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use finitechat_hermes::HermesMessageTypeV1;
+
+    #[test]
+    fn install_writes_embedded_plugin_and_local_env_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let plugin_dir = dir.path().join("hermes").join("plugins").join("finite");
+        let secret = generate_account_secret().unwrap();
+        crate::identity::persist_agent_identity(&home, &secret).unwrap();
+
+        let mut output = Vec::new();
+        cmd_install(
+            &home,
+            vec![
+                "--plugin-dir".to_owned(),
+                plugin_dir.display().to_string(),
+                "--finitechat-bin".to_owned(),
+                "/usr/local/bin/finitechat".to_owned(),
+            ],
+            true,
+            &mut output,
+        )
+        .expect("install succeeds");
+
+        let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(summary["plugin_name"], "finite");
+        assert_eq!(summary["plugin_dir"], plugin_dir.display().to_string());
+        assert!(plugin_dir.join("__init__.py").exists());
+        assert!(plugin_dir.join("adapter.py").exists());
+        assert!(plugin_dir.join("plugin.yaml").exists());
+        assert!(plugin_dir.join(HERMES_PLUGIN_ENV_FILE).exists());
+
+        let env = fs::read_to_string(plugin_dir.join(HERMES_PLUGIN_ENV_FILE)).unwrap();
+        assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
+        assert!(env.contains("FINITECHAT_BIN=/usr/local/bin/finitechat"));
+    }
+
+    #[test]
+    fn install_is_idempotent_but_refuses_to_overwrite_local_edits_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let plugin_dir = dir.path().join("finite-plugin");
+        let secret = generate_account_secret().unwrap();
+        crate::identity::persist_agent_identity(&home, &secret).unwrap();
+        let args = vec![
+            "--plugin-dir".to_owned(),
+            plugin_dir.display().to_string(),
+            "--finitechat-bin".to_owned(),
+            "/bin/finitechat".to_owned(),
+        ];
+
+        let mut output = Vec::new();
+        cmd_install(&home, args.clone(), true, &mut output).expect("first install");
+        output.clear();
+        cmd_install(&home, args.clone(), true, &mut output).expect("same install is idempotent");
+
+        fs::write(plugin_dir.join("adapter.py"), "# local edit\n").unwrap();
+        let error = cmd_install(&home, args.clone(), true, &mut output)
+            .expect_err("local edit requires --force");
+        assert!(error.to_string().contains("--force"));
+
+        let mut force_args = args;
+        force_args.push("--force".to_owned());
+        cmd_install(&home, force_args, true, &mut output).expect("force overwrites managed file");
+        let adapter = fs::read_to_string(plugin_dir.join("adapter.py")).unwrap();
+        assert!(adapter.contains("Finite Chat platform plugin for Hermes"));
+    }
+
+    #[test]
+    fn install_fails_when_agent_home_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let plugin_dir = dir.path().join("finite-plugin");
+        let mut output = Vec::new();
+
+        let error = cmd_install(
+            &home,
+            vec![
+                "--plugin-dir".to_owned(),
+                plugin_dir.display().to_string(),
+                "--finitechat-bin".to_owned(),
+                "/bin/finitechat".to_owned(),
+            ],
+            true,
+            &mut output,
+        )
+        .expect_err("missing identity fails");
+        assert!(error.to_string().contains("Agent Principal Key"));
+        assert!(!plugin_dir.exists());
+    }
 
     #[test]
     fn poll_decoder_unwraps_typed_chat_message_but_ignores_non_hermes_typed_payloads() {

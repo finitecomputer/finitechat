@@ -18,12 +18,11 @@ to end-to-end-encrypted Finite Chat rooms. The dream flow (ADR 0006):
 cargo install --path crates/finitechat-cli   # installs `finitechat`
 
 # 2. The agent identity
-finitechat hermes --home ~/.finite-agent init --server http://your-server:8787
-export FINITECHAT_HOME=~/.finite-agent
+finitechat identity --agent-home ~/.finite-agent init
+finitechat hermes --agent-home ~/.finite-agent init --server http://your-server:8787
 
 # 3. The plugin (Hermes ≥ 0.16 plugin layout)
-mkdir -p ~/.hermes/plugins
-cp -r integrations/hermes/finite-platform ~/.hermes/plugins/finite
+finitechat hermes --agent-home ~/.finite-agent install
 ```
 
 Enable it in `~/.hermes/config.yaml`:
@@ -41,6 +40,12 @@ gateway:
 
 Then `hermes gateway start` prints the invite QR/URL/PIN and the agent is
 reachable from the Finite Chat app.
+
+`finitechat hermes install` writes the embedded `finite-platform` plugin into
+`$HERMES_PLUGINS_DIR/finite`, `$HERMES_HOME/plugins/finite`, or
+`~/.hermes/plugins/finite`. It also writes a local `finitechat.env` file with
+the Agent Home and binary path. The plugin treats that file as defaults only:
+explicit Hermes config and process environment still win.
 
 ## How the pieces divide (ADR 0002)
 

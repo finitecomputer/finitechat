@@ -112,6 +112,39 @@ fn hermes_init_reuses_existing_agent_identity() {
 }
 
 #[test]
+fn hermes_install_installs_plugin_into_temp_hermes_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+    let hermes_home = dir.path().join("hermes-home");
+    let plugins_dir = hermes_home.join("plugins");
+    let plugins_arg = plugins_dir.display().to_string();
+
+    cli_json(&["identity", "--agent-home", &home_arg, "init"]);
+    let installed = hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "install",
+        "--plugins-dir",
+        &plugins_arg,
+        "--finitechat-bin",
+        "/bin/finitechat",
+        "--json",
+    ]);
+
+    let plugin_dir = plugins_dir.join("finite");
+    assert_eq!(installed["plugin_name"], "finite");
+    assert_eq!(installed["plugin_dir"], plugin_dir.display().to_string());
+    assert!(plugin_dir.join("__init__.py").exists());
+    assert!(plugin_dir.join("adapter.py").exists());
+    assert!(plugin_dir.join("plugin.yaml").exists());
+    let env = std::fs::read_to_string(plugin_dir.join("finitechat.env")).unwrap();
+    assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
+    assert!(env.contains("FINITECHAT_BIN=/bin/finitechat"));
+}
+
+#[test]
 fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("server.sqlite3");

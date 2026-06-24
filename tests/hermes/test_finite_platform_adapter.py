@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from dataclasses import dataclass, field
@@ -166,6 +167,34 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 os.environ.pop("FINITECHAT_BIN", None)
             else:
                 os.environ["FINITECHAT_BIN"] = old_value
+
+    def test_local_env_file_supplies_defaults_without_overriding_process_env(self):
+        old_home = os.environ.pop("FINITECHAT_HOME", None)
+        old_bin = os.environ.get("FINITECHAT_BIN")
+        os.environ["FINITECHAT_BIN"] = "/env/bin/finitechat"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env_path = Path(temp_dir) / self.module.LOCAL_ENV_FILE
+                env_path.write_text(
+                    "FINITECHAT_HOME=/agent/home\n"
+                    "FINITECHAT_BIN=/installed/bin/finitechat\n"
+                    "OTHER_SECRET=ignored\n",
+                    encoding="utf-8",
+                )
+                self.module._load_local_env_defaults(env_path)
+
+            self.assertEqual(os.environ["FINITECHAT_HOME"], "/agent/home")
+            self.assertEqual(os.environ["FINITECHAT_BIN"], "/env/bin/finitechat")
+            self.assertIsNone(os.environ.get("OTHER_SECRET"))
+        finally:
+            if old_home is None:
+                os.environ.pop("FINITECHAT_HOME", None)
+            else:
+                os.environ["FINITECHAT_HOME"] = old_home
+            if old_bin is None:
+                os.environ.pop("FINITECHAT_BIN", None)
+            else:
+                os.environ["FINITECHAT_BIN"] = old_bin
 
     def test_send_translates_hermes_room_thread_and_metadata_to_bridge_json(self):
         adapter = self.adapter()

@@ -23,10 +23,35 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 logger = logging.getLogger(__name__)
 
 FINITE_PLATFORM_NAME = "finite"
+LOCAL_ENV_FILE = "finitechat.env"
 DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
 DEFAULT_ACTIVITY_REFRESH_SECS = 30.0
 ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 1000
+
+
+def _load_local_env_defaults(path: Path | None = None) -> None:
+    env_path = path or Path(__file__).with_name(LOCAL_ENV_FILE)
+    try:
+        raw = env_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("[finite] could not read %s: %s", env_path, exc)
+        return
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key.startswith("FINITECHAT_"):
+            continue
+        os.environ.setdefault(key, value.strip())
+
+
+_load_local_env_defaults()
 
 
 def check_requirements() -> bool:
@@ -663,7 +688,8 @@ def register(ctx) -> None:
         required_env=["FINITECHAT_HOME"],
         install_hint=(
             "Install the finitechat binary, run `finitechat hermes "
-            "init --server URL`, and set FINITECHAT_HOME to the agent home."
+            "init --server URL`, then install this plugin with "
+            "`finitechat hermes install`."
         ),
         allowed_users_env="FINITECHAT_ALLOWED_USERS",
         allow_all_env="FINITECHAT_ALLOW_ALL_USERS",

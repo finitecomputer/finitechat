@@ -6,6 +6,17 @@ runtime image, but it should not fork the transport semantics.
 
 ## Bridge Commands
 
+The supported plugin distribution path is:
+
+```text
+finitechat hermes --agent-home DIR install
+```
+
+The command installs the embedded `finite-platform` Hermes plugin and writes a
+colocated `finitechat.env` with `FINITECHAT_HOME` and `FINITECHAT_BIN`
+defaults. It refuses to install from an Agent Home that does not already have
+an Agent Principal Key.
+
 The plugin calls a Finite Chat CLI/daemon boundary:
 
 ```text
