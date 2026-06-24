@@ -18,31 +18,34 @@ use finitechat_delivery::{
     MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 pub use finitechat_http::{
-    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
-    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
+    AckLinkPayloadRequest, AckLinkPayloadResponse, AckPushWakeRequest, AckPushWakeResponse,
+    AckWelcomeRequest, AckWelcomeResponse, ApplicationEffectCountsResponse,
+    ApplicationEffectRequest, BootstrapAccountRoomRequest, BootstrapAccountRoomResponse,
+    ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
+    ClaimLinkPayloadResponse, ClaimPushWakesRequest, ClaimPushWakesResponse, ClaimWelcomesRequest,
     CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
     ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
     ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
-    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest,
-    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
-    GetNostrProfilesResponse, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
-    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
-    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
-    HttpLinkSessionState, InboxSyncRequest, InviteAvailabilityEntry, InviteJoinStatusRequest,
-    InviteJoinStatusResponse, KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
+    FailPushWakeRequest, FailPushWakeResponse, FiniteAccountRoomCommitProjection,
+    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetEphemeralActivitiesRequest,
+    GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
+    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
+    InviteAvailabilityEntry, InviteJoinStatusRequest, InviteJoinStatusResponse,
+    KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
     ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileCacheEntry,
     NostrProfileRecord, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
-    PublishMessageRequest, PushTokenRecord, PutNostrProfileRequest, PutNostrProfileResponse,
-    RegisterPushTokenRequest, RegisterPushTokenResponse, ReleaseLinkClaimRequest,
-    ReleaseLinkClaimResponse, RemovePushTokenRequest, RemovePushTokenResponse,
-    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RespondInviteJoinRequest,
-    RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse,
-    SubmitInviteJoinRequest, SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse,
-    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+    PublishMessageRequest, PushTokenRecord, PushWakeDelivery, PushWakePayload,
+    PutNostrProfileRequest, PutNostrProfileResponse, RegisterPushTokenRequest,
+    RegisterPushTokenResponse, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
+    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
+    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse, UpdateRoomAdminsRequest,
+    UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
@@ -77,6 +80,9 @@ const MAX_NOSTR_PROFILE_BATCH: usize = 64;
 const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
 const MAX_NOSTR_PROFILE_ABOUT_BYTES: usize = 4 * 1024;
 const MAX_NOSTR_PROFILE_PICTURE_BYTES: usize = 2 * 1024;
+const MAX_PUSH_WAKE_CLAIM_BATCH: usize = 100;
+const MAX_PUSH_WAKE_LEASE_MS: u64 = 5 * 60 * 1_000;
+const MAX_PUSH_WAKE_ATTEMPTS: u32 = 5;
 
 /// Capacity limits for the durable finite chat server.
 ///
@@ -115,6 +121,7 @@ pub struct HttpServerState {
     nostr_profiles: Arc<Mutex<BTreeMap<String, NostrProfileRecord>>>,
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
+    push_wakes: Arc<Mutex<BTreeMap<String, PushWakeOutboxRecord>>>,
     blob_objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
     /// Long-poll wake signal (/sync/wait). A single hub: every accepted
@@ -171,6 +178,7 @@ impl HttpServerState {
             nostr_profiles: Arc::new(Mutex::new(BTreeMap::new())),
             welcome_claims: Arc::new(Mutex::new(HashMap::new())),
             push_tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            push_wakes: Arc::new(Mutex::new(BTreeMap::new())),
             blob_objects: Arc::new(Mutex::new(BTreeMap::new())),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             wake: Arc::new(tokio::sync::Notify::new()),
@@ -227,6 +235,7 @@ impl HttpServerState {
         let nostr_profiles = store.load_nostr_profiles()?;
         let welcome_claims = store.load_welcome_claims()?;
         let push_tokens = store.load_push_tokens()?;
+        let push_wakes = store.load_push_wakes()?;
         let blob_objects = store.load_blob_objects()?;
         Ok(Self {
             service: Arc::new(Mutex::new(service)),
@@ -244,6 +253,7 @@ impl HttpServerState {
             nostr_profiles: Arc::new(Mutex::new(nostr_profiles)),
             welcome_claims: Arc::new(Mutex::new(welcome_claims)),
             push_tokens: Arc::new(Mutex::new(push_tokens)),
+            push_wakes: Arc::new(Mutex::new(push_wakes)),
             blob_objects: Arc::new(Mutex::new(blob_objects)),
             ops_since_snapshot: Arc::new(Mutex::new(0)),
             wake: Arc::new(tokio::sync::Notify::new()),
@@ -2149,6 +2159,7 @@ impl HttpServerState {
             .application_effects
             .lock()
             .expect("HTTP application-effects mutex");
+        let mut push_wakes = self.push_wakes.lock().expect("HTTP push-wake mutex");
 
         // Check phase: every admission rule runs read-only against live
         // state, producing exactly the rows to persist.
@@ -2168,6 +2179,9 @@ impl HttpServerState {
             effect,
             &request.event.idempotency_key,
         )?;
+        let push_wake_mutation = effect_mutation
+            .as_ref()
+            .and_then(PushWakeOutboxRecord::from_effect);
 
         // Persist phase: one SQLite transaction, before any in-memory state
         // changes, so an injected failure rolls back with nothing to undo.
@@ -2176,6 +2190,7 @@ impl HttpServerState {
                 publish_mutation.as_ref(),
                 room_membership_projection.as_ref(),
                 effect_mutation.as_ref(),
+                push_wake_mutation.as_ref(),
             )?;
         }
 
@@ -2192,6 +2207,9 @@ impl HttpServerState {
         }
         if let Some(effect) = effect_mutation {
             application_effects.insert(effect.message_id.clone(), effect);
+        }
+        if let Some(wake) = push_wake_mutation {
+            push_wakes.insert(wake.wake_id.clone(), wake);
         }
         Ok(EventAccepted {
             seq: receipt.seq,
@@ -2285,6 +2303,125 @@ impl HttpServerState {
             push_outbox: usize_to_u32("push_outbox", push_outbox)?,
             unread: usize_to_u32("unread", unread)?,
             command_inbox: usize_to_u32("command_inbox", command_inbox)?,
+        })
+    }
+
+    fn claim_push_wakes(
+        &self,
+        request: ClaimPushWakesRequest,
+    ) -> Result<ClaimPushWakesResponse, ServerHttpError> {
+        let limit = request.limit.min(MAX_PUSH_WAKE_CLAIM_BATCH);
+        if limit == 0 {
+            return Ok(ClaimPushWakesResponse { wakes: Vec::new() });
+        }
+        if request.lease_ms == 0 || request.lease_ms > MAX_PUSH_WAKE_LEASE_MS {
+            return Err(ServerHttpError::InvalidDeviceRequest {
+                reason: format!("push wake lease_ms must be 1..={MAX_PUSH_WAKE_LEASE_MS}"),
+            });
+        }
+
+        let mut push_wakes = self.push_wakes.lock().expect("HTTP push-wake mutex");
+        let mut claimable: Vec<(HttpSequence, String, PushWakeOutboxRecord)> = push_wakes
+            .iter()
+            .filter(|(_, record)| record.claimable_at(request.now_ms))
+            .map(|(wake_id, record)| (record.seq, wake_id.clone(), record.clone()))
+            .collect();
+        claimable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        let claimed: Vec<PushWakeOutboxRecord> = claimable
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, record)| record.claimed(request.now_ms, request.lease_ms))
+            .collect();
+        if claimed.is_empty() {
+            return Ok(ClaimPushWakesResponse { wakes: Vec::new() });
+        }
+
+        if let Some(store) = &self.store {
+            store.upsert_push_wakes(&claimed)?;
+        }
+        for record in &claimed {
+            push_wakes.insert(record.wake_id.clone(), record.clone());
+        }
+        drop(push_wakes);
+
+        let tokens = self.push_tokens.lock().expect("HTTP push-token mutex");
+        let rooms = self
+            .room_memberships
+            .lock()
+            .expect("HTTP room-membership mutex");
+        let revoked = self.revoked_devices.lock().expect("HTTP device mutex");
+        let wakes = claimed
+            .iter()
+            .map(|record| PushWakeDelivery {
+                wake_id: record.wake_id.clone(),
+                payload: PushWakePayload {
+                    room_id: record.room_id.clone(),
+                    seq: record.seq,
+                },
+                tokens: push_tokens_for_wake(record, &tokens, &rooms, &revoked),
+                attempt: record.attempts(),
+            })
+            .collect();
+        Ok(ClaimPushWakesResponse { wakes })
+    }
+
+    fn ack_push_wake(
+        &self,
+        request: AckPushWakeRequest,
+    ) -> Result<AckPushWakeResponse, ServerHttpError> {
+        validate_string_bytes("wake_id", &request.wake_id, MAX_OBJECT_ID_BYTES).map_err(
+            |error| ServerHttpError::InvalidDeviceRequest {
+                reason: error.to_string(),
+            },
+        )?;
+        let mut push_wakes = self.push_wakes.lock().expect("HTTP push-wake mutex");
+        let acked = push_wakes.contains_key(&request.wake_id);
+        if acked {
+            if let Some(store) = &self.store {
+                store.delete_push_wake(&request.wake_id)?;
+            }
+            push_wakes.remove(&request.wake_id);
+        }
+        Ok(AckPushWakeResponse { acked })
+    }
+
+    fn fail_push_wake(
+        &self,
+        request: FailPushWakeRequest,
+    ) -> Result<FailPushWakeResponse, ServerHttpError> {
+        validate_string_bytes("wake_id", &request.wake_id, MAX_OBJECT_ID_BYTES).map_err(
+            |error| ServerHttpError::InvalidDeviceRequest {
+                reason: error.to_string(),
+            },
+        )?;
+        let mut push_wakes = self.push_wakes.lock().expect("HTTP push-wake mutex");
+        let Some(record) = push_wakes.get(&request.wake_id).cloned() else {
+            return Ok(FailPushWakeResponse {
+                retry: false,
+                dropped: false,
+            });
+        };
+
+        if record.attempts() >= MAX_PUSH_WAKE_ATTEMPTS {
+            if let Some(store) = &self.store {
+                store.delete_push_wake(&request.wake_id)?;
+            }
+            push_wakes.remove(&request.wake_id);
+            return Ok(FailPushWakeResponse {
+                retry: false,
+                dropped: true,
+            });
+        }
+
+        let retry = record.released_for_retry();
+        if let Some(store) = &self.store {
+            store.upsert_push_wakes(std::slice::from_ref(&retry))?;
+        }
+        push_wakes.insert(retry.wake_id.clone(), retry);
+        Ok(FailPushWakeResponse {
+            retry: true,
+            dropped: false,
         })
     }
 
@@ -2992,6 +3129,9 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/account-rooms/list", post(list_account_rooms))
         .route("/push-tokens", post(register_push_token))
         .route("/push-tokens/remove", post(remove_push_token))
+        .route("/push-wakes/claim", post(claim_push_wakes))
+        .route("/push-wakes/ack", post(ack_push_wake))
+        .route("/push-wakes/fail", post(fail_push_wake))
         .route("/rooms/leave", post(leave_room))
         .route("/rooms/admins", post(update_room_admins))
         .route("/rooms/report-invalid-commit", post(report_invalid_commit))
@@ -3435,6 +3575,30 @@ async fn remove_push_token(
     Ok(Json(response))
 }
 
+async fn claim_push_wakes(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ClaimPushWakesRequest>,
+) -> Result<Json<ClaimPushWakesResponse>, ServerHttpError> {
+    let response = state.claim_push_wakes(request)?;
+    Ok(Json(response))
+}
+
+async fn ack_push_wake(
+    State(state): State<HttpServerState>,
+    Json(request): Json<AckPushWakeRequest>,
+) -> Result<Json<AckPushWakeResponse>, ServerHttpError> {
+    let response = state.ack_push_wake(request)?;
+    Ok(Json(response))
+}
+
+async fn fail_push_wake(
+    State(state): State<HttpServerState>,
+    Json(request): Json<FailPushWakeRequest>,
+) -> Result<Json<FailPushWakeResponse>, ServerHttpError> {
+    let response = state.fail_push_wake(request)?;
+    Ok(Json(response))
+}
+
 async fn leave_room(
     State(state): State<HttpServerState>,
     Json(request): Json<LeaveRoomRequest>,
@@ -3625,6 +3789,77 @@ struct PublishMutation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PushWakeOutboxRecord {
+    wake_id: String,
+    room_id: String,
+    seq: HttpSequence,
+    sender: DeviceRef,
+    state: PushWakeOutboxState,
+}
+
+impl PushWakeOutboxRecord {
+    fn from_effect(effect: &HttpApplicationDeliveryEffect) -> Option<Self> {
+        effect
+            .delivery_policy
+            .creates_push()
+            .then(|| PushWakeOutboxRecord {
+                wake_id: effect.message_id.clone(),
+                room_id: effect.room_id.clone(),
+                seq: effect.seq,
+                sender: effect.sender.clone(),
+                state: PushWakeOutboxState::Pending { attempts: 0 },
+            })
+    }
+
+    fn attempts(&self) -> u32 {
+        match self.state {
+            PushWakeOutboxState::Pending { attempts }
+            | PushWakeOutboxState::Leased { attempts, .. } => attempts,
+        }
+    }
+
+    fn claimable_at(&self, now_ms: u64) -> bool {
+        match self.state {
+            PushWakeOutboxState::Pending { .. } => true,
+            PushWakeOutboxState::Leased {
+                lease_expires_at_ms,
+                ..
+            } => lease_expires_at_ms <= now_ms,
+        }
+    }
+
+    fn claimed(&self, now_ms: u64, lease_ms: u64) -> Self {
+        let mut next = self.clone();
+        let attempts = self.attempts().saturating_add(1);
+        next.state = PushWakeOutboxState::Leased {
+            lease_expires_at_ms: now_ms.saturating_add(lease_ms),
+            attempts,
+        };
+        next
+    }
+
+    fn released_for_retry(&self) -> Self {
+        let mut next = self.clone();
+        next.state = PushWakeOutboxState::Pending {
+            attempts: self.attempts(),
+        };
+        next
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PushWakeOutboxState {
+    Pending {
+        attempts: u32,
+    },
+    Leased {
+        lease_expires_at_ms: u64,
+        attempts: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct HttpRoomMembershipProjection {
     room_id: String,
     mls_group_id: String,
@@ -3748,6 +3983,10 @@ impl SqliteHttpDeliveryStore {
             );
             CREATE TABLE IF NOT EXISTS http_push_tokens (
                 device_key TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS http_push_wakes (
+                wake_id TEXT PRIMARY KEY,
                 record_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_state_snapshots (
@@ -3927,6 +4166,7 @@ impl SqliteHttpDeliveryStore {
         publish_mutation: Option<&PublishMutation>,
         room_membership_projection: Option<&HttpRoomMembershipProjection>,
         effect: Option<&HttpApplicationDeliveryEffect>,
+        push_wake: Option<&PushWakeOutboxRecord>,
     ) -> Result<(), DurableStoreError> {
         let mut conn = self.connection();
         let transaction = conn.transaction()?;
@@ -3961,6 +4201,9 @@ impl SqliteHttpDeliveryStore {
         }
         if let Some(effect) = effect {
             upsert_application_effect_in_transaction(&transaction, effect)?;
+        }
+        if let Some(push_wake) = push_wake {
+            upsert_push_wake_in_transaction(&transaction, push_wake)?;
         }
         transaction.commit()?;
         Ok(())
@@ -4056,6 +4299,21 @@ impl SqliteHttpDeliveryStore {
         Ok(tokens)
     }
 
+    fn load_push_wakes(&self) -> Result<BTreeMap<String, PushWakeOutboxRecord>, DurableStoreError> {
+        let conn = self.connection();
+        let mut statement =
+            conn.prepare("SELECT wake_id, record_json FROM http_push_wakes ORDER BY wake_id ASC")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut wakes = BTreeMap::new();
+        for row in rows {
+            let (wake_id, json) = row?;
+            wakes.insert(wake_id, serde_json::from_str(&json)?);
+        }
+        Ok(wakes)
+    }
+
     fn load_blob_objects(&self) -> Result<BTreeMap<String, Vec<u8>>, DurableStoreError> {
         let conn = self.connection();
         let mut statement = conn.prepare(
@@ -4109,6 +4367,25 @@ impl SqliteHttpDeliveryStore {
         conn.execute(
             "DELETE FROM http_push_tokens WHERE device_key = ?1",
             params![device_key],
+        )?;
+        Ok(())
+    }
+
+    fn upsert_push_wakes(&self, records: &[PushWakeOutboxRecord]) -> Result<(), DurableStoreError> {
+        let mut conn = self.connection();
+        let transaction = conn.transaction()?;
+        for record in records {
+            upsert_push_wake_in_transaction(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn delete_push_wake(&self, wake_id: &str) -> Result<(), DurableStoreError> {
+        let conn = self.connection();
+        conn.execute(
+            "DELETE FROM http_push_wakes WHERE wake_id = ?1",
+            params![wake_id],
         )?;
         Ok(())
     }
@@ -4632,6 +4909,19 @@ fn upsert_application_effect_in_transaction(
     Ok(())
 }
 
+fn upsert_push_wake_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    record: &PushWakeOutboxRecord,
+) -> Result<(), DurableStoreError> {
+    transaction.execute(
+        "INSERT INTO http_push_wakes (wake_id, record_json)
+         VALUES (?1, ?2)
+         ON CONFLICT(wake_id) DO UPDATE SET record_json = excluded.record_json",
+        params![&record.wake_id, serde_json::to_string(record)?],
+    )?;
+    Ok(())
+}
+
 fn blob_content_type(headers: &HeaderMap) -> Result<&str, ServerHttpError> {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return Err(ServerHttpError::InvalidBlobRequest {
@@ -4853,6 +5143,37 @@ fn check_application_delivery_effect(
         });
     }
     Ok(Some(effect))
+}
+
+fn push_tokens_for_wake(
+    record: &PushWakeOutboxRecord,
+    tokens: &BTreeMap<String, PushTokenRecord>,
+    rooms: &BTreeMap<String, HttpRoomMembershipProjection>,
+    revoked: &BTreeSet<String>,
+) -> Vec<PushTokenRecord> {
+    let Some(projection) = rooms.get(&record.room_id) else {
+        return Vec::new();
+    };
+    let mut recipients: Vec<PushTokenRecord> = projection
+        .membership
+        .values()
+        .filter(|membership| membership.device != record.sender)
+        .filter(|membership| projection.device_active_at_head(&membership.device))
+        .filter_map(|membership| {
+            let key = DeviceMembership::key(&membership.device);
+            if revoked.contains(&key) {
+                return None;
+            }
+            tokens.get(&key).cloned()
+        })
+        .collect();
+    recipients.sort_by(|left, right| {
+        left.device
+            .account_id
+            .cmp(&right.device.account_id)
+            .then_with(|| left.device.device_id.cmp(&right.device.device_id))
+    });
+    recipients
 }
 
 fn apply_account_room_membership_delta(

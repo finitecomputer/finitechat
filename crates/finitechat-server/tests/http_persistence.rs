@@ -9,29 +9,31 @@ use finitechat_delivery::{
     HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 use finitechat_http::{
-    AckLinkPayloadRequest, AckLinkPayloadResponse, AckWelcomeRequest, AckWelcomeResponse,
-    ApplicationEffectCountsResponse, ApplicationEffectRequest, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimWelcomesRequest,
+    AckLinkPayloadRequest, AckLinkPayloadResponse, AckPushWakeRequest, AckPushWakeResponse,
+    AckWelcomeRequest, AckWelcomeResponse, ApplicationEffectCountsResponse,
+    ApplicationEffectRequest, BootstrapAccountRoomRequest, BootstrapAccountRoomResponse,
+    ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
+    ClaimLinkPayloadResponse, ClaimPushWakesRequest, ClaimPushWakesResponse, ClaimWelcomesRequest,
     CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
     ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FiniteAccountRoomCommitProjection,
-    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetInviteAvailabilityRequest,
-    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
-    GetNostrProfilesResponse, GroupSyncRequest, HttpApplicationDeliveryEffect, HttpClaimedWelcome,
-    HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
-    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
-    HttpLinkSessionState, InboxSyncRequest, InviteJoinStatusRequest, InviteJoinStatusResponse,
-    KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
-    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileRecord,
-    ObserveDeviceLivenessRequest, PublishKeyPackageResponse, PublishMessageRequest, PushPlatform,
-    PutNostrProfileRequest, RegisterPushTokenRequest, ReleaseLinkClaimRequest,
-    ReleaseLinkClaimResponse, RemovePushTokenRequest, RemovePushTokenResponse,
-    ReportInvalidCommitRequest, ReportInvalidCommitResponse, RespondInviteJoinRequest,
-    RevokeDeviceRequest, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
-    SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse,
-    SyncWaitRoom, UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FailPushWakeRequest,
+    FailPushWakeResponse, FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest,
+    GetDeviceLivenessResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
+    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
+    InviteJoinStatusRequest, InviteJoinStatusResponse, KeyPackageInventoryRequest,
+    LeaveRoomRequest, LeaveRoomResponse, ListAccountRoomDirectoryRequest,
+    ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
+    ListInviteJoinRequestsResponse, NostrProfileRecord, ObserveDeviceLivenessRequest,
+    PublishKeyPackageResponse, PublishMessageRequest, PushPlatform, PutNostrProfileRequest,
+    RegisterPushTokenRequest, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
+    RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
+    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
+    SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest, SyncHintEvent,
+    SyncStreamRequest, SyncWaitInvite, SyncWaitRequest, SyncWaitResponse, SyncWaitRoom,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
@@ -6423,6 +6425,300 @@ async fn sqlite_push_tokens_register_survive_restart_and_drop_on_revocation() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn sqlite_push_wakes_claim_opaque_payload_and_ack() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-phone");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-push-wake-claim".to_owned();
+    let mls_group_id = "mls-push-wake-claim".to_owned();
+    let secret_text = "plaintext message body must not enter push payload";
+
+    let app = persistent_app(&db_path);
+    bootstrap_room(&app, &room_id, &mls_group_id, &alice).await;
+    add_device_to_room(
+        &app,
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-push-wake-bob",
+        "commit-push-wake-bob",
+    )
+    .await;
+    register_push_token(&app, &alice, PushPlatform::Apns, "apns-token-alice").await;
+    register_push_token(&app, &bob, PushPlatform::Apns, "apns-token-bob").await;
+
+    let message = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        1,
+        secret_text.as_bytes(),
+        "push-wake-message",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&message)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: EventAccepted = read_json(response).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-wakes/claim",
+        &ClaimPushWakesRequest {
+            now_ms: 1_000,
+            lease_ms: 30_000,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: ClaimPushWakesResponse = read_json(response).await;
+    assert_eq!(claimed.wakes.len(), 1);
+    let wake = &claimed.wakes[0];
+    assert_eq!(wake.payload.room_id, room_id);
+    assert_eq!(wake.payload.seq, accepted.seq);
+    assert_eq!(wake.attempt, 1);
+    assert_eq!(wake.tokens.len(), 1);
+    assert_eq!(wake.tokens[0].device, bob);
+    assert_eq!(wake.tokens[0].token, "apns-token-bob");
+    let claim_json = serde_json::to_string(&claimed).expect("claim json");
+    assert!(!claim_json.contains(secret_text));
+    assert!(!claim_json.contains("sender"));
+    assert!(!claim_json.contains("attachment"));
+
+    let response = post_json(
+        app.clone(),
+        "/push-wakes/ack",
+        &AckPushWakeRequest {
+            wake_id: wake.wake_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: AckPushWakeResponse = read_json(response).await;
+    assert!(ack.acked);
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-wakes/claim",
+        &ClaimPushWakesRequest {
+            now_ms: 2_000,
+            lease_ms: 30_000,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: ClaimPushWakesResponse = read_json(response).await;
+    assert!(claimed.wakes.is_empty());
+
+    let response = post_json(app.clone(), "/events", &typed_event_request(&message)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: EventAccepted = read_json(response).await;
+    assert_eq!(replayed, accepted);
+    let response = post_json(
+        app,
+        "/push-wakes/claim",
+        &ClaimPushWakesRequest {
+            now_ms: 3_000,
+            lease_ms: 30_000,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: ClaimPushWakesResponse = read_json(response).await;
+    assert!(
+        claimed.wakes.is_empty(),
+        "idempotent event replay must not recreate an acked wake"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_push_wake_fail_retries_then_drops_after_attempt_bound() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let alice = DeviceRef::new("alice", "alice-phone");
+    let bob = DeviceRef::new("bob", "bob-phone");
+    let room_id = "room-push-wake-fail".to_owned();
+    let mls_group_id = "mls-push-wake-fail".to_owned();
+
+    let app = persistent_app(&db_path);
+    bootstrap_room(&app, &room_id, &mls_group_id, &alice).await;
+    add_device_to_room(
+        &app,
+        &room_id,
+        &mls_group_id,
+        &alice,
+        &bob,
+        "welcome-push-wake-fail-bob",
+        "commit-push-wake-fail-bob",
+    )
+    .await;
+    register_push_token(&app, &bob, PushPlatform::Apns, "apns-token-bob").await;
+    let message = append_application_request(
+        &room_id,
+        &mls_group_id,
+        &alice,
+        1,
+        b"retry-bounded-push-wake",
+        "push-wake-fail-message",
+    );
+    let response = post_json(app.clone(), "/events", &typed_event_request(&message)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut wake_id = None;
+    for attempt in 1..=5 {
+        let app = persistent_app(&db_path);
+        let response = post_json(
+            app.clone(),
+            "/push-wakes/claim",
+            &ClaimPushWakesRequest {
+                now_ms: 1_000 + u64::from(attempt),
+                lease_ms: 30_000,
+                limit: 10,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let claimed: ClaimPushWakesResponse = read_json(response).await;
+        assert_eq!(claimed.wakes.len(), 1, "attempt {attempt}");
+        let wake = &claimed.wakes[0];
+        assert_eq!(wake.attempt, attempt);
+        wake_id = Some(wake.wake_id.clone());
+
+        let response = post_json(
+            app,
+            "/push-wakes/fail",
+            &FailPushWakeRequest {
+                wake_id: wake.wake_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let failed: FailPushWakeResponse = read_json(response).await;
+        if attempt < 5 {
+            assert!(failed.retry, "attempt {attempt}");
+            assert!(!failed.dropped, "attempt {attempt}");
+        } else {
+            assert!(!failed.retry);
+            assert!(failed.dropped);
+        }
+    }
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app.clone(),
+        "/push-wakes/claim",
+        &ClaimPushWakesRequest {
+            now_ms: 10_000,
+            lease_ms: 30_000,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: ClaimPushWakesResponse = read_json(response).await;
+    assert!(claimed.wakes.is_empty());
+
+    let response = post_json(
+        app,
+        "/push-wakes/ack",
+        &AckPushWakeRequest {
+            wake_id: wake_id.expect("wake id"),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: AckPushWakeResponse = read_json(response).await;
+    assert!(!ack.acked, "dropped wake is already gone");
+}
+
+async fn bootstrap_room(app: &Router, room_id: &str, mls_group_id: &str, creator: &DeviceRef) {
+    let response = post_json(
+        app.clone(),
+        "/account-rooms/bootstrap",
+        &BootstrapAccountRoomRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: mls_group_id.to_owned(),
+            creator: creator.clone(),
+            protocol: RoomProtocol::default(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn add_device_to_room(
+    app: &Router,
+    room_id: &str,
+    mls_group_id: &str,
+    sender: &DeviceRef,
+    added: &DeviceRef,
+    welcome_id: &str,
+    idempotency_key: &str,
+) -> CommitAccepted {
+    let request = submit_add_device_request(
+        room_id,
+        mls_group_id,
+        sender,
+        added,
+        welcome_id,
+        idempotency_key,
+    );
+    publish_and_claim_key_package_for_add(app, &request).await;
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted = read_json(response).await;
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(added),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].message.id, id(welcome_id));
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: id(welcome_id),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let ack: AckWelcomeResponse = read_json(response).await;
+    assert!(ack.acked);
+    accepted
+}
+
+async fn register_push_token(
+    app: &Router,
+    device: &DeviceRef,
+    platform: PushPlatform,
+    token: &str,
+) {
+    let response = post_json(
+        app.clone(),
+        "/push-tokens",
+        &RegisterPushTokenRequest {
+            device: device.clone(),
+            platform,
+            token: token.to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 fn submit_add_device_request(

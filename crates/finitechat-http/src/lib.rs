@@ -52,6 +52,53 @@ pub struct ApplicationEffectCountsResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushWakePayload {
+    pub room_id: String,
+    pub seq: HttpSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushWakeDelivery {
+    pub wake_id: String,
+    pub payload: PushWakePayload,
+    pub tokens: Vec<PushTokenRecord>,
+    pub attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimPushWakesRequest {
+    pub now_ms: u64,
+    pub lease_ms: u64,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimPushWakesResponse {
+    pub wakes: Vec<PushWakeDelivery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckPushWakeRequest {
+    pub wake_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckPushWakeResponse {
+    pub acked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailPushWakeRequest {
+    pub wake_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailPushWakeResponse {
+    pub retry: bool,
+    pub dropped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSyncRequest {
     pub group_id: GroupId,
     pub after_seq: HttpSequence,
