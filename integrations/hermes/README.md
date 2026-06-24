@@ -46,11 +46,13 @@ reachable from the Finite Chat app.
 `~/.hermes/plugins/finite`. It also writes a local `finitechat.env` file with
 the Agent Home and binary path. The plugin treats that file as defaults only:
 explicit Hermes config and process environment still win.
+Pass `--service-url URL` to also write `FINITECHAT_HERMES_SERVICE_URL` for a
+supervisor-managed `finitechat hermes serve` process.
 
 For the supervised Rust bridge work, `finitechat hermes serve` starts the
 loopback service boundary and exposes `GET /healthz`. The current plugin still
-uses the CLI-per-call bridge for messages until the service message/ack API is
-promoted.
+falls back to the CLI-per-call bridge when `FINITECHAT_HERMES_SERVICE_URL` is
+unset or unreachable.
 
 ## How the pieces divide (ADR 0002)
 

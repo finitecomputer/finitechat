@@ -14,7 +14,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, post},
+};
 use finitechat_blob::{
     BlossomDownloadHttpResponse, finish_blossom_download_http_response,
     prepare_blossom_download_http_request, sha256_hex,
@@ -127,6 +132,7 @@ fn cmd_install<W: Write>(
     let plugin_name = crate::take_option(&mut args, "--plugin-name")?
         .unwrap_or_else(|| HERMES_PLUGIN_INSTALL_NAME.to_owned());
     let finitechat_bin_arg = crate::take_option(&mut args, "--finitechat-bin")?;
+    let service_url = crate::take_option(&mut args, "--service-url")?;
     let force = take_flag(&mut args, "--force");
     crate::reject_extra_args(&args)?;
 
@@ -180,7 +186,8 @@ fn cmd_install<W: Write>(
         force,
         &mut installed,
     )?;
-    let env_contents = hermes_plugin_env_contents(home_dir, &finitechat_bin)?;
+    let env_contents =
+        hermes_plugin_env_contents(home_dir, &finitechat_bin, service_url.as_deref())?;
     write_managed_private_file(
         &plugin_dir.join(HERMES_PLUGIN_ENV_FILE),
         &env_contents,
@@ -223,7 +230,7 @@ struct HermesServiceStarted {
 
 #[derive(Debug, Clone)]
 struct HermesServiceState {
-    agent_home: String,
+    agent_home: PathBuf,
     account_id: String,
     device_id: String,
     server_url: String,
@@ -294,7 +301,7 @@ async fn prepare_hermes_service(
         .map_err(|error| CliError::Hermes(error.to_string()))?;
     let url = format!("http://{bound_addr}");
     let state = HermesServiceState {
-        agent_home: home_dir.display().to_string(),
+        agent_home: home_dir.to_path_buf(),
         account_id: home.config.account_id.clone(),
         device_id: home.config.device_id.clone(),
         server_url: home.config.server_url.clone(),
@@ -303,7 +310,7 @@ async fn prepare_hermes_service(
         service: "finitechat-hermes",
         url,
         addr: bound_addr.to_string(),
-        agent_home: state.agent_home.clone(),
+        agent_home: state.agent_home.display().to_string(),
         account_id: state.account_id.clone(),
         device_id: state.device_id.clone(),
         server_url: state.server_url.clone(),
@@ -337,6 +344,7 @@ async fn serve_prepared_hermes_service(prepared: PreparedHermesService) -> Resul
 fn hermes_service_router(state: HermesServiceState) -> Router {
     Router::new()
         .route("/healthz", get(hermes_service_healthz))
+        .route("/v1/hermes/{action}", post(hermes_service_action))
         .with_state(state)
 }
 
@@ -346,11 +354,67 @@ async fn hermes_service_healthz(
     Json(HermesServiceHealth {
         status: "ok",
         service: "finitechat-hermes",
-        agent_home: state.agent_home,
+        agent_home: state.agent_home.display().to_string(),
         account_id: state.account_id,
         device_id: state.device_id,
         server_url: state.server_url,
     })
+}
+
+async fn hermes_service_action(
+    State(state): State<HermesServiceState>,
+    AxumPath(action): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let home_dir = state.agent_home.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        handle_hermes_bridge_action(&home_dir, &action, payload)
+    })
+    .await
+    .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    result
+        .map(Json)
+        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
+}
+
+fn handle_hermes_bridge_action(
+    home_dir: &Path,
+    action: &str,
+    payload: Value,
+) -> Result<Value, CliError> {
+    let mut output = Vec::new();
+    match action {
+        "invite" => cmd_invite(home_dir, Vec::new(), true, &mut output)?,
+        "pin" => cmd_pin(home_dir, Vec::new(), &mut output)?,
+        "poll" => cmd_poll(home_dir, payload, &mut output)?,
+        "ack" => cmd_ack(home_dir, payload, &mut output)?,
+        "send" => cmd_send(home_dir, payload, &mut output)?,
+        "edit" => cmd_edit(home_dir, payload, &mut output)?,
+        "recover" => cmd_recover(home_dir, payload, &mut output)?,
+        "activity" => cmd_activity(home_dir, payload, &mut output)?,
+        _ => {
+            return Err(CliError::Usage(format!(
+                "unknown Hermes service action {action:?}"
+            )));
+        }
+    }
+    serde_json::from_slice(&output).map_err(CliError::Json)
+}
+
+fn status_for_cli_error(error: &CliError) -> StatusCode {
+    match error {
+        CliError::Usage(_) | CliError::Json(_) => StatusCode::BAD_REQUEST,
+        CliError::Hermes(_) | CliError::Identity(_) => StatusCode::CONFLICT,
+        CliError::Serialize(_)
+        | CliError::Http(_)
+        | CliError::Server { .. }
+        | CliError::Output(_)
+        | CliError::Core(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn service_error(status: StatusCode, error: String) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "ok": false, "error": error })))
 }
 
 fn cmd_init<W: Write>(
@@ -1458,20 +1522,34 @@ fn validate_plugin_name(name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn hermes_plugin_env_contents(home_dir: &Path, finitechat_bin: &Path) -> Result<String, CliError> {
+fn hermes_plugin_env_contents(
+    home_dir: &Path,
+    finitechat_bin: &Path,
+    service_url: Option<&str>,
+) -> Result<String, CliError> {
     let home = env_file_value("FINITECHAT_HOME", home_dir)?;
     let bin = env_file_value("FINITECHAT_BIN", finitechat_bin)?;
-    Ok(format!("FINITECHAT_HOME={home}\nFINITECHAT_BIN={bin}\n"))
+    let mut contents = format!("FINITECHAT_HOME={home}\nFINITECHAT_BIN={bin}\n");
+    if let Some(service_url) = service_url {
+        let service_url = env_string_value("FINITECHAT_HERMES_SERVICE_URL", service_url)?;
+        if !service_url.trim().is_empty() {
+            contents.push_str(&format!("FINITECHAT_HERMES_SERVICE_URL={service_url}\n"));
+        }
+    }
+    Ok(contents)
 }
 
 fn env_file_value(name: &str, path: &Path) -> Result<String, CliError> {
-    let value = path.display().to_string();
+    env_string_value(name, &path.display().to_string())
+}
+
+fn env_string_value(name: &str, value: &str) -> Result<String, CliError> {
     if value.contains('\n') || value.contains('\r') || value.contains('\0') {
         return Err(CliError::Hermes(format!(
-            "{name} path contains a character that cannot be written to finitechat.env"
+            "{name} contains a character that cannot be written to finitechat.env"
         )));
     }
-    Ok(value)
+    Ok(value.to_owned())
 }
 
 fn write_managed_plugin_file(
@@ -1672,7 +1750,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]
@@ -1696,6 +1774,8 @@ mod tests {
                 plugin_dir.display().to_string(),
                 "--finitechat-bin".to_owned(),
                 "/usr/local/bin/finitechat".to_owned(),
+                "--service-url".to_owned(),
+                "http://127.0.0.1:4321".to_owned(),
             ],
             true,
             &mut output,
@@ -1713,6 +1793,7 @@ mod tests {
         let env = fs::read_to_string(plugin_dir.join(HERMES_PLUGIN_ENV_FILE)).unwrap();
         assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
         assert!(env.contains("FINITECHAT_BIN=/usr/local/bin/finitechat"));
+        assert!(env.contains("FINITECHAT_HERMES_SERVICE_URL=http://127.0.0.1:4321"));
     }
 
     #[test]

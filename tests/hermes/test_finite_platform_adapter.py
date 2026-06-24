@@ -485,6 +485,87 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual([result.ok for result in results], [True, True])
         self.assertEqual(max_active, 1)
 
+    def test_finitechat_json_prefers_configured_service_url(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/false",
+                }
+            )
+        )
+        original_urlopen = self.module.urllib.request.urlopen
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b'{"recovered":0}'
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        try:
+            self.module.urllib.request.urlopen = fake_urlopen
+            result = asyncio.run(adapter._finitechat_json("recover", {}, timeout=7))
+        finally:
+            self.module.urllib.request.urlopen = original_urlopen
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["recovered"], 0)
+        self.assertEqual(captured["url"], "http://127.0.0.1:9999/v1/hermes/recover")
+        self.assertEqual(captured["body"], b"{}")
+        self.assertEqual(captured["timeout"], 7)
+
+    def test_finitechat_json_falls_back_to_cli_when_service_transport_fails(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/finitechat",
+                }
+            )
+        )
+        original_urlopen = self.module.urllib.request.urlopen
+        original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+        calls = []
+
+        class FakeProcess:
+            returncode = 0
+
+            async def communicate(self, stdin):
+                calls.append(stdin)
+                return b'{"recovered":0}', b""
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            calls.append(args)
+            return FakeProcess()
+
+        try:
+            self.module.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(
+                self.module.urllib.error.URLError("service down")
+            )
+            self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+            result = asyncio.run(adapter._finitechat_json("recover", {}, timeout=7))
+        finally:
+            self.module.urllib.request.urlopen = original_urlopen
+            self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["recovered"], 0)
+        self.assertEqual(calls[0][0:2], ("/bin/finitechat", "hermes"))
+        self.assertEqual(calls[0][-2:], ("recover", "--json"))
+
 
 if __name__ == "__main__":
     unittest.main()

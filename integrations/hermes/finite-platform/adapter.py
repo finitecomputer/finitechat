@@ -14,6 +14,9 @@ import logging
 import os
 import shlex
 import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +104,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 maximum=120,
             )
         )
+        self.service_url = str(
+            extra.get("service_url") or os.getenv("FINITECHAT_HERMES_SERVICE_URL") or ""
+        ).strip().rstrip("/")
         self._poll_task: asyncio.Task | None = None
         self._finitechat_cmd = _resolve_finitechat_command(str(extra.get("finitechat_bin") or ""))
         self._finitechat_lock = asyncio.Lock()
@@ -498,6 +504,20 @@ class FiniteChatAdapter(BasePlatformAdapter):
         *,
         timeout: int,
     ) -> _FiniteChatResult:
+        if self.service_url:
+            result = await asyncio.to_thread(
+                _finitechat_service_json,
+                self.service_url,
+                action,
+                payload,
+                timeout,
+            )
+            if result.ok or not result.transport_error:
+                return result
+            logger.warning(
+                "[finite] Hermes service unavailable (%s); falling back to finitechat CLI",
+                result.error,
+            )
         if not self._finitechat_cmd:
             return _FiniteChatResult(False, {}, "finitechat CLI is not configured", False)
         command = [*self._finitechat_cmd, "hermes"]
@@ -543,11 +563,19 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
 
 class _FiniteChatResult:
-    def __init__(self, ok: bool, data: dict[str, Any], error: str | None, retryable: bool):
+    def __init__(
+        self,
+        ok: bool,
+        data: dict[str, Any],
+        error: str | None,
+        retryable: bool,
+        transport_error: bool = False,
+    ):
         self.ok = ok
         self.data = data
         self.error = error
         self.retryable = retryable
+        self.transport_error = transport_error
 
 
 def _resolve_finitechat_command(configured: str) -> list[str]:
@@ -561,6 +589,54 @@ def _resolve_finitechat_command(configured: str) -> list[str]:
         if path:
             return [path]
     return []
+
+
+def _finitechat_service_json(
+    service_url: str,
+    action: str,
+    payload: dict[str, Any],
+    timeout: int,
+) -> _FiniteChatResult:
+    encoded_action = urllib.parse.quote(str(action), safe="")
+    request = urllib.request.Request(
+        f"{service_url}/v1/hermes/{encoded_action}",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        return _FiniteChatResult(
+            False,
+            {},
+            _service_error_body(body) or f"finitechat service returned HTTP {exc.code}",
+            _is_retryable_cli_error(body),
+            False,
+        )
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        return _FiniteChatResult(False, {}, str(exc), True, True)
+
+    if not body:
+        return _FiniteChatResult(True, {}, None, False)
+    try:
+        return _FiniteChatResult(True, json.loads(body), None, False)
+    except json.JSONDecodeError as exc:
+        return _FiniteChatResult(False, {}, f"finitechat service returned invalid JSON: {exc}", False)
+
+
+def _service_error_body(body: str) -> str | None:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return body or None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if error:
+            return str(error)
+    return body or None
 
 
 def _event_media(attachments: list[Any]) -> tuple[list[str], list[str]]:

@@ -181,7 +181,7 @@ fn hermes_serve_reports_process_health() {
         .expect("spawn finitechat hermes serve");
 
     let started_result = wait_for_ready_file(&ready_file);
-    let response_result = match &started_result {
+    let health_result = match &started_result {
         Ok(started) => {
             let health_url = format!("{}/healthz", started["url"].as_str().unwrap());
             reqwest::blocking::get(health_url)
@@ -190,15 +190,29 @@ fn hermes_serve_reports_process_health() {
         }
         Err(error) => Err(error.clone()),
     };
+    let recover_result = match &started_result {
+        Ok(started) => reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1/hermes/recover",
+                started["url"].as_str().unwrap()
+            ))
+            .json(&json!({}))
+            .send()
+            .map_err(|error| error.to_string())
+            .and_then(|response| response.json::<Value>().map_err(|error| error.to_string())),
+        Err(error) => Err(error.clone()),
+    };
     let _ = child.kill();
     child.wait().expect("wait hermes service");
 
     let started = started_result.expect("Hermes service wrote ready file");
-    let response = response_result.expect("Hermes service reported health");
+    let response = health_result.expect("Hermes service reported health");
     assert_eq!(response["status"], "ok");
     assert_eq!(response["service"], "finitechat-hermes");
     assert_eq!(response["agent_home"], home.display().to_string());
     assert_eq!(response["account_id"], started["account_id"]);
+    let recover = recover_result.expect("Hermes service handled bridge action");
+    assert_eq!(recover["recovered"], 0);
 }
 
 fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {
