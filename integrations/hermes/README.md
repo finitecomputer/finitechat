@@ -47,6 +47,11 @@ reachable from the Finite Chat app.
 the Agent Home and binary path. The plugin treats that file as defaults only:
 explicit Hermes config and process environment still win.
 
+For the supervised Rust bridge work, `finitechat hermes serve` starts the
+loopback service boundary and exposes `GET /healthz`. The current plugin still
+uses the CLI-per-call bridge for messages until the service message/ack API is
+promoted.
+
 ## How the pieces divide (ADR 0002)
 
 The Python adapter stays thin: it shells to `finitechat hermes

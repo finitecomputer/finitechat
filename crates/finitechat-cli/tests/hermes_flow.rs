@@ -17,6 +17,7 @@ use finitechat_proto::{
 };
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [41; NOSTR_SECRET_KEY_BYTES];
@@ -142,6 +143,74 @@ fn hermes_install_installs_plugin_into_temp_hermes_home() {
     let env = std::fs::read_to_string(plugin_dir.join("finitechat.env")).unwrap();
     assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
     assert!(env.contains("FINITECHAT_BIN=/bin/finitechat"));
+}
+
+#[test]
+fn hermes_serve_reports_process_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+    let ready_file = dir.path().join("serve-ready.json");
+    let ready_arg = ready_file.display().to_string();
+
+    cli_json(&["identity", "--agent-home", &home_arg, "init"]);
+    hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "init",
+        "--server",
+        "http://127.0.0.1:1",
+    ]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finitechat"))
+        .args([
+            "hermes",
+            "--agent-home",
+            &home_arg,
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--ready-file",
+            &ready_arg,
+            "--json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn finitechat hermes serve");
+
+    let started_result = wait_for_ready_file(&ready_file);
+    let response_result = match &started_result {
+        Ok(started) => {
+            let health_url = format!("{}/healthz", started["url"].as_str().unwrap());
+            reqwest::blocking::get(health_url)
+                .map_err(|error| error.to_string())
+                .and_then(|response| response.json::<Value>().map_err(|error| error.to_string()))
+        }
+        Err(error) => Err(error.clone()),
+    };
+    let _ = child.kill();
+    child.wait().expect("wait hermes service");
+
+    let started = started_result.expect("Hermes service wrote ready file");
+    let response = response_result.expect("Hermes service reported health");
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["service"], "finitechat-hermes");
+    assert_eq!(response["agent_home"], home.display().to_string());
+    assert_eq!(response["account_id"], started["account_id"]);
+}
+
+fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {
+    for _ in 0..100 {
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        {
+            return Ok(value);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(format!("Hermes service did not write {}", path.display()))
 }
 
 #[test]

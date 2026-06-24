@@ -10,9 +10,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::{Json, Router, extract::State, routing::get};
 use finitechat_blob::{
     BlossomDownloadHttpResponse, finish_blossom_download_http_response,
     prepare_blossom_download_http_request, sha256_hex,
@@ -56,6 +58,7 @@ const HERMES_PLUGIN_ADAPTER: &str =
 const HERMES_PLUGIN_YAML: &str =
     include_str!("../../../integrations/hermes/finite-platform/plugin.yaml");
 const HERMES_PLUGIN_ENV_FILE: &str = "finitechat.env";
+const DEFAULT_HERMES_SERVICE_ADDR: &str = "127.0.0.1:0";
 const DEFAULT_DEVICE_ID: &str = "agent";
 const DEFAULT_MAX_JOINS: u32 = 8;
 const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -90,6 +93,7 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
     match command.as_str() {
         "init" => cmd_init(&home_dir, rest, output),
         "install" => cmd_install(&home_dir, rest, json_mode, output),
+        "serve" => cmd_serve(&home_dir, rest, json_mode, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "pin" => cmd_pin(&home_dir, rest, output),
         "join" => cmd_join(&home_dir, rest, output),
@@ -203,6 +207,150 @@ fn cmd_install<W: Write>(
         writeln!(output, "Agent home: {}", summary.agent_home).map_err(CliError::Output)?;
         writeln!(output, "finitechat binary: {}", summary.finitechat_bin).map_err(CliError::Output)
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HermesServiceStarted {
+    service: &'static str,
+    url: String,
+    addr: String,
+    agent_home: String,
+    account_id: String,
+    device_id: String,
+    server_url: String,
+    pid: u32,
+}
+
+#[derive(Debug, Clone)]
+struct HermesServiceState {
+    agent_home: String,
+    account_id: String,
+    device_id: String,
+    server_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesServiceHealth {
+    status: &'static str,
+    service: &'static str,
+    agent_home: String,
+    account_id: String,
+    device_id: String,
+    server_url: String,
+}
+
+struct PreparedHermesService {
+    listener: tokio::net::TcpListener,
+    state: HermesServiceState,
+    started: HermesServiceStarted,
+}
+
+fn cmd_serve<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    json_mode: bool,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let addr = crate::take_option(&mut args, "--addr")?
+        .unwrap_or_else(|| DEFAULT_HERMES_SERVICE_ADDR.to_owned())
+        .parse::<SocketAddr>()
+        .map_err(|error| CliError::Usage(format!("invalid --addr: {error}")))?;
+    let ready_file = crate::take_option(&mut args, "--ready-file")?.map(PathBuf::from);
+    crate::reject_extra_args(&args)?;
+
+    let home = load_home(home_dir)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            CliError::Hermes(format!("could not start Hermes service runtime: {error}"))
+        })?;
+    let prepared = runtime.block_on(prepare_hermes_service(home_dir, &home, addr, ready_file))?;
+    if json_mode {
+        crate::write_pretty_json(output, &prepared.started)?;
+    } else {
+        writeln!(
+            output,
+            "finitechat hermes service listening on {}",
+            prepared.started.url
+        )
+        .map_err(CliError::Output)?;
+    }
+    output.flush().map_err(CliError::Output)?;
+    runtime.block_on(serve_prepared_hermes_service(prepared))
+}
+
+async fn prepare_hermes_service(
+    home_dir: &Path,
+    home: &AgentHome,
+    addr: SocketAddr,
+    ready_file: Option<PathBuf>,
+) -> Result<PreparedHermesService, CliError> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|error| CliError::Hermes(format!("could not bind Hermes service: {error}")))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let url = format!("http://{bound_addr}");
+    let state = HermesServiceState {
+        agent_home: home_dir.display().to_string(),
+        account_id: home.config.account_id.clone(),
+        device_id: home.config.device_id.clone(),
+        server_url: home.config.server_url.clone(),
+    };
+    let started = HermesServiceStarted {
+        service: "finitechat-hermes",
+        url,
+        addr: bound_addr.to_string(),
+        agent_home: state.agent_home.clone(),
+        account_id: state.account_id.clone(),
+        device_id: state.device_id.clone(),
+        server_url: state.server_url.clone(),
+        pid: std::process::id(),
+    };
+    if let Some(path) = ready_file {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| CliError::Hermes(error.to_string()))?;
+        }
+        write_private(
+            path,
+            &serde_json::to_string_pretty(&started).map_err(CliError::Serialize)?,
+        )?;
+    }
+    Ok(PreparedHermesService {
+        listener,
+        state,
+        started,
+    })
+}
+
+async fn serve_prepared_hermes_service(prepared: PreparedHermesService) -> Result<(), CliError> {
+    axum::serve(
+        prepared.listener,
+        hermes_service_router(prepared.state).into_make_service(),
+    )
+    .await
+    .map_err(|error| CliError::Hermes(format!("Hermes service failed: {error}")))
+}
+
+fn hermes_service_router(state: HermesServiceState) -> Router {
+    Router::new()
+        .route("/healthz", get(hermes_service_healthz))
+        .with_state(state)
+}
+
+async fn hermes_service_healthz(
+    State(state): State<HermesServiceState>,
+) -> Json<HermesServiceHealth> {
+    Json(HermesServiceHealth {
+        status: "ok",
+        service: "finitechat-hermes",
+        agent_home: state.agent_home,
+        account_id: state.account_id,
+        device_id: state.device_id,
+        server_url: state.server_url,
+    })
 }
 
 fn cmd_init<W: Write>(
@@ -1524,7 +1672,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--force] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]

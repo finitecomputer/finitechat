@@ -17,6 +17,19 @@ colocated `finitechat.env` with `FINITECHAT_HOME` and `FINITECHAT_BIN`
 defaults. It refuses to install from an Agent Home that does not already have
 an Agent Principal Key.
 
+The supervised service entrypoint is:
+
+```text
+finitechat hermes --agent-home DIR serve --addr 127.0.0.1:0 --ready-file PATH
+```
+
+`serve` currently establishes the Rust-owned loopback process boundary and
+exposes `GET /healthz`. It requires an initialized Agent Home and reports the
+agent account, device id, server URL, bound URL, and process id through the
+ready file or startup JSON. Message streaming and outbound actions still use
+the CLI bridge below until the Phase 2 message/ack path moves behind the
+service API.
+
 The plugin calls a Finite Chat CLI/daemon boundary:
 
 ```text
