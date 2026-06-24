@@ -28,6 +28,10 @@
 	<string>Finite Chat saves photos from chats to your photo library when you choose Save Photo.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Finite Chat uses speech recognition to transcribe voice messages you choose to send.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

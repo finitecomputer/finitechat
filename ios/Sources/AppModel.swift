@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct RuntimeConfig: Codable, Equatable {
@@ -364,6 +365,7 @@ final class AppModel: ObservableObject {
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
     private var lastTypingIntentByRoom: [String: Bool] = [:]
+    private var pendingPushToken: String?
     private var didRunLaunchAutomation = false
     private let launchConfigurationError: String?
 
@@ -524,6 +526,8 @@ final class AppModel: ObservableObject {
 
     func signOutAndDeleteEverything() {
         appendDiagnostic(category: "persistence", event: "signout.delete_all.requested")
+        removePushTokenIfPossible()
+        pendingPushToken = nil
         nostrIdentityStore.clear()
         closeRuntime()
         try? RuntimeDataStore.deleteDataDir(
@@ -589,7 +593,68 @@ final class AppModel: ObservableObject {
         }
         restartUpdateLoopIfEnabled()
         if runtime != nil {
+            flushPendingPushTokenIfPossible()
             runLaunchAutomationIfRequested()
+        }
+    }
+
+    func registerPushToken(_ token: String) {
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        pendingPushToken = token
+        appendDiagnostic(
+            category: "push",
+            event: "token.received",
+            details: ["token_bytes": "\(token.count / 2)"]
+        )
+        flushPendingPushTokenIfPossible()
+    }
+
+    func notePushRegistrationFailed(_ error: Error) {
+        appendDiagnostic(
+            category: "push",
+            event: "apns.registration.failed",
+            details: diagnosticErrorDetails(error)
+        )
+    }
+
+    func handleRemotePushWake(
+        userInfo: [AnyHashable: Any],
+        completion: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        appendDiagnostic(
+            category: "push",
+            event: "wake.received",
+            details: pushWakeDiagnosticDetails(userInfo)
+        )
+        Task { [weak self] in
+            guard let self else {
+                completion(.noData)
+                return
+            }
+            do {
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                let nextState = try await Task.detached(priority: .utility) {
+                    try runtime.dispatch(action: .startRuntime)
+                }.value
+                guard openKey == runtimeKey else {
+                    completion(.noData)
+                    return
+                }
+                state = nextState
+                errorText = nil
+                appendDiagnostic(category: "push", event: "wake.sync.succeeded")
+                restartUpdateLoopIfEnabled()
+                completion(.newData)
+            } catch {
+                appendDiagnostic(
+                    category: "push",
+                    event: "wake.sync.failed",
+                    details: diagnosticErrorDetails(error)
+                )
+                completion(.failed)
+            }
         }
     }
 
@@ -927,6 +992,41 @@ final class AppModel: ObservableObject {
         requiresNostrLogin = false
         appendDiagnostic(category: "persistence", event: "nostr_identity.applied")
         start()
+    }
+
+    private func flushPendingPushTokenIfPossible() {
+        guard let token = pendingPushToken else { return }
+        appendDiagnostic(category: "push", event: "token.register.requested")
+        do {
+            let runtime = try currentRuntime()
+            state = try runtime.dispatch(action: .setPushToken(token: token))
+            pendingPushToken = nil
+            appendDiagnostic(category: "push", event: "token.register.succeeded")
+            restartUpdateLoopIfEnabled()
+        } catch {
+            appendDiagnostic(
+                category: "push",
+                event: "token.register.failed",
+                details: diagnosticErrorDetails(error)
+            )
+        }
+    }
+
+    private func removePushTokenIfPossible() {
+        guard runtime != nil else { return }
+        appendDiagnostic(category: "push", event: "token.remove.requested")
+        do {
+            let runtime = try currentRuntime()
+            state = try runtime.dispatch(action: .removePushToken)
+            appendDiagnostic(category: "push", event: "token.remove.succeeded")
+            restartUpdateLoopIfEnabled()
+        } catch {
+            appendDiagnostic(
+                category: "push",
+                event: "token.remove.failed",
+                details: diagnosticErrorDetails(error)
+            )
+        }
     }
 
     private func startUpdateLoop() {
@@ -1359,7 +1459,30 @@ final class AppModel: ObservableObject {
                 name: "revoke_device",
                 details: ["account": accountId, "device": deviceId]
             )
+        case .setPushToken:
+            return DiagnosticActionSummary(
+                category: "push",
+                name: "set_push_token",
+                details: [:]
+            )
+        case .removePushToken:
+            return DiagnosticActionSummary(
+                category: "push",
+                name: "remove_push_token",
+                details: [:]
+            )
         }
+    }
+
+    private func pushWakeDiagnosticDetails(_ userInfo: [AnyHashable: Any]) -> [String: String] {
+        var details = [String: String]()
+        if let roomID = userInfo["room_id"] as? String {
+            details["room"] = roomID
+        }
+        if let seq = userInfo["seq"] {
+            details["seq"] = "\(seq)"
+        }
+        return details
     }
 
     private func redactedPathSummary(_ path: String) -> String {

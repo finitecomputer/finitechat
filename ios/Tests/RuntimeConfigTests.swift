@@ -1016,6 +1016,49 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }
 
+    func testPushTokenReceivedBeforeNostrLoginRegistersAfterSignIn() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = emptyChatState()
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore()
+        var openedOptions: [OpenOptions] = []
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return runtime
+        }
+
+        model.registerPushToken("  00010f10ff  ")
+
+        XCTAssertTrue(openedOptions.isEmpty)
+        XCTAssertTrue(runtime.dispatchedActions.isEmpty)
+
+        XCTAssertTrue(model.signInWithNsec(material.nsec))
+
+        XCTAssertEqual(openedOptions.count, 1)
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [.startRuntime, .setPushToken(token: "00010f10ff")]
+        )
+    }
+
     func testSignOutDeletesSavedNostrIdentityAndReturnsToLoginGate() throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
@@ -1056,6 +1099,44 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(model.runtimeStorePath)
         XCTAssertEqual(model.serverURL, "https://chat.finite.computer")
         XCTAssertEqual(model.deviceID, "ios")
+    }
+
+    func testSignOutRemovesPushTokenBeforeClearingRuntime() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = emptyChatState()
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore(identity: AppNostrIdentity(material: material))
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        model.registerPushToken("apns-token")
+        model.signOutAndDeleteEverything()
+
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [.startRuntime, .setPushToken(token: "apns-token"), .removePushToken]
+        )
+        XCTAssertNil(identityStore.load())
     }
 
     func testAttachmentCaptionOverrideDispatchesCaptionWithoutClearingComposerDraft() async throws {
@@ -2370,6 +2451,15 @@ final class ChatMediaGalleryItemIdentityTests: XCTestCase {
         )
 
         XCTAssertEqual(item.id, "room-main|message-1|image-1")
+    }
+}
+
+@MainActor
+final class PushNotificationManagerTests: XCTestCase {
+    func testDeviceTokenHexEncodingLowercasesAndPadsBytes() {
+        let token = PushNotificationManager.hexToken(from: Data([0x00, 0x01, 0x0f, 0x10, 0xff]))
+
+        XCTAssertEqual(token, "00010f10ff")
     }
 }
 

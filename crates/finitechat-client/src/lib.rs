@@ -10,10 +10,12 @@ use finitechat_http::{
     HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
     InviteJoinStatusResponse, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
-    ListInviteJoinRequestsResponse, NostrProfileRecord, PublishKeyPackageResponse,
-    PutNostrProfileRequest, PutNostrProfileResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
-    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
-    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse,
+    ListInviteJoinRequestsResponse, NostrProfileRecord, PublishKeyPackageResponse, PushPlatform,
+    PutNostrProfileRequest, PutNostrProfileResponse, RegisterPushTokenRequest,
+    RegisterPushTokenResponse, RemovePushTokenRequest, RemovePushTokenResponse,
+    RespondInviteJoinRequest, RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SubmitInviteJoinRequest, SyncHintEvent, SyncStreamRequest,
+    SyncWaitRequest, SyncWaitResponse,
 };
 use finitechat_mls::{
     ExpectedDeviceCredential, FiniteDeviceCredentialV1, MlsCredentialError, NOSTR_PUBLIC_KEY_BYTES,
@@ -4142,6 +4144,34 @@ impl<T: HttpRuntimeTransport> HttpRuntimeDelivery<T> {
         self.post_json(
             "/devices/revoke",
             &RevokeDeviceRequest {
+                device: device.clone(),
+            },
+        )
+    }
+
+    pub fn register_push_token(
+        &mut self,
+        device: &DeviceRef,
+        platform: PushPlatform,
+        token: String,
+    ) -> Result<RegisterPushTokenResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json(
+            "/push-tokens",
+            &RegisterPushTokenRequest {
+                device: device.clone(),
+                platform,
+                token,
+            },
+        )
+    }
+
+    pub fn remove_push_token(
+        &mut self,
+        device: &DeviceRef,
+    ) -> Result<RemovePushTokenResponse, HttpRuntimeDeliveryError<T::Error>> {
+        self.post_json(
+            "/push-tokens/remove",
+            &RemovePushTokenRequest {
                 device: device.clone(),
             },
         )

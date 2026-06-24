@@ -23,7 +23,8 @@ use finitechat_client::{
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{
-    GetEphemeralActivitiesRequest, SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom,
+    GetEphemeralActivitiesRequest, PushPlatform, SyncHintEvent, SyncStreamRequest, SyncWaitInvite,
+    SyncWaitRoom,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
@@ -502,6 +503,10 @@ pub enum AppAction {
         account_id: String,
         device_id: String,
     },
+    SetPushToken {
+        token: String,
+    },
+    RemovePushToken,
 }
 
 struct CoreState {
@@ -1030,6 +1035,8 @@ impl AppRuntimeState {
                 account_id,
                 device_id,
             } => self.revoke_device(account_id, device_id)?,
+            AppAction::SetPushToken { token } => self.set_push_token(token)?,
+            AppAction::RemovePushToken => self.remove_push_token()?,
         }
         self.bump_rev();
         Ok(())
@@ -1099,6 +1106,23 @@ impl AppRuntimeState {
                 heartbeat_ms: Some(normalize_app_update_wait_millis(timeout_millis)),
             },
         }
+    }
+
+    fn set_push_token(&mut self, token: String) -> Result<(), FiniteChatCoreError> {
+        let token = token.trim().to_owned();
+        let mut delivery = self.core.home_delivery();
+        delivery
+            .register_push_token(self.core.device.device_ref(), PushPlatform::Apns, token)
+            .map_err(send_delivery_error)?;
+        Ok(())
+    }
+
+    fn remove_push_token(&mut self) -> Result<(), FiniteChatCoreError> {
+        let mut delivery = self.core.home_delivery();
+        delivery
+            .remove_push_token(self.core.device.device_ref())
+            .map_err(delivery_error)?;
+        Ok(())
     }
 
     fn apply_sync_hint(&mut self, event: SyncHintEvent) {
@@ -5827,6 +5851,40 @@ mod tests {
             .expect_err("oversized room labels fail before network or storage side effects");
         assert!(matches!(error, FiniteChatCoreError::Client { .. }));
         assert!(app.state().unwrap().rooms.is_empty());
+    }
+
+    #[test]
+    fn app_push_token_actions_register_remove_and_surface_server_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let registered = app
+            .dispatch(AppAction::SetPushToken {
+                token: "  apns-token-alice  ".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(registered.status, "ready");
+        app.dispatch(AppAction::RemovePushToken).unwrap();
+
+        let error = app
+            .dispatch(AppAction::SetPushToken {
+                token: " ".to_owned(),
+            })
+            .expect_err("server rejects empty push tokens");
+        match error {
+            FiniteChatCoreError::ServerRejected { reason } => {
+                assert!(reason.contains("push token must be 1..=4096 bytes"));
+            }
+            other => panic!("expected server rejection, got {other:?}"),
+        }
     }
 
     #[test]
