@@ -26,8 +26,6 @@ shared blob substrate, and survive normal restart and multi-device scenarios.
   revalidate, following the Pika shape with Rust-owned state.
 - Wake-only APNs push works on a physical iPhone: locked phone receives a wake,
   syncs, and shows the message after opening.
-- Hosted web chat is a trusted hosted device with its own Rust client process,
-  SQLite store, device key, room membership, and revocation.
 - Finite Blob has a provider-neutral API with scoped capabilities and a path to
   S3-compatible hosted storage, with Latitude as the first canary candidate.
 - The in-app Finite Sites browser opens shared sites invisibly using direct
@@ -40,8 +38,9 @@ shared blob substrate, and survive normal restart and multi-device scenarios.
 - The agent never receives the user's personal Nostr secret.
 - Directly invited agents are P0. Human-to-agent delegation is designed for but
   not required before Friends Alpha.
-- Hosted web is a trusted hosted device, not browser-owned E2EE. Browser MLS is
-  explicitly out of scope for this milestone.
+- Hosted web is Friends Beta, not Friends Alpha. Browser MLS remains out of
+  scope, and trusted hosted-device specifics should be revisited before that
+  run of work starts.
 - In-app Finite Sites auth must not publish to or query Nostr relays.
 - Swift/native UI should render Rust-projected state and dispatch actions; it
   should not own profile relay fetching or cache semantics.
@@ -62,8 +61,6 @@ shared blob substrate, and survive normal restart and multi-device scenarios.
   act on behalf of a human/contact principal with bounded capabilities.
 - Direct Agent Principal: an agent invited or shared with as its own visible
   principal, similar to a human participant.
-- Trusted Hosted Device: a server-hosted Rust client for a user, with its own
-  device key and SQLite store. It can decrypt only rooms it has joined.
 - Finite Blob: provider-neutral blob service contract used by chat, sites, and
   brain through scoped capabilities.
 
@@ -292,40 +289,7 @@ Commit checkpoint:
 - Commit server/pusher plumbing before iOS entitlement work.
 - Commit Apple walkthrough with the first passing physical-device proof.
 
-## Phase 6 - Trusted Hosted Web Device
-
-Goal: provide practical web chat without browser-owned MLS.
-
-Work:
-
-- Run one Rust client process per hosted web user/principal.
-- Store one SQLite file per hosted device.
-- Give hosted device its own device key and membership.
-- Add hosted device to rooms explicitly through normal linking/admission.
-- Serve web UI from the hosted client process or a thin frontend over it.
-- Make trust posture visible in docs and internal product copy.
-
-Acceptance:
-
-- Hosted device can be added, sync messages, send messages, restart, and
-  recover.
-- Hosted device cannot read rooms it was never added to.
-- Revoking hosted device removes future access.
-- Native app plus hosted device can coexist for the same user principal.
-- This is not described as browser E2EE.
-
-Evaluation:
-
-- Multi-device Rust tests for hosted device add/sync/send/restart/revoke.
-- Negative test for unjoined room access.
-- Web integration test for bootstrap room and basic chat.
-- Product trust-mode doc update.
-
-Commit checkpoint:
-
-- Commit core hosted-device runtime before web UI wiring.
-
-## Phase 7 - Finite Blob Shared Substrate
+## Phase 6 - Finite Blob Shared Substrate
 
 Goal: give chat, sites, and brain one useful blob story without leaking bucket
 credentials or product policy.
@@ -365,7 +329,7 @@ Commit checkpoint:
 
 - Commit API/ref model first, backend seam second, Latitude canary third.
 
-## Phase 8 - In-App Finite Sites Browser Auth
+## Phase 7 - In-App Finite Sites Browser Auth
 
 Goal: let the native app open shared Finite Sites invisibly for the user.
 
@@ -417,7 +381,7 @@ Commit checkpoint:
 - Commit finite-sites RFC/doc first.
 - Commit server endpoint and tests before iOS browser wiring.
 
-## Phase 9 - Friends Alpha Integration Gate
+## Phase 8 - Friends Alpha Integration Gate
 
 Goal: prove the whole path works together before inviting friends.
 
@@ -431,7 +395,6 @@ Work:
 - Set and use Hermes home channel.
 - Open shared fsite in native browser without email flow.
 - Register APNs and verify locked-phone wake.
-- Add hosted web device and revoke it.
 - Exercise Finite Blob upload/download from at least chat and one other product
   caller.
 
@@ -448,13 +411,47 @@ Evaluation:
 - One simulator run for deterministic UI/product coverage.
 - One physical iPhone run for push and real device behavior.
 - One finitecomputer runtime run for supervised agent behavior.
-- One hosted web device run.
-- One failure drill: kill/restart Hermes service, pusher, hosted device, and
-  app runtime.
+- One failure drill: kill/restart Hermes service, pusher, and app runtime.
 
 Commit checkpoint:
 
 - Commit runbook and final integration evidence after the first full pass.
+
+## Friends Beta - Trusted Hosted Web Device
+
+Goal: provide practical web chat after Friends Alpha, without making browser
+MLS part of the product scope.
+
+This work is intentionally deferred because Friends Alpha is about people
+talking to people and directly invited agents through the native Finite Chat
+app. Revisit the exact product and security specifics before launching this
+run of work.
+
+Candidate shape:
+
+- Run one Rust client process per hosted web user/principal.
+- Store one SQLite file per hosted device.
+- Give the hosted device its own device key and explicit room membership.
+- Use the hosted device for bootstrap and convenience, not as a replacement for
+  native local E2EE.
+- Serve the web UI from the hosted client process or a thin frontend over it.
+- Make trust posture visible in docs and internal product copy.
+
+Candidate acceptance:
+
+- Hosted device can be added, sync messages, send messages, restart, and
+  recover.
+- Hosted device cannot read rooms it was never added to.
+- Revoking hosted device removes future access.
+- Native app plus hosted device can coexist for the same user principal.
+- This is not described as browser E2EE.
+
+Candidate evaluation:
+
+- Multi-device Rust tests for hosted device add/sync/send/restart/revoke.
+- Negative test for unjoined room access.
+- Web integration test for bootstrap room and basic chat.
+- Product trust-mode doc update.
 
 ## P1 After Friends Alpha
 
