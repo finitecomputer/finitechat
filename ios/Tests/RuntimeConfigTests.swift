@@ -1950,6 +1950,70 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(relaunch.selectedRoomMessages.map(\.text), ["saved before force close"])
     }
 
+    @MainActor
+    func testCreateRoomAndInviteForProfileUsesExistingRoomInviteActions() throws {
+        let profile = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            switch action {
+            case .createRoom(let displayName):
+                let room = AppRoomSummary(
+                    roomId: "room-bob",
+                    displayName: displayName,
+                    state: .connected,
+                    status: "connected",
+                    userStatusText: "Connected",
+                    lastMessagePreview: "",
+                    unreadCount: 0,
+                    canLoadOlder: false
+                )
+                state.rooms = [room]
+                state.selectedRoomId = room.roomId
+            case .createInvite(let roomId):
+                state.activeInvite = AppInviteState(
+                    roomId: roomId,
+                    inviteUrl: "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-bob&i=invite-bob&t=token&a=npub1bob",
+                    pin: "123456"
+                )
+                state.status = "invite ready"
+            default:
+                break
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.createRoomAndInvite(for: profile))
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .createRoom(displayName: "Chat with Bob"),
+                .createInvite(roomId: "room-bob"),
+            ]
+        )
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
+        XCTAssertEqual(model.state?.activeInvite?.pin, "123456")
+    }
+
     private func savedChatState(
         status: String = "ready",
         toast: String? = nil,
@@ -2597,11 +2661,17 @@ private struct RawDiagnosticError: Error, CustomStringConvertible {
 private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked Sendable {
     private var currentState: AppState
     private let startRuntimeState: AppState
+    private let dispatchOverride: ((AppAction, AppState) -> AppState)?
     private(set) var dispatchedActions: [AppAction] = []
 
-    init(initialState: AppState, startRuntimeState: AppState) {
+    init(
+        initialState: AppState,
+        startRuntimeState: AppState,
+        dispatchOverride: ((AppAction, AppState) -> AppState)? = nil
+    ) {
         currentState = initialState
         self.startRuntimeState = startRuntimeState
+        self.dispatchOverride = dispatchOverride
     }
 
     func state() throws -> AppState {
@@ -2612,6 +2682,8 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
         dispatchedActions.append(action)
         if action == .startRuntime {
             currentState = startRuntimeState
+        } else if let dispatchOverride {
+            currentState = dispatchOverride(action, currentState)
         }
         return currentState
     }

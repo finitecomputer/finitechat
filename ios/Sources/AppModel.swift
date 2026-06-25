@@ -679,6 +679,17 @@ final class AppModel: ObservableObject {
         return state?.activeInvite?.roomId == room.roomId
     }
 
+    func createRoomAndInvite(for profile: AppProfileSummary) -> Bool {
+        let existingRoomIDs = Set(rooms.map(\.roomId))
+        let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
+        roomDraft = "Chat with \(displayName)"
+        createRoom()
+        guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
+            return false
+        }
+        return createInvite(for: room)
+    }
+
     @discardableResult
     func scanTarget() -> Bool {
         let value = scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)

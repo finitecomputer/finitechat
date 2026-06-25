@@ -41,11 +41,15 @@ struct ContentView: View {
         .sheet(item: $sheet) { destination in
             switch destination {
             case .scan:
-                ScanSheet(model: model)
+                ScanSheet(model: model) { profile in
+                    startInviteFromScannedProfile(profile)
+                }
             case .invite:
                 InviteSheet(invite: model.state?.activeInvite)
             case .settings:
-                SettingsSheet(model: model)
+                SettingsSheet(model: model) { profile in
+                    startInviteFromScannedProfile(profile)
+                }
             }
         }
         .task {
@@ -202,6 +206,18 @@ struct ContentView: View {
         scheduledRoomRouteID = selectedRoomID
         selectedTab = .chats
         schedulePathUpdate([selectedRoomID])
+    }
+
+    private func startInviteFromScannedProfile(_ profile: AppProfileSummary) {
+        guard model.createRoomAndInvite(for: profile) else { return }
+        if let room = model.selectedRoom {
+            routeSelectedRoom(room.roomId)
+        }
+        sheet = nil
+        Task { @MainActor in
+            await Task.yield()
+            sheet = .invite
+        }
     }
 
     private func schedulePathUpdate(_ nextPath: [String]) {
@@ -1557,6 +1573,7 @@ private struct UnavailableOnDeviceView: View {
 private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    let onStartProfileChat: (AppProfileSummary) -> Void
     @State private var showingCameraScanner = false
 
     var body: some View {
@@ -1600,6 +1617,12 @@ private struct ScanSheet: View {
                 if let profile = model.activeProfile {
                     Section("Profile") {
                         ProfileRow(profile: profile)
+                        Button {
+                            dismiss()
+                            onStartProfileChat(profile)
+                        } label: {
+                            Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
+                        }
                     }
                 }
             }
@@ -1607,9 +1630,7 @@ private struct ScanSheet: View {
             .sheet(isPresented: $showingCameraScanner) {
                 QRCodeScannerSheet { value in
                     model.scanDraft = value
-                    if model.scanTarget() {
-                        dismiss()
-                    }
+                    continueWithTarget()
                 }
             }
             .toolbar {
@@ -1620,13 +1641,22 @@ private struct ScanSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Continue") {
-                        if model.scanTarget() {
-                            dismiss()
-                        }
+                        continueWithTarget()
                     }
                     .disabled(model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
+        }
+    }
+
+    private func continueWithTarget() {
+        if model.scanTarget() {
+            dismiss()
+            return
+        }
+        if let profile = model.activeProfile {
+            dismiss()
+            onStartProfileChat(profile)
         }
     }
 }
@@ -1672,6 +1702,7 @@ private struct InviteSheet: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    let onStartProfileChat: (AppProfileSummary) -> Void
     @State private var showingMyProfile = false
     @State private var showingScan = false
     @State private var confirmingSignOut = false
@@ -1839,7 +1870,7 @@ private struct SettingsSheet: View {
                 MyNostrProfileSheet(identity: model.nostrIdentity, myNpub: model.myNpub)
             }
             .sheet(isPresented: $showingScan) {
-                ScanSheet(model: model)
+                ScanSheet(model: model, onStartProfileChat: onStartProfileChat)
             }
             .confirmationDialog(
                 "Delete this device's Finite Chat data?",
