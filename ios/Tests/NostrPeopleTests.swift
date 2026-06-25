@@ -257,11 +257,151 @@ final class NostrPeopleTests: XCTestCase {
         )
 
         XCTAssertEqual(model.profiles.map(\.displayName), ["Cached Bob"])
-        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.unknown])
 
         try await Task.sleep(nanoseconds: 1_100_000_000)
 
         XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+    }
+
+    func testPeopleCacheIsAccountScopedAndAvailabilityNeutral() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: "cachedbob",
+                        about: nil,
+                        pictureURL: "https://example.com/bob.jpg",
+                        relayHint: nil,
+                        inviteAvailability: .available
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat-one.example"
+        )
+
+        let loaded = await cache.load(
+            accountID: owner.uppercased(),
+            serverURL: "https://chat-two.example"
+        )
+
+        XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Cached Bob"])
+        XCTAssertEqual(loaded?.profiles.map(\.inviteAvailability), [.unknown])
+    }
+
+    func testPeopleCachePreservesNonEmptyListWhenRefreshFindsNoFollows() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: nil,
+                        about: nil,
+                        pictureURL: nil,
+                        relayHint: nil,
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [],
+                relayCount: 5,
+                followedPubkeyCount: 0
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example",
+            preserveNonEmptyOnEmptyResult: true
+        )
+
+        let loaded = await cache.load(accountID: owner, serverURL: "https://chat.example")
+
+        XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Cached Bob"])
+    }
+
+    func testPeopleModelCachesFetchedProfilesBeforeAvailabilityFinishes() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        let availabilityGate = AvailabilityGate(accountID: bob)
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1,
+                            kind: 3,
+                            tags: [["p", bob]],
+                            content: ""
+                        ),
+                    ]
+                }
+                if filter.kinds == [0] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: bob,
+                            createdAt: 2,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Fresh Bob"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let availabilityService = FiniteInviteAvailabilityService(
+            availabilityLoader: { _, accountIDs in
+                await availabilityGate.enterAndWait(for: accountIDs)
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: availabilityService,
+            cache: cache
+        )
+
+        let refresh = Task {
+            await model.refresh(
+                identity: AppNostrIdentity(material: material),
+                serverURL: "https://chat.example"
+            )
+        }
+        await availabilityGate.waitUntilEntered()
+
+        let cached = await cache.load(
+            accountID: owner,
+            serverURL: "https://different-chat.example"
+        )
+
+        XCTAssertEqual(cached?.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(cached?.profiles.map(\.inviteAvailability), [.unknown])
+
+        await availabilityGate.release()
+        await refresh.value
         XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
     }
 
@@ -583,5 +723,48 @@ private actor InviteAvailabilitySequence {
         return Dictionary(uniqueKeysWithValues: accountIDs.map { accountID in
             (accountID, accountID == self.accountID && calls > 1)
         })
+    }
+}
+
+private actor AvailabilityGate {
+    private let accountID: String
+    private var entered = false
+    private var released = false
+    private var entryContinuations: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
+
+    init(accountID: String) {
+        self.accountID = accountID
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            entryContinuations.append(continuation)
+        }
+    }
+
+    func enterAndWait(for accountIDs: [String]) async -> [String: Bool] {
+        entered = true
+        for continuation in entryContinuations {
+            continuation.resume()
+        }
+        entryContinuations.removeAll()
+        if !released {
+            await withCheckedContinuation { continuation in
+                releaseContinuations.append(continuation)
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: accountIDs.map { accountID in
+            (accountID, accountID == self.accountID)
+        })
+    }
+
+    func release() {
+        released = true
+        for continuation in releaseContinuations {
+            continuation.resume()
+        }
+        releaseContinuations.removeAll()
     }
 }

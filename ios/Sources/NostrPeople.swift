@@ -117,29 +117,34 @@ actor NostrPeopleCache: Sendable {
     }
 
     func load(accountID: String, serverURL: String) -> NostrFollowFetchResult? {
-        let url = cacheURL(accountID: accountID, serverURL: serverURL)
-        guard let data = try? Data(contentsOf: url),
-              let envelope = try? decoder.decode(NostrPeopleCacheEnvelope.self, from: data)
-        else {
-            return nil
+        for url in [
+            cacheURL(accountID: accountID),
+            legacyCacheURL(accountID: accountID, serverURL: serverURL),
+        ] {
+            guard let result = load(from: url) else { continue }
+            return result
         }
-        return NostrFollowFetchResult(
-            profiles: envelope.profiles,
-            relayCount: envelope.relayCount,
-            followedPubkeyCount: envelope.followedPubkeyCount
-        )
+        return nil
     }
 
     func save(
         _ result: NostrFollowFetchResult,
         accountID: String,
-        serverURL: String
+        serverURL: String,
+        preserveNonEmptyOnEmptyResult: Bool = false
     ) {
         do {
             try FileManager.default.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true
             )
+            if preserveNonEmptyOnEmptyResult,
+               result.profiles.isEmpty,
+               let existing = load(from: cacheURL(accountID: accountID)),
+               !existing.profiles.isEmpty
+            {
+                return
+            }
             let envelope = NostrPeopleCacheEnvelope(
                 profiles: result.profiles,
                 relayCount: result.relayCount,
@@ -148,7 +153,7 @@ actor NostrPeopleCache: Sendable {
             )
             let data = try encoder.encode(envelope)
             try data.write(
-                to: cacheURL(accountID: accountID, serverURL: serverURL),
+                to: cacheURL(accountID: accountID),
                 options: [.atomic]
             )
         } catch {
@@ -156,8 +161,25 @@ actor NostrPeopleCache: Sendable {
         }
     }
 
-    private func cacheURL(accountID: String, serverURL: String) -> URL {
-        let accountKey = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    private func load(from url: URL) -> NostrFollowFetchResult? {
+        guard let data = try? Data(contentsOf: url),
+              let envelope = try? decoder.decode(NostrPeopleCacheEnvelope.self, from: data)
+        else {
+            return nil
+        }
+        return NostrFollowFetchResult(
+            profiles: envelope.profiles.map { $0.withInviteAvailability(.unknown) },
+            relayCount: envelope.relayCount,
+            followedPubkeyCount: envelope.followedPubkeyCount
+        )
+    }
+
+    private func cacheURL(accountID: String) -> URL {
+        directory.appendingPathComponent("\(accountCacheKey(accountID)).json")
+    }
+
+    private func legacyCacheURL(accountID: String, serverURL: String) -> URL {
+        let accountKey = accountCacheKey(accountID)
         let serverKey = serverURL
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -165,6 +187,11 @@ actor NostrPeopleCache: Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
         return directory.appendingPathComponent("\(accountKey)-\(serverKey).json")
+    }
+
+    private func accountCacheKey(_ accountID: String) -> String {
+        let accountKey = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return accountKey.isEmpty ? "unknown" : accountKey
     }
 }
 
@@ -232,6 +259,12 @@ final class NostrPeopleModel: ObservableObject {
             let result = try await service.fetchFollowProfiles(forAccountID: identity.accountID)
             guard isCurrent(identity: identity, serverURL: serverURL) else { return }
             profiles = result.profiles
+            await cache?.save(
+                result,
+                accountID: identity.accountID,
+                serverURL: serverURL,
+                preserveNonEmptyOnEmptyResult: true
+            )
             await refreshInviteAvailability(serverURL: serverURL)
             await cache?.save(
                 NostrFollowFetchResult(
@@ -240,7 +273,8 @@ final class NostrPeopleModel: ObservableObject {
                     followedPubkeyCount: result.followedPubkeyCount
                 ),
                 accountID: identity.accountID,
-                serverURL: serverURL
+                serverURL: serverURL,
+                preserveNonEmptyOnEmptyResult: true
             )
             if result.followedPubkeyCount == 0 {
                 statusText = "No follows found on the configured Nostr relays."

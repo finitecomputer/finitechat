@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ImageIO
 import SwiftUI
 import UIKit
@@ -28,6 +29,51 @@ final class RemoteImageMemoryCache: @unchecked Sendable {
     }
 }
 
+final class RemoteImageDiskCache: @unchecked Sendable {
+    static let shared = RemoteImageDiskCache()
+
+    private let directory: URL
+
+    init(directory: URL? = nil) {
+        if let directory {
+            self.directory = directory
+        } else {
+            let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first ?? FileManager.default.temporaryDirectory
+            self.directory = root
+                .appendingPathComponent("FiniteChat", isDirectory: true)
+                .appendingPathComponent("RemoteImageCache", isDirectory: true)
+        }
+    }
+
+    func data(for url: URL) -> Data? {
+        guard !url.isFileURL else { return nil }
+        return try? Data(contentsOf: cacheURL(for: url))
+    }
+
+    func setData(_ data: Data, for url: URL) {
+        guard !url.isFileURL else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            try data.write(to: cacheURL(for: url), options: [.atomic])
+        } catch {
+            // Avatar disk-cache failures should never block chat rendering.
+        }
+    }
+
+    private func cacheURL(for url: URL) -> URL {
+        directory.appendingPathComponent(cacheKey(for: url))
+    }
+
+    private func cacheKey(for url: URL) -> String {
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 @MainActor
 final class CachedRemoteImageLoader: ObservableObject {
     @Published private(set) var image: UIImage?
@@ -52,11 +98,21 @@ final class CachedRemoteImageLoader: ObservableObject {
         image = nil
         task = Task {
             do {
-                let data = try await Self.loadData(url: url)
+                let data: Data
+                if let cached = await Task.detached(operation: {
+                    RemoteImageDiskCache.shared.data(for: url)
+                }).value {
+                    data = cached
+                } else {
+                    data = try await Self.loadData(url: url)
+                }
                 let decoded = await Task.detached {
                     Self.decodeImage(data: data)
                 }.value
                 guard !Task.isCancelled, let decoded else { return }
+                await Task.detached {
+                    RemoteImageDiskCache.shared.setData(data, for: url)
+                }.value
                 RemoteImageMemoryCache.shared.setImage(decoded, for: url)
                 image = decoded
             } catch {
