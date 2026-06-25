@@ -736,6 +736,41 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(secondRuntime.dispatchedActions, [.startRuntime])
     }
 
+    func testForegroundStartRetriesRuntimeAndRefreshesVisibleState() async throws {
+        let supportURL = try temporarySupportURL()
+        let savedState = savedChatState(
+            status: "offline",
+            toast: "Showing saved chats. Connection will retry."
+        )
+        let readyState = savedChatState(status: "ready", toast: nil)
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedState,
+            startRuntimeStates: [savedState, readyState]
+        )
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            applicationSupportURL: supportURL,
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        XCTAssertEqual(model.state?.status, "offline")
+        model.startFromForeground()
+
+        try await waitUntil {
+            model.state?.status == "ready"
+                && runtime.dispatchedActions == [.startRuntime, .startRuntime]
+        }
+        XCTAssertNil(model.developerErrorText)
+        XCTAssertNil(model.userNoticeText)
+    }
+
     func testProductHarnessDeliveredTranscriptPresentationHasNoNormalOfflineBanner() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -3610,7 +3645,7 @@ private struct RawDiagnosticError: Error, CustomStringConvertible {
 
 private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked Sendable {
     private var currentState: AppState
-    private let startRuntimeState: AppState
+    private var startRuntimeStates: [AppState]
     private let dispatchOverride: ((AppAction, AppState) -> AppState)?
     private(set) var dispatchedActions: [AppAction] = []
 
@@ -3619,8 +3654,18 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
         startRuntimeState: AppState,
         dispatchOverride: ((AppAction, AppState) -> AppState)? = nil
     ) {
+        self.currentState = initialState
+        self.startRuntimeStates = [startRuntimeState]
+        self.dispatchOverride = dispatchOverride
+    }
+
+    init(
+        initialState: AppState,
+        startRuntimeStates: [AppState],
+        dispatchOverride: ((AppAction, AppState) -> AppState)? = nil
+    ) {
         currentState = initialState
-        self.startRuntimeState = startRuntimeState
+        self.startRuntimeStates = startRuntimeStates.isEmpty ? [initialState] : startRuntimeStates
         self.dispatchOverride = dispatchOverride
     }
 
@@ -3631,7 +3676,11 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
     func dispatch(action: AppAction) throws -> AppState {
         dispatchedActions.append(action)
         if action == .startRuntime {
-            currentState = startRuntimeState
+            if startRuntimeStates.count > 1 {
+                currentState = startRuntimeStates.removeFirst()
+            } else if let startRuntimeState = startRuntimeStates.first {
+                currentState = startRuntimeState
+            }
         } else if let dispatchOverride {
             currentState = dispatchOverride(action, currentState)
         }

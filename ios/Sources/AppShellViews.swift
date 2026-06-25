@@ -480,7 +480,6 @@ struct PeopleView: View {
 
     @State private var searchText = ""
     @State private var selectedFollow: NostrFollowProfile?
-    @State private var showingLookupProfile = false
 
     private var knownProfiles: [AppProfileSummary] {
         let selfAccountID = model.activeAccountID
@@ -566,22 +565,10 @@ struct PeopleView: View {
         .sheet(item: $selectedFollow) { profile in
             NostrFollowProfileSheet(
                 profile: profile,
-                onLookup: {
-                    lookupProfile(profile.npub)
-                },
                 onStartChat: {
                     startChat(with: profile.appProfileSummary)
                 }
             )
-        }
-        .sheet(isPresented: $showingLookupProfile) {
-            if let profile = model.activeProfile {
-                AppProfileLookupSheet(profile: profile) {
-                    startChat(with: profile)
-                }
-            } else {
-                ContentUnavailableView("Profile unavailable", systemImage: "person.crop.circle.badge.questionmark")
-            }
         }
     }
 
@@ -667,14 +654,6 @@ struct PeopleView: View {
                 }
             }
         }
-    }
-
-    private func lookupProfile(_ value: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        model.scanDraft = trimmed
-        _ = model.scanTarget()
-        showingLookupProfile = model.activeProfile != nil
     }
 
     @discardableResult
@@ -880,7 +859,6 @@ struct MyNostrProfileSheet: View {
 private struct NostrFollowProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     let profile: NostrFollowProfile
-    let onLookup: () -> Void
     let onStartChat: () -> Bool
 
     var body: some View {
@@ -905,15 +883,6 @@ private struct NostrFollowProfileSheet: View {
                         Label("Message", systemImage: "bubble.left.and.bubble.right")
                     }
                     .buttonStyle(.borderedProminent)
-
-                    Button {
-                        dismiss()
-                        Task { @MainActor in
-                            onLookup()
-                        }
-                    } label: {
-                        Label("Lookup Server Profile", systemImage: "person.text.rectangle")
-                    }
                 }
 
                 Section("Profile Code") {
@@ -928,59 +897,6 @@ private struct NostrFollowProfileSheet: View {
                 }
             }
             .navigationTitle(profile.displayName)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct AppProfileLookupSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let profile: AppProfileSummary
-    let onStartChat: () -> Bool
-    @State private var copiedField: String?
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    NostrProfileHeader(
-                        displayName: profile.displayName,
-                        npub: profile.npub,
-                        about: profile.about,
-                        pictureURL: profile.picture
-                    )
-                }
-                .listRowBackground(Color.clear)
-
-                Section {
-                    Button {
-                        if onStartChat() {
-                            dismiss()
-                        }
-                    } label: {
-                        Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
-                    }
-                }
-
-                Section("Profile Code") {
-                    QRCodeView(value: profile.npub)
-                        .frame(width: 220, height: 220)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                    CopyableValueRow(title: "npub", value: profile.npub, copiedField: $copiedField)
-                    ShareLink(item: profile.npub) {
-                        Label("Share Profile Code", systemImage: "square.and.arrow.up")
-                    }
-                }
-            }
-            .navigationTitle("Profile")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

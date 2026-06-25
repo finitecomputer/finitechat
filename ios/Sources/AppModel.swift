@@ -374,6 +374,7 @@ final class AppModel: ObservableObject {
 
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
+    private var foregroundStartKey: String?
     private let usesTransientStore: Bool
     private let persistsRuntimeIdentityUpdates: Bool
     private let applicationSupportURL: URL?
@@ -678,6 +679,58 @@ final class AppModel: ObservableObject {
             flushPendingPushTokenIfPossible()
             runLaunchAutomationIfRequested()
         }
+    }
+
+    func startFromForeground() {
+        guard foregroundStartKey == nil else {
+            appendDiagnostic(category: "runtime", event: "foreground_start.coalesced")
+            return
+        }
+        appendDiagnostic(category: "runtime", event: "foreground_start.requested")
+        do {
+            let runtime = try currentRuntime()
+            let runtimeKey = openKey
+            state = try runtime.state()
+            foregroundStartKey = runtimeKey
+            let foregroundStart = Task.detached(priority: .utility) { [runtime] in
+                try runtime.dispatch(action: .startRuntime)
+            }
+            Task { @MainActor [weak self, runtimeKey] in
+                do {
+                    let nextState = try await foregroundStart.value
+                    guard let self else { return }
+                    if self.foregroundStartKey == runtimeKey {
+                        self.foregroundStartKey = nil
+                    }
+                    guard self.openKey == runtimeKey else { return }
+                    self.state = nextState
+                    self.appendDiagnostic(category: "runtime", event: "foreground_start.succeeded")
+                    self.errorText = nil
+                    self.restartUpdateLoopIfEnabled()
+                    self.flushPendingPushTokenIfPossible()
+                } catch {
+                    guard let self else { return }
+                    if self.foregroundStartKey == runtimeKey {
+                        self.foregroundStartKey = nil
+                    }
+                    guard self.openKey == runtimeKey else { return }
+                    self.appendDiagnostic(
+                        category: "runtime",
+                        event: "foreground_start.failed",
+                        details: self.diagnosticErrorDetails(error)
+                    )
+                    self.errorText = String(describing: error)
+                }
+            }
+        } catch {
+            appendDiagnostic(
+                category: "runtime",
+                event: "foreground_open.failed",
+                details: diagnosticErrorDetails(error)
+            )
+            errorText = String(describing: error)
+        }
+        restartUpdateLoopIfEnabled()
     }
 
     func registerPushToken(_ token: String) {
@@ -1366,6 +1419,7 @@ final class AppModel: ObservableObject {
         updateTask = nil
         launchAutomationTask = nil
         postSendCatchUpTask = nil
+        foregroundStartKey = nil
         attachmentDownloadsInFlight.removeAll()
         messageRetriesInFlight.removeAll()
         lastTypingIntentByRoom.removeAll()

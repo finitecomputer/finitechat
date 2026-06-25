@@ -29,6 +29,7 @@ private enum AppSheet: Identifiable {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var model: AppModel
     @StateObject private var people = NostrPeopleModel()
     @State private var selectedTab: AppTab = .home
@@ -70,9 +71,11 @@ struct ContentView: View {
             }
         }
         .task(id: model.requiresNostrLogin) {
-            guard !model.requiresNostrLogin else { return }
-            model.start()
-            lastAppliedSelectedRoomID = model.state?.selectedRoomId
+            startRuntimeIfAuthenticated()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            startRuntimeFromForegroundIfAuthenticated()
         }
         .onChange(of: model.requiresNostrLogin) { _, requiresLogin in
             if requiresLogin {
@@ -87,6 +90,18 @@ struct ContentView: View {
             guard !model.requiresNostrLogin else { return }
             routeSelectedRoomIfNeeded(selectedRoomID)
         }
+    }
+
+    private func startRuntimeIfAuthenticated() {
+        guard !model.requiresNostrLogin else { return }
+        model.startFromForeground()
+        lastAppliedSelectedRoomID = model.state?.selectedRoomId
+    }
+
+    private func startRuntimeFromForegroundIfAuthenticated() {
+        guard !model.requiresNostrLogin else { return }
+        model.startFromForeground()
+        lastAppliedSelectedRoomID = model.state?.selectedRoomId
     }
 
     @ViewBuilder
@@ -526,13 +541,18 @@ private struct ChatPeoplePickerSheet: View {
                         } label: {
                             Label("Scan Profile Code", systemImage: "qrcode.viewfinder")
                         }
+                        .accessibilityIdentifier("NewRoomScanProfileButton")
                     }
 
                     Button {
-                        addCode(UIPasteboard.general.string ?? "")
+                        addCode(
+                            UIPasteboard.general.string ?? "",
+                            startDirectChatIfPossible: existingRoom == nil && selectedProfiles.isEmpty
+                        )
                     } label: {
                         Label("Paste Profile Code", systemImage: "doc.on.clipboard")
                     }
+                    .accessibilityIdentifier("NewRoomPasteProfileButton")
 
                     TextField("npub, hex key, or profile code", text: $memberCode, axis: .vertical)
                         .textInputAutocapitalization(.never)
@@ -550,6 +570,7 @@ private struct ChatPeoplePickerSheet: View {
                         Label("Add Entered Profile", systemImage: "person.badge.plus")
                     }
                     .disabled(memberCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("NewRoomAddEnteredProfileButton")
                 } header: {
                     Text("Add People")
                 }
