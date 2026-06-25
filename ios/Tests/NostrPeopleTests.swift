@@ -1096,6 +1096,59 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].username, "relayhint")
     }
 
+    func testFetchFollowProfilesFetchesMetadataChunksConcurrently() async throws {
+        let owner = String(repeating: "1", count: 64)
+        let followed = (0..<81).map { index in
+            String(format: "%064x", index + 2)
+        }
+        let overlapProbe = MetadataChunkOverlapProbe()
+
+        let service = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_050,
+                            kind: 3,
+                            tags: followed.map { ["p", $0] },
+                            content: ""
+                        ),
+                    ]
+                }
+
+                if filter.kinds == [0] {
+                    await overlapProbe.recordMetadataChunk()
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                    guard await overlapProbe.sawOverlappingMetadataChunks else { return [] }
+                    return filter.authors.map { pubkey in
+                        NostrRelayEvent(
+                            pubkey: pubkey,
+                            createdAt: 1_800_000_051,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Friend \#(pubkey.suffix(2))"}"#
+                        )
+                    }
+                }
+
+                return []
+            }
+        )
+
+        let result = try await service.fetchFollowProfiles(forAccountID: owner)
+
+        XCTAssertEqual(result.followedPubkeyCount, 81)
+        XCTAssertTrue(
+            result.profiles.contains { $0.pubkey == followed[0] && $0.displayName.hasPrefix("Friend") }
+        )
+        XCTAssertTrue(
+            result.profiles.contains { $0.pubkey == followed[80] && $0.displayName.hasPrefix("Friend") }
+        )
+    }
+
     func testLiveFollowProfilesFixtureLoadsFromConfiguredRelays() async throws {
 #if FINITECHAT_LIVE_NOSTR_TESTS
         let accountID = "4dcfa4f7ab49fb1484623c5f4c271fd0a079691c6d3ea3b1da0221a418638e8e"
@@ -1154,6 +1207,18 @@ private actor InviteAvailabilityChunkRecorder {
 
     func recordedChunks() -> [[String]] {
         chunks
+    }
+}
+
+private actor MetadataChunkOverlapProbe {
+    private var metadataChunkCount = 0
+
+    var sawOverlappingMetadataChunks: Bool {
+        metadataChunkCount > 1
+    }
+
+    func recordMetadataChunk() {
+        metadataChunkCount += 1
     }
 }
 

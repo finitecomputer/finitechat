@@ -896,20 +896,36 @@ final class NostrRelayProfileService: Sendable {
     }
 
     private func fetchMetadata(forPubkeys pubkeys: [String], relays: [String]) async -> [String: NostrProfileMetadata] {
-        var metadata: [String: NostrProfileMetadata] = [:]
-        for chunk in pubkeys.chunked(into: 80) {
-            let filter = NostrRelayFilter(kinds: [0], authors: chunk, limit: chunk.count)
-            let batch = await fetchEvents(
-                filter: filter,
-                subscriptionPrefix: "finite-profiles",
-                relays: relays
-            )
-            for event in batch.events where event.kind == 0 {
-                guard Self.isHexPubkey(event.pubkey) else { continue }
-                let pubkey = event.pubkey.lowercased()
-                guard metadata[pubkey]?.createdAt ?? 0 <= event.createdAt else { continue }
-                metadata[pubkey] = NostrProfileMetadata(event: event)
+        await withTaskGroup(of: [String: NostrProfileMetadata].self) { group in
+            for chunk in pubkeys.chunked(into: 80) {
+                group.addTask {
+                    await self.fetchMetadataChunk(forPubkeys: chunk, relays: relays)
+                }
             }
+
+            var metadata: [String: NostrProfileMetadata] = [:]
+            for await chunkMetadata in group {
+                metadata.merge(chunkMetadata) { current, next in
+                    current.createdAt >= next.createdAt ? current : next
+                }
+            }
+            return metadata
+        }
+    }
+
+    private func fetchMetadataChunk(forPubkeys pubkeys: [String], relays: [String]) async -> [String: NostrProfileMetadata] {
+        var metadata: [String: NostrProfileMetadata] = [:]
+        let filter = NostrRelayFilter(kinds: [0], authors: pubkeys, limit: pubkeys.count)
+        let batch = await fetchEvents(
+            filter: filter,
+            subscriptionPrefix: "finite-profiles",
+            relays: relays
+        )
+        for event in batch.events where event.kind == 0 {
+            guard Self.isHexPubkey(event.pubkey) else { continue }
+            let pubkey = event.pubkey.lowercased()
+            guard metadata[pubkey]?.createdAt ?? 0 <= event.createdAt else { continue }
+            metadata[pubkey] = NostrProfileMetadata(event: event)
         }
         return metadata
     }
