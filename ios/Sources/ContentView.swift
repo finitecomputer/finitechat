@@ -351,11 +351,24 @@ private struct ChatPeoplePickerSheet: View {
         Set(selectedProfiles.map(\.accountId))
     }
 
+    private var existingMemberAccountIDs: Set<String> {
+        guard let existingRoom,
+              let details = model.state?.roomDetails,
+              details.roomId == existingRoom.roomId
+        else {
+            return []
+        }
+        return Set(details.members.map(\.accountId))
+    }
+
     private var filteredFollowProfiles: [NostrFollowProfile] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let existingMembers = existingMemberAccountIDs
         return people.profiles
             .filter { profile in
-                profile.pubkey != selfAccountID && !selectedIDs.contains(profile.pubkey)
+                profile.pubkey != selfAccountID
+                    && !selectedIDs.contains(profile.pubkey)
+                    && !existingMembers.contains(profile.pubkey)
             }
             .filter { profile in
                 guard !query.isEmpty else { return true }
@@ -369,10 +382,12 @@ private struct ChatPeoplePickerSheet: View {
     private var filteredKnownProfiles: [AppProfileSummary] {
         let followIDs = Set(people.profiles.map(\.pubkey))
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let existingMembers = existingMemberAccountIDs
         return (model.state?.profiles ?? [])
             .filter { profile in
                 profile.accountId != selfAccountID
                     && !selectedIDs.contains(profile.accountId)
+                    && !existingMembers.contains(profile.accountId)
                     && !followIDs.contains(profile.accountId)
             }
             .filter { profile in
@@ -559,7 +574,7 @@ private struct ChatPeoplePickerSheet: View {
                 Section {
                     ContentUnavailableView(
                         searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            ? "No people yet"
+                            ? emptyPeopleTitle
                             : "No matches",
                         systemImage: "person.crop.circle.badge.questionmark",
                         description: Text(people.statusText ?? "Paste or scan a profile code.")
@@ -579,6 +594,10 @@ private struct ChatPeoplePickerSheet: View {
                 parseError = "That is your own profile code."
                 return
             }
+            if existingMemberAccountIDs.contains(accountID) {
+                parseError = "That person is already in this chat."
+                return
+            }
             addProfile(profileSummary(accountID: accountID, npub: npub))
             memberCode = ""
             parseError = nil
@@ -590,6 +609,10 @@ private struct ChatPeoplePickerSheet: View {
     private func addProfile(_ profile: AppProfileSummary) {
         guard profile.accountId != selfAccountID else {
             parseError = "That is your own profile code."
+            return
+        }
+        guard !existingMemberAccountIDs.contains(profile.accountId) else {
+            parseError = "That person is already in this chat."
             return
         }
         guard !selectedIDs.contains(profile.accountId) else {
@@ -619,6 +642,10 @@ private struct ChatPeoplePickerSheet: View {
             picture: nil,
             stale: true
         )
+    }
+
+    private var emptyPeopleTitle: String {
+        existingRoom == nil ? "No people yet" : "No other people found"
     }
 
     private func create() {
@@ -2064,12 +2091,14 @@ private struct ScanSheet: View {
                     } label: {
                         Label("Paste", systemImage: "doc.on.clipboard")
                     }
+                    .accessibilityIdentifier("ScanPasteButton")
 
                     TextField("Invite URL or npub", text: $model.scanDraft, axis: .vertical)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .lineLimit(3...6)
                         .accessibilityLabel("Invite URL or npub")
+                        .accessibilityIdentifier("ScanCodeField")
                 } header: {
                     Text("Invite or Profile Code")
                 }
@@ -2116,6 +2145,7 @@ private struct ScanSheet: View {
                         continueWithTarget()
                     }
                     .disabled(model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("ScanContinueButton")
                 }
             }
         }

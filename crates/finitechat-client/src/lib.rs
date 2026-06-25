@@ -2361,6 +2361,31 @@ impl FiniteChatDevice {
         Ok(count)
     }
 
+    pub fn room_members(&self, room_id: &str) -> Result<Vec<DeviceRef>, ClientError> {
+        let group = self.group(room_id)?;
+        let mut members = Vec::new();
+        for member in group.members() {
+            let credential = FiniteDeviceCredentialV1::from_credential(member.credential)?;
+            credential.verify_expected(ExpectedDeviceCredential {
+                account_public_key: credential.account_public_key(),
+                device_id: credential.device_id(),
+                mls_leaf_signing_public_key: &member.signature_key,
+                now_unix_seconds: self.now_unix_seconds,
+            })?;
+            members.push(DeviceRef {
+                account_id: hex_lower(credential.account_public_key().as_bytes()),
+                device_id: credential.device_id().to_owned(),
+            });
+        }
+        members.sort_by(|left, right| {
+            left.account_id
+                .cmp(&right.account_id)
+                .then_with(|| left.device_id.cmp(&right.device_id))
+        });
+        members.dedup();
+        Ok(members)
+    }
+
     fn random_bytes<const N: usize>(&self) -> Result<[u8; N], ClientError> {
         self.provider
             .rand()

@@ -393,7 +393,17 @@ pub struct AppRoomDetailsState {
     pub user_status_text: String,
     pub can_create_invite: bool,
     pub media_item_count: u32,
+    pub members: Vec<AppRoomMemberSummary>,
     pub devices: Vec<AppDeviceSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppRoomMemberSummary {
+    pub account_id: String,
+    pub device_id: String,
+    pub npub: String,
+    pub display_name: String,
+    pub current_device: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -2780,6 +2790,21 @@ impl AppRuntimeState {
             .filter(|gallery| gallery.room_id == room_id)
             .map(|gallery| gallery.items.len().min(u32::MAX as usize) as u32)
             .unwrap_or_default();
+        let members = if room.state == AppRoomState::Connected {
+            self.core
+                .device
+                .room_members(&room_id)
+                .map(|members| {
+                    room_member_summaries(
+                        members,
+                        &self.profile_cache,
+                        self.core.device.device_ref(),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.app.room_details = Some(AppRoomDetailsState {
             room_id,
             display_name: room.display_name.clone(),
@@ -2788,6 +2813,7 @@ impl AppRuntimeState {
             user_status_text: app_room_user_status_text(&room),
             can_create_invite: room.state == AppRoomState::Connected,
             media_item_count,
+            members,
             devices: self.app.devices.clone(),
         });
     }
@@ -3135,6 +3161,46 @@ fn placeholder_profile(account_id: &str) -> AppProfileSummary {
         picture: None,
         stale: true,
     }
+}
+
+fn room_member_summaries(
+    members: Vec<DeviceRef>,
+    profile_cache: &BTreeMap<String, AppProfileSummary>,
+    current_device: &DeviceRef,
+) -> Vec<AppRoomMemberSummary> {
+    let mut summaries = members
+        .into_iter()
+        .map(|member| {
+            let profile_name = profile_cache
+                .get(&member.account_id)
+                .map(|profile| profile.display_name.trim())
+                .filter(|name| !name.is_empty());
+            let is_current_device = &member == current_device;
+            let display_name = if is_current_device {
+                "You".to_owned()
+            } else if let Some(profile_name) = profile_name {
+                profile_name.to_owned()
+            } else {
+                short_account_label(&member.account_id)
+            };
+            AppRoomMemberSummary {
+                npub: npub_encode(&member.account_id).unwrap_or_else(|_| member.account_id.clone()),
+                current_device: is_current_device,
+                account_id: member.account_id,
+                device_id: member.device_id,
+                display_name,
+            }
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right
+            .current_device
+            .cmp(&left.current_device)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.account_id.cmp(&right.account_id))
+            .then_with(|| left.device_id.cmp(&right.device_id))
+    });
+    summaries
 }
 
 fn stored_profile_from_app(profile: &AppProfileSummary) -> StoredAppProfile {
@@ -7260,7 +7326,7 @@ mod tests {
 
         let alice_state = alice
             .dispatch(AppAction::StartGroupChat {
-                account_ids: vec![bob_account_id, carol_account_id],
+                account_ids: vec![bob_account_id.clone(), carol_account_id.clone()],
                 display_name: "Weekend plans".to_owned(),
             })
             .unwrap();
@@ -7269,6 +7335,13 @@ mod tests {
         assert_eq!(room.display_name, "Weekend plans");
         assert_eq!(room.state, AppRoomState::Connected);
         let room_id = room.room_id.clone();
+        let details = alice_state
+            .room_details
+            .as_ref()
+            .expect("group room details");
+        assert_member_in_room_details(details, &alice_state.identity.account_id, "alice-ios", true);
+        assert_member_in_room_details(details, &bob_account_id, "bob-ios", false);
+        assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
 
         let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
         assert_eq!(
@@ -7393,7 +7466,7 @@ mod tests {
 
         let alice_state = alice
             .dispatch(AppAction::StartProfileChat {
-                account_id: bob_account_id,
+                account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -7412,7 +7485,7 @@ mod tests {
         let alice_state = alice
             .dispatch(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
-                account_ids: vec![carol_account_id],
+                account_ids: vec![carol_account_id.clone()],
             })
             .unwrap();
         assert_eq!(alice_state.status, "people added");
@@ -7420,6 +7493,13 @@ mod tests {
             app_room(&alice_state, &room_id).state,
             AppRoomState::Connected
         );
+        let details = alice_state
+            .room_details
+            .as_ref()
+            .expect("room details after adding member");
+        assert_member_in_room_details(details, &alice_state.identity.account_id, "alice-ios", true);
+        assert_member_in_room_details(details, &bob_account_id, "bob-ios", false);
+        assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
 
         let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
         assert_eq!(
@@ -10399,6 +10479,22 @@ mod tests {
         assert_eq!(device.current_device, current_device);
         assert_eq!(device.revoked, revoked);
         assert_eq!(device.room_count, 1);
+    }
+
+    fn assert_member_in_room_details(
+        details: &AppRoomDetailsState,
+        account_id: &str,
+        device_id: &str,
+        current_device: bool,
+    ) {
+        let member = details
+            .members
+            .iter()
+            .find(|member| member.account_id == account_id && member.device_id == device_id)
+            .unwrap_or_else(|| panic!("missing room details member {account_id}/{device_id}"));
+        assert_eq!(member.current_device, current_device);
+        assert!(!member.display_name.trim().is_empty());
+        assert!(member.npub.starts_with("npub1") || member.npub == account_id);
     }
 
     fn assert_reaction(

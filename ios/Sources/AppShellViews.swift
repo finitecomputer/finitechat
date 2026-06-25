@@ -456,9 +456,6 @@ struct PeopleView: View {
     @StateObject private var people = NostrPeopleModel()
     @State private var searchText = ""
     @State private var selectedFollow: NostrFollowProfile?
-    @State private var unavailableInviteProfile: NostrFollowProfile?
-    @State private var checkingInviteProfileID: String?
-    @State private var inviteAvailabilityCheckFailed = false
     @State private var showingLookupProfile = false
 
     private var knownProfiles: [AppProfileSummary] {
@@ -539,14 +536,6 @@ struct PeopleView: View {
                 }
             )
         }
-        .sheet(item: $unavailableInviteProfile) { profile in
-            InviteUnavailableSheet(profile: profile)
-        }
-        .alert("Could not check invite availability", isPresented: $inviteAvailabilityCheckFailed) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Try again when the Finite Chat server is reachable.")
-        }
         .sheet(isPresented: $showingLookupProfile) {
             if let profile = model.activeProfile {
                 AppProfileLookupSheet(profile: profile) {
@@ -602,41 +591,14 @@ struct PeopleView: View {
                 Section("Nostr Follows") {
                     ForEach(filteredProfiles) { profile in
                         Button {
-                            selectFollow(profile)
+                            selectedFollow = profile
                         } label: {
-                            NostrProfileRow(
-                                profile: profile,
-                                isChecking: checkingInviteProfileID == profile.id
-                            )
-                            .padding(.vertical, 6)
+                            NostrProfileRow(profile: profile)
+                                .padding(.vertical, 6)
                         }
                         .buttonStyle(.plain)
                     }
                 }
-            }
-        }
-    }
-
-    private func selectFollow(_ profile: NostrFollowProfile) {
-        guard profile.inviteAvailability == .unavailable else {
-            selectedFollow = profile
-            return
-        }
-        checkingInviteProfileID = profile.id
-        Task { @MainActor in
-            defer { checkingInviteProfileID = nil }
-            do {
-                let updated = try await people.recheckInviteAvailability(
-                    for: profile,
-                    serverURL: model.serverURL
-                )
-                if updated.inviteAvailability == .available {
-                    selectedFollow = updated
-                } else {
-                    unavailableInviteProfile = updated
-                }
-            } catch {
-                inviteAvailabilityCheckFailed = true
             }
         }
     }
@@ -954,45 +916,6 @@ private struct AppProfileLookupSheet: View {
     }
 }
 
-private struct InviteUnavailableSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let profile: NostrFollowProfile
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    NostrProfileHeader(
-                        displayName: profile.displayName,
-                        npub: profile.npub,
-                        about: profile.about,
-                        pictureURL: profile.pictureURL
-                    )
-                }
-                .listRowBackground(Color.clear)
-
-                Section {
-                    Text("This person doesn't have Finite Chat yet.")
-                        .foregroundStyle(.secondary)
-
-                    ShareLink(item: finiteChatInstallInviteURL(for: profile)) {
-                        Label("Send Invite Link", systemImage: "square.and.arrow.up")
-                    }
-                }
-            }
-            .navigationTitle("Invite")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-}
-
 private struct NostrProfileHeader: View {
     let displayName: String
     let npub: String
@@ -1029,11 +952,8 @@ private struct NostrProfileHeader: View {
 
 private struct NostrProfileRow: View {
     let profile: NostrFollowProfile
-    let isChecking: Bool
 
     var body: some View {
-        let isUnavailable = profile.inviteAvailability == .unavailable
-
         HStack(spacing: 12) {
             NostrAvatar(name: profile.displayName, pictureURL: profile.pictureURL, size: 42)
 
@@ -1049,21 +969,13 @@ private struct NostrProfileRow: View {
 
             Spacer(minLength: 8)
 
-            if isChecking {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Text(profile.shortenedNpub)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
+            Text(profile.shortenedNpub)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
-        .opacity(isUnavailable ? 0.45 : 1)
-        .saturation(isUnavailable ? 0 : 1)
         .contentShape(Rectangle())
-        .accessibilityValue(isUnavailable ? "Invite unavailable" : "")
     }
 }
 
@@ -1176,14 +1088,6 @@ private struct CopyableValueRow: View {
 private func shortenedNpub(_ npub: String) -> String {
     guard npub.count > 18 else { return npub }
     return "\(npub.prefix(10))...\(npub.suffix(4))"
-}
-
-private func finiteChatInstallInviteURL(for profile: NostrFollowProfile) -> URL {
-    var components = URLComponents(string: "https://chat.finite.computer/invite")!
-    components.queryItems = [
-        URLQueryItem(name: "npub", value: profile.npub),
-    ]
-    return components.url!
 }
 
 private extension AppRoomState {

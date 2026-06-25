@@ -51,6 +51,17 @@ struct RoomDetailsView: View {
                         }
                     }
 
+                    Section("People") {
+                        if details.members.isEmpty {
+                            Text("No people found")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(details.members, id: \.detailsListID) { member in
+                                RoomDetailsMemberRow(member: member)
+                            }
+                        }
+                    }
+
                     Section("Your Devices") {
                         if details.devices.isEmpty {
                             Text("No devices found")
@@ -116,6 +127,51 @@ private struct RoomDetailsHeader: View {
         }
         .padding(.vertical, 8)
         .accessibilityElement(children: .combine)
+    }
+}
+
+private struct RoomDetailsMemberRow: View {
+    let member: AppRoomMemberSummary
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color(.tertiarySystemFill))
+                Text(member.displayName.prefix(1).uppercased())
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 38, height: 38)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(member.displayName)
+                        .font(.body)
+                        .lineLimit(1)
+                    if member.currentDevice {
+                        Text("You")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text(memberSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var memberSubtitle: String {
+        let npub = shortenedRoomDetailsNpub(member.npub)
+        guard !member.deviceId.isEmpty else { return npub }
+        return "\(npub) - \(member.deviceId)"
     }
 }
 
@@ -194,4 +250,15 @@ private extension AppDeviceSummary {
     var detailsListID: String {
         "\(accountId)/\(deviceId)"
     }
+}
+
+private extension AppRoomMemberSummary {
+    var detailsListID: String {
+        "\(accountId)/\(deviceId)"
+    }
+}
+
+private func shortenedRoomDetailsNpub(_ npub: String) -> String {
+    guard npub.count > 18 else { return npub }
+    return "\(npub.prefix(10))...\(npub.suffix(4))"
 }

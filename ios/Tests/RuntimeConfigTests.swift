@@ -2302,7 +2302,7 @@ final class AppModelPersistenceTests: XCTestCase {
             var state = currentState
             if case .scanTarget = action {
                 state.status = "profile unavailable"
-                state.toast = "Profile lookup requires a connection"
+                state.toast = "Profile unavailable"
             }
             return state
         }
@@ -2325,7 +2325,7 @@ final class AppModelPersistenceTests: XCTestCase {
             XCTFail("expected unavailable scan result")
         }
         XCTAssertEqual(model.scanDraft, "npub1bob")
-        XCTAssertEqual(model.userNoticeText, "Profile lookup requires a connection")
+        XCTAssertEqual(model.userNoticeText, "Profile unavailable")
     }
 
     @MainActor
