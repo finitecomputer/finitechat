@@ -30,6 +30,7 @@ private enum AppSheet: Identifiable {
 
 struct ContentView: View {
     @ObservedObject var model: AppModel
+    @StateObject private var people = NostrPeopleModel()
     @State private var selectedTab: AppTab = .home
     @State private var sheet: AppSheet?
     @State private var chatPath: [String] = []
@@ -47,7 +48,7 @@ struct ContentView: View {
         .sheet(item: $sheet) { destination in
             switch destination {
             case .newChat:
-                ChatPeoplePickerSheet(model: model, existingRoom: nil) { room in
+                ChatPeoplePickerSheet(model: model, people: people, existingRoom: nil) { room in
                     routeSelectedRoom(room.roomId)
                 }
             case .myProfile:
@@ -135,6 +136,7 @@ struct ContentView: View {
         NavigationStack(path: $chatPath) {
             RoomListView(
                 model: model,
+                people: people,
                 present: { destination in
                     sheet = destination
                 },
@@ -144,7 +146,7 @@ struct ContentView: View {
                 }
             )
             .navigationDestination(for: String.self) { roomID in
-                RoomThreadView(model: model, roomID: roomID) {
+                RoomThreadView(model: model, people: people, roomID: roomID) {
                     sheet = .invite
                 }
             }
@@ -155,6 +157,7 @@ struct ContentView: View {
         NavigationStack {
             PeopleView(
                 model: model,
+                people: people,
                 startProfileChat: { profile in
                     startChatFromScannedProfile(profile)
                 },
@@ -266,6 +269,7 @@ struct ContentView: View {
 
 private struct RoomListView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var people: NostrPeopleModel
     let present: (AppSheet) -> Void
     let open: (AppRoomSummary) -> Void
     @State private var searchText = ""
@@ -350,7 +354,7 @@ private struct RoomListView: View {
             prompt: "Search chats"
         )
         .sheet(isPresented: $showingNewRoom) {
-            ChatPeoplePickerSheet(model: model, existingRoom: nil) { room in
+            ChatPeoplePickerSheet(model: model, people: people, existingRoom: nil) { room in
                 open(room)
             }
         }
@@ -363,10 +367,10 @@ private struct RoomListView: View {
 private struct ChatPeoplePickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    @ObservedObject var people: NostrPeopleModel
     let existingRoom: AppRoomSummary?
     let onCreated: (AppRoomSummary) -> Void
 
-    @StateObject private var people = NostrPeopleModel()
     @State private var roomName = ""
     @State private var memberCode = ""
     @State private var selectedProfiles: [AppProfileSummary] = []
@@ -1037,6 +1041,7 @@ private struct RoomOptionsSheet: View {
 
 private struct RoomThreadView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var people: NostrPeopleModel
     let roomID: String
     let showInvite: () -> Void
     @State private var followsBottom = true
@@ -1206,7 +1211,7 @@ private struct RoomThreadView: View {
         }
         .sheet(isPresented: $showAddPeople) {
             if let room {
-                ChatPeoplePickerSheet(model: model, existingRoom: room) { _ in }
+                ChatPeoplePickerSheet(model: model, people: people, existingRoom: room) { _ in }
             } else {
                 ContentUnavailableView("Room unavailable", systemImage: "exclamationmark.triangle")
             }

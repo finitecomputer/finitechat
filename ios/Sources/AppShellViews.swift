@@ -461,13 +461,13 @@ struct NostrLoginView: View {
 
 struct PeopleView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var people: NostrPeopleModel
     let startProfileChat: (AppProfileSummary) -> Bool
     let showMyProfile: () -> Void
     let showNewChat: () -> Void
     let showScan: () -> Void
     let showSettings: () -> Void
 
-    @StateObject private var people = NostrPeopleModel()
     @State private var searchText = ""
     @State private var selectedFollow: NostrFollowProfile?
     @State private var showingLookupProfile = false
