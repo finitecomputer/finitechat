@@ -11,7 +11,7 @@ enum InviteAvailability: String, Codable, Equatable, Sendable {
         case .available:
             return "Ready to message"
         case .unavailable:
-            return "No device available"
+            return "Needs Finite Chat open"
         case .unknown:
             return "Checking availability"
         }

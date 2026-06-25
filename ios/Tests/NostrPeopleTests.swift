@@ -53,7 +53,7 @@ final class NostrPeopleTests: XCTestCase {
         )
         XCTAssertEqual(
             InviteAvailability.unavailable.userStatusText,
-            "No device available"
+            "Needs Finite Chat open"
         )
         XCTAssertEqual(
             InviteAvailability.unknown.userStatusText,

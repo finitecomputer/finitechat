@@ -2390,7 +2390,7 @@ final class AppModelPersistenceTests: XCTestCase {
             var state = currentState
             if case .startProfileChat = action {
                 state.status = "chat unavailable"
-                state.toast = "No available Finite Chat device was found for that profile"
+                state.toast = "Ask them to open Finite Chat, then try again"
             }
             return state
         }
@@ -2408,7 +2408,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.rooms.isEmpty)
         XCTAssertEqual(
             model.userNoticeText,
-            "No available Finite Chat device was found for that profile"
+            "Ask them to open Finite Chat, then try again"
         )
         XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
     }
@@ -2616,7 +2616,7 @@ final class AppModelPersistenceTests: XCTestCase {
                 var state = currentState
                 if case .startGroupChat = action {
                     state.status = "chat unavailable"
-                    state.toast = "No available Finite Chat device was found for one or more selected people"
+                    state.toast = "Ask everyone to open Finite Chat, then try again"
                 }
                 return state
             }
@@ -2634,7 +2634,7 @@ final class AppModelPersistenceTests: XCTestCase {
             XCTAssertTrue(model.rooms.isEmpty)
             XCTAssertEqual(
                 model.userNoticeText,
-                "No available Finite Chat device was found for one or more selected people"
+                "Ask everyone to open Finite Chat, then try again"
             )
             XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
         }
@@ -2701,7 +2701,7 @@ final class AppModelPersistenceTests: XCTestCase {
                 var state = currentState
                 if case .addRoomMembers = action {
                     state.status = "chat unavailable"
-                    state.toast = "No available Finite Chat device was found for one or more selected people"
+                    state.toast = "Ask everyone to open Finite Chat, then try again"
                 }
                 return state
             }
@@ -2721,7 +2721,7 @@ final class AppModelPersistenceTests: XCTestCase {
             XCTAssertEqual(model.rooms[0].roomId, "room-main")
             XCTAssertEqual(
                 model.userNoticeText,
-                "No available Finite Chat device was found for one or more selected people"
+                "Ask everyone to open Finite Chat, then try again"
             )
             XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
         }

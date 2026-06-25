@@ -1492,7 +1492,7 @@ impl AppRuntimeState {
                 Ok(None) => {
                     self.set_online_action_unavailable(
                         "chat unavailable",
-                        "No available Finite Chat device was found for that profile",
+                        "Ask them to open Finite Chat, then try again",
                     );
                     return Ok(());
                 }
@@ -1641,7 +1641,7 @@ impl AppRuntimeState {
             Ok(None) => {
                 self.set_online_action_unavailable(
                     "chat unavailable",
-                    "No available Finite Chat device was found for one or more selected people",
+                    "Ask everyone to open Finite Chat, then try again",
                 );
                 return Ok(());
             }
@@ -1767,7 +1767,7 @@ impl AppRuntimeState {
             Ok(None) => {
                 self.set_online_action_unavailable(
                     "chat unavailable",
-                    "No available Finite Chat device was found for one or more selected people",
+                    "Ask everyone to open Finite Chat, then try again",
                 );
                 return Ok(());
             }
@@ -7764,7 +7764,7 @@ mod tests {
         assert_eq!(state.status, "chat unavailable");
         assert_eq!(
             state.toast.as_deref(),
-            Some("No available Finite Chat device was found for that profile")
+            Some("Ask them to open Finite Chat, then try again")
         );
         assert!(state.rooms.is_empty());
         let profile = app_profile(&state, &account_id);
@@ -7939,7 +7939,7 @@ mod tests {
         assert_eq!(state.status, "chat unavailable");
         assert_eq!(
             state.toast.as_deref(),
-            Some("No available Finite Chat device was found for one or more selected people")
+            Some("Ask everyone to open Finite Chat, then try again")
         );
         assert!(state.rooms.is_empty());
         assert!(app_profile(&state, &missing_account_id).stale);
@@ -8088,7 +8088,7 @@ mod tests {
         assert_eq!(state.status, "chat unavailable");
         assert_eq!(
             state.toast.as_deref(),
-            Some("No available Finite Chat device was found for one or more selected people")
+            Some("Ask everyone to open Finite Chat, then try again")
         );
         assert_eq!(state.rooms.len(), 1);
         assert_eq!(app_room(&state, &room_id).display_name, "Existing room");
