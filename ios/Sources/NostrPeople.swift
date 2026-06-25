@@ -732,11 +732,7 @@ final class NostrRelayProfileService: Sendable {
         "wss://relay.primal.net",
         "wss://nos.lol",
         "wss://relay.damus.io",
-        "wss://relay.nostr.band",
-        "wss://relay.snort.social",
         "wss://offchain.pub",
-        "wss://us-east.nostr.pikachat.org",
-        "wss://eu.nostr.pikachat.org",
     ]
 
     static let profileDiscoveryRelays = [
@@ -1154,19 +1150,25 @@ final class NostrRelayProfileService: Sendable {
         message: String,
         timeoutNanoseconds: UInt64
     ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await task.send(.string(message))
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let resume = NostrRelayContinuation<Void>(continuation)
+                let timeout = relayTimeoutWorkItem(
+                    task: task,
+                    timeoutNanoseconds: timeoutNanoseconds,
+                    resume: resume
+                )
+                task.send(.string(message)) { error in
+                    timeout.cancel()
+                    if let error {
+                        resume.resume(throwing: error)
+                    } else {
+                        resume.resume(returning: ())
+                    }
+                }
             }
-            group.addTask { [timeoutNanoseconds] in
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                task.cancel(with: .goingAway, reason: nil)
-                throw NostrRelayTimeout()
-            }
-            defer { group.cancelAll() }
-            guard let _ = try await group.next() else {
-                throw NostrRelayTimeout()
-            }
+        } onCancel: {
+            task.cancel(with: .goingAway, reason: nil)
         }
     }
 
@@ -1174,21 +1176,44 @@ final class NostrRelayProfileService: Sendable {
         _ task: URLSessionWebSocketTask,
         timeoutNanoseconds: UInt64
     ) async throws -> URLSessionWebSocketTask.Message {
-        try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
-            group.addTask {
-                try await task.receive()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let resume = NostrRelayContinuation<URLSessionWebSocketTask.Message>(continuation)
+                let timeout = relayTimeoutWorkItem(
+                    task: task,
+                    timeoutNanoseconds: timeoutNanoseconds,
+                    resume: resume
+                )
+                task.receive { result in
+                    timeout.cancel()
+                    switch result {
+                    case .success(let message):
+                        resume.resume(returning: message)
+                    case .failure(let error):
+                        resume.resume(throwing: error)
+                    }
+                }
             }
-            group.addTask { [timeoutNanoseconds] in
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                task.cancel(with: .goingAway, reason: nil)
-                throw NostrRelayTimeout()
-            }
-            defer { group.cancelAll() }
-            guard let first = try await group.next() else {
-                throw NostrRelayTimeout()
-            }
-            return first
+        } onCancel: {
+            task.cancel(with: .goingAway, reason: nil)
         }
+    }
+
+    private static func relayTimeoutWorkItem<Value>(
+        task: URLSessionWebSocketTask,
+        timeoutNanoseconds: UInt64,
+        resume: NostrRelayContinuation<Value>
+    ) -> NostrRelayTimeoutHandle {
+        let timeoutSeconds = Double(timeoutNanoseconds) / 1_000_000_000
+        let timeout = DispatchWorkItem {
+            task.cancel(with: .goingAway, reason: nil)
+            resume.resume(throwing: NostrRelayTimeout())
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + timeoutSeconds,
+            execute: timeout
+        )
+        return NostrRelayTimeoutHandle(workItem: timeout)
     }
 
     private static func parseRelayMessage(_ text: String) -> NostrRelayMessage {
@@ -1260,6 +1285,43 @@ struct NostrRelayFilter: Encodable, Sendable {
 }
 
 private struct NostrRelayTimeout: Error, Sendable {}
+
+private final class NostrRelayTimeoutHandle: @unchecked Sendable {
+    private let workItem: DispatchWorkItem
+
+    init(workItem: DispatchWorkItem) {
+        self.workItem = workItem
+    }
+
+    func cancel() {
+        workItem.cancel()
+    }
+}
+
+private final class NostrRelayContinuation<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    init(_ continuation: CheckedContinuation<Value, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: Value) {
+        takeContinuation()?.resume(returning: value)
+    }
+
+    func resume(throwing error: Error) {
+        takeContinuation()?.resume(throwing: error)
+    }
+
+    private func takeContinuation() -> CheckedContinuation<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = continuation
+        continuation = nil
+        return current
+    }
+}
 
 private struct NostrRelayMessage: Sendable {
     var subscriptionID: String?

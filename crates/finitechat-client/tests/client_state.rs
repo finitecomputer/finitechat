@@ -168,6 +168,40 @@ fn runtime_sync_tick_replenishes_key_packages_over_finitechat_http_routes() {
 }
 
 #[test]
+fn runtime_sync_tick_replenishes_after_key_package_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_db = dir.path().join("finitechat-http.sqlite3");
+    let alice_config = test_config(ALICE_ACCOUNT_SECRET_BYTES, "alice_http_claim_replenish");
+    let mut alice_store = sqlite_client_store(dir.path().join("alice.sqlite3"), &alice_config);
+    let mut alice = FiniteChatDevice::new(alice_config.clone()).unwrap();
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 1,
+        max_sync_pages_per_room: 4,
+    };
+    alice_store.save_device_state(&alice).unwrap();
+
+    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let initial =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(initial.uploaded_key_packages, 1);
+    let claimed = delivery
+        .claim_key_package_for_device(alice.device_ref())
+        .unwrap();
+    assert!(claimed.is_some());
+    let inventory = delivery.key_package_inventory(alice.device_ref()).unwrap();
+    assert_eq!(inventory.available, 0);
+    assert_eq!(inventory.leased, 1);
+
+    let mut alice = alice_store.load_device(alice_config).unwrap();
+    let replenished =
+        run_runtime_sync_tick(&mut alice_store, &mut alice, &mut delivery, &options).unwrap();
+    assert_eq!(replenished.uploaded_key_packages, 1);
+    let inventory = delivery.key_package_inventory(alice.device_ref()).unwrap();
+    assert_eq!(inventory.available, 1);
+    assert_eq!(inventory.leased, 1);
+}
+
+#[test]
 fn runtime_delivery_claims_key_package_metadata_over_finitechat_http_routes() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("finitechat-http.sqlite3");

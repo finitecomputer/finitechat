@@ -1293,6 +1293,38 @@ final class NostrPeopleTests: XCTestCase {
         throw XCTSkip("Pass OTHER_SWIFT_FLAGS='$(inherited) -D FINITECHAT_LIVE_NOSTR_TESTS' to run the live Nostr relay fixture test.")
 #endif
     }
+
+    func testLiveConfiguredAccountIDsLoadFollowsFromConfiguredRelays() async throws {
+#if FINITECHAT_LIVE_NOSTR_TESTS
+        let environment = ProcessInfo.processInfo.environment
+        let rawAccountIDs = environment["FINITECHAT_LIVE_NOSTR_ACCOUNT_IDS"]
+            ?? environment["TEST_RUNNER_FINITECHAT_LIVE_NOSTR_ACCOUNT_IDS"]
+            ?? ""
+        let accountIDs = rawAccountIDs
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !accountIDs.isEmpty else {
+            throw XCTSkip("Set FINITECHAT_LIVE_NOSTR_ACCOUNT_IDS to comma-separated hex pubkeys.")
+        }
+
+        let service = NostrRelayProfileService(timeoutSeconds: 10)
+        for accountID in accountIDs {
+            let result = try await service.fetchFollowProfileSeeds(forAccountID: accountID)
+            XCTAssertGreaterThan(
+                result.followedPubkeyCount,
+                0,
+                "expected \(accountID) to have visible follow contacts"
+            )
+            XCTAssertFalse(
+                result.profiles.isEmpty,
+                "expected \(accountID) to render at least one follow seed"
+            )
+        }
+#else
+        throw XCTSkip("Pass OTHER_SWIFT_FLAGS='$(inherited) -D FINITECHAT_LIVE_NOSTR_TESTS' to run live Nostr relay tests.")
+#endif
+    }
 }
 
 private func temporaryCacheDirectory(
