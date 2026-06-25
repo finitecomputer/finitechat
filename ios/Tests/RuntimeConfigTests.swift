@@ -2551,6 +2551,69 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testScannedProfileCodeBuildsDirectChatTargetWithoutLookup() throws {
+        let bob = try createNostrIdentity()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startProfileChat(let accountId, let displayName) = action {
+                state.rooms = [
+                    AppRoomSummary(
+                        roomId: "room-bob",
+                        displayName: displayName,
+                        state: .connected,
+                        status: "connected",
+                        userStatusText: "Connected",
+                        lastMessagePreview: "",
+                        unreadCount: 0,
+                        canLoadOlder: false
+                    ),
+                ]
+                state.selectedRoomId = "room-bob"
+                state.status = "chat created"
+                XCTAssertEqual(accountId, bob.accountId)
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        let profile = try profileSummaryFromScannedProfileCode("nostr:\(bob.npub)", model: model)
+
+        XCTAssertEqual(profile.accountId, bob.accountId)
+        XCTAssertEqual(profile.npub, bob.npub)
+        XCTAssertTrue(profile.stale)
+        XCTAssertTrue(model.startProfileChat(for: profile))
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .startProfileChat(
+                    accountId: bob.accountId,
+                    displayName: "Chat with \(profile.displayName)"
+                ),
+            ]
+        )
+    }
+
+    func testFiniteJoinCodeIsReservedForInviteHandlingEvenWhenItCarriesInviterNpub() throws {
+        let inviter = try createNostrIdentity()
+        let inviteCode = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=\(inviter.npub)"
+
+        XCTAssertTrue(isFiniteChatInviteCode(inviteCode))
+        XCTAssertEqual(try profileNpub(from: inviteCode), inviter.npub)
+    }
+
     private func savedChatState(
         status: String = "ready",
         toast: String? = nil,

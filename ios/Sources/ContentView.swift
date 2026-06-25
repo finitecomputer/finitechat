@@ -667,7 +667,7 @@ private struct ChatPeoplePickerSheet: View {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            let npub = try extractNpub(from: trimmed)
+            let npub = try profileNpub(from: trimmed)
             let accountID = try accountIdFromNpub(npub: npub)
             if accountID == selfAccountID {
                 parseError = "That is your own profile code."
@@ -749,41 +749,69 @@ private struct ChatPeoplePickerSheet: View {
         dismiss()
     }
 
-    private func extractNpub(from value: String) throws -> String {
-        var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if candidate.lowercased().hasPrefix("nostr:") {
-            candidate = String(candidate.dropFirst("nostr:".count))
-        }
-        if candidate.lowercased().hasPrefix("npub1") {
-            return candidate
-        }
-        if let components = URLComponents(string: candidate) {
-            for item in components.queryItems ?? [] {
-                if item.name.lowercased() == "npub",
-                   let value = item.value,
-                   value.lowercased().hasPrefix("npub1")
-                {
-                    return value
-                }
-            }
-        }
-        guard let range = candidate.range(of: "npub1", options: [.caseInsensitive]) else {
-            throw NewGroupChatCodeError.missingNpub
-        }
-        let suffix = candidate[range.lowerBound...]
-        let separators = CharacterSet.whitespacesAndNewlines
-            .union(CharacterSet(charactersIn: "\"'<>"))
-        let npub = suffix.prefix { character in
-            !character.unicodeScalars.contains { scalar in
-                separators.contains(scalar)
-            }
-        }
-        return String(npub)
-    }
 }
 
 private enum NewGroupChatCodeError: Error {
     case missingNpub
+}
+
+@MainActor
+func profileSummaryFromScannedProfileCode(
+    _ value: String,
+    model: AppModel
+) throws -> AppProfileSummary {
+    let npub = try profileNpub(from: value)
+    let accountID = try accountIdFromNpub(npub: npub)
+    if let profile = model.state?.profiles.first(where: { $0.accountId == accountID }) {
+        return profile
+    }
+    return AppProfileSummary(
+        accountId: accountID,
+        npub: npub,
+        displayName: shortenedDisplayNpub(npub),
+        about: nil,
+        picture: nil,
+        stale: true
+    )
+}
+
+func isFiniteChatInviteCode(_ value: String) -> Bool {
+    value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .hasPrefix("finite://join")
+}
+
+func profileNpub(from value: String) throws -> String {
+    var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if candidate.lowercased().hasPrefix("nostr:") {
+        candidate = String(candidate.dropFirst("nostr:".count))
+    }
+    if candidate.lowercased().hasPrefix("npub1") {
+        return candidate
+    }
+    if let components = URLComponents(string: candidate) {
+        for item in components.queryItems ?? [] {
+            if item.name.lowercased() == "npub",
+               let value = item.value,
+               value.lowercased().hasPrefix("npub1")
+            {
+                return value
+            }
+        }
+    }
+    guard let range = candidate.range(of: "npub1", options: [.caseInsensitive]) else {
+        throw NewGroupChatCodeError.missingNpub
+    }
+    let suffix = candidate[range.lowerBound...]
+    let separators = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "\"'<>"))
+    let npub = suffix.prefix { character in
+        !character.unicodeScalars.contains { scalar in
+            separators.contains(scalar)
+        }
+    }
+    return String(npub)
 }
 
 private struct NewGroupFollowRow: View {
@@ -2284,6 +2312,17 @@ private struct ScanSheet: View {
     }
 
     private func continueWithTarget() {
+        let value = model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !isFiniteChatInviteCode(value),
+           let profile = try? profileSummaryFromScannedProfileCode(value, model: model)
+        {
+            if onStartProfileChat(profile) {
+                model.scanDraft = ""
+                dismiss()
+            }
+            return
+        }
+
         switch model.scanTargetResult() {
         case .empty:
             dismiss()
