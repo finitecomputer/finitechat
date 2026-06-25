@@ -94,9 +94,11 @@ struct Composer: View {
                                 .padding(.leading, 13)
                                 .padding(.top, 10)
                                 .allowsHitTesting(false)
+                                .accessibilityHidden(true)
                         }
                     }
                     .accessibilityLabel("Message")
+                    .accessibilityIdentifier("ComposerMessageField")
 
                 if showsVoiceButton {
                     Button {
@@ -532,9 +534,24 @@ final class PastableTextView: UITextView {
     var onReturnKey: (() -> Void)?
     var maxAllowedHeight: CGFloat = 150
 
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        configureAccessibility()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureAccessibility()
+    }
+
     override var intrinsicContentSize: CGSize {
         let size = sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude))
         return CGSize(width: UIView.noIntrinsicMetric, height: min(size.height, maxAllowedHeight))
+    }
+
+    private func configureAccessibility() {
+        accessibilityLabel = "Message"
+        accessibilityIdentifier = "ComposerMessageField"
     }
 
     func recalculateHeight() {

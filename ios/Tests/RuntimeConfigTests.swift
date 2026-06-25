@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import UIKit
 @testable import FiniteChat
 
 final class RuntimeConfigTests: XCTestCase {
@@ -3830,6 +3831,16 @@ final class MessageCollectionLayoutTests: XCTestCase {
             ),
             .reconfigureOnly
         )
+    }
+}
+
+final class ChatComposerAccessibilityTests: XCTestCase {
+    @MainActor
+    func testComposerTextViewHasStableAccessibilityTarget() {
+        let textView = PastableTextView()
+
+        XCTAssertEqual(textView.accessibilityLabel, "Message")
+        XCTAssertEqual(textView.accessibilityIdentifier, "ComposerMessageField")
     }
 }
 
