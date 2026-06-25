@@ -36,10 +36,10 @@ use finitechat_proto::{
     DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind, EphemeralActivityActionV1,
     EphemeralActivityIngressContext, EphemeralActivityProjection, EphemeralActivityProjectionEntry,
     FINITECHAT_ACTIVITY_KIND_THINKING, FINITECHAT_ACTIVITY_KIND_TYPING,
-    FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest,
-    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
-    RoomProtocol, RuntimeActivityClearV1, invite_current_pin, npub_decode, npub_encode,
-    nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
+    FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, INVITE_URL_PREFIX, InviteCodeV1,
+    ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1, invite_current_pin,
+    npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -682,8 +682,75 @@ pub fn npub_from_account_id(account_id: String) -> Result<String, FiniteChatCore
 #[uniffi::export]
 pub fn account_id_from_npub(npub: String) -> Result<String, FiniteChatCoreError> {
     let trimmed = npub.trim();
-    let normalized = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
+    let normalized = strip_ascii_prefix(trimmed, "nostr:").unwrap_or(trimmed);
     npub_decode(normalized).map_err(invite_error)
+}
+
+fn explicit_profile_npub(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if starts_with_ascii_case_insensitive(trimmed, "npub1") {
+        return Some(trimmed.to_owned());
+    }
+    strip_ascii_prefix(trimmed, "nostr:").and_then(|rest| {
+        if starts_with_ascii_case_insensitive(rest, "npub1") {
+            Some(rest.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn embedded_profile_npub(value: &str) -> Option<String> {
+    profile_npub_query_value(value).or_else(|| first_embedded_profile_npub(value))
+}
+
+fn profile_npub_query_value(value: &str) -> Option<String> {
+    let (_, query_and_fragment) = value.split_once('?')?;
+    let query = query_and_fragment
+        .split_once('#')
+        .map(|(query, _)| query)
+        .unwrap_or(query_and_fragment);
+    for pair in query.split('&') {
+        let Some((key, raw_value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("npub") {
+            continue;
+        }
+        if let Some(npub) = explicit_profile_npub(raw_value) {
+            return Some(take_profile_npub_candidate(&npub).to_owned());
+        }
+    }
+    None
+}
+
+fn first_embedded_profile_npub(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let start = lower.find("npub1")?;
+    Some(take_profile_npub_candidate(&value[start..]).to_owned())
+}
+
+fn take_profile_npub_candidate(value: &str) -> &str {
+    let separators = ['"', '\'', '<', '>', '&', '#', '?', '/', '\\'];
+    value
+        .trim()
+        .split(|character: char| character.is_whitespace() || separators.contains(&character))
+        .next()
+        .unwrap_or("")
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if starts_with_ascii_case_insensitive(value, prefix) {
+        Some(&value[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
 }
 
 #[uniffi::export]
@@ -1805,36 +1872,20 @@ impl AppRuntimeState {
 
     fn scan_target(&mut self, value: String) -> Result<(), FiniteChatCoreError> {
         let trimmed = value.trim();
-        if trimmed.starts_with("npub1") || trimmed.starts_with("nostr:npub1") {
-            let npub = trimmed.strip_prefix("nostr:").unwrap_or(trimmed);
-            let account_id = npub_decode(npub).map_err(invite_error)?;
-            let found = match self.fetch_profiles(vec![account_id.clone()]) {
-                Ok(found) => found,
-                Err(error) => {
-                    if !online_action_failure(&error) {
-                        return Err(error);
-                    }
-                    self.remember_placeholder_profile(&account_id)?;
-                    self.app.active_profile_id = Some(account_id);
-                    self.set_online_action_unavailable(
-                        "profile details unavailable",
-                        "Profile details unavailable; you can still start a chat",
-                    );
-                    return Ok(());
-                }
-            };
-            self.app.active_profile_id = Some(account_id.clone());
-            if found {
-                self.app.status = "profile loaded".to_owned();
-                self.app.toast = None;
-            } else {
-                self.remember_placeholder_profile(&account_id)?;
-                self.app.status = "profile not found".to_owned();
-                self.app.toast = Some("No cached profile was available for that npub".to_owned());
-            }
-            return Ok(());
+        if let Some(npub) = explicit_profile_npub(trimmed) {
+            return self.scan_profile_npub(&npub);
         }
-        let code = parse_invite(trimmed)?;
+        let code = match parse_invite(trimmed) {
+            Ok(code) => code,
+            Err(invite_error) => {
+                if !starts_with_ascii_case_insensitive(trimmed, INVITE_URL_PREFIX) {
+                    if let Some(npub) = embedded_profile_npub(trimmed) {
+                        return self.scan_profile_npub(&npub);
+                    }
+                }
+                return Err(invite_error);
+            }
+        };
         let room_id = code.room_id.clone();
         let display_name = code
             .display_name
@@ -1858,6 +1909,35 @@ impl AppRuntimeState {
         self.app.selected_room_id = Some(room_id);
         self.persist_app_state()?;
         self.app.status = "invite scanned".to_owned();
+        Ok(())
+    }
+
+    fn scan_profile_npub(&mut self, npub: &str) -> Result<(), FiniteChatCoreError> {
+        let account_id = npub_decode(npub).map_err(invite_error)?;
+        let found = match self.fetch_profiles(vec![account_id.clone()]) {
+            Ok(found) => found,
+            Err(error) => {
+                if !online_action_failure(&error) {
+                    return Err(error);
+                }
+                self.remember_placeholder_profile(&account_id)?;
+                self.app.active_profile_id = Some(account_id);
+                self.set_online_action_unavailable(
+                    "profile details unavailable",
+                    "Profile details unavailable; you can still start a chat",
+                );
+                return Ok(());
+            }
+        };
+        self.app.active_profile_id = Some(account_id.clone());
+        if found {
+            self.app.status = "profile loaded".to_owned();
+            self.app.toast = None;
+        } else {
+            self.remember_placeholder_profile(&account_id)?;
+            self.app.status = "profile not found".to_owned();
+            self.app.toast = Some("No cached profile was available for that npub".to_owned());
+        }
         Ok(())
     }
 
@@ -7008,6 +7088,150 @@ mod tests {
         assert_eq!(cached.profiles.len(), 1);
         assert_eq!(cached.profiles[0].account_id, account_id);
         assert!(cached.profiles[0].stale);
+    }
+
+    #[test]
+    fn app_scan_profile_url_query_npub_loads_server_backed_profile_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let account_id =
+            "2222222222222222222222222222222222222222222222222222222222222222".to_owned();
+        let npub = npub_encode(&account_id).unwrap();
+        put_profile(
+            &server_url,
+            NostrProfileRecord {
+                account_id: account_id.clone(),
+                name: Some("alice-url".to_owned()),
+                display_name: Some("Alice URL".to_owned()),
+                about: None,
+                picture: None,
+                fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
+                expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
+            },
+        );
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let state = app
+            .dispatch(AppAction::ScanTarget {
+                value: format!("https://finite.computer/profile?npub={npub}&source=qr"),
+            })
+            .unwrap();
+
+        assert_eq!(state.status, "profile loaded");
+        assert_eq!(
+            state.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(state.profiles[0].display_name, "Alice URL");
+        assert_eq!(state.profiles[0].npub, npub);
+    }
+
+    #[test]
+    fn app_scan_embedded_npub_falls_back_to_profile_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let account_id =
+            "3333333333333333333333333333333333333333333333333333333333333333".to_owned();
+        let npub = npub_encode(&account_id).unwrap();
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let state = app
+            .dispatch(AppAction::ScanTarget {
+                value: format!("Profile code: {npub}\nShared from Finite Chat"),
+            })
+            .unwrap();
+
+        assert_eq!(state.status, "profile details unavailable");
+        assert_eq!(
+            state.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(state.profiles[0].account_id, account_id);
+        assert_eq!(state.profiles[0].npub, npub);
+        assert!(state.profiles[0].stale);
+    }
+
+    #[test]
+    fn app_scan_valid_invite_wins_over_extra_npub_query_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("bob");
+        let room_id = "room-invite-with-extra-npub".to_owned();
+        let invite_code = InviteCodeV1 {
+            server_url: unavailable_http_server_url(),
+            room_id: room_id.clone(),
+            invite_id: "invite-extra-npub".to_owned(),
+            invite_token: vec![7; 16],
+            inviter_account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            display_name: Some("Invite Extra".to_owned()),
+        };
+        let profile_npub =
+            npub_encode("4444444444444444444444444444444444444444444444444444444444444444")
+                .unwrap();
+        let invite_url = format!("{}&npub={profile_npub}", invite_code.encode().unwrap());
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let scanned = app
+            .dispatch(AppAction::ScanTarget { value: invite_url })
+            .unwrap();
+
+        let pending = app_room(&scanned, &room_id);
+        assert_eq!(pending.state, AppRoomState::WaitingForApproval);
+        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(scanned.active_profile_id, None);
+    }
+
+    #[test]
+    fn app_scan_malformed_invite_does_not_fall_back_to_inviter_npub() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("bob");
+        let inviter_npub =
+            npub_encode("5555555555555555555555555555555555555555555555555555555555555555")
+                .unwrap();
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let error = app
+            .dispatch(AppAction::ScanTarget {
+                value: format!("{INVITE_URL_PREFIX}v=1&a={inviter_npub}"),
+            })
+            .expect_err("malformed invite should stay an invite error");
+
+        assert!(
+            format!("{error}").contains("invite code is missing required field"),
+            "unexpected scan error: {error}"
+        );
+        let state = app.state().unwrap();
+        assert_eq!(state.active_profile_id, None);
+        assert!(state.profiles.is_empty());
     }
 
     #[test]
