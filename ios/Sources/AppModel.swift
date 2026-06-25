@@ -9,7 +9,7 @@ struct RuntimeConfig: Codable, Equatable {
     let usesTransientStore: Bool
     let persistsRuntimeIdentityUpdates: Bool
 
-    private static let defaultServerURL = "https://chat.finite.computer"
+    static let defaultServerURL = "https://chat.finite.computer"
     private static let defaultDeviceID = "ios"
     private static let transientConfigArgument = "--finitechat-transient-config"
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
@@ -65,14 +65,11 @@ struct RuntimeConfig: Codable, Equatable {
         let persistLaunchOverride = argumentFlag(persistLaunchConfigArgument, in: args)
             || truthyEnvironmentValue(persistLaunchConfigEnvironmentKey, in: environment)
         let hasLaunchOverride = serverURL != nil || deviceID != nil
-        let hasPersistentLaunchState = persisted.serverURL != nil
-            || persisted.deviceID != nil
         let transientOverride = argumentFlag(transientConfigArgument, in: args)
             || truthyEnvironmentValue(transientConfigEnvironmentKey, in: environment)
             || hostedUnitTest
-        let shouldPersistFirstLaunchOverride = hasLaunchOverride
-            && !hasPersistentLaunchState
         let shouldPersistResolvedIdentity = !transientOverride
+            && (!hasLaunchOverride || persistLaunchOverride)
         let config = RuntimeConfig(
             serverURL: serverURL ?? fallback.serverURL,
             deviceID: deviceID ?? fallback.deviceID,
@@ -84,13 +81,11 @@ struct RuntimeConfig: Codable, Equatable {
                 persisted.serverURL != config.serverURL
                     || persisted.deviceID != config.deviceID
             )
-        // Runtime identity is product state. First-run launch values can seed a
-        // stable client store. Existing saved identities are not rewritten by
-        // one-off launch overrides unless the caller explicitly persists them.
+        // Runtime identity is product state. Launch values are test/developer
+        // inputs unless the caller explicitly opts into persisting them.
         if !transientOverride
             && (
                 shouldPersistFallbackRepair
-                    || shouldPersistFirstLaunchOverride
                     || persistLaunchOverride
             )
         {
@@ -604,6 +599,33 @@ final class AppModel: ObservableObject {
         requiresNostrLogin = true
         canRecoverRuntimeIdentity = false
         errorText = nil
+    }
+
+    func useDefaultServer() {
+        let defaultServerURL = RuntimeConfig.defaultServerURL
+        guard serverURL != defaultServerURL else { return }
+        appendDiagnostic(
+            category: "persistence",
+            event: "server.reset_default.requested",
+            details: ["from": Self.redactedDiagnosticValue(serverURL)]
+        )
+        closeRuntime()
+        serverURL = defaultServerURL
+        do {
+            try RuntimeConfig(serverURL: serverURL, deviceID: deviceID).save(
+                storageURL: configStorageURL
+            )
+            appendDiagnostic(category: "persistence", event: "server.reset_default.succeeded")
+            errorText = nil
+        } catch {
+            appendDiagnostic(
+                category: "persistence",
+                event: "server.reset_default.failed",
+                details: diagnosticErrorDetails(error)
+            )
+            errorText = String(describing: error)
+        }
+        start()
     }
 
     var canSend: Bool {

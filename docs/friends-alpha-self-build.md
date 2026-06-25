@@ -67,10 +67,10 @@ In Xcode:
 4. Let Xcode create or download the development provisioning profile.
 5. Build and run.
 
-If the phone has ever run a development build that used a local server URL,
-delete Finite Chat from the phone before this install. The app persists its
-first-run runtime config, so a clean install is the simplest way to prove it is
-using the deployed default server.
+Normal Xcode launches do not persist server or device launch overrides. If the
+phone has old pre-alpha app data, a clean install can still be useful to reset
+chat state, but it should not be necessary just to get the deployed server
+default.
 
 After launch, check the app's Settings/diagnostics and confirm the server is:
 
@@ -78,8 +78,13 @@ After launch, check the app's Settings/diagnostics and confirm the server is:
 https://chat.finite.computer
 ```
 
+If an old pre-alpha install still shows a local or staging server, open
+Settings, expand Developer diagnostics, and tap **Use Deployed Server**.
+
 Do not add `FINITECHAT_SERVER_URL`, `--finitechat-server`, or an Xcode launch
-argument for normal friend testing.
+argument for normal friend testing. The only code path that may persist a
+launch-time server override is an explicit development or harness run with
+`--finitechat-persist-launch-config`.
 
 ## Command-Line Build Option
 

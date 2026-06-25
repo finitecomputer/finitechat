@@ -166,12 +166,14 @@ launch. Regression coverage must include a remote-synced message that survives
 force-close and offline relaunch, because that is the user-visible chat
 contract, not an implementation detail.
 
-On iOS, stable launch overrides for server URL or device id are treated as
-product configuration once the Rust runtime opens successfully. The app writes
-the resolved runtime identity back to its config file so a force-close relaunch
-without Xcode launch arguments reopens the same local SQLite identity and
-projection. Throwaway diagnostics must use the explicit transient store flag;
-ordinary stable launches are not temporary.
+On iOS, launch overrides for server URL or device id are temporary unless the
+caller explicitly supplies `--finitechat-persist-launch-config`. The app may
+write the resolved runtime device id back to its config file during normal
+startup, but a temporary Xcode/RMP server override must not become product
+configuration after the Rust runtime opens. Harnesses that need same-config
+force-close relaunches must opt into persistence explicitly. Throwaway
+diagnostics must use the explicit transient store flag; ordinary Home Screen
+launches are the product path.
 Normal startup no longer scans or migrates pre-release `FiniteChat/<device>`
 app-support stores. Those old dev stores are reset-only inputs; product launch
 opens `FiniteChatStore` or an explicit `FiniteChatTransient/<device>` root, and

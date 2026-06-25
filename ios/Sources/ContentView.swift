@@ -2517,6 +2517,14 @@ private struct SettingsSheet: View {
                 Section {
                     DisclosureGroup {
                         LabeledContent("Server", value: model.serverURL)
+                        if model.serverURL != RuntimeConfig.defaultServerURL {
+                            Button {
+                                model.useDefaultServer()
+                            } label: {
+                                Label("Use Deployed Server", systemImage: "network")
+                            }
+                            .accessibilityIdentifier("UseDefaultServerButton")
+                        }
                         LabeledContent("Configured Device", value: model.deviceID)
 
                         if let state = model.state {
