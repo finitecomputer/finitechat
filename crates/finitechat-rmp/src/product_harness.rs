@@ -215,6 +215,12 @@ fn ios_product_harness_with_ios_development_team_env(
         &device,
         "after online create/send phase",
     )?;
+    let key_packages_after_online = assert_server_key_package_availability(
+        &server_sqlite,
+        &device,
+        1,
+        "after online create/send phase",
+    )?;
     let local_after_online = assert_local_projection_snapshot(
         &store_path,
         &server_url,
@@ -455,6 +461,7 @@ fn ios_product_harness_with_ios_development_team_env(
     server.stop()?;
     let assertions = HarnessAssertions {
         after_online,
+        key_packages_after_online,
         after_offline,
         after_offline_attachment,
         after_restart,
@@ -626,6 +633,7 @@ struct HarnessResult {
 #[derive(Clone, Debug, Serialize)]
 struct HarnessAssertions {
     after_online: ServerDeliverySnapshot,
+    key_packages_after_online: KeyPackageAvailabilitySnapshot,
     after_offline: ServerDeliverySnapshot,
     after_offline_attachment: ServerDeliverySnapshot,
     after_restart: ServerDeliverySnapshot,
@@ -647,6 +655,15 @@ struct ProfileDmHarnessAssertions {
     peer_after_profile_dm: PeerReceiptSnapshot,
     peer_account_id: String,
     peer_npub: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct KeyPackageAvailabilitySnapshot {
+    device_id: String,
+    account_ids: Vec<String>,
+    available: i64,
+    claimed: i64,
+    consumed: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -806,6 +823,14 @@ fn render_harness_result(json: bool, status: &str, result: HarnessResult) {
             assertions.after_offline.publish_messages,
             assertions.after_offline_attachment.publish_messages,
             assertions.after_restart.publish_messages
+        );
+        eprintln!(
+            "assertions: key packages for {} after online launch: available={}, claimed={}, consumed={}, accounts={}",
+            assertions.key_packages_after_online.device_id,
+            assertions.key_packages_after_online.available,
+            assertions.key_packages_after_online.claimed,
+            assertions.key_packages_after_online.consumed,
+            assertions.key_packages_after_online.account_ids.join(",")
         );
         eprintln!(
             "assertions: final app effects={}, idempotency rows={}, rooms={}, sender devices={}",
@@ -1169,6 +1194,116 @@ fn assert_server_delivery_snapshot(
         )));
     }
     Ok(snapshot)
+}
+
+fn assert_server_key_package_availability(
+    sqlite_path: &Path,
+    expected_device: &str,
+    min_available: i64,
+    label: &str,
+) -> Result<KeyPackageAvailabilitySnapshot, CliError> {
+    let snapshot = read_server_key_package_availability(sqlite_path, expected_device)?;
+    if snapshot.available < min_available {
+        return Err(CliError::operational(format!(
+            "{label}: expected at least {min_available} available KeyPackage row(s) for device `{expected_device}`, got available={}, claimed={}, consumed={}, account_ids={:?}",
+            snapshot.available, snapshot.claimed, snapshot.consumed, snapshot.account_ids
+        )));
+    }
+    Ok(snapshot)
+}
+
+fn read_server_key_package_availability(
+    sqlite_path: &Path,
+    expected_device: &str,
+) -> Result<KeyPackageAvailabilitySnapshot, CliError> {
+    let conn = Connection::open(sqlite_path).map_err(|error| {
+        CliError::operational(format!(
+            "failed to open harness server sqlite {}: {error}",
+            sqlite_path.display()
+        ))
+    })?;
+    let mut stmt = conn
+        .prepare("SELECT owner_json, state_json FROM http_key_package_inventory")
+        .map_err(|error| {
+            CliError::operational(format!(
+                "failed to prepare key package inventory query: {error}"
+            ))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            CliError::operational(format!(
+                "failed to query key package inventory rows: {error}"
+            ))
+        })?;
+    let mut account_ids = BTreeSet::new();
+    let mut available = 0;
+    let mut claimed = 0;
+    let mut consumed = 0;
+    for row in rows {
+        let (owner_json, state_json) = row.map_err(|error| {
+            CliError::operational(format!("failed to read key package inventory row: {error}"))
+        })?;
+        let Some(owner) = decode_key_package_owner(&owner_json)? else {
+            continue;
+        };
+        if owner.device_id != expected_device {
+            continue;
+        }
+        account_ids.insert(owner.account_id);
+        let state: String = serde_json::from_str(&state_json).map_err(|error| {
+            CliError::operational(format!(
+                "failed to parse key package state_json `{state_json}`: {error}"
+            ))
+        })?;
+        match state.as_str() {
+            "Available" => available += 1,
+            "Claimed" => claimed += 1,
+            "Consumed" => consumed += 1,
+            other => {
+                return Err(CliError::operational(format!(
+                    "unexpected key package inventory state `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(KeyPackageAvailabilitySnapshot {
+        device_id: expected_device.to_owned(),
+        account_ids: account_ids.into_iter().collect(),
+        available,
+        claimed,
+        consumed,
+    })
+}
+
+#[derive(Debug)]
+struct DecodedKeyPackageOwner {
+    account_id: String,
+    device_id: String,
+}
+
+fn decode_key_package_owner(owner_json: &str) -> Result<Option<DecodedKeyPackageOwner>, CliError> {
+    let owner_bytes: Vec<u8> = serde_json::from_str(owner_json).map_err(|error| {
+        CliError::operational(format!(
+            "failed to parse key package owner_json as member bytes: {error}"
+        ))
+    })?;
+    let owner: serde_json::Value = match serde_json::from_slice(&owner_bytes) {
+        Ok(owner) => owner,
+        Err(_) => return Ok(None),
+    };
+    let Some(account_id) = owner.get("account_id").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let Some(device_id) = owner.get("device_id").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(DecodedKeyPackageOwner {
+        account_id: account_id.to_owned(),
+        device_id: device_id.to_owned(),
+    }))
 }
 
 fn read_server_delivery_snapshot(sqlite_path: &Path) -> Result<ServerDeliverySnapshot, CliError> {

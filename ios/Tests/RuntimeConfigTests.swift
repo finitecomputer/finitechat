@@ -798,6 +798,51 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(model.userNoticeText)
     }
 
+    func testForegroundStartRunsLaunchAutomationAfterRuntimeReady() async throws {
+        let supportURL = try temporarySupportURL()
+        let readyState = savedChatState(status: "ready", toast: nil)
+        let runtime = FakeFiniteChatRuntime(
+            initialState: readyState,
+            startRuntimeState: readyState
+        )
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            applicationSupportURL: supportURL,
+            args: [
+                "FiniteChat",
+                "--finitechat-auto-send",
+                "foreground launch automation message",
+            ],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.startFromForeground()
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendMessage = $0 { return true }
+                return false
+            }
+        }
+        XCTAssertEqual(
+            Array(runtime.dispatchedActions.prefix(3)),
+            [
+                .startRuntime,
+                .openRoom(roomId: "room-main"),
+                .sendMessage(
+                    roomId: "room-main",
+                    text: "foreground launch automation message"
+                ),
+            ]
+        )
+        XCTAssertNil(model.developerErrorText)
+    }
+
     func testProductHarnessDeliveredTranscriptPresentationHasNoNormalOfflineBanner() throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1084,7 +1129,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }
 
-    func testExistingStableRuntimeStoreRequiresExplicitLoginOrRecovery() throws {
+    func testExistingStableRuntimeStoreAutoRecoversWithoutLoginPrompt() throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
@@ -1123,17 +1168,19 @@ final class AppModelPersistenceTests: XCTestCase {
             return runtime
         }
 
-        XCTAssertTrue(model.requiresNostrLogin)
+        XCTAssertFalse(model.requiresNostrLogin)
         XCTAssertTrue(model.canRecoverRuntimeIdentity)
 
         model.start()
 
-        XCTAssertTrue(openedOptions.isEmpty)
-        XCTAssertNil(model.nostrIdentity)
-        XCTAssertNil(model.activeAccountID)
-        XCTAssertNil(identityStore.load())
-        XCTAssertTrue(runtime.dispatchedActions.isEmpty)
-        XCTAssertEqual(model.developerErrorText, "Create or sign in to a Nostr account first.")
+        XCTAssertFalse(model.requiresNostrLogin)
+        XCTAssertFalse(model.canRecoverRuntimeIdentity)
+        XCTAssertEqual(openedOptions.count, 1)
+        XCTAssertNil(openedOptions[0].accountSecretHex)
+        XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
+        XCTAssertEqual(model.activeAccountID, material.accountId)
+        XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }
 
     func testExplicitExistingDeviceAccountRecoveryRestoresKeychainIdentity() throws {
@@ -1175,7 +1222,7 @@ final class AppModelPersistenceTests: XCTestCase {
             return runtime
         }
 
-        XCTAssertTrue(model.requiresNostrLogin)
+        XCTAssertFalse(model.requiresNostrLogin)
         XCTAssertTrue(model.canRecoverRuntimeIdentity)
 
         XCTAssertTrue(model.recoverExistingDeviceAccount())

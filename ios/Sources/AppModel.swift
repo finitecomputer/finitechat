@@ -489,10 +489,11 @@ final class AppModel: ObservableObject {
                 applicationSupportURL: resolvedApplicationSupportURL
             )
         nostrIdentity = storedNostrIdentity
-        canRecoverRuntimeIdentity = hasRecoverableRuntimeIdentity
         self.requiresNostrLogin = requiresNostrLogin
             && storedNostrIdentity == nil
+            && !hasRecoverableRuntimeIdentity
             && !Self.hasLaunchAutomation(args: args)
+        canRecoverRuntimeIdentity = hasRecoverableRuntimeIdentity
         launchConfigurationError = productHarnessSupport.error
         appendDiagnostic(
             category: "persistence",
@@ -763,6 +764,7 @@ final class AppModel: ObservableObject {
                     self.errorText = nil
                     self.restartUpdateLoopIfEnabled()
                     self.flushPendingPushTokenIfPossible()
+                    self.runLaunchAutomationIfRequested()
                 } catch {
                     guard let self else { return }
                     if self.foregroundStartKey == runtimeKey {
@@ -1465,6 +1467,7 @@ final class AppModel: ObservableObject {
         let appIdentity = AppNostrIdentity(material: material)
         nostrIdentityStore.save(appIdentity)
         nostrIdentity = appIdentity
+        canRecoverRuntimeIdentity = false
     }
 
     private func closeRuntime() {
