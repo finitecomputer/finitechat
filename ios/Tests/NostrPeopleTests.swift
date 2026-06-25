@@ -2,6 +2,50 @@ import XCTest
 @testable import FiniteChat
 
 final class NostrPeopleTests: XCTestCase {
+    func testFollowProfileBuildsDirectChatProfileSummary() throws {
+        let pubkey = String(repeating: "a", count: 64)
+        let npub = try npubFromAccountId(accountId: pubkey)
+        let follow = NostrFollowProfile(
+            pubkey: pubkey,
+            npub: npub,
+            name: "Alice",
+            username: "alice",
+            about: "available for finite chat",
+            pictureURL: "https://example.com/alice.jpg",
+            relayHint: "wss://relay.example",
+            inviteAvailability: .available
+        )
+
+        let profile = follow.appProfileSummary
+
+        XCTAssertEqual(profile.accountId, pubkey)
+        XCTAssertEqual(profile.npub, npub)
+        XCTAssertEqual(profile.displayName, "Alice")
+        XCTAssertEqual(profile.about, "available for finite chat")
+        XCTAssertEqual(profile.picture, "https://example.com/alice.jpg")
+        XCTAssertFalse(profile.stale)
+    }
+
+    func testUnknownFollowProfileBuildsStaleProfileSummary() throws {
+        let pubkey = String(repeating: "b", count: 64)
+        let npub = try npubFromAccountId(accountId: pubkey)
+        let follow = NostrFollowProfile(
+            pubkey: pubkey,
+            npub: npub,
+            name: nil,
+            username: nil,
+            about: nil,
+            pictureURL: nil,
+            relayHint: nil,
+            inviteAvailability: .unknown
+        )
+
+        let profile = follow.appProfileSummary
+
+        XCTAssertEqual(profile.displayName, follow.shortenedNpub)
+        XCTAssertTrue(profile.stale)
+    }
+
     func testInviteAvailabilityServiceChunksAndMergesResponses() async throws {
         let ids = [
             String(repeating: "a", count: 64),

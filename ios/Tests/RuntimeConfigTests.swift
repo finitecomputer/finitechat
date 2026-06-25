@@ -2132,6 +2132,54 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.userNoticeText, "Profile lookup requires a connection")
     }
 
+    @MainActor
+    func testScanTargetResultReturnsProfileWhenLookupFallsBackToPlaceholder() throws {
+        let profile = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "bob-acc…ount",
+            about: nil,
+            picture: nil,
+            stale: true
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .scanTarget = action {
+                state.activeProfileId = profile.accountId
+                state.profiles = [profile]
+                state.status = "profile details unavailable"
+                state.toast = "Profile details unavailable; you can still start a chat"
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+        model.scanDraft = "npub1bob"
+
+        let result = model.scanTargetResult()
+
+        guard case .profile(let scanned) = result else {
+            return XCTFail("expected scanned profile result")
+        }
+        XCTAssertEqual(scanned.accountId, "bob-account")
+        XCTAssertTrue(scanned.stale)
+        XCTAssertEqual(model.scanDraft, "")
+        XCTAssertEqual(
+            model.userNoticeText,
+            "Profile details unavailable; you can still start a chat"
+        )
+    }
+
     private func savedChatState(
         status: String = "ready",
         toast: String? = nil,

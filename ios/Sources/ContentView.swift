@@ -87,18 +87,21 @@ struct ContentView: View {
             chatsStack
                 .tabItem {
                     Label(AppTab.chats.title, systemImage: AppTab.chats.systemImage)
+                        .accessibilityIdentifier(AppTab.chats.accessibilityIdentifier)
                 }
                 .tag(AppTab.chats)
 
             peopleStack
                 .tabItem {
                     Label(AppTab.people.title, systemImage: AppTab.people.systemImage)
+                        .accessibilityIdentifier(AppTab.people.accessibilityIdentifier)
                 }
                 .tag(AppTab.people)
 
             agentsStack
                 .tabItem {
                     Label(AppTab.agents.title, systemImage: AppTab.agents.systemImage)
+                        .accessibilityIdentifier(AppTab.agents.accessibilityIdentifier)
                 }
                 .tag(AppTab.agents)
 
@@ -106,6 +109,7 @@ struct ContentView: View {
                 .accessibilityHidden(true)
                 .tabItem {
                     Label(AppTab.home.title, systemImage: AppTab.home.systemImage)
+                        .accessibilityIdentifier(AppTab.home.accessibilityIdentifier)
                 }
                 .tag(AppTab.home)
         }
@@ -135,10 +139,11 @@ struct ContentView: View {
         NavigationStack {
             PeopleView(
                 model: model,
-                openRoom: { room in
-                    selectedTab = .chats
-                    model.openRoom(room)
-                    routeSelectedRoom(room.roomId)
+                startProfileChat: { profile in
+                    startChatFromScannedProfile(profile)
+                },
+                showScan: {
+                    sheet = .scan
                 },
                 showSettings: {
                     sheet = .settings
@@ -169,6 +174,9 @@ struct ContentView: View {
                 model: model,
                 openChats: {
                     selectedTab = .chats
+                },
+                openPeople: {
+                    selectedTab = .people
                 },
                 openAgents: {
                     selectedTab = .agents
@@ -239,6 +247,7 @@ private struct RoomListView: View {
     let present: (AppSheet) -> Void
     let open: (AppRoomSummary) -> Void
     @State private var searchText = ""
+    @State private var showingNewRoom = false
 
     private var filteredRooms: [AppRoomSummary] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -277,16 +286,110 @@ private struct RoomListView: View {
         .listStyle(.plain)
         .navigationTitle("Chats")
         .toolbar {
-            ShellToolbarActions(showSettings: { present(.settings) })
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    present(.scan)
+                } label: {
+                    Image(systemName: "qrcode.viewfinder")
+                }
+                .accessibilityLabel("Scan code")
+                .accessibilityIdentifier("ChatsScanButton")
+
+                Menu {
+                    Button {
+                        showingNewRoom = true
+                    } label: {
+                        Label("New Group Chat", systemImage: "person.2.badge.plus")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("New chat")
+                .accessibilityIdentifier("ChatsNewChatButton")
+
+                Button {
+                    present(.settings)
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Settings")
+                .accessibilityIdentifier("TopSettingsButton")
+            }
         }
         .searchable(
             text: $searchText,
             placement: .navigationBarDrawer(displayMode: .automatic),
             prompt: "Search chats"
         )
+        .sheet(isPresented: $showingNewRoom) {
+            NewRoomSheet { name in
+                createRoom(named: name)
+            }
+        }
         .safeAreaInset(edge: .bottom) {
             NoticeBar(text: model.userNoticeText)
         }
+    }
+
+    private func createRoom(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let existingRoomIDs = Set(model.rooms.map(\.roomId))
+        model.roomDraft = name
+        model.createRoom()
+        if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
+            open(room)
+        }
+    }
+}
+
+private struct NewRoomSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onCreate: (String) -> Void
+    @State private var roomName = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Room name", text: $roomName)
+                        .focused($focused)
+                        .submitLabel(.done)
+                        .onSubmit(create)
+                        .accessibilityIdentifier("NewRoomNameField")
+                } header: {
+                    Text("Group Chat")
+                }
+            }
+            .navigationTitle("New Chat")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create", action: create)
+                        .disabled(trimmedName.isEmpty)
+                        .accessibilityIdentifier("NewRoomCreateButton")
+                }
+            }
+            .task {
+                focused = true
+            }
+        }
+    }
+
+    private var trimmedName: String {
+        roomName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func create() {
+        guard !trimmedName.isEmpty else { return }
+        onCreate(trimmedName)
+        dismiss()
     }
 }
 

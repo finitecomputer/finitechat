@@ -1384,13 +1384,6 @@ impl AppRuntimeState {
         let room_id = self.core.generate_object_id("room")?;
         self.core
             .bootstrap_room(&room_id, Some(display_name.clone()))?;
-        self.upsert_room(
-            &room_id,
-            &display_name,
-            AppRoomState::Connected,
-            "connected",
-        );
-        self.persist_room_projection(&room_id)?;
 
         let welcome_id = self.core.generate_object_id("welcome")?;
         let idempotency_key = self.core.generate_object_id("direct-add")?;
@@ -1500,9 +1493,11 @@ impl AppRuntimeState {
                     if !online_action_failure(&error) {
                         return Err(error);
                     }
+                    self.remember_placeholder_profile(&account_id)?;
+                    self.app.active_profile_id = Some(account_id);
                     self.set_online_action_unavailable(
-                        "profile unavailable",
-                        "Profile lookup requires a connection",
+                        "profile details unavailable",
+                        "Profile details unavailable; you can still start a chat",
                     );
                     return Ok(());
                 }
@@ -1512,10 +1507,7 @@ impl AppRuntimeState {
                 self.app.status = "profile loaded".to_owned();
                 self.app.toast = None;
             } else {
-                let profile = placeholder_profile(&account_id);
-                self.persist_profile(&profile)?;
-                self.profile_cache.insert(account_id, profile);
-                self.sync_profile_state();
+                self.remember_placeholder_profile(&account_id)?;
                 self.app.status = "profile not found".to_owned();
                 self.app.toast = Some("No cached profile was available for that npub".to_owned());
             }
@@ -2271,6 +2263,17 @@ impl AppRuntimeState {
             .store
             .save_app_profiles(&owner, std::slice::from_ref(&stored))
             .map_err(store_error)
+    }
+
+    fn remember_placeholder_profile(
+        &mut self,
+        account_id: &str,
+    ) -> Result<(), FiniteChatCoreError> {
+        let profile = placeholder_profile(account_id);
+        self.persist_profile(&profile)?;
+        self.profile_cache.insert(account_id.to_owned(), profile);
+        self.sync_profile_state();
+        Ok(())
     }
 
     fn sync_profile_state(&mut self) {
@@ -6602,7 +6605,7 @@ mod tests {
     }
 
     #[test]
-    fn app_profile_scan_offline_without_cache_is_transient_only() {
+    fn app_profile_scan_offline_without_cache_surfaces_stale_profile_placeholder() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let account_id =
@@ -6622,13 +6625,19 @@ mod tests {
                 value: npub.clone(),
             })
             .unwrap();
-        assert_eq!(state.status, "profile unavailable");
+        assert_eq!(state.status, "profile details unavailable");
         assert_eq!(
             state.toast.as_deref(),
-            Some("Profile lookup requires a connection")
+            Some("Profile details unavailable; you can still start a chat")
         );
-        assert_eq!(state.active_profile_id, None);
-        assert!(state.profiles.is_empty());
+        assert_eq!(
+            state.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].account_id, account_id);
+        assert_eq!(state.profiles[0].npub, npub);
+        assert!(state.profiles[0].stale);
         assert!(state.messages.is_empty());
         assert!(runtime_outbox(&app).is_empty());
         drop(app);
@@ -6643,7 +6652,9 @@ mod tests {
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert_eq!(reopened_state.active_profile_id, None);
-        assert!(reopened_state.profiles.is_empty());
+        assert_eq!(reopened_state.profiles.len(), 1);
+        assert_eq!(reopened_state.profiles[0].account_id, account_id);
+        assert!(reopened_state.profiles[0].stale);
     }
 
     #[test]

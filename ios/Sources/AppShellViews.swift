@@ -32,11 +32,25 @@ enum AppTab: Hashable {
             "plus.circle.fill"
         }
     }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .chats:
+            "ChatsTab"
+        case .people:
+            "PeopleTab"
+        case .agents:
+            "AgentsTab"
+        case .home:
+            "NewTab"
+        }
+    }
 }
 
 struct HomeView: View {
     @ObservedObject var model: AppModel
     let openChats: () -> Void
+    let openPeople: () -> Void
     let openAgents: () -> Void
     let openRoom: (AppRoomSummary) -> Void
     let showScan: () -> Void
@@ -77,6 +91,7 @@ struct HomeView: View {
                 isFocused: $intentionFocused,
                 canSubmit: canSubmitIntention,
                 openChats: openChats,
+                openPeople: openPeople,
                 openAgents: openAgents,
                 showScan: showScan,
                 submit: submitIntention
@@ -197,6 +212,7 @@ private struct HomeInputDock: View {
     let isFocused: FocusState<Bool>.Binding
     let canSubmit: Bool
     let openChats: () -> Void
+    let openPeople: () -> Void
     let openAgents: () -> Void
     let showScan: () -> Void
     let submit: () -> Void
@@ -208,7 +224,7 @@ private struct HomeInputDock: View {
                     HomeSuggestionButton(
                         title: "Message someone",
                         systemImage: "person",
-                        action: openChats
+                        action: openPeople
                     )
 
                     HomeSuggestionButton(
@@ -433,7 +449,8 @@ struct NostrLoginView: View {
 
 struct PeopleView: View {
     @ObservedObject var model: AppModel
-    let openRoom: (AppRoomSummary) -> Void
+    let startProfileChat: (AppProfileSummary) -> Bool
+    let showScan: () -> Void
     let showSettings: () -> Void
 
     @StateObject private var people = NostrPeopleModel()
@@ -443,6 +460,29 @@ struct PeopleView: View {
     @State private var checkingInviteProfileID: String?
     @State private var inviteAvailabilityCheckFailed = false
     @State private var showingLookupProfile = false
+
+    private var knownProfiles: [AppProfileSummary] {
+        let selfAccountID = model.nostrIdentity?.accountID
+        let followIDs = Set(people.profiles.map(\.pubkey))
+        return (model.state?.profiles ?? [])
+            .filter { profile in
+                profile.accountId != selfAccountID && !followIDs.contains(profile.accountId)
+            }
+            .sorted { left, right in
+                left.displayName.localizedCaseInsensitiveCompare(right.displayName) == .orderedAscending
+            }
+    }
+
+    private var filteredKnownProfiles: [AppProfileSummary] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return knownProfiles }
+        return knownProfiles.filter { profile in
+            profile.displayName.lowercased().contains(query)
+                || profile.npub.lowercased().contains(query)
+                || profile.accountId.lowercased().contains(query)
+                || (profile.about?.lowercased().contains(query) ?? false)
+        }
+    }
 
     private var filteredProfiles: [NostrFollowProfile] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -457,12 +497,25 @@ struct PeopleView: View {
 
     var body: some View {
         List {
+            knownProfilesSection
             followsSection
         }
         .listStyle(.plain)
         .navigationTitle("People")
         .toolbar {
-            ShellToolbarActions(showSettings: showSettings)
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(action: showScan) {
+                    Image(systemName: "qrcode.viewfinder")
+                }
+                .accessibilityLabel("Scan code")
+                .accessibilityIdentifier("PeopleScanButton")
+
+                Button(action: showSettings) {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Settings")
+                .accessibilityIdentifier("TopSettingsButton")
+            }
         }
         .searchable(
             text: $searchText,
@@ -481,8 +534,8 @@ struct PeopleView: View {
                 onLookup: {
                     lookupProfile(profile.npub)
                 },
-                onCreateRoom: {
-                    createRoom(named: "Chat with \(profile.displayName)")
+                onStartChat: {
+                    startChat(with: profile.appProfileSummary)
                 }
             )
         }
@@ -497,7 +550,7 @@ struct PeopleView: View {
         .sheet(isPresented: $showingLookupProfile) {
             if let profile = model.activeProfile {
                 AppProfileLookupSheet(profile: profile) {
-                    createRoom(named: "Chat with \(profile.displayName)")
+                    startChat(with: profile)
                 }
             } else {
                 ContentUnavailableView("Profile unavailable", systemImage: "person.crop.circle.badge.questionmark")
@@ -506,8 +559,25 @@ struct PeopleView: View {
     }
 
     @ViewBuilder
+    private var knownProfilesSection: some View {
+        if !filteredKnownProfiles.isEmpty {
+            Section("Known in Finite Chat") {
+                ForEach(filteredKnownProfiles, id: \.accountId) { profile in
+                    Button {
+                        startChat(with: profile)
+                    } label: {
+                        KnownProfileRow(profile: profile)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
     private var followsSection: some View {
-        if people.isLoading && people.profiles.isEmpty {
+        if people.isLoading && people.profiles.isEmpty && knownProfiles.isEmpty {
             HStack {
                 Spacer()
                 ProgressView("Loading people...")
@@ -515,7 +585,7 @@ struct PeopleView: View {
             }
             .padding(.vertical, 16)
             .listRowSeparator(.hidden)
-        } else if people.profiles.isEmpty {
+        } else if people.profiles.isEmpty && knownProfiles.isEmpty {
             ContentUnavailableView(
                 "No people yet",
                 systemImage: "person.crop.circle.badge.questionmark",
@@ -523,22 +593,26 @@ struct PeopleView: View {
             )
                 .padding(.vertical, 18)
                 .listRowSeparator(.hidden)
-        } else if filteredProfiles.isEmpty {
+        } else if filteredProfiles.isEmpty && filteredKnownProfiles.isEmpty {
             ContentUnavailableView("No matches", systemImage: "magnifyingglass")
                 .padding(.vertical, 18)
                 .listRowSeparator(.hidden)
         } else {
-            ForEach(filteredProfiles) { profile in
-                Button {
-                    selectFollow(profile)
-                } label: {
-                    NostrProfileRow(
-                        profile: profile,
-                        isChecking: checkingInviteProfileID == profile.id
-                    )
-                        .padding(.vertical, 6)
+            if !filteredProfiles.isEmpty {
+                Section("Nostr Follows") {
+                    ForEach(filteredProfiles) { profile in
+                        Button {
+                            selectFollow(profile)
+                        } label: {
+                            NostrProfileRow(
+                                profile: profile,
+                                isChecking: checkingInviteProfileID == profile.id
+                            )
+                            .padding(.vertical, 6)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-                .buttonStyle(.plain)
             }
         }
     }
@@ -575,13 +649,9 @@ struct PeopleView: View {
         showingLookupProfile = model.activeProfile != nil
     }
 
-    private func createRoom(named rawName: String) {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        model.roomDraft = name.isEmpty ? "New Chat" : name
-        model.createRoom()
-        if let room = model.selectedRoom {
-            openRoom(room)
-        }
+    @discardableResult
+    private func startChat(with profile: AppProfileSummary) -> Bool {
+        startProfileChat(profile)
     }
 }
 
@@ -772,7 +842,7 @@ private struct NostrFollowProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     let profile: NostrFollowProfile
     let onLookup: () -> Void
-    let onCreateRoom: () -> Void
+    let onStartChat: () -> Bool
 
     var body: some View {
         NavigationStack {
@@ -789,8 +859,9 @@ private struct NostrFollowProfileSheet: View {
 
                 Section {
                     Button {
-                        onCreateRoom()
-                        dismiss()
+                        if onStartChat() {
+                            dismiss()
+                        }
                     } label: {
                         Label("Message", systemImage: "bubble.left.and.bubble.right")
                     }
@@ -833,7 +904,7 @@ private struct NostrFollowProfileSheet: View {
 private struct AppProfileLookupSheet: View {
     @Environment(\.dismiss) private var dismiss
     let profile: AppProfileSummary
-    let onCreateRoom: () -> Void
+    let onStartChat: () -> Bool
     @State private var copiedField: String?
 
     var body: some View {
@@ -851,10 +922,11 @@ private struct AppProfileLookupSheet: View {
 
                 Section {
                     Button {
-                        onCreateRoom()
-                        dismiss()
+                        if onStartChat() {
+                            dismiss()
+                        }
                     } label: {
-                        Label("Create Chat Room", systemImage: "bubble.left.and.bubble.right")
+                        Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
                     }
                 }
 
@@ -992,6 +1064,35 @@ private struct NostrProfileRow: View {
         .saturation(isUnavailable ? 0 : 1)
         .contentShape(Rectangle())
         .accessibilityValue(isUnavailable ? "Invite unavailable" : "")
+    }
+}
+
+private struct KnownProfileRow: View {
+    let profile: AppProfileSummary
+
+    var body: some View {
+        HStack(spacing: 12) {
+            NostrAvatar(name: profile.displayName, pictureURL: profile.picture, size: 42)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(profile.displayName)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(profile.about ?? shortenedNpub(profile.npub))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(profile.stale ? "Cached profile" : "")
     }
 }
 

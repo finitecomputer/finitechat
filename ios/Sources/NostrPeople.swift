@@ -78,6 +78,17 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
             inviteAvailability: availability
         )
     }
+
+    var appProfileSummary: AppProfileSummary {
+        AppProfileSummary(
+            accountId: pubkey,
+            npub: npub,
+            displayName: displayName,
+            about: about,
+            picture: pictureURL,
+            stale: inviteAvailability == .unknown
+        )
+    }
 }
 
 struct NostrFollowFetchResult: Equatable, Sendable {
