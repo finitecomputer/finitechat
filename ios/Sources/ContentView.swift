@@ -522,7 +522,10 @@ private struct ChatPeoplePickerSheet: View {
             }
             .sheet(isPresented: $showingCameraScanner) {
                 QRCodeScannerSheet { value in
-                    addCode(value)
+                    addCode(
+                        value,
+                        startDirectChatIfPossible: existingRoom == nil && selectedProfiles.isEmpty
+                    )
                 }
             }
             .toolbar {
@@ -635,7 +638,10 @@ private struct ChatPeoplePickerSheet: View {
         }
     }
 
-    private func addCode(_ rawValue: String) {
+    private func addCode(
+        _ rawValue: String,
+        startDirectChatIfPossible: Bool = false
+    ) {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
@@ -649,29 +655,35 @@ private struct ChatPeoplePickerSheet: View {
                 parseError = "That person is already in this chat."
                 return
             }
-            addProfile(profileSummary(accountID: accountID, npub: npub))
+            let profile = profileSummary(accountID: accountID, npub: npub)
+            guard addProfile(profile) else { return }
             memberCode = ""
             parseError = nil
+            if startDirectChatIfPossible {
+                create()
+            }
         } catch {
             parseError = "That code is not a valid profile npub."
         }
     }
 
-    private func addProfile(_ profile: AppProfileSummary) {
+    @discardableResult
+    private func addProfile(_ profile: AppProfileSummary) -> Bool {
         guard profile.accountId != selfAccountID else {
             parseError = "That is your own profile code."
-            return
+            return false
         }
         guard !existingMemberAccountIDs.contains(profile.accountId) else {
             parseError = "That person is already in this chat."
-            return
+            return false
         }
         guard !selectedIDs.contains(profile.accountId) else {
             parseError = nil
-            return
+            return false
         }
         selectedProfiles.append(profile)
         parseError = nil
+        return true
     }
 
     private func removeProfile(_ profile: AppProfileSummary) {
