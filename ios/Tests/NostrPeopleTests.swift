@@ -374,6 +374,70 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(loaded?.profiles.map(\.inviteAvailability), [.unknown])
     }
 
+    func testPeopleCachePrefersNonEmptyLegacyCacheOverEmptyCurrentCache() async throws {
+        let owner = "555ae69c929b24dcd4e0057f052bf3c8f3a85f3fd84a2b8b4516fae5d0dff7d9"
+        let bob = "7bc70ce80a898cc4b3e17d0992fa17264df188e1c806b60ed54424e8b41f5686"
+        let carol = "7c765d407d3a9d5ea117cb8b8699628560787fc084a0c76afaa449bfbd121d84"
+        let serverURL = "https://chat.finite.computer"
+        let directory = temporaryCacheDirectory()
+        let cache = NostrPeopleCache(directory: directory)
+        try writePeopleCacheEnvelope(
+            directory: directory,
+            filename: "\(owner).json",
+            profiles: [],
+            relayCount: 13,
+            followedPubkeyCount: 0
+        )
+        try writePeopleCacheEnvelope(
+            directory: directory,
+            filename: legacyPeopleCacheFilename(accountID: owner, serverURL: serverURL),
+            profiles: [
+                sparsePeopleProfile(pubkey: bob, npub: try npubFromAccountId(accountId: bob)),
+                sparsePeopleProfile(pubkey: carol, npub: try npubFromAccountId(accountId: carol)),
+            ],
+            relayCount: 9,
+            followedPubkeyCount: 467
+        )
+
+        let loaded = await cache.load(accountID: owner, serverURL: serverURL)
+
+        XCTAssertEqual(loaded?.profiles.map(\.pubkey), [bob, carol])
+        XCTAssertEqual(loaded?.profiles.map(\.inviteAvailability), [.unknown, .unknown])
+        XCTAssertEqual(loaded?.followedPubkeyCount, 467)
+    }
+
+    func testPeopleCachePreserveNonEmptyResultConsidersLegacyCache() async throws {
+        let owner = "555ae69c929b24dcd4e0057f052bf3c8f3a85f3fd84a2b8b4516fae5d0dff7d9"
+        let bob = "7bc70ce80a898cc4b3e17d0992fa17264df188e1c806b60ed54424e8b41f5686"
+        let serverURL = "https://chat.finite.computer"
+        let directory = temporaryCacheDirectory()
+        let cache = NostrPeopleCache(directory: directory)
+        try writePeopleCacheEnvelope(
+            directory: directory,
+            filename: legacyPeopleCacheFilename(accountID: owner, serverURL: serverURL),
+            profiles: [
+                sparsePeopleProfile(pubkey: bob, npub: try npubFromAccountId(accountId: bob)),
+            ],
+            relayCount: 9,
+            followedPubkeyCount: 467
+        )
+
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [],
+                relayCount: 13,
+                followedPubkeyCount: 0
+            ),
+            accountID: owner,
+            serverURL: serverURL,
+            preserveNonEmptyOnEmptyResult: true
+        )
+        let loaded = await cache.load(accountID: owner, serverURL: serverURL)
+
+        XCTAssertEqual(loaded?.profiles.map(\.pubkey), [bob])
+        XCTAssertEqual(loaded?.followedPubkeyCount, 467)
+    }
+
     func testPeopleCachePreservesNonEmptyListWhenRefreshFindsNoFollows() async throws {
         let owner = String(repeating: "a", count: 64)
         let bob = String(repeating: "b", count: 64)
@@ -1340,6 +1404,49 @@ private func temporaryCacheDirectory(
         XCTFail("failed to create temp cache directory: \(error)", file: file, line: line)
     }
     return url
+}
+
+private func writePeopleCacheEnvelope(
+    directory: URL,
+    filename: String,
+    profiles: [[String: Any]],
+    relayCount: Int,
+    followedPubkeyCount: Int,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws {
+    let envelope: [String: Any] = [
+        "profiles": profiles,
+        "relayCount": relayCount,
+        "followedPubkeyCount": followedPubkeyCount,
+        "cachedAt": Date().timeIntervalSinceReferenceDate,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+    do {
+        try data.write(to: directory.appendingPathComponent(filename), options: [.atomic])
+    } catch {
+        XCTFail("failed to write people cache fixture: \(error)", file: file, line: line)
+        throw error
+    }
+}
+
+private func sparsePeopleProfile(pubkey: String, npub: String) -> [String: Any] {
+    [
+        "pubkey": pubkey,
+        "npub": npub,
+        "inviteAvailability": InviteAvailability.unknown.rawValue,
+    ]
+}
+
+private func legacyPeopleCacheFilename(accountID: String, serverURL: String) -> String {
+    let accountKey = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let serverKey = serverURL
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .utf8
+        .map { String(format: "%02x", $0) }
+        .joined()
+    return "\(accountKey)-\(serverKey).json"
 }
 
 private actor InviteAvailabilityChunkRecorder {

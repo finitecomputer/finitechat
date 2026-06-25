@@ -170,14 +170,17 @@ actor NostrPeopleCache: Sendable {
 
     func load(accountID: String, serverURL: String) -> NostrFollowFetchResult? {
         let metadata = loadProfileMetadata()
-        for url in [
-            cacheURL(accountID: accountID),
-            legacyCacheURL(accountID: accountID, serverURL: serverURL),
-        ] {
+        var firstResult: NostrFollowFetchResult?
+        for url in cacheURLs(accountID: accountID, serverURL: serverURL) {
             guard let result = load(from: url) else { continue }
-            return enrich(result, metadata: metadata)
+            if firstResult == nil {
+                firstResult = result
+            }
+            if !result.profiles.isEmpty {
+                return enrich(result, metadata: metadata)
+            }
         }
-        return nil
+        return firstResult.map { enrich($0, metadata: metadata) }
     }
 
     func enrich(_ result: NostrFollowFetchResult) -> NostrFollowFetchResult {
@@ -197,8 +200,7 @@ actor NostrPeopleCache: Sendable {
             )
             if preserveNonEmptyOnEmptyResult,
                result.profiles.isEmpty,
-               let existing = load(from: cacheURL(accountID: accountID)),
-               !existing.profiles.isEmpty
+               hasNonEmptyCachedProfiles(accountID: accountID, serverURL: serverURL)
             {
                 return
             }
@@ -230,6 +232,13 @@ actor NostrPeopleCache: Sendable {
             relayCount: envelope.relayCount,
             followedPubkeyCount: envelope.followedPubkeyCount
         )
+    }
+
+    private func hasNonEmptyCachedProfiles(accountID: String, serverURL: String) -> Bool {
+        cacheURLs(accountID: accountID, serverURL: serverURL).contains { url in
+            guard let existing = load(from: url) else { return false }
+            return !existing.profiles.isEmpty
+        }
     }
 
     private func enrich(
@@ -309,6 +318,13 @@ actor NostrPeopleCache: Sendable {
 
     private func cacheURL(accountID: String) -> URL {
         directory.appendingPathComponent("\(accountCacheKey(accountID)).json")
+    }
+
+    private func cacheURLs(accountID: String, serverURL: String) -> [URL] {
+        [
+            cacheURL(accountID: accountID),
+            legacyCacheURL(accountID: accountID, serverURL: serverURL),
+        ]
     }
 
     private func profileMetadataURL() -> URL {
