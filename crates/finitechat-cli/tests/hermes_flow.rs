@@ -80,6 +80,25 @@ fn hermes_ack(home_arg: &str, event: &Value) -> Value {
     ])
 }
 
+fn hermes_send_text(home_arg: &str, room_id: &str, text: &str) -> Value {
+    hermes(&[
+        "hermes",
+        "--home",
+        home_arg,
+        "send",
+        "--request-json",
+        &json!({
+            "room_id": room_id,
+            "conversation_id": null,
+            "text": text,
+            "kind": "message",
+            "status": "complete",
+            "reply_to_message_id": null,
+        })
+        .to_string(),
+    ])
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -228,6 +247,98 @@ fn hermes_serve_reports_process_health() {
     assert_eq!(recover["recovered"], 0);
     let home_channel = home_channel_result.expect("Hermes service handled home-channel action");
     assert_eq!(home_channel["home_channel"], Value::Null);
+}
+
+#[test]
+fn hermes_cli_app_syncs_second_message_after_read_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_url = spawn_live_http_server(&dir.path().join("server.sqlite3"));
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+    let app_dir = dir.path().join("app");
+
+    hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+        "--device-id",
+        "agent",
+    ]);
+    let invite = hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "invite",
+        "--room-name",
+        "Hermes CLI Receipt Followup",
+        "--max-joins",
+        "1",
+        "--json",
+    ]);
+    let room_id = invite["room_id"].as_str().unwrap().to_owned();
+    let app = FiniteChatRuntime::open(OpenOptions {
+        data_dir: app_dir.to_string_lossy().into_owned(),
+        server_url: server_url.clone(),
+        device_id: "ios-smoke".to_owned(),
+        account_secret_hex: None,
+        now_unix_seconds: None,
+    })
+    .unwrap();
+
+    app.dispatch(AppAction::ScanTarget {
+        value: invite["url"].as_str().unwrap().to_owned(),
+    })
+    .unwrap();
+    app.dispatch(AppAction::SubmitInvitePin {
+        pending_room_id: room_id.clone(),
+        pin: invite["pin"].as_str().unwrap().to_owned(),
+    })
+    .unwrap();
+    let admitted = hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":0}"#,
+    ]);
+    assert_eq!(admitted["joined"].as_array().unwrap().len(), 1);
+    app.dispatch(AppAction::StartRuntime).unwrap();
+
+    hermes_send_text(&home_arg, &room_id, "first agent message");
+    let first_sync = app.dispatch(AppAction::StartRuntime).unwrap();
+    assert!(
+        first_sync
+            .messages
+            .iter()
+            .any(|message| message.text == "first agent message")
+    );
+    app.dispatch(AppAction::MarkRoomRead {
+        room_id: room_id.clone(),
+    })
+    .unwrap();
+    hermes_send_text(&home_arg, &room_id, "second agent message");
+    drop(app);
+
+    let reopened = FiniteChatRuntime::open(OpenOptions {
+        data_dir: app_dir.to_string_lossy().into_owned(),
+        server_url,
+        device_id: "ios-smoke".to_owned(),
+        account_secret_hex: None,
+        now_unix_seconds: None,
+    })
+    .unwrap();
+    let final_state = reopened.dispatch(AppAction::StartRuntime).unwrap();
+    assert!(
+        final_state
+            .messages
+            .iter()
+            .any(|message| message.text == "second agent message"),
+        "app should decrypt the second Hermes CLI message after sending a read receipt"
+    );
 }
 
 fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {

@@ -10416,6 +10416,93 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_syncs_second_hermes_message_after_read_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let room_id = "room-hermes-receipt-followup".to_owned();
+        let app_dir = dir.path().join("app");
+        let agent = FiniteChatCore::open(OpenOptions {
+            data_dir: dir.path().join("agent").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "agent".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: app_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "ios-smoke".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        agent
+            .bootstrap_room(room_id.clone(), Some("Hermes Receipt Followup".to_owned()))
+            .unwrap();
+        let invite = agent
+            .create_invite(room_id.clone(), Some("Hermes Receipt Followup".to_owned()))
+            .unwrap();
+        app.dispatch(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        app.dispatch(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+        agent
+            .accept_invite_joins(invite.invite_url.clone())
+            .unwrap();
+        app.dispatch(AppAction::StartRuntime).unwrap();
+
+        agent
+            .state
+            .lock()
+            .unwrap()
+            .send_application_plaintext(&room_id, hermes_chat_event("first agent message"))
+            .unwrap();
+        let first_sync = app.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            first_sync
+                .messages
+                .iter()
+                .any(|message| message.text == "first agent message")
+        );
+        app.dispatch(AppAction::MarkRoomRead {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+        agent.sync().unwrap();
+        agent
+            .state
+            .lock()
+            .unwrap()
+            .send_application_plaintext(&room_id, hermes_chat_event("second agent message"))
+            .unwrap();
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: app_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "ios-smoke".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let final_state = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            final_state
+                .messages
+                .iter()
+                .any(|message| message.text == "second agent message"),
+            "app should decrypt the second Hermes message after sending a read receipt"
+        );
+    }
+
+    #[test]
     fn app_runtime_unread_counts_are_local_durable_and_offline_clearable() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -10892,6 +10979,24 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect()
+    }
+
+    fn hermes_chat_event(text: &str) -> Vec<u8> {
+        let payload = HermesMessagePayloadV1 {
+            payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: None,
+            text: text.to_owned(),
+            kind: finitechat_hermes::HermesSendKindV1::Message,
+            status: finitechat_hermes::HermesMessageStatusV1::Complete,
+            edit_of: None,
+            attachments: Vec::new(),
+            reply_to_message_id: None,
+            sender_name: None,
+            metadata: Default::default(),
+        }
+        .encode()
+        .unwrap();
+        encode_application_event(DurableAppEventKind::ChatMessage, None, &payload).unwrap()
     }
 
     fn app_room<'a>(state: &'a AppState, room_id: &str) -> &'a AppRoomSummary {
