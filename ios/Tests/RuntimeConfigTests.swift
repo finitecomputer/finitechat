@@ -2795,6 +2795,63 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
+    func testScannedNprofileCodeBuildsDirectChatTargetWithoutLookup() throws {
+        let bobAccountID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        let bobNpub = try npubFromAccountId(accountId: bobAccountID)
+        let bobNprofile = "nprofile1qqsqzg69v7y6hn00qy352euf40x77qfrg4ncn27dauqjx3t83x4ummcs22eux"
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startProfileChat(let accountId, let displayName) = action {
+                XCTAssertEqual(accountId, bobAccountID)
+                state.rooms = [
+                    AppRoomSummary(
+                        roomId: "room-bob",
+                        displayName: displayName,
+                        state: .connected,
+                        status: "connected",
+                        userStatusText: "Connected",
+                        lastMessagePreview: "",
+                        unreadCount: 0,
+                        canLoadOlder: false
+                    ),
+                ]
+                state.selectedRoomId = "room-bob"
+                state.status = "chat created"
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        let profile = try profileSummaryFromScannedProfileCode("nostr:\(bobNprofile)", model: model)
+
+        XCTAssertEqual(profile.accountId, bobAccountID)
+        XCTAssertEqual(profile.npub, bobNpub)
+        XCTAssertEqual(profile.displayName, shortenedDisplayNpub(bobNpub))
+        XCTAssertTrue(model.startProfileChat(for: profile))
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .startProfileChat(
+                    accountId: bobAccountID,
+                    displayName: "Chat with \(profile.displayName)"
+                ),
+            ]
+        )
+    }
+
+    @MainActor
     func testScannedProfileUrlBuildsDirectChatTargetWithoutLookup() throws {
         let bob = try createNostrIdentity()
         let model = AppModel(
@@ -2819,6 +2876,36 @@ final class AppModelPersistenceTests: XCTestCase {
 
         XCTAssertEqual(profile.accountId, bob.accountId)
         XCTAssertEqual(profile.npub, bob.npub)
+        XCTAssertTrue(profile.stale)
+    }
+
+    @MainActor
+    func testScannedProfileUrlNprofileBuildsDirectChatTargetWithoutLookup() throws {
+        let bobAccountID = "2222222222222222222222222222222222222222222222222222222222222222"
+        let bobNpub = try npubFromAccountId(accountId: bobAccountID)
+        let bobNprofile = "nprofile1qqszyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygsmjs029"
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in
+            FakeFiniteChatRuntime(
+                initialState: self.emptyChatState(),
+                startRuntimeState: self.emptyChatState()
+            )
+        }
+
+        model.start()
+
+        let profile = try profileSummaryFromScannedProfileCode(
+            "https://finite.computer/profile?nprofile=\(bobNprofile)",
+            model: model
+        )
+
+        XCTAssertEqual(profile.accountId, bobAccountID)
+        XCTAssertEqual(profile.npub, bobNpub)
         XCTAssertTrue(profile.stale)
     }
 

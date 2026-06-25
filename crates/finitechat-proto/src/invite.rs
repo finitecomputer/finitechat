@@ -19,6 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const INVITE_URL_SCHEME: &str = "finite";
 pub const INVITE_URL_PREFIX: &str = "finite://join?";
 pub const NOSTR_NPUB_HRP: &str = "npub";
+pub const NOSTR_NPROFILE_HRP: &str = "nprofile";
 pub const NOSTR_NSEC_HRP: &str = "nsec";
 /// Accept proofs computed in nearby PIN windows to absorb clock skew and the
 /// human copy/paste delay in local/manual invite flows.
@@ -304,6 +305,37 @@ pub fn npub_decode(npub: &str) -> Result<String, String> {
     Ok(hex_lower(&bytes))
 }
 
+/// Decode a NIP-19 nprofile back to the embedded 64-hex account id.
+pub fn nprofile_decode(nprofile: &str) -> Result<String, String> {
+    let (hrp, bytes) = bech32::decode(nprofile).map_err(|error| error.to_string())?;
+    if hrp.as_str() != NOSTR_NPROFILE_HRP {
+        return Err(format!("expected {NOSTR_NPROFILE_HRP}, got {hrp}"));
+    }
+
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if offset + 2 > bytes.len() {
+            return Err("nprofile contains truncated TLV header".to_owned());
+        }
+        let tag = bytes[offset];
+        let length = bytes[offset + 1] as usize;
+        offset += 2;
+        if offset + length > bytes.len() {
+            return Err("nprofile contains truncated TLV value".to_owned());
+        }
+        let value = &bytes[offset..offset + length];
+        offset += length;
+        if tag == 0 {
+            if value.len() != 32 {
+                return Err("nprofile pubkey TLV must be 32 bytes".to_owned());
+            }
+            return Ok(hex_lower(value));
+        }
+    }
+
+    Err("nprofile is missing pubkey TLV".to_owned())
+}
+
 /// NIP-19 nsec display form of a 32-byte account secret.
 pub fn nsec_encode(secret_hex: &str) -> Result<String, String> {
     let bytes = decode_hex(secret_hex)?;
@@ -523,6 +555,38 @@ mod tests {
         assert!(npub.starts_with("npub1"));
         assert_eq!(npub_decode(&npub).expect("decode"), hex);
         assert!(npub_decode("nsec1qqqq").is_err());
+    }
+
+    #[test]
+    fn nprofile_decodes_pubkey_tlv() {
+        let hex = account_hex();
+        let mut payload = vec![0, 32];
+        payload.extend(decode_hex(&hex).expect("hex"));
+        let nprofile = bech32::encode::<bech32::Bech32>(
+            bech32::Hrp::parse(NOSTR_NPROFILE_HRP).expect("hrp"),
+            &payload,
+        )
+        .expect("encode");
+
+        assert!(nprofile.starts_with("nprofile1"));
+        assert_eq!(nprofile_decode(&nprofile).expect("decode"), hex);
+    }
+
+    #[test]
+    fn nprofile_skips_relay_tlv_before_pubkey() {
+        let hex = account_hex();
+        let relay = b"wss://relay.example";
+        let mut payload = vec![1, relay.len() as u8];
+        payload.extend(relay);
+        payload.extend([0, 32]);
+        payload.extend(decode_hex(&hex).expect("hex"));
+        let nprofile = bech32::encode::<bech32::Bech32>(
+            bech32::Hrp::parse(NOSTR_NPROFILE_HRP).expect("hrp"),
+            &payload,
+        )
+        .expect("encode");
+
+        assert_eq!(nprofile_decode(&nprofile).expect("decode"), hex);
     }
 
     #[test]

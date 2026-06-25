@@ -39,7 +39,8 @@ use finitechat_proto::{
     FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, INVITE_URL_PREFIX, InviteCodeV1,
     ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES,
     MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1, invite_current_pin,
-    npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
+    nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
+    validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -683,28 +684,42 @@ pub fn npub_from_account_id(account_id: String) -> Result<String, FiniteChatCore
 pub fn account_id_from_npub(npub: String) -> Result<String, FiniteChatCoreError> {
     let trimmed = npub.trim();
     let normalized = strip_ascii_prefix(trimmed, "nostr:").unwrap_or(trimmed);
-    npub_decode(normalized).map_err(invite_error)
+    profile_account_id_from_nip19(normalized).map_err(invite_error)
 }
 
-fn explicit_profile_npub(value: &str) -> Option<String> {
+fn profile_account_id_from_nip19(value: &str) -> Result<String, String> {
+    if starts_with_ascii_case_insensitive(value, "npub1") {
+        return npub_decode(value);
+    }
+    if starts_with_ascii_case_insensitive(value, "nprofile1") {
+        return nprofile_decode(value);
+    }
+    npub_decode(value)
+}
+
+fn explicit_profile_account_id(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if starts_with_ascii_case_insensitive(trimmed, "npub1") {
-        return Some(trimmed.to_owned());
+    if starts_with_ascii_case_insensitive(trimmed, "npub1")
+        || starts_with_ascii_case_insensitive(trimmed, "nprofile1")
+    {
+        return profile_account_id_from_nip19(trimmed).ok();
     }
     strip_ascii_prefix(trimmed, "nostr:").and_then(|rest| {
-        if starts_with_ascii_case_insensitive(rest, "npub1") {
-            Some(rest.to_owned())
+        if starts_with_ascii_case_insensitive(rest, "npub1")
+            || starts_with_ascii_case_insensitive(rest, "nprofile1")
+        {
+            profile_account_id_from_nip19(rest).ok()
         } else {
             None
         }
     })
 }
 
-fn embedded_profile_npub(value: &str) -> Option<String> {
-    profile_npub_query_value(value).or_else(|| first_embedded_profile_npub(value))
+fn embedded_profile_account_id(value: &str) -> Option<String> {
+    profile_account_id_query_value(value).or_else(|| first_embedded_profile_account_id(value))
 }
 
-fn profile_npub_query_value(value: &str) -> Option<String> {
+fn profile_account_id_query_value(value: &str) -> Option<String> {
     let (_, query_and_fragment) = value.split_once('?')?;
     let query = query_and_fragment
         .split_once('#')
@@ -714,23 +729,30 @@ fn profile_npub_query_value(value: &str) -> Option<String> {
         let Some((key, raw_value)) = pair.split_once('=') else {
             continue;
         };
-        if !key.eq_ignore_ascii_case("npub") {
+        if !key.eq_ignore_ascii_case("npub") && !key.eq_ignore_ascii_case("nprofile") {
             continue;
         }
-        if let Some(npub) = explicit_profile_npub(raw_value) {
-            return Some(take_profile_npub_candidate(&npub).to_owned());
+        let candidate = take_profile_bech32_candidate(raw_value);
+        if let Some(account_id) = explicit_profile_account_id(candidate) {
+            return Some(account_id);
         }
     }
     None
 }
 
-fn first_embedded_profile_npub(value: &str) -> Option<String> {
+fn first_embedded_profile_account_id(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
-    let start = lower.find("npub1")?;
-    Some(take_profile_npub_candidate(&value[start..]).to_owned())
+    let npub_start = lower.find("npub1");
+    let nprofile_start = lower.find("nprofile1");
+    let start = match (npub_start, nprofile_start) {
+        (Some(left), Some(right)) => left.min(right),
+        (Some(index), None) | (None, Some(index)) => index,
+        (None, None) => return None,
+    };
+    explicit_profile_account_id(take_profile_bech32_candidate(&value[start..]))
 }
 
-fn take_profile_npub_candidate(value: &str) -> &str {
+fn take_profile_bech32_candidate(value: &str) -> &str {
     let separators = ['"', '\'', '<', '>', '&', '#', '?', '/', '\\'];
     value
         .trim()
@@ -1882,15 +1904,15 @@ impl AppRuntimeState {
 
     fn scan_target(&mut self, value: String) -> Result<(), FiniteChatCoreError> {
         let trimmed = value.trim();
-        if let Some(npub) = explicit_profile_npub(trimmed) {
-            return self.scan_profile_npub(&npub);
+        if let Some(account_id) = explicit_profile_account_id(trimmed) {
+            return self.scan_profile_account_id(account_id);
         }
         let code = match parse_invite(trimmed) {
             Ok(code) => code,
             Err(invite_error) => {
                 if !starts_with_ascii_case_insensitive(trimmed, INVITE_URL_PREFIX) {
-                    if let Some(npub) = embedded_profile_npub(trimmed) {
-                        return self.scan_profile_npub(&npub);
+                    if let Some(account_id) = embedded_profile_account_id(trimmed) {
+                        return self.scan_profile_account_id(account_id);
                     }
                 }
                 return Err(invite_error);
@@ -1922,8 +1944,7 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn scan_profile_npub(&mut self, npub: &str) -> Result<(), FiniteChatCoreError> {
-        let account_id = npub_decode(npub).map_err(invite_error)?;
+    fn scan_profile_account_id(&mut self, account_id: String) -> Result<(), FiniteChatCoreError> {
         let found = match self.fetch_profiles(vec![account_id.clone()]) {
             Ok(found) => found,
             Err(error) => {
@@ -7104,6 +7125,53 @@ mod tests {
     }
 
     #[test]
+    fn app_scan_nprofile_loads_server_backed_profile_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let account_id =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+        let npub = npub_encode(&account_id).unwrap();
+        let nprofile = "nprofile1qqsqzg69v7y6hn00qy352euf40x77qfrg4ncn27dauqjx3t83x4ummcs22eux";
+        put_profile(
+            &server_url,
+            NostrProfileRecord {
+                account_id: account_id.clone(),
+                name: Some("alice".to_owned()),
+                display_name: Some("Alice Nprofile".to_owned()),
+                about: Some("nprofile cache test".to_owned()),
+                picture: None,
+                fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
+                expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
+            },
+        );
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let state = app
+            .dispatch(AppAction::ScanTarget {
+                value: format!("nostr:{nprofile}"),
+            })
+            .unwrap();
+
+        assert_eq!(state.status, "profile loaded");
+        assert_eq!(
+            state.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(state.profiles[0].account_id, account_id);
+        assert_eq!(state.profiles[0].npub, npub);
+        assert_eq!(state.profiles[0].display_name, "Alice Nprofile");
+        assert!(!state.profiles[0].stale);
+    }
+
+    #[test]
     fn app_scan_missing_npub_surfaces_stale_profile_placeholder() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
@@ -7195,6 +7263,51 @@ mod tests {
             Some(account_id.as_str())
         );
         assert_eq!(state.profiles[0].display_name, "Alice URL");
+        assert_eq!(state.profiles[0].npub, npub);
+    }
+
+    #[test]
+    fn app_scan_profile_url_query_nprofile_loads_server_backed_profile_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let account_id =
+            "2222222222222222222222222222222222222222222222222222222222222222".to_owned();
+        let npub = npub_encode(&account_id).unwrap();
+        let nprofile = "nprofile1qqszyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygsmjs029";
+        put_profile(
+            &server_url,
+            NostrProfileRecord {
+                account_id: account_id.clone(),
+                name: Some("alice-url".to_owned()),
+                display_name: Some("Alice URL Nprofile".to_owned()),
+                about: None,
+                picture: None,
+                fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
+                expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
+            },
+        );
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let state = app
+            .dispatch(AppAction::ScanTarget {
+                value: format!("https://finite.computer/profile?nprofile={nprofile}&source=qr"),
+            })
+            .unwrap();
+
+        assert_eq!(state.status, "profile loaded");
+        assert_eq!(
+            state.active_profile_id.as_deref(),
+            Some(account_id.as_str())
+        );
+        assert_eq!(state.profiles[0].display_name, "Alice URL Nprofile");
         assert_eq!(state.profiles[0].npub, npub);
     }
 

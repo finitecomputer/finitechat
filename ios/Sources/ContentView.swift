@@ -835,35 +835,63 @@ private func profileTarget(from value: String) throws -> ProfileCodeTarget {
 }
 
 func profileNpub(from value: String) throws -> String {
+    let identifier = try profileNip19Identifier(from: value)
+    if identifier.lowercased().hasPrefix("npub1") {
+        return identifier
+    }
+    let accountID = try accountIdFromNpub(npub: identifier)
+    return try npubFromAccountId(accountId: accountID)
+}
+
+private func profileNip19Identifier(from value: String) throws -> String {
     var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
     if candidate.lowercased().hasPrefix("nostr:") {
         candidate = String(candidate.dropFirst("nostr:".count))
     }
-    if candidate.lowercased().hasPrefix("npub1") {
+    if isNostrProfileIdentifier(candidate) {
         return candidate
     }
     if let components = URLComponents(string: candidate) {
         for item in components.queryItems ?? [] {
-            if item.name.lowercased() == "npub",
+            let itemName = item.name.lowercased()
+            if (itemName == "npub" || itemName == "nprofile"),
                let value = item.value,
-               value.lowercased().hasPrefix("npub1")
+               isNostrProfileIdentifier(value)
             {
                 return value
             }
         }
     }
-    guard let range = candidate.range(of: "npub1", options: [.caseInsensitive]) else {
+    guard let range = firstProfileIdentifierRange(in: candidate) else {
         throw NewGroupChatCodeError.missingNpub
     }
     let suffix = candidate[range.lowerBound...]
     let separators = CharacterSet.whitespacesAndNewlines
-        .union(CharacterSet(charactersIn: "\"'<>"))
-    let npub = suffix.prefix { character in
+        .union(CharacterSet(charactersIn: "\"'<>&#?/\\"))
+    let identifier = suffix.prefix { character in
         !character.unicodeScalars.contains { scalar in
             separators.contains(scalar)
         }
     }
-    return String(npub)
+    return String(identifier)
+}
+
+private func isNostrProfileIdentifier(_ value: String) -> Bool {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalized.hasPrefix("npub1") || normalized.hasPrefix("nprofile1")
+}
+
+private func firstProfileIdentifierRange(in value: String) -> Range<String.Index>? {
+    let npubRange = value.range(of: "npub1", options: [.caseInsensitive])
+    let nprofileRange = value.range(of: "nprofile1", options: [.caseInsensitive])
+    switch (npubRange, nprofileRange) {
+    case (.some(let left), .some(let right)):
+        return left.lowerBound < right.lowerBound ? left : right
+    case (.some(let range), .none), (.none, .some(let range)):
+        return range
+    case (.none, .none):
+        return nil
+    }
 }
 
 private func isHexAccountID(_ value: String) -> Bool {
