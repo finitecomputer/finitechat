@@ -166,6 +166,7 @@ struct ContentView: View {
                 RoomThreadView(model: model, people: people, roomID: roomID) {
                     sheet = .invite
                 }
+                .toolbar(.hidden, for: .tabBar)
             }
         }
     }
@@ -1264,6 +1265,7 @@ private struct RoomThreadView: View {
     @State private var showRoomDetails = false
     @State private var showRoomOptions = false
     @State private var showAddPeople = false
+    @State private var composerText = ""
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
@@ -1467,6 +1469,9 @@ private struct RoomThreadView: View {
                 model.openRoom(room)
             }
         }
+        .onChange(of: latestMessageID) { _, _ in
+            markRoomReadIfNeeded()
+        }
         .fileImporter(
             isPresented: $importingAttachment,
             allowedContentTypes: [.item],
@@ -1511,7 +1516,7 @@ private struct RoomThreadView: View {
         .onChange(of: selectedPhotoItems) { _, items in
             stagePhotoItems(items)
         }
-        .onChange(of: model.outboundText) { _, text in
+        .onChange(of: composerText) { _, text in
             updateTypingIntent(text)
         }
     }
@@ -1629,12 +1634,16 @@ private struct RoomThreadView: View {
             .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             Composer(
-                model: model,
+                text: $composerText,
                 replyTarget: replyDraftMessage,
+                canSubmit: model.canSend(roomID: roomID, text: composerText),
                 stagedAttachments: $stagedAttachments,
                 isPhotoPickerPresented: $showPhotoPicker,
                 selectedPhotoItems: $selectedPhotoItems,
                 isInputFocused: $composerFocused,
+                reportError: { message in
+                    model.errorText = message
+                },
                 onCancelReply: {
                     replyDraftMessage = nil
                 },
@@ -1729,9 +1738,15 @@ private struct RoomThreadView: View {
         model.setTyping(roomID: roomID, isTyping: isTyping)
     }
 
+    private func markRoomReadIfNeeded() {
+        guard let room, room.unreadCount > 0 else { return }
+        model.markRoomRead(room)
+    }
+
     private func sendComposerDraft() {
         if stagedAttachments.isEmpty {
-            if model.send(roomID: roomID, replyTo: replyDraftMessage) {
+            if model.send(roomID: roomID, text: composerText, replyTo: replyDraftMessage) {
+                composerText = ""
                 model.setTyping(roomID: roomID, isTyping: false)
                 replyDraftMessage = nil
             }
@@ -1739,7 +1754,13 @@ private struct RoomThreadView: View {
         }
 
         let outbound = stagedAttachments.map(\.outboundAttachment)
-        model.sendAttachments(roomID: roomID, attachments: outbound, replyTo: replyDraftMessage) {
+        model.sendAttachments(
+            roomID: roomID,
+            attachments: outbound,
+            replyTo: replyDraftMessage,
+            captionOverride: composerText
+        ) {
+            composerText = ""
             model.setTyping(roomID: roomID, isTyping: false)
             stagedAttachments = []
             selectedPhotoItems = []

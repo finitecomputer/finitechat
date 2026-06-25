@@ -8,13 +8,13 @@ enum MessageCollectionUpdateKind: Equatable {
 
 enum MessageCollectionLayout {
     static let jumpButtonSpacing: CGFloat = 12
-    static let bottomContentSpacing: CGFloat = 12
+    static let bottomContentSpacing: CGFloat = 4
 
     static func bottomViewportInset(
         keyboardInset: CGFloat,
         accessoryHeight: CGFloat
     ) -> CGFloat {
-        max(0, keyboardInset) + max(0, accessoryHeight)
+        max(max(0, keyboardInset), max(0, accessoryHeight))
     }
 
     static func shouldPinToBottom(
@@ -23,6 +23,24 @@ enum MessageCollectionLayout {
         isHoldingInitialBottomPin: Bool
     ) -> Bool {
         isNearBottom || followsBottom || isHoldingInitialBottomPin
+    }
+
+    static func nextFollowsBottom(
+        current: Bool,
+        isNearBottom: Bool,
+        isUserScrolling: Bool
+    ) -> Bool {
+        if isNearBottom {
+            return true
+        }
+        if isUserScrolling {
+            return false
+        }
+        return current
+    }
+
+    static func shouldShowJumpButton(isNearBottom: Bool, followsBottom: Bool) -> Bool {
+        !isNearBottom && !followsBottom
     }
 
     static func effectiveContentInset(

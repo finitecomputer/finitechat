@@ -5,12 +5,14 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct Composer: View {
-    @ObservedObject var model: AppModel
+    @Binding var text: String
     let replyTarget: ChatMessage?
+    let canSubmit: Bool
     @Binding var stagedAttachments: [StagedComposerAttachment]
     @Binding var isPhotoPickerPresented: Bool
     @Binding var selectedPhotoItems: [PhotosPickerItem]
     @Binding var isInputFocused: Bool
+    let reportError: (String) -> Void
     let onCancelReply: () -> Void
     let onSend: () -> Void
     let onStartVoiceRecording: () -> Void
@@ -18,7 +20,7 @@ struct Composer: View {
     let onCreatePoll: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 8) {
             if let replyTarget {
                 ComposerReplyPreview(
                     message: replyTarget,
@@ -43,100 +45,118 @@ struct Composer: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            HStack(spacing: 10) {
-                Menu {
-                    Button {
-                        isPhotoPickerPresented = true
-                    } label: {
-                        Label("Photos & Videos", systemImage: "photo.on.rectangle")
+            VStack(alignment: .leading, spacing: 10) {
+                ZStack(alignment: .topLeading) {
+                    if text.isEmpty {
+                        Text("Message")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
                     }
 
-                    Button {
-                        onAttach()
-                    } label: {
-                        Label("Files", systemImage: "doc")
-                    }
-
-                    Button {
-                        onCreatePoll()
-                    } label: {
-                        Label("Poll", systemImage: "chart.bar.doc.horizontal")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.title3)
-                        .frame(width: 30, height: 30)
-                }
-                .accessibilityLabel("Attach")
-                .accessibilityIdentifier("AttachButton")
-                .photosPicker(
-                    isPresented: $isPhotoPickerPresented,
-                    selection: $selectedPhotoItems,
-                    maxSelectionCount: remainingPhotoSelectionCount,
-                    matching: .any(of: [.images, .videos])
-                )
-
-                StickerAwareTextView(
-                    text: $model.outboundText,
-                    isFocused: $isInputFocused,
-                    maxHeight: 150,
-                    onSend: onSend,
-                    onImagePaste: stagePastedAttachment
-                )
-                    .frame(minHeight: 36)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(alignment: .topLeading) {
-                        if model.outboundText.isEmpty {
-                            Text("Message")
-                                .foregroundStyle(.tertiary)
-                                .padding(.leading, 13)
-                                .padding(.top, 10)
-                                .allowsHitTesting(false)
-                                .accessibilityHidden(true)
-                        }
-                    }
+                    StickerAwareTextView(
+                        text: $text,
+                        isFocused: $isInputFocused,
+                        maxHeight: 150,
+                        onSend: onSend,
+                        onImagePaste: stagePastedAttachment
+                    )
+                    .frame(minHeight: 52)
                     .accessibilityLabel("Message")
                     .accessibilityIdentifier("ComposerMessageField")
-
-                if showsVoiceButton {
-                    Button {
-                        onStartVoiceRecording()
-                    } label: {
-                        Image(systemName: "mic.fill")
-                            .font(.title2)
-                    }
-                    .accessibilityLabel("Record voice message")
-                    .accessibilityIdentifier("VoiceRecordButton")
-                    .transition(.scale.combined(with: .opacity))
-                } else {
-                    Button {
-                        onSend()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                    }
-                    .disabled(sendDisabled)
-                    .accessibilityLabel("Send")
-                    .accessibilityIdentifier("SendButton")
-                    .transition(.scale.combined(with: .opacity))
                 }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+
+                HStack(spacing: 12) {
+                    Menu {
+                        Button {
+                            isPhotoPickerPresented = true
+                        } label: {
+                            Label("Photos & Videos", systemImage: "photo.on.rectangle")
+                        }
+
+                        Button {
+                            onAttach()
+                        } label: {
+                            Label("Files", systemImage: "doc")
+                        }
+
+                        Button {
+                            onCreatePoll()
+                        } label: {
+                            Label("Poll", systemImage: "chart.bar.doc.horizontal")
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.title3.weight(.regular))
+                            .frame(width: 34, height: 34)
+                            .contentShape(Circle())
+                    }
+                    .accessibilityLabel("Attach")
+                    .accessibilityIdentifier("AttachButton")
+                    .photosPicker(
+                        isPresented: $isPhotoPickerPresented,
+                        selection: $selectedPhotoItems,
+                        maxSelectionCount: remainingPhotoSelectionCount,
+                        matching: .any(of: [.images, .videos])
+                    )
+
+                    Spacer()
+
+                    if stagedAttachments.isEmpty {
+                        Button {
+                            onStartVoiceRecording()
+                        } label: {
+                            Image(systemName: "mic")
+                                .font(.title3.weight(.regular))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .accessibilityLabel("Record voice message")
+                        .accessibilityIdentifier("VoiceRecordButton")
+                    }
+
+                    if showsSendButton {
+                        Button {
+                            onSend()
+                        } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.body.weight(.bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 34, height: 34)
+                                .background(Circle().fill(Color.accentColor))
+                        }
+                        .disabled(sendDisabled)
+                        .accessibilityLabel("Send")
+                        .accessibilityIdentifier("SendButton")
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 10)
             }
-            .padding()
+            .frame(maxWidth: .infinity, minHeight: 92, alignment: .topLeading)
+            .modifier(ChatComposerSurface())
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
         .background(.bar)
         .animation(.easeInOut(duration: 0.16), value: stagedAttachments.isEmpty)
-        .animation(.easeInOut(duration: 0.15), value: showsVoiceButton)
+        .animation(.snappy(duration: 0.18), value: showsSendButton)
     }
 
     private var sendDisabled: Bool {
-        stagedAttachments.isEmpty && !model.canSend
+        stagedAttachments.isEmpty && !canSubmit
     }
 
-    private var showsVoiceButton: Bool {
-        stagedAttachments.isEmpty
-            && model.outboundText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private var showsSendButton: Bool {
+        !stagedAttachments.isEmpty || canSubmit
     }
 
     private var remainingPhotoSelectionCount: Int {
@@ -145,7 +165,7 @@ struct Composer: View {
 
     private func stagePastedAttachment(data: Data, mimeType: String) {
         guard stagedAttachments.count < maxStagedComposerAttachments else {
-            model.errorText = "Attachment limit is \(maxStagedComposerAttachments) files."
+            reportError("Attachment limit is \(maxStagedComposerAttachments) files.")
             return
         }
 
@@ -158,7 +178,27 @@ struct Composer: View {
                 stagedAttachments.append(attachment)
             }
         } catch {
-            model.errorText = String(describing: error)
+            reportError(String(describing: error))
+        }
+    }
+}
+
+private struct ChatComposerSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 28))
+        } else {
+            content
+                .background(
+                    .ultraThinMaterial,
+                    in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .strokeBorder(Color(.separator).opacity(0.18), lineWidth: 0.5)
+                }
+                .shadow(color: .black.opacity(0.08), radius: 18, x: 0, y: 8)
         }
     }
 }

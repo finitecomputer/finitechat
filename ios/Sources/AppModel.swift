@@ -687,8 +687,12 @@ final class AppModel: ObservableObject {
 
     var canSend: Bool {
         guard let selectedRoom else { return false }
-        return selectedRoom.state == .connected
-            && !outboundText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return canSend(roomID: selectedRoom.roomId, text: outboundText)
+    }
+
+    func canSend(roomID: String, text: String) -> Bool {
+        roomAllowsComposition(roomID)
+            && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func roomAllowsComposition(_ roomID: String) -> Bool {
@@ -851,7 +855,8 @@ final class AppModel: ObservableObject {
     }
 
     func openRoom(_ room: AppRoomSummary) {
-        dispatch(.openRoom(roomId: room.roomId))
+        guard dispatch(.openRoom(roomId: room.roomId)) else { return }
+        dispatch(.markRoomRead(roomId: room.roomId))
     }
 
     func projection(for roomID: String) -> ChatRoomProjection {
@@ -1029,8 +1034,17 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func send(roomID: String, replyTo message: ChatMessage? = nil) -> Bool {
+        let sent = send(roomID: roomID, text: outboundText, replyTo: message)
+        if sent {
+            outboundText = ""
+        }
+        return sent
+    }
+
+    @discardableResult
+    func send(roomID: String, text rawText: String, replyTo message: ChatMessage? = nil) -> Bool {
         guard roomAllowsComposition(roomID) else { return false }
-        let text = outboundText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
         let action: AppAction
         if let message {
@@ -1044,7 +1058,6 @@ final class AppModel: ObservableObject {
         }
         let sent = dispatch(action)
         if sent {
-            outboundText = ""
             schedulePostSendCatchUp()
         }
         return sent

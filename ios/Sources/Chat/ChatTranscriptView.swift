@@ -489,10 +489,26 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
                 return
             }
 
-            viewController?.setJumpButtonVisible(!nearBottom, animated: true)
-            if nearBottom != parent.followsBottom {
+            let isUserScrolling = [
+                scrollView.isDragging,
+                scrollView.isDecelerating,
+                scrollView.isTracking,
+            ].contains(true)
+            let nextFollowsBottom = MessageCollectionLayout.nextFollowsBottom(
+                current: parent.followsBottom,
+                isNearBottom: nearBottom,
+                isUserScrolling: isUserScrolling
+            )
+            viewController?.setJumpButtonVisible(
+                MessageCollectionLayout.shouldShowJumpButton(
+                    isNearBottom: nearBottom,
+                    followsBottom: nextFollowsBottom
+                ),
+                animated: true
+            )
+            if nextFollowsBottom != parent.followsBottom {
                 DispatchQueue.main.async {
-                    self.parent.followsBottom = nearBottom
+                    self.parent.followsBottom = nextFollowsBottom
                 }
             }
         }

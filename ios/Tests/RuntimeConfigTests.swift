@@ -1944,6 +1944,40 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send to the visible thread only")
     }
 
+    func testOpeningRoomMarksItRead() throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = savedChatState()
+        state.rooms[0].unreadCount = 1
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        let room = try XCTUnwrap(model.rooms.first)
+        model.openRoom(room)
+
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .openRoom(roomId: "room-main"),
+                .markRoomRead(roomId: "room-main"),
+            ]
+        )
+    }
+
     func testNoticeBarPresentationExposesStableAccessibilityOnlyWhenVisible() {
         let visible = NoticeBarPresentation(text: " Network problem ")
         XCTAssertEqual(visible.visibleText, "Network problem")
@@ -3788,17 +3822,17 @@ final class MessageCollectionLayoutTests: XCTestCase {
             bottomInset: 72
         )
 
-        XCTAssertEqual(inset.top, 292)
-        XCTAssertEqual(inset.bottom, 84)
+        XCTAssertEqual(inset.top, 300)
+        XCTAssertEqual(inset.bottom, 76)
     }
 
-    func testBottomViewportInsetIncludesKeyboardAndAccessory() {
+    func testBottomViewportInsetUsesOccupiedKeyboardOrAccessoryHeight() {
         XCTAssertEqual(
             MessageCollectionLayout.bottomViewportInset(
                 keyboardInset: 330,
                 accessoryHeight: 58
             ),
-            388
+            330
         )
         XCTAssertEqual(
             MessageCollectionLayout.bottomViewportInset(
@@ -3829,6 +3863,42 @@ final class MessageCollectionLayoutTests: XCTestCase {
                 isNearBottom: false,
                 followsBottom: false,
                 isHoldingInitialBottomPin: false
+            )
+        )
+    }
+
+    func testFollowsBottomOnlyTurnsOffForUserScroll() {
+        XCTAssertTrue(
+            MessageCollectionLayout.nextFollowsBottom(
+                current: true,
+                isNearBottom: false,
+                isUserScrolling: false
+            )
+        )
+        XCTAssertFalse(
+            MessageCollectionLayout.nextFollowsBottom(
+                current: true,
+                isNearBottom: false,
+                isUserScrolling: true
+            )
+        )
+        XCTAssertTrue(
+            MessageCollectionLayout.nextFollowsBottom(
+                current: false,
+                isNearBottom: true,
+                isUserScrolling: false
+            )
+        )
+        XCTAssertFalse(
+            MessageCollectionLayout.shouldShowJumpButton(
+                isNearBottom: false,
+                followsBottom: true
+            )
+        )
+        XCTAssertTrue(
+            MessageCollectionLayout.shouldShowJumpButton(
+                isNearBottom: false,
+                followsBottom: false
             )
         )
     }
