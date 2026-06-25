@@ -755,6 +755,17 @@ final class AppModel: ObservableObject {
         return room.state == .connected
     }
 
+    func startNewChat(named rawName: String, with profiles: [AppProfileSummary]) -> Bool {
+        let candidates = profiles.filter {
+            !$0.accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !candidates.isEmpty else { return false }
+        if candidates.count == 1, let profile = candidates.first {
+            return startProfileChat(for: profile)
+        }
+        return startGroupChat(named: rawName, with: candidates)
+    }
+
     func addMembers(to room: AppRoomSummary, profiles: [AppProfileSummary]) -> Bool {
         guard room.state == .connected else { return false }
         let accountIDs = profiles

@@ -450,6 +450,7 @@ struct NostrLoginView: View {
 struct PeopleView: View {
     @ObservedObject var model: AppModel
     let startProfileChat: (AppProfileSummary) -> Bool
+    let showNewChat: () -> Void
     let showScan: () -> Void
     let showSettings: () -> Void
 
@@ -501,6 +502,12 @@ struct PeopleView: View {
         .navigationTitle("People")
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(action: showNewChat) {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("New chat")
+                .accessibilityIdentifier("PeopleNewChatButton")
+
                 Button(action: showScan) {
                     Image(systemName: "qrcode.viewfinder")
                 }

@@ -2154,6 +2154,59 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
     }
 
+    @MainActor
+    func testStartNewChatWithOneProfileStartsDirectChatWithoutRoomName() throws {
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startProfileChat(_, let displayName) = action {
+                let room = AppRoomSummary(
+                    roomId: "room-bob",
+                    displayName: displayName,
+                    state: .connected,
+                    status: "connected",
+                    userStatusText: "Connected",
+                    lastMessagePreview: "",
+                    unreadCount: 0,
+                    canLoadOlder: false
+                )
+                state.rooms = [room]
+                state.selectedRoomId = room.roomId
+                state.status = "chat created"
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.startNewChat(named: "", with: [bob]))
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            ]
+        )
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
+    }
+
     func testStartGroupChatDispatchesBackedGroupAction() async throws {
         await MainActor.run {
             let bob = AppProfileSummary(
@@ -2208,6 +2261,71 @@ final class AppModelPersistenceTests: XCTestCase {
             model.start()
 
             XCTAssertTrue(model.startGroupChat(named: "Weekend plans", with: [bob, carol]))
+            XCTAssertEqual(
+                runtime.dispatchedActions,
+                [
+                    .startRuntime,
+                    .startGroupChat(
+                        accountIds: ["bob-account", "carol-account"],
+                        displayName: "Weekend plans"
+                    ),
+                ]
+            )
+            XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
+        }
+    }
+
+    func testStartNewChatWithMultipleProfilesStartsNamedGroup() async throws {
+        await MainActor.run {
+            let bob = AppProfileSummary(
+                accountId: "bob-account",
+                npub: "npub1bob",
+                displayName: "Bob",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let carol = AppProfileSummary(
+                accountId: "carol-account",
+                npub: "npub1carol",
+                displayName: "Carol",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let runtime = FakeFiniteChatRuntime(
+                initialState: emptyChatState(),
+                startRuntimeState: emptyChatState()
+            ) { action, currentState in
+                var state = currentState
+                if case .startGroupChat(_, let displayName) = action {
+                    let room = AppRoomSummary(
+                        roomId: "room-group",
+                        displayName: displayName,
+                        state: .connected,
+                        status: "connected",
+                        userStatusText: "Connected",
+                        lastMessagePreview: "",
+                        unreadCount: 0,
+                        canLoadOlder: false
+                    )
+                    state.rooms = [room]
+                    state.selectedRoomId = room.roomId
+                    state.status = "chat created"
+                }
+                return state
+            }
+            let model = AppModel(
+                config: RuntimeConfig(
+                    serverURL: "https://chat.finite.computer",
+                    deviceID: "alice-phone"
+                ),
+                startsUpdateLoop: false
+            ) { _ in runtime }
+
+            model.start()
+
+            XCTAssertTrue(model.startNewChat(named: "Weekend plans", with: [bob, carol]))
             XCTAssertEqual(
                 runtime.dispatchedActions,
                 [

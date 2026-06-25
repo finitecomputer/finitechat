@@ -6,12 +6,15 @@ import UIKit
 import UniformTypeIdentifiers
 
 private enum AppSheet: Identifiable {
+    case newChat
     case scan
     case invite
     case settings
 
     var id: String {
         switch self {
+        case .newChat:
+            "newChat"
         case .scan:
             "scan"
         case .invite:
@@ -40,6 +43,10 @@ struct ContentView: View {
         }
         .sheet(item: $sheet) { destination in
             switch destination {
+            case .newChat:
+                ChatPeoplePickerSheet(model: model, existingRoom: nil) { room in
+                    routeSelectedRoom(room.roomId)
+                }
             case .scan:
                 ScanSheet(model: model) { profile in
                     startChatFromScannedProfile(profile)
@@ -142,6 +149,9 @@ struct ContentView: View {
                 startProfileChat: { profile in
                     startChatFromScannedProfile(profile)
                 },
+                showNewChat: {
+                    sheet = .newChat
+                },
                 showScan: {
                     sheet = .scan
                 },
@@ -176,7 +186,7 @@ struct ContentView: View {
                     selectedTab = .chats
                 },
                 openPeople: {
-                    selectedTab = .people
+                    sheet = .newChat
                 },
                 openAgents: {
                     selectedTab = .agents
@@ -405,7 +415,7 @@ private struct ChatPeoplePickerSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                if existingRoom == nil {
+                if showsGroupNameField {
                     Section {
                         TextField("Room name", text: $roomName)
                             .focused($focused)
@@ -483,6 +493,16 @@ private struct ChatPeoplePickerSheet: View {
                             }
                         }
                     }
+
+                    Section {
+                        Button(action: create) {
+                            Label(primaryActionLabel, systemImage: primaryActionSystemImage)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(primaryActionDisabled)
+                        .accessibilityIdentifier("NewRoomPrimaryActionButton")
+                    }
                 }
 
                 peopleSection
@@ -512,7 +532,7 @@ private struct ChatPeoplePickerSheet: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(existingRoom == nil ? "Create" : "Add", action: create)
+                    Button(primaryActionTitle, action: create)
                         .disabled(primaryActionDisabled)
                         .accessibilityIdentifier("NewRoomCreateButton")
                 }
@@ -528,7 +548,38 @@ private struct ChatPeoplePickerSheet: View {
     }
 
     private var primaryActionDisabled: Bool {
-        selectedProfiles.isEmpty || (existingRoom == nil && trimmedName.isEmpty)
+        if selectedProfiles.isEmpty {
+            return true
+        }
+        if existingRoom != nil {
+            return false
+        }
+        return selectedProfiles.count > 1 && trimmedName.isEmpty
+    }
+
+    private var showsGroupNameField: Bool {
+        existingRoom == nil && selectedProfiles.count > 1
+    }
+
+    private var primaryActionTitle: String {
+        if existingRoom != nil {
+            return "Add"
+        }
+        return selectedProfiles.count > 1 ? "Create" : "Start"
+    }
+
+    private var primaryActionLabel: String {
+        if existingRoom != nil {
+            return "Add People"
+        }
+        return selectedProfiles.count > 1 ? "Create Group Chat" : "Start Chat"
+    }
+
+    private var primaryActionSystemImage: String {
+        if existingRoom != nil || selectedProfiles.count > 1 {
+            return "person.2.badge.plus"
+        }
+        return "bubble.left.and.bubble.right"
     }
 
     @ViewBuilder
@@ -653,9 +704,8 @@ private struct ChatPeoplePickerSheet: View {
         if let existingRoom {
             guard model.addMembers(to: existingRoom, profiles: selectedProfiles) else { return }
         } else {
-            guard !trimmedName.isEmpty else { return }
             let existingRoomIDs = Set(model.rooms.map(\.roomId))
-            guard model.startGroupChat(named: trimmedName, with: selectedProfiles) else { return }
+            guard model.startNewChat(named: trimmedName, with: selectedProfiles) else { return }
             if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
                 ?? model.selectedRoom
             {
