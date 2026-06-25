@@ -941,6 +941,7 @@ private struct RoomAvatar: View {
 private struct RoomOptionsSheet: View {
     @Environment(\.dismiss) private var dismiss
     let showAddPeople: () -> Void
+    let showInvite: () -> Void
     let showRoomDetails: () -> Void
     let showMediaGallery: () -> Void
 
@@ -956,6 +957,17 @@ private struct RoomOptionsSheet: View {
                             title: "Add people",
                             subtitle: nil,
                             systemImage: "person.badge.plus"
+                        )
+                    }
+
+                    Button {
+                        dismiss()
+                        showInvite()
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Invite",
+                            subtitle: nil,
+                            systemImage: "qrcode"
                         )
                     }
 
@@ -1138,6 +1150,15 @@ private struct RoomThreadView: View {
                     showRoomOptions = false
                     Task { @MainActor in
                         showAddPeople = true
+                    }
+                },
+                showInvite: {
+                    showRoomOptions = false
+                    Task { @MainActor in
+                        if let room {
+                            _ = model.createInvite(for: room)
+                            showInvite()
+                        }
                     }
                 },
                 showRoomDetails: {
