@@ -339,6 +339,47 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Cached Bob"])
     }
 
+    func testPeopleModelKeepsVisibleProfilesWhenRefreshFindsNoFollows() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let sequence = FollowRefreshSequence(owner: owner, followed: bob)
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                await sequence.events(for: filter)
+            }
+        )
+        let availabilityService = FiniteInviteAvailabilityService(
+            availabilityLoader: { _, accountIDs in
+                Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: availabilityService,
+            cache: NostrPeopleCache(directory: temporaryCacheDirectory())
+        )
+
+        await model.refresh(
+            identity: AppNostrIdentity(material: material),
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+
+        await model.refresh(
+            identity: AppNostrIdentity(material: material),
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+        XCTAssertEqual(model.statusText, "Showing cached people. Refresh found no follows across 1 Nostr relays.")
+    }
+
     func testPeopleModelCachesFetchedProfilesBeforeAvailabilityFinishes() async throws {
         let material = try createNostrIdentity()
         let owner = material.accountId
@@ -792,6 +833,45 @@ private actor InviteAvailabilityChunkRecorder {
 
     func recordedChunks() -> [[String]] {
         chunks
+    }
+}
+
+private actor FollowRefreshSequence {
+    private let owner: String
+    private let followed: String
+    private var contactListFetchCount = 0
+
+    init(owner: String, followed: String) {
+        self.owner = owner
+        self.followed = followed
+    }
+
+    func events(for filter: NostrRelayFilter) -> [NostrRelayEvent] {
+        if filter.kinds == [3] {
+            contactListFetchCount += 1
+            guard contactListFetchCount == 1 else { return [] }
+            return [
+                NostrRelayEvent(
+                    pubkey: owner,
+                    createdAt: 1_800_000_040,
+                    kind: 3,
+                    tags: [["p", followed]],
+                    content: ""
+                ),
+            ]
+        }
+        if filter.kinds == [0] {
+            return [
+                NostrRelayEvent(
+                    pubkey: followed,
+                    createdAt: 1_800_000_041,
+                    kind: 0,
+                    tags: [],
+                    content: #"{"display_name":"Fresh Bob"}"#
+                ),
+            ]
+        }
+        return []
     }
 }
 

@@ -258,6 +258,27 @@ final class NostrPeopleModel: ObservableObject {
         do {
             let result = try await service.fetchFollowProfiles(forAccountID: identity.accountID)
             guard isCurrent(identity: identity, serverURL: serverURL) else { return }
+            if result.profiles.isEmpty, !profiles.isEmpty {
+                await cache?.save(
+                    result,
+                    accountID: identity.accountID,
+                    serverURL: serverURL,
+                    preserveNonEmptyOnEmptyResult: true
+                )
+                await refreshInviteAvailability(serverURL: serverURL)
+                await cache?.save(
+                    NostrFollowFetchResult(
+                        profiles: profiles,
+                        relayCount: result.relayCount,
+                        followedPubkeyCount: max(result.followedPubkeyCount, profiles.count)
+                    ),
+                    accountID: identity.accountID,
+                    serverURL: serverURL,
+                    preserveNonEmptyOnEmptyResult: true
+                )
+                statusText = "Showing cached people. Refresh found no follows across \(result.relayCount) Nostr relays."
+                return
+            }
             profiles = result.profiles
             await cache?.save(
                 result,
