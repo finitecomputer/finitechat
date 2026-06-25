@@ -56,6 +56,8 @@ struct ContentView: View {
                 MyNostrProfileSheet(
                     identity: model.nostrIdentity,
                     myNpub: model.myNpub,
+                    accountID: model.activeAccountID,
+                    serverURL: model.serverURL,
                     showsSecretKey: false
                 )
             case .scan:
@@ -2563,9 +2565,12 @@ private struct SettingsSheet: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
+                            Spacer(minLength: 0)
                         }
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("SettingsMyProfileButton")
                 }
 
                 Section("Codes") {
@@ -2705,7 +2710,12 @@ private struct SettingsSheet: View {
                 model.refreshDevices()
             }
             .sheet(isPresented: $showingMyProfile) {
-                MyNostrProfileSheet(identity: model.nostrIdentity, myNpub: model.myNpub)
+                MyNostrProfileSheet(
+                    identity: model.nostrIdentity,
+                    myNpub: model.myNpub,
+                    accountID: model.activeAccountID,
+                    serverURL: model.serverURL
+                )
             }
             .sheet(isPresented: $showingScan) {
                 ScanSheet(model: model, onStartProfileChat: onStartProfileChat)

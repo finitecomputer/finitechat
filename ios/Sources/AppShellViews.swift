@@ -240,6 +240,12 @@ private struct HomeInputDock: View {
                     )
 
                     HomeSuggestionButton(
+                        title: "Scan Code",
+                        systemImage: "qrcode.viewfinder",
+                        action: showScan
+                    )
+
+                    HomeSuggestionButton(
                         title: "Chat with Agent",
                         systemImage: "sparkles",
                         action: openAgents
@@ -788,22 +794,89 @@ private struct AgentRoomRow: View {
     }
 }
 
+private enum ProfileCodeReadinessState: Equatable {
+    case checking
+    case ready
+    case unavailable
+    case failed
+
+    var title: String {
+        switch self {
+        case .checking:
+            return "Checking profile code"
+        case .ready:
+            return "Ready to receive new chats"
+        case .unavailable:
+            return "Not ready for new chats"
+        case .failed:
+            return "Could not check profile code"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .checking:
+            return "Checking chat setup..."
+        case .ready:
+            return "New chats are available."
+        case .unavailable:
+            return "Keep Finite Chat open for a moment, then check again."
+        case .failed:
+            return "Check your connection, then try again."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .checking:
+            return "clock"
+        case .ready:
+            return "checkmark.circle.fill"
+        case .unavailable:
+            return "exclamationmark.circle"
+        case .failed:
+            return "wifi.exclamationmark"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .checking, .failed:
+            return .secondary
+        case .ready:
+            return .green
+        case .unavailable:
+            return .orange
+        }
+    }
+}
+
 struct MyNostrProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     let identity: AppNostrIdentity?
     let myNpub: String?
+    let accountID: String?
+    let serverURL: String
     let showsSecretKey: Bool
+    private let availabilityService: FiniteInviteAvailabilityService
     @State private var showingSecret = false
     @State private var copiedField: String?
+    @State private var profileCodeReadiness: ProfileCodeReadinessState = .checking
 
     init(
         identity: AppNostrIdentity?,
         myNpub: String?,
-        showsSecretKey: Bool = true
+        accountID: String? = nil,
+        serverURL: String = RuntimeConfig.defaultServerURL,
+        showsSecretKey: Bool = true,
+        availabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService()
     ) {
         self.identity = identity
         self.myNpub = myNpub
+        self.accountID = accountID
+        self.serverURL = serverURL
         self.showsSecretKey = showsSecretKey
+        self.availabilityService = availabilityService
     }
 
     var body: some View {
@@ -822,6 +895,30 @@ struct MyNostrProfileSheet: View {
                         }
                     } header: {
                         Text("Profile Code")
+                    }
+                }
+
+                if normalizedAccountID != nil {
+                    Section("Chat Readiness") {
+                        Label {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(profileCodeReadiness.title)
+                                Text(profileCodeReadiness.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: profileCodeReadiness.systemImage)
+                                .foregroundStyle(profileCodeReadiness.tint)
+                        }
+
+                        Button {
+                            Task {
+                                await refreshProfileCodeReadiness()
+                            }
+                        } label: {
+                            Label("Check Again", systemImage: "arrow.clockwise")
+                        }
                     }
                 }
 
@@ -845,6 +942,9 @@ struct MyNostrProfileSheet: View {
             }
             .navigationTitle("My Profile")
             .navigationBarTitleDisplayMode(.inline)
+            .task(id: readinessTaskID) {
+                await refreshProfileCodeReadiness()
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
@@ -852,6 +952,31 @@ struct MyNostrProfileSheet: View {
                     }
                 }
             }
+        }
+    }
+
+    private var normalizedAccountID: String? {
+        let value = accountID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let value, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private var readinessTaskID: String {
+        "\(normalizedAccountID ?? "")|\(serverURL)"
+    }
+
+    @MainActor
+    private func refreshProfileCodeReadiness() async {
+        guard let accountID = normalizedAccountID else { return }
+        profileCodeReadiness = .checking
+        do {
+            let availability = try await availabilityService.fetchAvailability(
+                serverURL: serverURL,
+                accountIDs: [accountID]
+            )
+            profileCodeReadiness = availability[accountID] == true ? .ready : .unavailable
+        } catch {
+            profileCodeReadiness = .failed
         }
     }
 }
