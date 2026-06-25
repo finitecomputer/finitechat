@@ -46,6 +46,21 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertTrue(profile.stale)
     }
 
+    func testInviteAvailabilityUsesHumanReadableStatusText() {
+        XCTAssertEqual(
+            InviteAvailability.available.userStatusText,
+            "Ready to message"
+        )
+        XCTAssertEqual(
+            InviteAvailability.unavailable.userStatusText,
+            "No device available"
+        )
+        XCTAssertEqual(
+            InviteAvailability.unknown.userStatusText,
+            "Checking availability"
+        )
+    }
+
     func testInviteAvailabilityServiceChunksAndMergesResponses() async throws {
         let ids = [
             String(repeating: "a", count: 64),

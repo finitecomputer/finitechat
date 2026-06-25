@@ -820,6 +820,11 @@ private struct NewGroupFollowRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                Label(profile.inviteAvailability.userStatusText, systemImage: statusSystemImage)
+                    .font(.caption2)
+                    .foregroundStyle(statusTint)
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 8)
@@ -835,6 +840,28 @@ private struct NewGroupFollowRow: View {
         Text(profile.displayName.prefix(1).uppercased())
             .font(.headline)
             .foregroundStyle(.secondary)
+    }
+
+    private var statusSystemImage: String {
+        switch profile.inviteAvailability {
+        case .available:
+            return "checkmark.circle.fill"
+        case .unavailable:
+            return "exclamationmark.circle"
+        case .unknown:
+            return "clock"
+        }
+    }
+
+    private var statusTint: Color {
+        switch profile.inviteAvailability {
+        case .available:
+            return .green
+        case .unavailable:
+            return .orange
+        case .unknown:
+            return .secondary
+        }
     }
 }
 

@@ -5,6 +5,17 @@ enum InviteAvailability: String, Codable, Equatable, Sendable {
     case unknown
     case available
     case unavailable
+
+    var userStatusText: String {
+        switch self {
+        case .available:
+            return "Ready to message"
+        case .unavailable:
+            return "No device available"
+        case .unknown:
+            return "Checking availability"
+        }
+    }
 }
 
 struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {

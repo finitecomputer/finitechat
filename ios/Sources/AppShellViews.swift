@@ -618,13 +618,25 @@ struct PeopleView: View {
             if !filteredProfiles.isEmpty {
                 Section("Nostr Follows") {
                     ForEach(filteredProfiles) { profile in
-                        Button {
-                            selectedFollow = profile
-                        } label: {
-                            NostrProfileRow(profile: profile)
-                                .padding(.vertical, 6)
+                        HStack(spacing: 8) {
+                            Button {
+                                startChat(with: profile.appProfileSummary)
+                            } label: {
+                                NostrProfileRow(profile: profile)
+                                    .padding(.vertical, 6)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                selectedFollow = profile
+                            } label: {
+                                Image(systemName: "info.circle")
+                                    .frame(width: 34, height: 34)
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Profile details for \(profile.displayName)")
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -1004,17 +1016,42 @@ private struct NostrProfileRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                Label(profile.inviteAvailability.userStatusText, systemImage: statusSystemImage)
+                    .font(.caption2)
+                    .foregroundStyle(statusTint)
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 8)
 
-            Text(profile.shortenedNpub)
-                .font(.caption)
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
         }
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusSystemImage: String {
+        switch profile.inviteAvailability {
+        case .available:
+            return "checkmark.circle.fill"
+        case .unavailable:
+            return "exclamationmark.circle"
+        case .unknown:
+            return "clock"
+        }
+    }
+
+    private var statusTint: Color {
+        switch profile.inviteAvailability {
+        case .available:
+            return .green
+        case .unavailable:
+            return .orange
+        case .unknown:
+            return .secondary
+        }
     }
 }
 
