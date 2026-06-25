@@ -287,6 +287,10 @@ private struct RoomListView: View {
 
     var body: some View {
         List {
+            if !model.rooms.isEmpty {
+                chatActionRow
+            }
+
             if model.rooms.isEmpty {
                 VStack(spacing: 14) {
                     ContentUnavailableView(
@@ -340,9 +344,9 @@ private struct RoomListView: View {
                 Button {
                     present(.myProfile)
                 } label: {
-                    Image(systemName: "person.crop.circle")
+                    Label("My profile code", systemImage: "person.crop.circle")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("My profile code")
                 .accessibilityIdentifier("ChatsMyProfileButton")
             }
 
@@ -350,25 +354,25 @@ private struct RoomListView: View {
                 Button {
                     present(.scan)
                 } label: {
-                    Image(systemName: "qrcode.viewfinder")
+                    Label("Scan code", systemImage: "qrcode.viewfinder")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("Scan code")
                 .accessibilityIdentifier("ChatsScanButton")
 
                 Button {
                     showingNewRoom = true
                 } label: {
-                    Image(systemName: "plus")
+                    Label("New chat", systemImage: "plus")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("New chat")
                 .accessibilityIdentifier("ChatsNewChatButton")
 
                 Button {
                     present(.settings)
                 } label: {
-                    Image(systemName: "gearshape")
+                    Label("Settings", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("Settings")
                 .accessibilityIdentifier("TopSettingsButton")
             }
         }
@@ -385,6 +389,30 @@ private struct RoomListView: View {
         .safeAreaInset(edge: .bottom) {
             NoticeBar(text: model.userNoticeText)
         }
+    }
+
+    private var chatActionRow: some View {
+        HStack(spacing: 10) {
+            Button {
+                showingNewRoom = true
+            } label: {
+                Label("New Chat", systemImage: "person.badge.plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("ChatsInlineNewChatButton")
+
+            Button {
+                present(.scan)
+            } label: {
+                Label("Scan", systemImage: "qrcode.viewfinder")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("ChatsInlineScanButton")
+        }
+        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 12, trailing: 16))
     }
 }
 
@@ -2343,8 +2371,22 @@ private struct ScanSheet: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .lineLimit(3...6)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            continueWithTarget()
+                        }
                         .accessibilityLabel("Invite URL, npub, or hex key")
                         .accessibilityIdentifier("ScanCodeField")
+
+                    Button {
+                        continueWithTarget()
+                    } label: {
+                        Label("Continue", systemImage: "arrow.right.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(scanDraftIsEmpty)
+                    .accessibilityIdentifier("ScanInlineContinueButton")
                 } header: {
                     Text("Invite or Profile Code")
                 }
@@ -2390,11 +2432,15 @@ private struct ScanSheet: View {
                     Button("Continue") {
                         continueWithTarget()
                     }
-                    .disabled(model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(scanDraftIsEmpty)
                     .accessibilityIdentifier("ScanContinueButton")
                 }
             }
         }
+    }
+
+    private var scanDraftIsEmpty: Bool {
+        model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func continueWithTarget() {

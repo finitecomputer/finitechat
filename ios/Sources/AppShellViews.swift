@@ -102,9 +102,9 @@ struct HomeView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(action: showSettings) {
-                    Image(systemName: "person.crop.circle")
+                    Label("Profile", systemImage: "person.crop.circle")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("Profile")
                 .accessibilityIdentifier("HomeProfileButton")
             }
         }
@@ -526,29 +526,29 @@ struct PeopleView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button(action: showMyProfile) {
-                    Image(systemName: "person.crop.circle")
+                    Label("My profile code", systemImage: "person.crop.circle")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("My profile code")
                 .accessibilityIdentifier("PeopleMyProfileButton")
             }
 
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button(action: showNewChat) {
-                    Image(systemName: "plus")
+                    Label("New chat", systemImage: "plus")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("New chat")
                 .accessibilityIdentifier("PeopleNewChatButton")
 
                 Button(action: showScan) {
-                    Image(systemName: "qrcode.viewfinder")
+                    Label("Scan code", systemImage: "qrcode.viewfinder")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("Scan code")
                 .accessibilityIdentifier("PeopleScanButton")
 
                 Button(action: showSettings) {
-                    Image(systemName: "gearshape")
+                    Label("Settings", systemImage: "gearshape")
+                        .labelStyle(.iconOnly)
                 }
-                .accessibilityLabel("Settings")
                 .accessibilityIdentifier("TopSettingsButton")
             }
         }
