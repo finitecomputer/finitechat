@@ -288,10 +288,34 @@ private struct RoomListView: View {
     var body: some View {
         List {
             if model.rooms.isEmpty {
-                ContentUnavailableView("No chats yet", systemImage: "bubble.left.and.text.bubble")
-                    .padding(.vertical, 28)
-                    .frame(maxWidth: .infinity)
-                    .listRowSeparator(.hidden)
+                VStack(spacing: 14) {
+                    ContentUnavailableView(
+                        "No chats yet",
+                        systemImage: "bubble.left.and.text.bubble",
+                        description: Text("Start a chat from a profile code or your Nostr follows.")
+                    )
+
+                    HStack(spacing: 10) {
+                        Button {
+                            showingNewRoom = true
+                        } label: {
+                            Label("New Chat", systemImage: "person.badge.plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("EmptyChatsNewChatButton")
+
+                        Button {
+                            present(.scan)
+                        } label: {
+                            Label("Scan", systemImage: "qrcode.viewfinder")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("EmptyChatsScanButton")
+                    }
+                }
+                .padding(.vertical, 28)
+                .frame(maxWidth: .infinity)
+                .listRowSeparator(.hidden)
             } else if filteredRooms.isEmpty {
                 ContentUnavailableView("No matching chats", systemImage: "magnifyingglass")
                     .padding(.vertical, 28)
@@ -482,7 +506,7 @@ private struct ChatPeoplePickerSheet: View {
                         Label("Paste Profile Code", systemImage: "doc.on.clipboard")
                     }
 
-                    TextField("npub or profile code", text: $memberCode, axis: .vertical)
+                    TextField("npub, hex key, or profile code", text: $memberCode, axis: .vertical)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .lineLimit(2...4)
@@ -671,8 +695,9 @@ private struct ChatPeoplePickerSheet: View {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         do {
-            let npub = try profileNpub(from: trimmed)
-            let accountID = try accountIdFromNpub(npub: npub)
+            let target = try profileTarget(from: trimmed)
+            let npub = target.npub
+            let accountID = target.accountID
             if accountID == selfAccountID {
                 parseError = "That is your own profile code."
                 return
@@ -689,7 +714,7 @@ private struct ChatPeoplePickerSheet: View {
                 create()
             }
         } catch {
-            parseError = "That code is not a valid profile npub."
+            parseError = "That code is not a valid profile code."
         }
     }
 
@@ -764,8 +789,9 @@ func profileSummaryFromScannedProfileCode(
     _ value: String,
     model: AppModel
 ) throws -> AppProfileSummary {
-    let npub = try profileNpub(from: value)
-    let accountID = try accountIdFromNpub(npub: npub)
+    let target = try profileTarget(from: value)
+    let accountID = target.accountID
+    let npub = target.npub
     if let profile = model.state?.profiles.first(where: { $0.accountId == accountID }) {
         return profile
     }
@@ -784,6 +810,28 @@ func isFiniteChatInviteCode(_ value: String) -> Bool {
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
         .hasPrefix("finite://join")
+}
+
+private struct ProfileCodeTarget {
+    let accountID: String
+    let npub: String
+}
+
+private func profileTarget(from value: String) throws -> ProfileCodeTarget {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if isHexAccountID(trimmed) {
+        let accountID = trimmed.lowercased()
+        return ProfileCodeTarget(
+            accountID: accountID,
+            npub: try npubFromAccountId(accountId: accountID)
+        )
+    }
+
+    let npub = try profileNpub(from: trimmed)
+    return ProfileCodeTarget(
+        accountID: try accountIdFromNpub(npub: npub),
+        npub: npub
+    )
 }
 
 func profileNpub(from value: String) throws -> String {
@@ -816,6 +864,11 @@ func profileNpub(from value: String) throws -> String {
         }
     }
     return String(npub)
+}
+
+private func isHexAccountID(_ value: String) -> Bool {
+    guard value.count == 64 else { return false }
+    return value.allSatisfy(\.isHexDigit)
 }
 
 private struct NewGroupFollowRow: View {
@@ -2258,11 +2311,11 @@ private struct ScanSheet: View {
                     }
                     .accessibilityIdentifier("ScanPasteButton")
 
-                    TextField("Invite URL or npub", text: $model.scanDraft, axis: .vertical)
+                    TextField("Invite URL, npub, or hex key", text: $model.scanDraft, axis: .vertical)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .lineLimit(3...6)
-                        .accessibilityLabel("Invite URL or npub")
+                        .accessibilityLabel("Invite URL, npub, or hex key")
                         .accessibilityIdentifier("ScanCodeField")
                 } header: {
                     Text("Invite or Profile Code")

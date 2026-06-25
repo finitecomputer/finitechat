@@ -21,6 +21,8 @@ use crate::product_store::{
 };
 use crate::run::{self, IosDeviceInstalledApp, IosInstalledApp};
 
+const HARNESS_SERVER_START_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub fn product_harness(
     root: &Path,
     json: bool,
@@ -149,7 +151,7 @@ fn ios_product_harness_with_ios_development_team_env(
     )?;
 
     let mut server = HarnessServer::start(root, &server_addr, &server_sqlite, &server_log)?;
-    server.wait_until_ready(&server_addr, Duration::from_secs(30))?;
+    server.wait_until_ready(&server_addr, HARNESS_SERVER_START_TIMEOUT)?;
     if scenario == "profile-dm" {
         let assertions = run_profile_dm_harness(
             &target,
@@ -385,7 +387,7 @@ fn ios_product_harness_with_ios_development_team_env(
     )?;
 
     let mut server = HarnessServer::start(root, &server_addr, &server_sqlite, &server_log)?;
-    server.wait_until_ready(&server_addr, Duration::from_secs(30))?;
+    server.wait_until_ready(&server_addr, HARNESS_SERVER_START_TIMEOUT)?;
     let launch = launch_phase(
         &target,
         &support_root,

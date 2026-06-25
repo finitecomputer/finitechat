@@ -234,7 +234,7 @@ private struct HomeInputDock: View {
                     )
 
                     HomeSuggestionButton(
-                        title: "Message someone",
+                        title: "New Chat",
                         systemImage: "person",
                         action: openPeople
                     )
@@ -600,16 +600,32 @@ struct PeopleView: View {
                 ProgressView("Loading people...")
                 Spacer()
             }
-            .padding(.vertical, 16)
-            .listRowSeparator(.hidden)
-        } else if people.profiles.isEmpty && knownProfiles.isEmpty {
-            ContentUnavailableView(
-                "No people yet",
-                systemImage: "person.crop.circle.badge.questionmark",
-                description: Text(people.statusText ?? "Pull to refresh.")
-            )
-                .padding(.vertical, 18)
+                .padding(.vertical, 16)
                 .listRowSeparator(.hidden)
+        } else if people.profiles.isEmpty && knownProfiles.isEmpty {
+            VStack(spacing: 14) {
+                ContentUnavailableView(
+                    "No people yet",
+                    systemImage: "person.crop.circle.badge.questionmark",
+                    description: Text(people.statusText ?? "Start with a profile code or pull to refresh.")
+                )
+
+                HStack(spacing: 10) {
+                    Button(action: showNewChat) {
+                        Label("New Chat", systemImage: "person.badge.plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("EmptyPeopleNewChatButton")
+
+                    Button(action: showScan) {
+                        Label("Scan", systemImage: "qrcode.viewfinder")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("EmptyPeopleScanButton")
+                }
+            }
+            .padding(.vertical, 18)
+            .listRowSeparator(.hidden)
         } else if filteredProfiles.isEmpty && filteredKnownProfiles.isEmpty {
             ContentUnavailableView("No matches", systemImage: "magnifyingglass")
                 .padding(.vertical, 18)

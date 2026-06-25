@@ -2710,6 +2710,63 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testScannedHexProfileCodeBuildsDirectChatTargetWithoutLookup() throws {
+        let bob = try createNostrIdentity()
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in
+            FakeFiniteChatRuntime(
+                initialState: self.emptyChatState(),
+                startRuntimeState: self.emptyChatState()
+            )
+        }
+
+        model.start()
+
+        let profile = try profileSummaryFromScannedProfileCode(
+            bob.accountId.uppercased(),
+            model: model
+        )
+
+        XCTAssertEqual(profile.accountId, bob.accountId)
+        XCTAssertEqual(profile.npub, bob.npub)
+        XCTAssertEqual(profile.displayName, shortenedDisplayNpub(bob.npub))
+        XCTAssertTrue(profile.stale)
+    }
+
+    @MainActor
+    func testScannedProfileUrlBuildsDirectChatTargetWithoutLookup() throws {
+        let bob = try createNostrIdentity()
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in
+            FakeFiniteChatRuntime(
+                initialState: self.emptyChatState(),
+                startRuntimeState: self.emptyChatState()
+            )
+        }
+
+        model.start()
+
+        let profile = try profileSummaryFromScannedProfileCode(
+            "https://finite.computer/profile?npub=\(bob.npub)",
+            model: model
+        )
+
+        XCTAssertEqual(profile.accountId, bob.accountId)
+        XCTAssertEqual(profile.npub, bob.npub)
+        XCTAssertTrue(profile.stale)
+    }
+
     func testFiniteJoinCodeIsReservedForInviteHandlingEvenWhenItCarriesInviterNpub() throws {
         let inviter = try createNostrIdentity()
         let inviteCode = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=\(inviter.npub)"
