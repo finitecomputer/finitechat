@@ -473,12 +473,26 @@ final class NostrRelayProfileService: Sendable {
         "wss://eu.nostr.pikachat.org",
     ]
 
+    static let profileDiscoveryRelays = [
+        "wss://purplepag.es",
+        "wss://nostr.wine",
+        "wss://nostr.mom",
+        "wss://relay.current.fyi",
+        "wss://relayable.org",
+        "wss://relay.nostr.wirednet.jp",
+        "wss://nostr-pub.wellorder.net",
+        "wss://nostr-01.yakihonne.com",
+        "wss://nostr-02.yakihonne.com",
+    ]
+
     private let relays: [String]
+    private let discoveryRelays: [String]
     private let timeoutNanoseconds: UInt64
     private let eventLoader: EventLoader
 
     init(
         relays: [String] = NostrRelayProfileService.pikaProfileRelays,
+        discoveryRelays: [String] = NostrRelayProfileService.profileDiscoveryRelays,
         timeoutSeconds: Double = 5,
         eventLoader: @escaping EventLoader = { relay, filter, subscriptionPrefix, timeoutNanoseconds in
             try await NostrRelayProfileService.fetchEventsFromRelay(
@@ -489,14 +503,26 @@ final class NostrRelayProfileService: Sendable {
             )
         }
     ) {
-        self.relays = relays
+        self.relays = Self.mergedRelays(relays)
+        self.discoveryRelays = Self.mergedRelays(discoveryRelays)
         timeoutNanoseconds = UInt64(max(timeoutSeconds, 1) * 1_000_000_000)
         self.eventLoader = eventLoader
     }
 
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
-        let contactRelays = await contactListRelays(forAccountID: accountID)
-        let contactResult = await fetchContacts(forAccountID: accountID, relays: contactRelays)
+        let primaryContactRelays = await contactListRelays(
+            forAccountID: accountID,
+            bootstrapRelays: relays
+        )
+        let primaryContactResult = await fetchContacts(
+            forAccountID: accountID,
+            relays: primaryContactRelays
+        )
+        let (contactRelays, contactResult) = await selectedContactFetch(
+            forAccountID: accountID,
+            primaryRelays: primaryContactRelays,
+            primaryResult: primaryContactResult
+        )
         if contactResult.allRelayAttemptsFailed {
             throw NostrPeopleFetchError.allContactRelaysFailed
         }
@@ -510,7 +536,7 @@ final class NostrRelayProfileService: Sendable {
                 followedPubkeyCount: 0
             )
         }
-        let metadataRelays = mergedRelays(contactRelays + followed.compactMap(\.relayHint))
+        let metadataRelays = Self.mergedRelays(contactRelays + followed.compactMap(\.relayHint))
         let metadata = await fetchMetadata(
             forPubkeys: followed.map(\.pubkey),
             relays: metadataRelays
@@ -543,19 +569,50 @@ final class NostrRelayProfileService: Sendable {
         )
     }
 
-    private func contactListRelays(forAccountID accountID: String) async -> [String] {
+    private func selectedContactFetch(
+        forAccountID accountID: String,
+        primaryRelays: [String],
+        primaryResult: NostrContactFetchResult
+    ) async -> ([String], NostrContactFetchResult) {
+        guard (primaryResult.contacts.isEmpty || primaryResult.allRelayAttemptsFailed),
+              !discoveryRelays.isEmpty
+        else {
+            return (primaryRelays, primaryResult)
+        }
+        let expandedBootstrapRelays = Self.mergedRelays(primaryRelays + discoveryRelays)
+        guard expandedBootstrapRelays.count > primaryRelays.count else {
+            return (primaryRelays, primaryResult)
+        }
+        let expandedContactRelays = await contactListRelays(
+            forAccountID: accountID,
+            bootstrapRelays: expandedBootstrapRelays
+        )
+        let expandedResult = await fetchContacts(
+            forAccountID: accountID,
+            relays: expandedContactRelays
+        )
+        if !expandedResult.contacts.isEmpty || primaryResult.allRelayAttemptsFailed {
+            return (expandedContactRelays, expandedResult)
+        }
+        return (primaryRelays, primaryResult)
+    }
+
+    private func contactListRelays(
+        forAccountID accountID: String,
+        bootstrapRelays: [String]
+    ) async -> [String] {
         let normalizedAccountID = accountID.lowercased()
         let filter = NostrRelayFilter(kinds: [10_002], authors: [normalizedAccountID], limit: 1)
         let batch = await fetchEvents(
             filter: filter,
             subscriptionPrefix: "finite-relays",
-            relays: relays
+            relays: bootstrapRelays
         )
         guard let latest = batch.events
             .filter({ $0.kind == 10_002 && $0.pubkey.lowercased() == normalizedAccountID })
             .max(by: { $0.createdAt < $1.createdAt })
         else {
-            return relays
+            return bootstrapRelays
         }
 
         let advertisedRelays = latest.tags.compactMap { tag -> String? in
@@ -566,7 +623,7 @@ final class NostrRelayProfileService: Sendable {
             guard marker.isEmpty || marker == "write" || marker == "read" else { return nil }
             return tag[1].nostrNonEmptyTrimmed
         }
-        return mergedRelays(relays + advertisedRelays)
+        return Self.mergedRelays(bootstrapRelays + advertisedRelays)
     }
 
     private func fetchContacts(forAccountID accountID: String, relays: [String]) async -> NostrContactFetchResult {
@@ -660,7 +717,7 @@ final class NostrRelayProfileService: Sendable {
         }
     }
 
-    private func mergedRelays(_ values: [String]) -> [String] {
+    private static func mergedRelays(_ values: [String]) -> [String] {
         var seen: Set<String> = []
         var merged: [String] = []
         for value in values {

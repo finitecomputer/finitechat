@@ -617,6 +617,77 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].displayName, "Read Relay Follow")
     }
 
+    func testFetchFollowProfilesFallsBackToDiscoveryRelaysWhenPrimaryMissesContacts() async throws {
+        let owner = String(repeating: "6", count: 64)
+        let followed = String(repeating: "7", count: 64)
+
+        let service = NostrRelayProfileService(
+            relays: ["wss://primary.example"],
+            discoveryRelays: ["wss://discovery.example"],
+            eventLoader: { relay, filter, _, _ in
+                if relay == "wss://primary.example" {
+                    throw URLError(.timedOut)
+                }
+
+                if filter.kinds == [10_002],
+                   relay == "wss://discovery.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_030,
+                            kind: 10_002,
+                            tags: [
+                                ["r", "wss://contacts.example", "write"],
+                                ["r", "wss://profile.example", "read"],
+                            ],
+                            content: ""
+                        ),
+                    ]
+                }
+
+                if filter.kinds == [3],
+                   relay == "wss://contacts.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_031,
+                            kind: 3,
+                            tags: [["p", followed, "wss://profile.example", "Fallback Bob"]],
+                            content: ""
+                        ),
+                    ]
+                }
+
+                if filter.kinds == [0],
+                   relay == "wss://profile.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: followed,
+                            createdAt: 1_800_000_032,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Discovery Relay Bob","name":"discoverybob"}"#
+                        ),
+                    ]
+                }
+
+                return []
+            }
+        )
+
+        let result = try await service.fetchFollowProfiles(forAccountID: owner)
+
+        XCTAssertEqual(result.relayCount, 4)
+        XCTAssertEqual(result.followedPubkeyCount, 1)
+        XCTAssertEqual(result.profiles[0].pubkey, followed)
+        XCTAssertEqual(result.profiles[0].displayName, "Discovery Relay Bob")
+        XCTAssertEqual(result.profiles[0].username, "discoverybob")
+        XCTAssertEqual(result.profiles[0].relayHint, "wss://profile.example")
+    }
+
     func testFetchFollowProfilesUsesContactRelayHintForMetadata() async throws {
         let owner = String(repeating: "4", count: 64)
         let followed = String(repeating: "5", count: 64)
