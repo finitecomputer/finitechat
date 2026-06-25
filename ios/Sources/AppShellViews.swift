@@ -473,7 +473,7 @@ struct PeopleView: View {
     @State private var showingLookupProfile = false
 
     private var knownProfiles: [AppProfileSummary] {
-        let selfAccountID = model.nostrIdentity?.accountID
+        let selfAccountID = model.activeAccountID
         let followIDs = Set(people.profiles.map(\.pubkey))
         return (model.state?.profiles ?? [])
             .filter { profile in
@@ -547,11 +547,11 @@ struct PeopleView: View {
             placement: .navigationBarDrawer(displayMode: .automatic),
             prompt: "Search people"
         )
-        .task(id: "\(model.nostrIdentity?.accountID ?? "")|\(model.serverURL)") {
-            await people.loadIfNeeded(identity: model.nostrIdentity, serverURL: model.serverURL)
+        .task(id: "\(model.activeAccountID ?? "")|\(model.serverURL)") {
+            await people.loadIfNeeded(accountID: model.activeAccountID, serverURL: model.serverURL)
         }
         .refreshable {
-            await people.refresh(identity: model.nostrIdentity, serverURL: model.serverURL)
+            await people.refresh(accountID: model.activeAccountID, serverURL: model.serverURL)
         }
         .sheet(item: $selectedFollow) { profile in
             NostrFollowProfileSheet(

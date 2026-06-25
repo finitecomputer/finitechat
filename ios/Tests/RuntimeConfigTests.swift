@@ -1009,6 +1009,7 @@ final class AppModelPersistenceTests: XCTestCase {
 
         XCTAssertFalse(model.requiresNostrLogin)
         XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
+        XCTAssertEqual(model.activeAccountID, material.accountId)
         XCTAssertEqual(model.nostrIdentity?.npub, material.npub)
         XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
         XCTAssertEqual(openedOptions.count, 1)
@@ -1062,6 +1063,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(openedOptions.count, 1)
         XCTAssertNil(openedOptions[0].accountSecretHex)
         XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
+        XCTAssertEqual(model.activeAccountID, material.accountId)
         XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }

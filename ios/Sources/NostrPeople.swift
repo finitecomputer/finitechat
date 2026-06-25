@@ -237,42 +237,52 @@ final class NostrPeopleModel: ObservableObject {
 
     @MainActor
     func loadIfNeeded(identity: AppNostrIdentity?, serverURL: String) async {
-        guard let identity else {
+        await loadIfNeeded(accountID: identity?.accountID, serverURL: serverURL)
+    }
+
+    @MainActor
+    func loadIfNeeded(accountID: String?, serverURL: String) async {
+        guard let accountID = normalizedAccountID(accountID) else {
             profiles = []
             statusText = nil
             lastLoadedAccountID = nil
             lastLoadedServerURL = nil
             return
         }
-        guard lastLoadedAccountID != identity.accountID
+        guard lastLoadedAccountID != accountID
             || lastLoadedServerURL != serverURL
             || profiles.isEmpty
         else { return }
-        if let cached = await cache?.load(accountID: identity.accountID, serverURL: serverURL) {
-            applyCached(cached, identity: identity, serverURL: serverURL)
+        if let cached = await cache?.load(accountID: accountID, serverURL: serverURL) {
+            applyCached(cached, accountID: accountID, serverURL: serverURL)
             Task { [weak self] in
-                await self?.refresh(identity: identity, serverURL: serverURL)
+                await self?.refresh(accountID: accountID, serverURL: serverURL)
             }
             return
         }
-        await refresh(identity: identity, serverURL: serverURL)
+        await refresh(accountID: accountID, serverURL: serverURL)
     }
 
     @MainActor
     func refresh(identity: AppNostrIdentity?, serverURL: String) async {
-        guard let identity else { return }
-        lastLoadedAccountID = identity.accountID
+        await refresh(accountID: identity?.accountID, serverURL: serverURL)
+    }
+
+    @MainActor
+    func refresh(accountID: String?, serverURL: String) async {
+        guard let accountID = normalizedAccountID(accountID) else { return }
+        lastLoadedAccountID = accountID
         lastLoadedServerURL = serverURL
         isLoading = true
         defer { isLoading = false }
         statusText = nil
         do {
-            let result = try await service.fetchFollowProfiles(forAccountID: identity.accountID)
-            guard isCurrent(identity: identity, serverURL: serverURL) else { return }
+            let result = try await service.fetchFollowProfiles(forAccountID: accountID)
+            guard isCurrent(accountID: accountID, serverURL: serverURL) else { return }
             if result.profiles.isEmpty, !profiles.isEmpty {
                 await cache?.save(
                     result,
-                    accountID: identity.accountID,
+                    accountID: accountID,
                     serverURL: serverURL,
                     preserveNonEmptyOnEmptyResult: true
                 )
@@ -283,7 +293,7 @@ final class NostrPeopleModel: ObservableObject {
                         relayCount: result.relayCount,
                         followedPubkeyCount: max(result.followedPubkeyCount, profiles.count)
                     ),
-                    accountID: identity.accountID,
+                    accountID: accountID,
                     serverURL: serverURL,
                     preserveNonEmptyOnEmptyResult: true
                 )
@@ -293,7 +303,7 @@ final class NostrPeopleModel: ObservableObject {
             profiles = result.profiles
             await cache?.save(
                 result,
-                accountID: identity.accountID,
+                accountID: accountID,
                 serverURL: serverURL,
                 preserveNonEmptyOnEmptyResult: true
             )
@@ -304,7 +314,7 @@ final class NostrPeopleModel: ObservableObject {
                     relayCount: result.relayCount,
                     followedPubkeyCount: result.followedPubkeyCount
                 ),
-                accountID: identity.accountID,
+                accountID: accountID,
                 serverURL: serverURL,
                 preserveNonEmptyOnEmptyResult: true
             )
@@ -316,11 +326,11 @@ final class NostrPeopleModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
-            guard isCurrent(identity: identity, serverURL: serverURL) else { return }
+            guard isCurrent(accountID: accountID, serverURL: serverURL) else { return }
             if profiles.isEmpty,
-               let cached = await cache?.load(accountID: identity.accountID, serverURL: serverURL)
+               let cached = await cache?.load(accountID: accountID, serverURL: serverURL)
             {
-                applyCached(cached, identity: identity, serverURL: serverURL)
+                applyCached(cached, accountID: accountID, serverURL: serverURL)
                 statusText = "Showing cached people. Refresh failed: \(error.localizedDescription)"
             } else if profiles.isEmpty {
                 profiles = []
@@ -334,10 +344,10 @@ final class NostrPeopleModel: ObservableObject {
     @MainActor
     private func applyCached(
         _ result: NostrFollowFetchResult,
-        identity: AppNostrIdentity,
+        accountID: String,
         serverURL: String
     ) {
-        lastLoadedAccountID = identity.accountID
+        lastLoadedAccountID = accountID
         lastLoadedServerURL = serverURL
         profiles = result.profiles
         statusText = result.followedPubkeyCount == 0
@@ -346,8 +356,14 @@ final class NostrPeopleModel: ObservableObject {
     }
 
     @MainActor
-    private func isCurrent(identity: AppNostrIdentity, serverURL: String) -> Bool {
-        lastLoadedAccountID == identity.accountID && lastLoadedServerURL == serverURL
+    private func isCurrent(accountID: String, serverURL: String) -> Bool {
+        lastLoadedAccountID == accountID && lastLoadedServerURL == serverURL
+    }
+
+    private func normalizedAccountID(_ accountID: String?) -> String? {
+        let trimmed = accountID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let trimmed, !trimmed.isEmpty else { return nil }
+        return trimmed
     }
 
     @MainActor

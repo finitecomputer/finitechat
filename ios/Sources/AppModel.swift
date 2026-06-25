@@ -535,6 +535,11 @@ final class AppModel: ObservableObject {
         return try? npubFromAccountId(accountId: accountID)
     }
 
+    var activeAccountID: String? {
+        nostrIdentity?.accountID.nonEmptyTrimmed
+            ?? state?.identity.accountId.nonEmptyTrimmed
+    }
+
     @discardableResult
     func createAndSignInNostrIdentity() -> Bool {
         do {

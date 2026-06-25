@@ -152,6 +152,65 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.unavailable, .available])
     }
 
+    func testPeopleModelLoadsFollowsFromAccountIDWithoutNostrIdentity() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [3],
+                   filter.authors == [owner],
+                   filter.limit == 1
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1,
+                            kind: 3,
+                            tags: [["p", bob]],
+                            content: ""
+                        ),
+                    ]
+                }
+                if filter.kinds == [0],
+                   filter.authors == [bob]
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: bob,
+                            createdAt: 1,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Runtime Bob"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: FiniteInviteAvailabilityService(
+                availabilityLoader: { _, accountIDs in
+                    Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
+                }
+            ),
+            cache: NostrPeopleCache(directory: temporaryCacheDirectory())
+        )
+
+        await model.loadIfNeeded(
+            accountID: "  \(owner.uppercased())  ",
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Runtime Bob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+        XCTAssertEqual(
+            model.statusText,
+            "Loaded 1 of 1 follows from 1 relays."
+        )
+    }
+
     func testPeopleModelRechecksInviteAvailabilityForOneProfile() async throws {
         let material = try createNostrIdentity()
         let owner = material.accountId

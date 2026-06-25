@@ -540,11 +540,11 @@ private struct ChatPeoplePickerSheet: View {
                 placement: .navigationBarDrawer(displayMode: .automatic),
                 prompt: "Search people"
             )
-            .task(id: "\(model.nostrIdentity?.accountID ?? "")|\(model.serverURL)") {
-                await people.loadIfNeeded(identity: model.nostrIdentity, serverURL: model.serverURL)
+            .task(id: "\(model.activeAccountID ?? "")|\(model.serverURL)") {
+                await people.loadIfNeeded(accountID: model.activeAccountID, serverURL: model.serverURL)
             }
             .refreshable {
-                await people.refresh(identity: model.nostrIdentity, serverURL: model.serverURL)
+                await people.refresh(accountID: model.activeAccountID, serverURL: model.serverURL)
             }
             .sheet(isPresented: $showingCameraScanner) {
                 QRCodeScannerSheet { value in
