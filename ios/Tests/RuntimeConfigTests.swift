@@ -1287,6 +1287,108 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(attachments[0].bytes, Data("offline attachment proof".utf8))
     }
 
+    func testLaunchAutomationStartsProfileChatAndSendsThroughNewRoom() async throws {
+        let bobAccountID = String(repeating: "b", count: 64)
+        let bobNpub = try npubFromAccountId(accountId: bobAccountID)
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            switch action {
+            case .startProfileChat(_, let displayName):
+                let room = AppRoomSummary(
+                    roomId: "room-bob",
+                    displayName: displayName,
+                    state: .connected,
+                    status: "connected",
+                    userStatusText: "Connected",
+                    lastMessagePreview: "",
+                    unreadCount: 0,
+                    canLoadOlder: false
+                )
+                state.rooms = [room]
+                state.selectedRoomId = room.roomId
+                state.status = "chat created"
+            case .openRoom(let roomID):
+                state.selectedRoomId = roomID
+            case .sendMessage(let roomID, let text):
+                state.messages.append(ChatMessage(
+                    roomId: roomID,
+                    seq: 1,
+                    messageId: "message-bob",
+                    conversationId: nil,
+                    senderAccountId: "alice-account",
+                    senderDeviceId: "qt433",
+                    senderDisplayName: "qt433",
+                    senderNpub: nil,
+                    text: text,
+                    displayContent: text,
+                    richTextJson: "",
+                    payload: Data(text.utf8),
+                    replyToMessageId: nil,
+                    isMine: true,
+                    outboundDelivery: OutboundDelivery(
+                        localSend: .sent,
+                        serverDelivery: .delivered
+                    ),
+                    reactions: [],
+                    media: [],
+                    readReceipt: nil,
+                    poll: nil,
+                    timestampUnixSeconds: 1_700_000_000,
+                    displayTimestamp: "now"
+                ))
+            default:
+                break
+            }
+            return state
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: [
+                "FiniteChat",
+                "--finitechat-auto-start-profile-chat-npub",
+                bobNpub,
+                "--finitechat-auto-send",
+                "hello from profile automation",
+            ],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendMessage = $0 { return true }
+                return false
+            }
+        }
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .startProfileChat(
+                    accountId: bobAccountID,
+                    displayName: "Chat with \(shortenedDisplayNpub(bobNpub))"
+                ),
+                .openRoom(roomId: "room-bob"),
+                .sendMessage(
+                    roomId: "room-bob",
+                    text: "hello from profile automation"
+                ),
+            ]
+        )
+        XCTAssertEqual(model.outboundText, "")
+    }
+
     func testLaunchAutomationSendsAttachmentFileThroughRustAction() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",

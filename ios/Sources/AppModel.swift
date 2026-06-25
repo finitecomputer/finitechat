@@ -1718,6 +1718,7 @@ final class AppModel: ObservableObject {
         guard !didRunLaunchAutomation else { return }
         let inviteURL = Self.argumentValue("--finitechat-auto-join", in: args)
         let createRoomName = Self.argumentValue("--finitechat-auto-create-room", in: args)
+        let profileChatNpub = Self.argumentValue("--finitechat-auto-start-profile-chat-npub", in: args)
         let outbound = Self.argumentValue("--finitechat-auto-send", in: args)
         let attachmentText = Self.argumentValue(
             "--finitechat-auto-send-attachment-text",
@@ -1745,6 +1746,7 @@ final class AppModel: ObservableObject {
         )
         guard inviteURL != nil
             || createRoomName != nil
+            || profileChatNpub != nil
             || outbound != nil
             || attachmentText != nil
             || attachmentFile != nil
@@ -1773,6 +1775,11 @@ final class AppModel: ObservableObject {
                 if let room = self.launchAutomationRoom(roomID: roomID) {
                     self.submitPin(for: room)
                 }
+            }
+            if let profileChatNpub,
+               !profileChatNpub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                self.startLaunchAutomationProfileChat(npub: profileChatNpub)
             }
             let roomID = requestedRoomID ?? self.state?.selectedRoomId
             if let outbound, !outbound.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1803,6 +1810,24 @@ final class AppModel: ObservableObject {
                     caption: attachmentCaption ?? ""
                 )
             }
+        }
+    }
+
+    private func startLaunchAutomationProfileChat(npub rawNpub: String) {
+        let npub = rawNpub.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let accountID = try accountIdFromNpub(npub: npub)
+            let profile = AppProfileSummary(
+                accountId: accountID,
+                npub: npub,
+                displayName: shortenedDisplayNpub(npub),
+                about: nil,
+                picture: nil,
+                stale: true
+            )
+            _ = startProfileChat(for: profile)
+        } catch {
+            errorText = "Launch automation profile npub was invalid"
         }
     }
 
@@ -1943,6 +1968,7 @@ final class AppModel: ObservableObject {
         [
             "--finitechat-auto-join",
             "--finitechat-auto-create-room",
+            "--finitechat-auto-start-profile-chat-npub",
             "--finitechat-auto-send",
             "--finitechat-auto-send-attachment-text",
             "--finitechat-auto-send-attachment-file",

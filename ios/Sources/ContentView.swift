@@ -2611,7 +2611,7 @@ private struct SettingsRowLabel: View {
     }
 }
 
-private func shortenedDisplayNpub(_ npub: String) -> String {
+func shortenedDisplayNpub(_ npub: String) -> String {
     guard npub.count > 18 else { return npub }
     return "\(npub.prefix(10))...\(npub.suffix(4))"
 }

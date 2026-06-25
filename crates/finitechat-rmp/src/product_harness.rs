@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use finitechat_core::{
     AppAction, AppOutboxDebugRow, AppRoomState, AppState, FiniteChatRuntime,
     OpenOptions as CoreOpenOptions, OutboundLocalSendState, OutboundServerDeliveryState,
+    npub_from_account_id,
 };
 use rusqlite::Connection;
 use serde::Serialize;
@@ -57,9 +58,9 @@ fn ios_product_harness_with_ios_development_team_env(
 ) -> Result<(), CliError> {
     let scenario = checked_path_component("scenario", &args.scenario)?;
     let device = checked_path_component("device", &args.device)?;
-    if scenario != "text-offline" {
+    if !matches!(scenario.as_str(), "text-offline" | "profile-dm") {
         return Err(CliError::user(format!(
-            "unsupported product harness scenario `{scenario}`; expected `text-offline`"
+            "unsupported product harness scenario `{scenario}`; expected `text-offline` or `profile-dm`"
         )));
     }
     let server_url = checked_server_url(&args.server_url)?;
@@ -119,6 +120,7 @@ fn ios_product_harness_with_ios_development_team_env(
                 ios_development_team,
                 bundle_id: None,
                 assertions: None,
+                profile_dm_assertions: None,
             },
         );
         return Ok(());
@@ -148,6 +150,46 @@ fn ios_product_harness_with_ios_development_team_env(
 
     let mut server = HarnessServer::start(root, &server_addr, &server_sqlite, &server_log)?;
     server.wait_until_ready(&server_addr, Duration::from_secs(30))?;
+    if scenario == "profile-dm" {
+        let assertions = run_profile_dm_harness(
+            &target,
+            &store_path,
+            &peer_store_path,
+            &support_root,
+            &server_url,
+            &device,
+            &peer_device,
+            &server_sqlite,
+            verbose,
+            args.settle_seconds,
+        )?;
+        server.stop()?;
+        render_harness_result(
+            json,
+            "asserted",
+            HarnessResult {
+                platform: platform_label,
+                scenario,
+                device,
+                server_url,
+                server_addr,
+                server_probe_addr,
+                support_root,
+                config_path,
+                store_path,
+                peer_store_path,
+                server_sqlite,
+                server_log,
+                phases,
+                udid: Some(target.udid().to_owned()),
+                ios_development_team,
+                bundle_id: Some(target.bundle_id().to_owned()),
+                assertions: None,
+                profile_dm_assertions: Some(assertions),
+            },
+        );
+        return Ok(());
+    }
     let launch = launch_phase(
         &target,
         &support_root,
@@ -446,9 +488,116 @@ fn ios_product_harness_with_ios_development_team_env(
             ios_development_team,
             bundle_id: Some(target.bundle_id().to_owned()),
             assertions: Some(assertions),
+            profile_dm_assertions: None,
         },
     );
     Ok(())
+}
+
+fn run_profile_dm_harness(
+    target: &HarnessIosTarget,
+    store_path: &Path,
+    peer_store_path: &Path,
+    support_root: &Path,
+    server_url: &str,
+    device: &str,
+    peer_device: &str,
+    server_sqlite: &Path,
+    verbose: bool,
+    settle_seconds: u64,
+) -> Result<ProfileDmHarnessAssertions, CliError> {
+    let peer = open_product_runtime(
+        peer_store_path,
+        server_url,
+        peer_device,
+        "profile DM peer preparation",
+    )?;
+    let peer_state = peer.dispatch(AppAction::StartRuntime).map_err(|error| {
+        CliError::operational(format!(
+            "profile DM peer preparation: peer failed to publish key packages: {error}"
+        ))
+    })?;
+    let peer_account_id = peer_state.identity.account_id;
+    let peer_npub = npub_from_account_id(peer_account_id.clone()).map_err(|error| {
+        CliError::operational(format!(
+            "profile DM peer preparation: failed to encode peer npub: {error}"
+        ))
+    })?;
+
+    let launch = launch_phase(
+        target,
+        support_root,
+        server_url,
+        device,
+        &[
+            "--finitechat-auto-start-profile-chat-npub",
+            peer_npub.as_str(),
+            "--finitechat-auto-send",
+            "profile dm product harness message",
+        ],
+        verbose,
+        settle_seconds,
+    )?;
+    terminate_phase(target, launch, verbose)?;
+    pull_device_store_if_needed(target, store_path, verbose)?;
+
+    let after_profile_dm = assert_server_delivery_snapshot(
+        server_sqlite,
+        1,
+        device,
+        "after profile DM start/send phase",
+    )?;
+    let local_after_profile_dm = assert_local_projection_snapshot(
+        store_path,
+        server_url,
+        device,
+        "after profile DM start/send phase",
+        LocalProjectionExpectation {
+            expected_messages: 1,
+            expected_delivered: 1,
+            expected_undelivered: 0,
+            required_delivered_message_ids: &[],
+        },
+    )?;
+    let message_id = local_after_profile_dm
+        .delivered_message_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            CliError::operational(
+                "after profile DM start/send phase: expected one delivered message id".to_owned(),
+            )
+        })?;
+    assert_server_snapshot_contains_message(
+        &after_profile_dm,
+        &message_id,
+        "after profile DM start/send phase",
+    )?;
+    let room_id = local_after_profile_dm
+        .selected_room_id
+        .clone()
+        .ok_or_else(|| {
+            CliError::operational(
+                "after profile DM start/send phase: expected selected direct room".to_owned(),
+            )
+        })?;
+    let peer_after_profile_dm = assert_peer_delivery_snapshot(
+        peer_store_path,
+        server_url,
+        peer_device,
+        &room_id,
+        device,
+        &message_id,
+        "after profile DM start/send phase",
+    )?;
+
+    Ok(ProfileDmHarnessAssertions {
+        after_profile_dm,
+        local_after_profile_dm,
+        peer_after_profile_dm,
+        peer_account_id,
+        peer_npub,
+    })
 }
 
 struct HarnessResult {
@@ -469,6 +618,7 @@ struct HarnessResult {
     ios_development_team: Option<String>,
     bundle_id: Option<String>,
     assertions: Option<HarnessAssertions>,
+    profile_dm_assertions: Option<ProfileDmHarnessAssertions>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -486,6 +636,15 @@ struct HarnessAssertions {
     outbox_after_offline_attachment: LocalOutboxSnapshot,
     outbox_after_restart: LocalOutboxSnapshot,
     peer_after_restart: PeerReceiptSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProfileDmHarnessAssertions {
+    after_profile_dm: ServerDeliverySnapshot,
+    local_after_profile_dm: LocalProjectionSnapshot,
+    peer_after_profile_dm: PeerReceiptSnapshot,
+    peer_account_id: String,
+    peer_npub: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -613,6 +772,7 @@ fn render_harness_result(json: bool, status: &str, result: HarnessResult) {
                 "ios_development_team": result.ios_development_team,
                 "bundle_id": result.bundle_id,
                 "assertions": result.assertions,
+                "profile_dm_assertions": result.profile_dm_assertions,
             }),
         });
         return;
@@ -690,6 +850,28 @@ fn render_harness_result(json: bool, status: &str, result: HarnessResult) {
             assertions.peer_after_restart.message_id,
             assertions.peer_after_restart.inbound_matching_messages,
             assertions.peer_after_restart.sender_devices.join(",")
+        );
+    }
+    if let Some(assertions) = result.profile_dm_assertions {
+        eprintln!(
+            "assertions: profile DM server messages={}, rooms={}, peer={}",
+            assertions.after_profile_dm.application_delivery_effects,
+            assertions.after_profile_dm.rooms.join(","),
+            assertions.peer_npub
+        );
+        eprintln!(
+            "assertions: profile DM local messages={}, delivered ids={}",
+            assertions.local_after_profile_dm.messages,
+            assertions
+                .local_after_profile_dm
+                .delivered_message_ids
+                .join(",")
+        );
+        eprintln!(
+            "assertions: profile DM peer received message {} exactly {} time(s) as inbound from {}",
+            assertions.peer_after_profile_dm.message_id,
+            assertions.peer_after_profile_dm.inbound_matching_messages,
+            assertions.peer_after_profile_dm.sender_devices.join(",")
         );
     }
 }
@@ -1944,6 +2126,7 @@ fn harness_phases(scenario: &str) -> Vec<&'static str> {
             "attempt-offline-attachment-fail-fast",
             "restart-same-server-url-and-drain",
         ],
+        "profile-dm" => vec!["peer-publishes-key-packages", "profile-dm-start-and-send"],
         _ => vec![],
     }
 }
@@ -1958,6 +2141,11 @@ mod tests {
     }
 
     impl ProductHarnessArgsBuilder {
+        fn scenario(mut self, value: &str) -> Self {
+            self.args.scenario = value.to_owned();
+            self
+        }
+
         fn server_url(mut self, value: &str) -> Self {
             self.args.server_url = value.to_owned();
             self
@@ -2144,6 +2332,32 @@ mod tests {
         )
         .expect("device dry run with env team");
 
+        assert!(
+            !temp.path().join(".state").exists(),
+            "dry-run must not create product harness state"
+        );
+    }
+
+    #[test]
+    fn profile_dm_simulator_dry_run_preflights_without_creating_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        ios_product_harness_with_ios_development_team_env(
+            temp.path(),
+            false,
+            false,
+            product_harness_args(ProductHarnessPlatform::IosSimulator)
+                .scenario("profile-dm")
+                .dry_run(true)
+                .build(),
+            None,
+        )
+        .expect("profile dm simulator dry run");
+
+        assert_eq!(
+            harness_phases("profile-dm"),
+            vec!["peer-publishes-key-packages", "profile-dm-start-and-send"]
+        );
         assert!(
             !temp.path().join(".state").exists(),
             "dry-run must not create product harness state"
