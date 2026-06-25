@@ -721,13 +721,20 @@ final class AppModel: ObservableObject {
             accountId: profile.accountId,
             displayName: "Chat with \(displayName)"
         ))
-        guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
-            if userNoticeText == nil {
-                errorText = "Chat could not be created."
-            }
-            return false
+        if let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
+            return room.state == .connected
         }
-        return room.state == .connected
+        let status = state?.status.nonEmptyTrimmed
+        if let room = selectedRoom,
+           room.state == .connected,
+           status == "chat opened" || status == "chat created"
+        {
+            return true
+        }
+        if userNoticeText == nil {
+            errorText = "Chat could not be created."
+        }
+        return false
     }
 
     func startGroupChat(named rawName: String, with profiles: [AppProfileSummary]) -> Bool {

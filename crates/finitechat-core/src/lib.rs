@@ -1382,6 +1382,15 @@ impl AppRuntimeState {
             label.to_owned()
         };
 
+        if let Some(room_id) = self.existing_profile_chat_room_id(&account_id) {
+            self.app.selected_room_id = Some(room_id);
+            self.persist_app_state()?;
+            self.sync_selected_room_messages();
+            self.app.status = "chat opened".to_owned();
+            self.app.toast = None;
+            return Ok(());
+        }
+
         let claimed = {
             let mut delivery = self.core.home_delivery();
             match delivery.claim_key_package_for_account(&account_id) {
@@ -3083,6 +3092,29 @@ impl AppRuntimeState {
         self.room(room_id)
             .is_some_and(|room| room.state == AppRoomState::Connected)
             && self.core.has_room(room_id)
+    }
+
+    fn existing_profile_chat_room_id(&self, account_id: &str) -> Option<String> {
+        let current_account_id = &self.app.identity.account_id;
+        for room in &self.app.rooms {
+            if room.state != AppRoomState::Connected || !self.core.has_room(&room.room_id) {
+                continue;
+            }
+            let Ok(members) = self.core.device.room_members(&room.room_id) else {
+                continue;
+            };
+            let member_account_ids = members
+                .into_iter()
+                .map(|member| member.account_id)
+                .collect::<BTreeSet<_>>();
+            if member_account_ids.len() == 2
+                && member_account_ids.contains(current_account_id)
+                && member_account_ids.contains(account_id)
+            {
+                return Some(room.room_id.clone());
+            }
+        }
+        None
     }
 
     fn room(&self, room_id: &str) -> Option<&AppRoomSummary> {
@@ -7225,7 +7257,7 @@ mod tests {
 
         let alice_state = alice
             .dispatch(AppAction::StartProfileChat {
-                account_id: bob_account_id,
+                account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -7234,6 +7266,23 @@ mod tests {
         assert_eq!(room.display_name, "Chat with Bob");
         assert_eq!(room.state, AppRoomState::Connected);
         let room_id = room.room_id.clone();
+
+        let reopened_state = alice
+            .dispatch(AppAction::StartProfileChat {
+                account_id: bob_account_id.clone(),
+                display_name: "Chat with Bob".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(reopened_state.status, "chat opened");
+        assert_eq!(
+            reopened_state.selected_room_id.as_deref(),
+            Some(room_id.as_str())
+        );
+        assert_eq!(reopened_state.rooms.len(), 1);
+        assert_eq!(
+            app_room(&reopened_state, &room_id).state,
+            AppRoomState::Connected
+        );
 
         let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
         let bob_room = app_room(&bob_state, &room_id);
@@ -7342,6 +7391,24 @@ mod tests {
         assert_member_in_room_details(details, &alice_state.identity.account_id, "alice-ios", true);
         assert_member_in_room_details(details, &bob_account_id, "bob-ios", false);
         assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
+
+        let direct_state = alice
+            .dispatch(AppAction::StartProfileChat {
+                account_id: bob_account_id.clone(),
+                display_name: "Chat with Bob".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(direct_state.status, "chat created");
+        assert_eq!(direct_state.rooms.len(), 2);
+        let direct_room_id = direct_state
+            .selected_room_id
+            .as_deref()
+            .expect("selected direct room");
+        assert_ne!(direct_room_id, room_id);
+        assert_eq!(
+            app_room(&direct_state, direct_room_id).state,
+            AppRoomState::Connected
+        );
 
         let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
         assert_eq!(

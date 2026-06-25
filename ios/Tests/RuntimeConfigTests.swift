@@ -2058,6 +2058,63 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
+    func testStartProfileChatTreatsOpenedExistingDirectRoomAsSuccess() throws {
+        let profile = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let existingRoom = AppRoomSummary(
+            roomId: "room-bob",
+            displayName: "Chat with Bob",
+            state: .connected,
+            status: "connected",
+            userStatusText: "Connected",
+            lastMessagePreview: "",
+            unreadCount: 0,
+            canLoadOlder: false
+        )
+        var existingState = emptyChatState()
+        existingState.rooms = [existingRoom]
+        let runtime = FakeFiniteChatRuntime(
+            initialState: existingState,
+            startRuntimeState: existingState
+        ) { action, currentState in
+            var state = currentState
+            if case .startProfileChat = action {
+                state.selectedRoomId = "room-bob"
+                state.status = "chat opened"
+                state.toast = nil
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.startProfileChat(for: profile))
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [
+                .startRuntime,
+                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            ]
+        )
+        XCTAssertEqual(model.rooms.count, 1)
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
+        XCTAssertNil(model.developerErrorText)
+    }
+
+    @MainActor
     func testStartProfileChatFailureKeepsNoticeVisibleWithoutRooms() throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
