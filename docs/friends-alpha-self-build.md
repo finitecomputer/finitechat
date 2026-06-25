@@ -101,6 +101,10 @@ xcrun devicectl list devices
 Use the hardware UDID from `xctrace` for `xcodebuild` and the CoreDevice
 identifier from `devicectl` for install/launch.
 
+Paul's local team id for the canonical `computer.finite.finitechat` debug build
+is `JBLHZ83X6T`. Friends building from their own Apple account should use their
+own team id for `DEVELOPMENT_TEAM`.
+
 ```sh
 export IOS_HARDWARE_UDID="<udid-from-xctrace>"
 export COREDEVICE_ID="<identifier-from-devicectl>"

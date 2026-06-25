@@ -440,10 +440,27 @@ private struct ChatPeoplePickerSheet: View {
     let existingRoom: AppRoomSummary?
     let onCreated: (AppRoomSummary) -> Void
 
+    private enum NewConversationMode: String, CaseIterable, Identifiable {
+        case chat
+        case group
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .chat:
+                return "Chat"
+            case .group:
+                return "Group"
+            }
+        }
+    }
+
     @State private var roomName = ""
     @State private var memberCode = ""
     @State private var selectedProfiles: [AppProfileSummary] = []
     @State private var searchText = ""
+    @State private var conversationMode: NewConversationMode = .chat
     @State private var showingCameraScanner = false
     @State private var parseError: String?
     @FocusState private var focused: Bool
@@ -510,6 +527,18 @@ private struct ChatPeoplePickerSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                if existingRoom == nil {
+                    Section {
+                        Picker("Conversation type", selection: $conversationMode) {
+                            ForEach(NewConversationMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .accessibilityIdentifier("NewRoomConversationModePicker")
+                    }
+                }
+
                 if showsGroupNameField {
                     Section {
                         TextField("Room name", text: $roomName)
@@ -541,7 +570,7 @@ private struct ChatPeoplePickerSheet: View {
                         Button {
                             showingCameraScanner = true
                         } label: {
-                            Label("Scan Profile Code", systemImage: "qrcode.viewfinder")
+                            Label(scanActionTitle, systemImage: "qrcode.viewfinder")
                         }
                         .accessibilityIdentifier("NewRoomScanProfileButton")
                     }
@@ -549,10 +578,10 @@ private struct ChatPeoplePickerSheet: View {
                     Button {
                         addCode(
                             UIPasteboard.general.string ?? "",
-                            startDirectChatIfPossible: existingRoom == nil && selectedProfiles.isEmpty
+                            startDirectChatIfPossible: startsDirectChatFromEnteredCode
                         )
                     } label: {
-                        Label("Paste Profile Code", systemImage: "doc.on.clipboard")
+                        Label(pasteActionTitle, systemImage: "doc.on.clipboard")
                     }
                     .accessibilityIdentifier("NewRoomPasteProfileButton")
 
@@ -625,7 +654,7 @@ private struct ChatPeoplePickerSheet: View {
                 QRCodeScannerSheet { value in
                     addCode(
                         value,
-                        startDirectChatIfPossible: existingRoom == nil && selectedProfiles.isEmpty
+                        startDirectChatIfPossible: startsDirectChatFromEnteredCode
                     )
                 }
             }
@@ -644,6 +673,13 @@ private struct ChatPeoplePickerSheet: View {
             .task {
                 focused = existingRoom == nil
             }
+            .onChange(of: conversationMode) { _, mode in
+                parseError = nil
+                roomName = ""
+                if mode == .chat && selectedProfiles.count > 1 {
+                    selectedProfiles = Array(selectedProfiles.prefix(1))
+                }
+            }
         }
     }
 
@@ -658,36 +694,43 @@ private struct ChatPeoplePickerSheet: View {
         if existingRoom != nil {
             return false
         }
-        return selectedProfiles.count > 1 && trimmedName.isEmpty
+        if conversationMode == .group {
+            return trimmedName.isEmpty
+        }
+        return selectedProfiles.count != 1
     }
 
     private var showsGroupNameField: Bool {
-        existingRoom == nil && selectedProfiles.count > 1
+        existingRoom == nil && conversationMode == .group
     }
 
     private var primaryActionTitle: String {
         if existingRoom != nil {
             return "Add"
         }
-        return selectedProfiles.count > 1 ? "Create" : "Start"
+        return conversationMode == .group ? "Create" : "Start"
     }
 
     private var primaryActionLabel: String {
         if existingRoom != nil {
             return "Add People"
         }
-        return selectedProfiles.count > 1 ? "Create Group Chat" : "Start Chat"
+        return conversationMode == .group ? "Create Group Chat" : "Start Chat"
     }
 
     private var primaryActionSystemImage: String {
-        if existingRoom != nil || selectedProfiles.count > 1 {
+        if existingRoom != nil || conversationMode == .group {
             return "person.2.badge.plus"
         }
         return "bubble.left.and.bubble.right"
     }
 
     private var startsDirectChatFromManualCode: Bool {
-        existingRoom == nil && selectedProfiles.isEmpty
+        startsDirectChatFromEnteredCode
+    }
+
+    private var startsDirectChatFromEnteredCode: Bool {
+        existingRoom == nil && conversationMode == .chat && selectedProfiles.isEmpty
     }
 
     private var manualCodeActionTitle: String {
@@ -696,6 +739,14 @@ private struct ChatPeoplePickerSheet: View {
 
     private var manualCodeActionSystemImage: String {
         startsDirectChatFromManualCode ? "bubble.left.and.bubble.right" : "person.badge.plus"
+    }
+
+    private var scanActionTitle: String {
+        conversationMode == .group || existingRoom != nil ? "Scan Profile Code" : "Scan and Start Chat"
+    }
+
+    private var pasteActionTitle: String {
+        conversationMode == .group || existingRoom != nil ? "Paste Profile Code" : "Paste and Start Chat"
     }
 
     @ViewBuilder
@@ -713,7 +764,7 @@ private struct ChatPeoplePickerSheet: View {
                 Section("Nostr Follows") {
                     ForEach(filteredFollowProfiles) { profile in
                         Button {
-                            addProfile(profile.appProfileSummary)
+                            chooseProfile(profile.appProfileSummary)
                         } label: {
                             NewGroupFollowRow(profile: profile)
                                 .padding(.vertical, 5)
@@ -727,7 +778,7 @@ private struct ChatPeoplePickerSheet: View {
                 Section("Known in Finite Chat") {
                     ForEach(filteredKnownProfiles, id: \.accountId) { profile in
                         Button {
-                            addProfile(profile)
+                            chooseProfile(profile)
                         } label: {
                             ProfileRow(profile: profile)
                                 .padding(.vertical, 5)
@@ -778,6 +829,16 @@ private struct ChatPeoplePickerSheet: View {
             }
         } catch {
             parseError = "That code is not a valid profile code."
+        }
+    }
+
+    private func chooseProfile(_ profile: AppProfileSummary) {
+        let shouldStartDirectChat = existingRoom == nil
+            && conversationMode == .chat
+            && selectedProfiles.isEmpty
+        guard addProfile(profile) else { return }
+        if shouldStartDirectChat {
+            create()
         }
     }
 

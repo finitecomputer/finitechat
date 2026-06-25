@@ -10,7 +10,7 @@ Finite Chat ships as its own App Store Connect app record.
 - Primary language: English
 - Xcode project: `ios/FiniteChat.xcodeproj`
 - Scheme: `FiniteChat`
-- Signing team in `ios/project.yml`: `Y392XZ3MST`
+- Signing team in `ios/project.yml`: `JBLHZ83X6T`
 
 This keeps the App Store Connect record aligned with the repo, bundle ID,
 keychain/runtime naming, and product metadata.
