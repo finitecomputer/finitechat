@@ -1017,7 +1017,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }
 
-    func testExistingStableRuntimeStoreBypassesLoginGateAndRestoresKeychainIdentity() throws {
+    func testExistingStableRuntimeStoreRequiresExplicitLoginOrRecovery() throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
@@ -1056,10 +1056,65 @@ final class AppModelPersistenceTests: XCTestCase {
             return runtime
         }
 
-        XCTAssertFalse(model.requiresNostrLogin)
+        XCTAssertTrue(model.requiresNostrLogin)
+        XCTAssertTrue(model.canRecoverRuntimeIdentity)
 
         model.start()
 
+        XCTAssertTrue(openedOptions.isEmpty)
+        XCTAssertNil(model.nostrIdentity)
+        XCTAssertNil(model.activeAccountID)
+        XCTAssertNil(identityStore.load())
+        XCTAssertTrue(runtime.dispatchedActions.isEmpty)
+        XCTAssertEqual(model.developerErrorText, "Create or sign in to a Nostr account first.")
+    }
+
+    func testExplicitExistingDeviceAccountRecoveryRestoresKeychainIdentity() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "https://chat.finite.computer",
+            deviceID: "ios"
+        )
+        let supportURL = try temporarySupportURL()
+        let storeURL = supportURL.appendingPathComponent("FiniteChatStore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: storeURL,
+            withIntermediateDirectories: true
+        )
+        try Data(material.accountSecretHex.utf8)
+            .write(to: storeURL.appendingPathComponent("account-secret.hex"))
+        try Data().write(to: storeURL.appendingPathComponent("client.sqlite3"))
+
+        var state = emptyChatState(deviceID: "ios")
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "ios",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore()
+        var openedOptions: [OpenOptions] = []
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: supportURL,
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return runtime
+        }
+
+        XCTAssertTrue(model.requiresNostrLogin)
+        XCTAssertTrue(model.canRecoverRuntimeIdentity)
+
+        XCTAssertTrue(model.recoverExistingDeviceAccount())
+
+        XCTAssertFalse(model.requiresNostrLogin)
+        XCTAssertFalse(model.canRecoverRuntimeIdentity)
         XCTAssertEqual(openedOptions.count, 1)
         XCTAssertNil(openedOptions[0].accountSecretHex)
         XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)

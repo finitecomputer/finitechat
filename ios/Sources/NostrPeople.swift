@@ -319,7 +319,7 @@ final class NostrPeopleModel: ObservableObject {
                 preserveNonEmptyOnEmptyResult: true
             )
             if result.followedPubkeyCount == 0 {
-                statusText = "No follows found across \(result.relayCount) Nostr relays."
+                statusText = "No follows found for \(accountDisplay(accountID)) across \(result.relayCount) Nostr relays."
             } else {
                 statusText = "Loaded \(result.profiles.count) of \(result.followedPubkeyCount) follows from \(result.relayCount) relays."
             }
@@ -364,6 +364,19 @@ final class NostrPeopleModel: ObservableObject {
         let trimmed = accountID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard let trimmed, !trimmed.isEmpty else { return nil }
         return trimmed
+    }
+
+    private func accountDisplay(_ accountID: String) -> String {
+        if let npub = try? npubFromAccountId(accountId: accountID) {
+            return shortenedNpub(npub)
+        }
+        guard accountID.count > 12 else { return accountID }
+        return "\(accountID.prefix(8))...\(accountID.suffix(4))"
+    }
+
+    private func shortenedNpub(_ npub: String) -> String {
+        guard npub.count > 18 else { return npub }
+        return "\(npub.prefix(10))...\(npub.suffix(4))"
     }
 
     @MainActor
@@ -639,7 +652,10 @@ final class NostrRelayProfileService: Sendable {
             forAccountID: accountID,
             relays: expandedContactRelays
         )
-        if !expandedResult.contacts.isEmpty || primaryResult.allRelayAttemptsFailed {
+        if !expandedResult.contacts.isEmpty
+            || (primaryResult.contacts.isEmpty && !expandedResult.allRelayAttemptsFailed)
+            || primaryResult.allRelayAttemptsFailed
+        {
             return (expandedContactRelays, expandedResult)
         }
         return (primaryRelays, primaryResult)

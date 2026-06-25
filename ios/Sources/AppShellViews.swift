@@ -432,6 +432,16 @@ struct NostrLoginView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .accessibilityIdentifier("NostrCreateAccountButton")
+
+                    if model.canRecoverRuntimeIdentity {
+                        Button {
+                            _ = model.recoverExistingDeviceAccount()
+                        } label: {
+                            Label("Use Existing Device Account", systemImage: "iphone")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .accessibilityIdentifier("NostrRecoverExistingAccountButton")
+                    }
                 } header: {
                     Text("Nostr Account")
                 }

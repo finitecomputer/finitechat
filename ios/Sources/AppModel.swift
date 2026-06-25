@@ -375,6 +375,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
     @Published private(set) var nostrIdentity: AppNostrIdentity?
     @Published private(set) var requiresNostrLogin: Bool
+    @Published private(set) var canRecoverRuntimeIdentity: Bool
 
     private var runtime: (any FiniteChatRuntimeProtocol)?
     private var openKey = ""
@@ -437,9 +438,9 @@ final class AppModel: ObservableObject {
                 applicationSupportURL: resolvedApplicationSupportURL
             )
         nostrIdentity = storedNostrIdentity
+        canRecoverRuntimeIdentity = hasRecoverableRuntimeIdentity
         self.requiresNostrLogin = requiresNostrLogin
             && storedNostrIdentity == nil
-            && !hasRecoverableRuntimeIdentity
             && !Self.hasLaunchAutomation(args: args)
         launchConfigurationError = productHarnessSupport.error
         appendDiagnostic(
@@ -564,6 +565,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func recoverExistingDeviceAccount() -> Bool {
+        guard canRecoverRuntimeIdentity else { return false }
+        appendDiagnostic(category: "persistence", event: "recover_existing_account.requested")
+        requiresNostrLogin = false
+        start()
+        if nostrIdentity != nil {
+            canRecoverRuntimeIdentity = false
+            appendDiagnostic(category: "persistence", event: "recover_existing_account.succeeded")
+            return true
+        }
+        closeRuntime()
+        requiresNostrLogin = true
+        errorText = "Existing device account could not be recovered."
+        appendDiagnostic(category: "persistence", event: "recover_existing_account.failed")
+        return false
+    }
+
     func signOutAndDeleteEverything() {
         appendDiagnostic(category: "persistence", event: "signout.delete_all.requested")
         removePushTokenIfPossible()
@@ -583,6 +602,7 @@ final class AppModel: ObservableObject {
         deviceID = resetConfig.deviceID
         nostrIdentity = nil
         requiresNostrLogin = true
+        canRecoverRuntimeIdentity = false
         errorText = nil
     }
 
@@ -1106,6 +1126,7 @@ final class AppModel: ObservableObject {
         nostrIdentityStore.save(identity)
         nostrIdentity = identity
         requiresNostrLogin = false
+        canRecoverRuntimeIdentity = false
         appendDiagnostic(category: "persistence", event: "nostr_identity.applied")
         start()
     }

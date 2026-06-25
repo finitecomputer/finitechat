@@ -454,6 +454,32 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(model.statusText, "Showing cached people. Refresh found no follows across 1 Nostr relays.")
     }
 
+    func testPeopleModelNoFollowsStatusNamesAccountAndExpandedRelayCount() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let npub = try npubFromAccountId(accountId: owner)
+        let shortened = "\(npub.prefix(10))...\(npub.suffix(4))"
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://primary.example"],
+            discoveryRelays: ["wss://discovery.example"],
+            eventLoader: { _, _, _, _ in [] }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: FiniteInviteAvailabilityService(
+                availabilityLoader: { _, _ in [:] }
+            ),
+            cache: NostrPeopleCache(directory: temporaryCacheDirectory())
+        )
+
+        await model.refresh(accountID: owner, serverURL: "https://chat.example")
+
+        XCTAssertTrue(model.profiles.isEmpty)
+        XCTAssertEqual(
+            model.statusText,
+            "No follows found for \(shortened) across 2 Nostr relays."
+        )
+    }
+
     func testPeopleModelCachesFetchedProfilesBeforeAvailabilityFinishes() async throws {
         let material = try createNostrIdentity()
         let owner = material.accountId
