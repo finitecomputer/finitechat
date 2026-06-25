@@ -186,7 +186,7 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
 
     func normalized() -> PersistedRuntimeConfig {
         PersistedRuntimeConfig(
-            serverURL: normalizedNonEmpty(serverURL),
+            serverURL: normalizedPersistedServerURL(serverURL),
             deviceID: normalizedNonEmpty(deviceID)
         )
     }
@@ -195,6 +195,46 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else { return nil }
         return trimmed
+    }
+
+    private func normalizedPersistedServerURL(_ value: String?) -> String? {
+        guard let trimmed = normalizedNonEmpty(value),
+              let components = URLComponents(string: trimmed),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty,
+              !Self.isDevelopmentHost(host)
+        else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func isDevelopmentHost(_ host: String) -> Bool {
+        if host == "localhost"
+            || host == "0.0.0.0"
+            || host == "::1"
+            || host.hasSuffix(".local")
+        {
+            return true
+        }
+
+        if host.hasPrefix("127.") {
+            return true
+        }
+
+        let octets = host.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4 else { return false }
+        if octets[0] == 10 || (octets[0] == 192 && octets[1] == 168) {
+            return true
+        }
+        if octets[0] == 172 && (16...31).contains(octets[1]) {
+            return true
+        }
+        if octets[0] == 169 && octets[1] == 254 {
+            return true
+        }
+        return false
     }
 }
 
@@ -415,7 +455,10 @@ final class AppModel: ObservableObject {
         let resolvedApplicationSupportURL = applicationSupportURL ?? productHarnessSupport.url
         let resolvedConfigStorageURL = configStorageURL
             ?? resolvedApplicationSupportURL?.appendingPathComponent("finitechat_config.json")
-        let resolvedConfig = config ?? RuntimeConfig.load(storageURL: resolvedConfigStorageURL)
+        let resolvedConfig = config ?? RuntimeConfig.load(
+            args: args,
+            storageURL: resolvedConfigStorageURL
+        )
         serverURL = resolvedConfig.serverURL
         deviceID = resolvedConfig.deviceID
         usesTransientStore = resolvedConfig.usesTransientStore
