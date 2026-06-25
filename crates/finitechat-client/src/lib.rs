@@ -1000,6 +1000,10 @@ impl FiniteChatDevice {
         &self.device_ref
     }
 
+    pub fn set_now_unix_seconds(&mut self, now_unix_seconds: u64) {
+        self.now_unix_seconds = now_unix_seconds;
+    }
+
     pub fn create_group_state(
         &mut self,
         room_id: impl Into<RoomId>,
@@ -9181,6 +9185,68 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn refreshed_device_clock_accepts_key_packages_created_after_runtime_open() {
+        let alice_secret = NostrSecretKey::from_bytes([1; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let bob_secret = NostrSecretKey::from_bytes([2; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let mut alice = FiniteChatDevice::new(FiniteChatDeviceConfig {
+            account_secret_key: alice_secret,
+            device_id: "alice-phone".to_owned(),
+            now_unix_seconds: NOW,
+            credential_not_before_unix_seconds: NOW.saturating_sub(60),
+            credential_not_after_unix_seconds: NOW.saturating_add(600),
+        })
+        .unwrap();
+        alice
+            .create_group_state("room-clock", "mls-room-clock")
+            .unwrap();
+
+        let bob = FiniteChatDevice::new(FiniteChatDeviceConfig {
+            account_secret_key: bob_secret,
+            device_id: "bob-phone".to_owned(),
+            now_unix_seconds: NOW + 120,
+            credential_not_before_unix_seconds: NOW + 60,
+            credential_not_after_unix_seconds: NOW + 600,
+        })
+        .unwrap();
+        let bob_key_package = bob.upload_key_package_auto_id_request().unwrap();
+        let claimed = ClaimKeyPackageResult {
+            lease_token: "lease-clock".to_owned(),
+            key_package_id: bob_key_package.key_package_id,
+            owner: bob_key_package.owner,
+            key_package_ref: bob_key_package.key_package_ref,
+            key_package_hash: bob_key_package.key_package_hash,
+            key_package_payload: bob_key_package.key_package_payload,
+        };
+
+        let stale_error = alice
+            .prepare_add_member_commit(
+                "room-clock",
+                &claimed,
+                "welcome-clock-stale",
+                "direct-add-clock-stale",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                stale_error,
+                ClientError::MlsCredential(MlsCredentialError::CredentialNotYetValid)
+            ),
+            "expected stale clock to reject Bob's newer credential, got {stale_error:?}"
+        );
+
+        alice.set_now_unix_seconds(NOW + 120);
+        let prepared = alice
+            .prepare_add_member_commit(
+                "room-clock",
+                &claimed,
+                "welcome-clock-fresh",
+                "direct-add-clock-fresh",
+            )
+            .unwrap();
+        assert_eq!(prepared.request.room_id, "room-clock");
+    }
 
     #[test]
     fn sqlite_client_store_persists_app_messages_across_reopen() {

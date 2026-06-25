@@ -1044,6 +1044,7 @@ impl AppRuntimeState {
 
     fn dispatch(&mut self, action: AppAction) -> Result<(), FiniteChatCoreError> {
         self.app.toast = None;
+        self.core.refresh_device_clock()?;
         match action {
             AppAction::StartRuntime => self.start_runtime()?,
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
@@ -3397,6 +3398,12 @@ impl CoreState {
         Ok(self
             .fixed_now_unix_seconds
             .unwrap_or_else(current_unix_seconds))
+    }
+
+    fn refresh_device_clock(&mut self) -> Result<(), FiniteChatCoreError> {
+        let now = self.now_unix_seconds()?;
+        self.device.set_now_unix_seconds(now);
+        Ok(())
     }
 
     fn now_millis(&self) -> Result<u64, FiniteChatCoreError> {
@@ -7244,7 +7251,7 @@ mod tests {
         .unwrap();
         let bob = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
-            server_url,
+            server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
@@ -7283,6 +7290,31 @@ mod tests {
             app_room(&reopened_state, &room_id).state,
             AppRoomState::Connected
         );
+        drop(alice);
+
+        let reopened_alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let disk_reopened_state = reopened_alice
+            .dispatch(AppAction::StartProfileChat {
+                account_id: bob_account_id.clone(),
+                display_name: "Chat with Bob".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(disk_reopened_state.status, "chat opened");
+        assert_eq!(
+            disk_reopened_state.selected_room_id.as_deref(),
+            Some(room_id.as_str())
+        );
+        assert_eq!(
+            app_room(&disk_reopened_state, &room_id).state,
+            AppRoomState::Connected
+        );
 
         let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
         let bob_room = app_room(&bob_state, &room_id);
@@ -7292,7 +7324,7 @@ mod tests {
         })
         .unwrap();
 
-        alice
+        reopened_alice
             .dispatch(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "hello direct".to_owned(),
