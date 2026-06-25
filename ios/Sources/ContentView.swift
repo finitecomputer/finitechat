@@ -562,14 +562,14 @@ private struct ChatPeoplePickerSheet: View {
                         .lineLimit(2...4)
                         .submitLabel(.done)
                         .onSubmit {
-                            addCode(memberCode)
+                            addCode(memberCode, startDirectChatIfPossible: startsDirectChatFromManualCode)
                         }
                         .accessibilityIdentifier("NewRoomMemberCodeField")
 
                     Button {
-                        addCode(memberCode)
+                        addCode(memberCode, startDirectChatIfPossible: startsDirectChatFromManualCode)
                     } label: {
-                        Label("Add Entered Profile", systemImage: "person.badge.plus")
+                        Label(manualCodeActionTitle, systemImage: manualCodeActionSystemImage)
                     }
                     .disabled(memberCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .accessibilityIdentifier("NewRoomAddEnteredProfileButton")
@@ -684,6 +684,18 @@ private struct ChatPeoplePickerSheet: View {
             return "person.2.badge.plus"
         }
         return "bubble.left.and.bubble.right"
+    }
+
+    private var startsDirectChatFromManualCode: Bool {
+        existingRoom == nil && selectedProfiles.isEmpty
+    }
+
+    private var manualCodeActionTitle: String {
+        startsDirectChatFromManualCode ? "Start Chat" : "Add Entered Profile"
+    }
+
+    private var manualCodeActionSystemImage: String {
+        startsDirectChatFromManualCode ? "bubble.left.and.bubble.right" : "person.badge.plus"
     }
 
     @ViewBuilder
@@ -2363,6 +2375,7 @@ private struct ScanSheet: View {
     @ObservedObject var model: AppModel
     let onStartProfileChat: (AppProfileSummary) -> Bool
     @State private var showingCameraScanner = false
+    @State private var scanError: String?
 
     var body: some View {
         NavigationStack {
@@ -2377,6 +2390,7 @@ private struct ScanSheet: View {
                 Section {
                     if QRCodeScannerSheet.canUseCamera {
                         Button {
+                            scanError = nil
                             showingCameraScanner = true
                         } label: {
                             Label("Scan with Camera", systemImage: "qrcode.viewfinder")
@@ -2384,6 +2398,7 @@ private struct ScanSheet: View {
                     }
 
                     Button {
+                        scanError = nil
                         model.scanDraft = UIPasteboard.general.string ?? ""
                     } label: {
                         Label("Paste", systemImage: "doc.on.clipboard")
@@ -2414,6 +2429,13 @@ private struct ScanSheet: View {
                     Text("Invite or Profile Code")
                 }
 
+                if let scanError {
+                    Section {
+                        Label(scanError, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                    }
+                }
+
                 Section {
                     Label("Create New Finite Agent", systemImage: "sparkles")
                         .foregroundStyle(.secondary)
@@ -2441,6 +2463,7 @@ private struct ScanSheet: View {
             .navigationTitle("Scan")
             .sheet(isPresented: $showingCameraScanner) {
                 QRCodeScannerSheet { value in
+                    scanError = nil
                     model.scanDraft = value
                     continueWithTarget()
                 }
@@ -2468,24 +2491,37 @@ private struct ScanSheet: View {
 
     private func continueWithTarget() {
         let value = model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !isFiniteChatInviteCode(value),
-           let profile = try? profileSummaryFromScannedProfileCode(value, model: model)
-        {
-            if onStartProfileChat(profile) {
-                model.scanDraft = ""
-                dismiss()
+        guard !value.isEmpty else {
+            scanError = nil
+            dismiss()
+            return
+        }
+
+        if !isFiniteChatInviteCode(value) {
+            do {
+                let profile = try profileSummaryFromScannedProfileCode(value, model: model)
+                scanError = nil
+                if onStartProfileChat(profile) {
+                    model.scanDraft = ""
+                    dismiss()
+                }
+            } catch {
+                scanError = "That code is not a valid invite or profile code."
             }
             return
         }
 
         switch model.scanTargetResult() {
         case .empty:
+            scanError = nil
             dismiss()
         case .profile(let profile):
             if onStartProfileChat(profile) {
+                scanError = nil
                 dismiss()
             }
         case .room:
+            scanError = nil
             dismiss()
         case .unavailable:
             break
