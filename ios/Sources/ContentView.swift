@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 
 private enum AppSheet: Identifiable {
     case newChat
+    case myProfile
     case scan
     case invite
     case settings
@@ -15,6 +16,8 @@ private enum AppSheet: Identifiable {
         switch self {
         case .newChat:
             "newChat"
+        case .myProfile:
+            "myProfile"
         case .scan:
             "scan"
         case .invite:
@@ -47,6 +50,12 @@ struct ContentView: View {
                 ChatPeoplePickerSheet(model: model, existingRoom: nil) { room in
                     routeSelectedRoom(room.roomId)
                 }
+            case .myProfile:
+                MyNostrProfileSheet(
+                    identity: model.nostrIdentity,
+                    myNpub: model.myNpub,
+                    showsSecretKey: false
+                )
             case .scan:
                 ScanSheet(model: model) { profile in
                     startChatFromScannedProfile(profile)
@@ -148,6 +157,9 @@ struct ContentView: View {
                 model: model,
                 startProfileChat: { profile in
                     startChatFromScannedProfile(profile)
+                },
+                showMyProfile: {
+                    sheet = .myProfile
                 },
                 showNewChat: {
                     sheet = .newChat
@@ -296,6 +308,16 @@ private struct RoomListView: View {
         .listStyle(.plain)
         .navigationTitle("Chats")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    present(.myProfile)
+                } label: {
+                    Image(systemName: "person.crop.circle")
+                }
+                .accessibilityLabel("My profile code")
+                .accessibilityIdentifier("ChatsMyProfileButton")
+            }
+
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button {
                     present(.scan)

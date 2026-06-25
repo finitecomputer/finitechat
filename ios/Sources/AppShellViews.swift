@@ -220,7 +220,19 @@ private struct HomeInputDock: View {
     var body: some View {
         glassContainer {
             VStack(spacing: 8) {
-                HStack(spacing: 10) {
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 10),
+                        GridItem(.flexible(), spacing: 10),
+                    ],
+                    spacing: 8
+                ) {
+                    HomeSuggestionButton(
+                        title: "Chats",
+                        systemImage: "bubble.left.and.bubble.right",
+                        action: openChats
+                    )
+
                     HomeSuggestionButton(
                         title: "Message someone",
                         systemImage: "person",
@@ -450,6 +462,7 @@ struct NostrLoginView: View {
 struct PeopleView: View {
     @ObservedObject var model: AppModel
     let startProfileChat: (AppProfileSummary) -> Bool
+    let showMyProfile: () -> Void
     let showNewChat: () -> Void
     let showScan: () -> Void
     let showSettings: () -> Void
@@ -501,6 +514,14 @@ struct PeopleView: View {
         .listStyle(.plain)
         .navigationTitle("People")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(action: showMyProfile) {
+                    Image(systemName: "person.crop.circle")
+                }
+                .accessibilityLabel("My profile code")
+                .accessibilityIdentifier("PeopleMyProfileButton")
+            }
+
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button(action: showNewChat) {
                     Image(systemName: "plus")
@@ -754,8 +775,19 @@ struct MyNostrProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     let identity: AppNostrIdentity?
     let myNpub: String?
+    let showsSecretKey: Bool
     @State private var showingSecret = false
     @State private var copiedField: String?
+
+    init(
+        identity: AppNostrIdentity?,
+        myNpub: String?,
+        showsSecretKey: Bool = true
+    ) {
+        self.identity = identity
+        self.myNpub = myNpub
+        self.showsSecretKey = showsSecretKey
+    }
 
     var body: some View {
         NavigationStack {
@@ -776,7 +808,7 @@ struct MyNostrProfileSheet: View {
                     }
                 }
 
-                if let identity {
+                if showsSecretKey, let identity {
                     Section {
                         if showingSecret {
                             CopyableValueRow(title: "nsec", value: identity.nsec, copiedField: $copiedField)
