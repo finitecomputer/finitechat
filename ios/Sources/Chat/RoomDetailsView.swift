@@ -5,6 +5,7 @@ struct RoomDetailsView: View {
     let mediaItems: [ChatMediaGalleryItem]
     let onDownloadAttachment: (ChatMediaGalleryItem) -> Void
     let onCreateInvite: () -> Void
+    let onAddPeople: () -> Void
     let onRefreshDevices: () -> Void
     let onRevokeDevice: (AppDeviceSummary) -> Void
 
@@ -34,6 +35,13 @@ struct RoomDetailsView: View {
                         .accessibilityIdentifier("RoomDetailsMediaGalleryLink")
 
                         if details.canCreateInvite {
+                            Button {
+                                onAddPeople()
+                            } label: {
+                                Label("Add People", systemImage: "person.badge.plus")
+                            }
+                            .accessibilityIdentifier("RoomDetailsAddPeopleButton")
+
                             Button {
                                 onCreateInvite()
                             } label: {

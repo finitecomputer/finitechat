@@ -318,7 +318,7 @@ private struct RoomListView: View {
             prompt: "Search chats"
         )
         .sheet(isPresented: $showingNewRoom) {
-            NewGroupChatSheet(model: model) { room in
+            ChatPeoplePickerSheet(model: model, existingRoom: nil) { room in
                 open(room)
             }
         }
@@ -328,9 +328,10 @@ private struct RoomListView: View {
     }
 }
 
-private struct NewGroupChatSheet: View {
+private struct ChatPeoplePickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
+    let existingRoom: AppRoomSummary?
     let onCreated: (AppRoomSummary) -> Void
 
     @StateObject private var people = NostrPeopleModel()
@@ -389,14 +390,16 @@ private struct NewGroupChatSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    TextField("Room name", text: $roomName)
-                        .focused($focused)
-                        .submitLabel(.done)
-                        .onSubmit(create)
-                        .accessibilityIdentifier("NewRoomNameField")
-                } header: {
-                    Text("Group Chat")
+                if existingRoom == nil {
+                    Section {
+                        TextField("Room name", text: $roomName)
+                            .focused($focused)
+                            .submitLabel(.done)
+                            .onSubmit(create)
+                            .accessibilityIdentifier("NewRoomNameField")
+                    } header: {
+                        Text("Group Chat")
+                    }
                 }
 
                 if let notice = model.actionNoticeText {
@@ -469,7 +472,7 @@ private struct NewGroupChatSheet: View {
 
                 peopleSection
             }
-            .navigationTitle("New Chat")
+            .navigationTitle(existingRoom == nil ? "New Chat" : "Add People")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(
                 text: $searchText,
@@ -494,19 +497,23 @@ private struct NewGroupChatSheet: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create", action: create)
-                        .disabled(trimmedName.isEmpty || selectedProfiles.isEmpty)
+                    Button(existingRoom == nil ? "Create" : "Add", action: create)
+                        .disabled(primaryActionDisabled)
                         .accessibilityIdentifier("NewRoomCreateButton")
                 }
             }
             .task {
-                focused = true
+                focused = existingRoom == nil
             }
         }
     }
 
     private var trimmedName: String {
         roomName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var primaryActionDisabled: Bool {
+        selectedProfiles.isEmpty || (existingRoom == nil && trimmedName.isEmpty)
     }
 
     @ViewBuilder
@@ -615,13 +622,18 @@ private struct NewGroupChatSheet: View {
     }
 
     private func create() {
-        guard !trimmedName.isEmpty, !selectedProfiles.isEmpty else { return }
-        let existingRoomIDs = Set(model.rooms.map(\.roomId))
-        guard model.startGroupChat(named: trimmedName, with: selectedProfiles) else { return }
-        if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
-            ?? model.selectedRoom
-        {
-            onCreated(room)
+        guard !selectedProfiles.isEmpty else { return }
+        if let existingRoom {
+            guard model.addMembers(to: existingRoom, profiles: selectedProfiles) else { return }
+        } else {
+            guard !trimmedName.isEmpty else { return }
+            let existingRoomIDs = Set(model.rooms.map(\.roomId))
+            guard model.startGroupChat(named: trimmedName, with: selectedProfiles) else { return }
+            if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
+                ?? model.selectedRoom
+            {
+                onCreated(room)
+            }
         }
         dismiss()
     }
@@ -790,6 +802,7 @@ private struct RoomAvatar: View {
 
 private struct RoomOptionsSheet: View {
     @Environment(\.dismiss) private var dismiss
+    let showAddPeople: () -> Void
     let showRoomDetails: () -> Void
     let showMediaGallery: () -> Void
 
@@ -797,6 +810,17 @@ private struct RoomOptionsSheet: View {
         NavigationStack {
             Form {
                 Section {
+                    Button {
+                        dismiss()
+                        showAddPeople()
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Add people",
+                            subtitle: nil,
+                            systemImage: "person.badge.plus"
+                        )
+                    }
+
                     Button {
                         dismiss()
                         showRoomDetails()
@@ -851,6 +875,7 @@ private struct RoomThreadView: View {
     @State private var showMediaGallery = false
     @State private var showRoomDetails = false
     @State private var showRoomOptions = false
+    @State private var showAddPeople = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var stagedAttachments: [StagedComposerAttachment] = []
     @State private var showPhotoPicker = false
@@ -971,6 +996,12 @@ private struct RoomThreadView: View {
         }
         .sheet(isPresented: $showRoomOptions) {
             RoomOptionsSheet(
+                showAddPeople: {
+                    showRoomOptions = false
+                    Task { @MainActor in
+                        showAddPeople = true
+                    }
+                },
                 showRoomDetails: {
                     showRoomOptions = false
                     Task { @MainActor in
@@ -985,6 +1016,13 @@ private struct RoomThreadView: View {
                 }
             )
             .presentationDetents([.medium])
+        }
+        .sheet(isPresented: $showAddPeople) {
+            if let room {
+                ChatPeoplePickerSheet(model: model, existingRoom: room) { _ in }
+            } else {
+                ContentUnavailableView("Room unavailable", systemImage: "exclamationmark.triangle")
+            }
         }
         .navigationDestination(isPresented: $showRoomDetails) {
             RoomDetailsView(
@@ -1002,6 +1040,9 @@ private struct RoomThreadView: View {
                         _ = model.createInvite(for: room)
                         showInvite()
                     }
+                },
+                onAddPeople: {
+                    showAddPeople = true
                 },
                 onRefreshDevices: {
                     model.refreshDevices()

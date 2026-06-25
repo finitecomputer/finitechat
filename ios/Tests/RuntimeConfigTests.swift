@@ -2206,6 +2206,93 @@ final class AppModelPersistenceTests: XCTestCase {
         }
     }
 
+    func testAddRoomMembersDispatchesBackedMemberAction() async throws {
+        await MainActor.run {
+            let bob = AppProfileSummary(
+                accountId: "bob-account",
+                npub: "npub1bob",
+                displayName: "Bob",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let runtime = FakeFiniteChatRuntime(
+                initialState: savedChatState(),
+                startRuntimeState: savedChatState()
+            ) { action, currentState in
+                var state = currentState
+                if case .addRoomMembers(let roomID, _) = action {
+                    state.selectedRoomId = roomID
+                    state.status = "people added"
+                }
+                return state
+            }
+            let model = AppModel(
+                config: RuntimeConfig(
+                    serverURL: "https://chat.finite.computer",
+                    deviceID: "alice-phone"
+                ),
+                startsUpdateLoop: false
+            ) { _ in runtime }
+
+            model.start()
+            let room = model.rooms[0]
+
+            XCTAssertTrue(model.addMembers(to: room, profiles: [bob]))
+            XCTAssertEqual(
+                runtime.dispatchedActions,
+                [
+                    .startRuntime,
+                    .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
+                ]
+            )
+            XCTAssertEqual(model.selectedRoom?.roomId, "room-main")
+        }
+    }
+
+    func testAddRoomMembersFailureKeepsNoticeVisibleAndExistingRoom() async throws {
+        await MainActor.run {
+            let bob = AppProfileSummary(
+                accountId: "bob-account",
+                npub: "npub1bob",
+                displayName: "Bob",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let runtime = FakeFiniteChatRuntime(
+                initialState: savedChatState(),
+                startRuntimeState: savedChatState()
+            ) { action, currentState in
+                var state = currentState
+                if case .addRoomMembers = action {
+                    state.status = "chat unavailable"
+                    state.toast = "No available Finite Chat device was found for one or more selected people"
+                }
+                return state
+            }
+            let model = AppModel(
+                config: RuntimeConfig(
+                    serverURL: "https://chat.finite.computer",
+                    deviceID: "alice-phone"
+                ),
+                startsUpdateLoop: false
+            ) { _ in runtime }
+
+            model.start()
+            let room = model.rooms[0]
+
+            XCTAssertFalse(model.addMembers(to: room, profiles: [bob]))
+            XCTAssertEqual(model.rooms.count, 1)
+            XCTAssertEqual(model.rooms[0].roomId, "room-main")
+            XCTAssertEqual(
+                model.userNoticeText,
+                "No available Finite Chat device was found for one or more selected people"
+            )
+            XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
+        }
+    }
+
     @MainActor
     func testScanTargetResultKeepsFailedProfileCodeVisible() throws {
         let runtime = FakeFiniteChatRuntime(

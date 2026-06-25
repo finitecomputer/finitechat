@@ -748,6 +748,23 @@ final class AppModel: ObservableObject {
         return room.state == .connected
     }
 
+    func addMembers(to room: AppRoomSummary, profiles: [AppProfileSummary]) -> Bool {
+        guard room.state == .connected else { return false }
+        let accountIDs = profiles
+            .map(\.accountId)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !accountIDs.isEmpty else { return false }
+        dispatch(.addRoomMembers(roomId: room.roomId, accountIds: accountIDs))
+        if state?.status == "people added" {
+            return true
+        }
+        if userNoticeText == nil {
+            errorText = "People could not be added to this chat."
+        }
+        return false
+    }
+
     @discardableResult
     func scanTarget() -> Bool {
         if case .profile = scanTargetResult() {
@@ -1460,6 +1477,12 @@ final class AppModel: ObservableObject {
                 category: "transport",
                 name: "start_group_chat",
                 details: ["members": "\(accountIds.count)"]
+            )
+        case .addRoomMembers(let roomId, let accountIds):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "add_room_members",
+                details: ["room": roomId, "members": "\(accountIds.count)"]
             )
         case .createInvite(let roomId):
             return DiagnosticActionSummary(
