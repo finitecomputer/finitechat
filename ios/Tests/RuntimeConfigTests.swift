@@ -1016,6 +1016,56 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
     }
 
+    func testExistingStableRuntimeStoreBypassesLoginGateAndRestoresKeychainIdentity() throws {
+        let material = try createNostrIdentity()
+        let config = RuntimeConfig(
+            serverURL: "https://chat.finite.computer",
+            deviceID: "ios"
+        )
+        let supportURL = try temporarySupportURL()
+        let storeURL = supportURL.appendingPathComponent("FiniteChatStore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: storeURL,
+            withIntermediateDirectories: true
+        )
+        try Data(material.accountSecretHex.utf8)
+            .write(to: storeURL.appendingPathComponent("account-secret.hex"))
+        try Data().write(to: storeURL.appendingPathComponent("client.sqlite3"))
+
+        var state = emptyChatState(deviceID: "ios")
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "ios",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let identityStore = MemoryNostrIdentityStore()
+        var openedOptions: [OpenOptions] = []
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: supportURL,
+            requiresNostrLogin: true,
+            nostrIdentityStore: identityStore,
+            startsUpdateLoop: false
+        ) { options in
+            openedOptions.append(options)
+            return runtime
+        }
+
+        XCTAssertFalse(model.requiresNostrLogin)
+
+        model.start()
+
+        XCTAssertEqual(openedOptions.count, 1)
+        XCTAssertNil(openedOptions[0].accountSecretHex)
+        XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
+        XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
+        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+    }
+
     func testPushTokenReceivedBeforeNostrLoginRegistersAfterSignIn() throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
@@ -2005,6 +2055,81 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
         XCTAssertNil(model.state?.activeInvite)
+    }
+
+    @MainActor
+    func testStartProfileChatFailureKeepsNoticeVisibleWithoutRooms() throws {
+        let profile = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startProfileChat = action {
+                state.status = "chat unavailable"
+                state.toast = "No available Finite Chat device was found for that profile"
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertFalse(model.startProfileChat(for: profile))
+        XCTAssertTrue(model.rooms.isEmpty)
+        XCTAssertEqual(
+            model.userNoticeText,
+            "No available Finite Chat device was found for that profile"
+        )
+        XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
+    }
+
+    @MainActor
+    func testScanTargetResultKeepsFailedProfileCodeVisible() throws {
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .scanTarget = action {
+                state.status = "profile unavailable"
+                state.toast = "Profile lookup requires a connection"
+            }
+            return state
+        }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+        model.scanDraft = "npub1bob"
+
+        let result = model.scanTargetResult()
+
+        if case .unavailable = result {
+            // Expected.
+        } else {
+            XCTFail("expected unavailable scan result")
+        }
+        XCTAssertEqual(model.scanDraft, "npub1bob")
+        XCTAssertEqual(model.userNoticeText, "Profile lookup requires a connection")
     }
 
     private func savedChatState(

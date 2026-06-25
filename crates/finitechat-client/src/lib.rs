@@ -61,6 +61,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -3975,15 +3976,53 @@ impl HttpRuntimeTransport for ReqwestHttpRuntimeTransport {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ReqwestHttpRuntimeTransportError {
-    #[error("HTTP runtime request failed: {0}")]
     Request(reqwest::Error),
-    #[error("server returned {status}: {body}")]
     Server {
         status: reqwest::StatusCode,
         body: String,
     },
+}
+
+impl fmt::Display for ReqwestHttpRuntimeTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => {
+                write!(
+                    formatter,
+                    "HTTP runtime request failed: {}",
+                    error_message_with_sources(error)
+                )
+            }
+            Self::Server { status, body } => {
+                write!(formatter, "server returned {status}: {body}")
+            }
+        }
+    }
+}
+
+impl StdError for ReqwestHttpRuntimeTransportError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::Server { .. } => None,
+        }
+    }
+}
+
+fn error_message_with_sources(error: &(dyn StdError + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        let next_message = next.to_string();
+        if !next_message.is_empty() && !message.contains(&next_message) {
+            message.push_str(": ");
+            message.push_str(&next_message);
+        }
+        source = next.source();
+    }
+    message
 }
 
 pub struct ReqwestSyncHintStream {

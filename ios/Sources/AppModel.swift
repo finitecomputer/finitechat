@@ -257,6 +257,26 @@ struct RuntimeDataStore {
         }
     }
 
+    static func hasRecoverableStableStore(applicationSupportURL: URL? = nil) -> Bool {
+        let supportURL: URL
+        if let applicationSupportURL {
+            supportURL = applicationSupportURL
+        } else if let defaultURL = try? defaultApplicationSupportURL(create: false) {
+            supportURL = defaultURL
+        } else {
+            return false
+        }
+        let storeURL = supportURL.appendingPathComponent(
+            currentDataDirectoryName,
+            isDirectory: true
+        )
+        return FileManager.default.fileExists(
+            atPath: storeURL.appendingPathComponent("account-secret.hex").path
+        ) && FileManager.default.fileExists(
+            atPath: storeURL.appendingPathComponent("client.sqlite3").path
+        )
+    }
+
     private static func safeDeviceDirectoryName(_ deviceID: String) -> String {
         deviceID
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -271,6 +291,13 @@ struct RuntimeDataStore {
             create: create
         )
     }
+}
+
+enum AppScanTargetResult {
+    case empty
+    case profile(AppProfileSummary)
+    case room(AppRoomSummary)
+    case unavailable
 }
 
 private struct ProductHarnessSupportResolution {
@@ -404,9 +431,15 @@ final class AppModel: ObservableObject {
         self.startsUpdateLoop = startsUpdateLoop
         self.nostrIdentityStore = nostrIdentityStore
         let storedNostrIdentity = nostrIdentityStore.load()
+        let hasRecoverableRuntimeIdentity = !usesTransientStore
+            && storedNostrIdentity == nil
+            && RuntimeDataStore.hasRecoverableStableStore(
+                applicationSupportURL: resolvedApplicationSupportURL
+            )
         nostrIdentity = storedNostrIdentity
         self.requiresNostrLogin = requiresNostrLogin
             && storedNostrIdentity == nil
+            && !hasRecoverableRuntimeIdentity
             && !Self.hasLaunchAutomation(args: args)
         launchConfigurationError = productHarnessSupport.error
         appendDiagnostic(
@@ -415,6 +448,7 @@ final class AppModel: ObservableObject {
             details: [
                 "store_mode": usesTransientStore ? "transient" : "stable",
                 "has_explicit_support_root": resolvedApplicationSupportURL == nil ? "false" : "true",
+                "has_recoverable_runtime_identity": hasRecoverableRuntimeIdentity ? "true" : "false",
                 "has_launch_configuration_error": launchConfigurationError == nil ? "false" : "true",
                 "requires_nostr_login": self.requiresNostrLogin ? "true" : "false",
             ]
@@ -451,14 +485,15 @@ final class AppModel: ObservableObject {
     }
 
     var userNoticeText: String? {
-        if rooms.isEmpty {
-            return nil
-        }
         let toast = state?.toast?.nonEmptyTrimmed
         if toast == "Showing saved chats. Connection will retry." {
             return nil
         }
         return toast
+    }
+
+    var actionNoticeText: String? {
+        userNoticeText ?? developerErrorText
     }
 
     var developerErrorText: String? {
@@ -687,6 +722,9 @@ final class AppModel: ObservableObject {
             displayName: "Chat with \(displayName)"
         ))
         guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
+            if userNoticeText == nil {
+                errorText = "Chat could not be created."
+            }
             return false
         }
         return room.state == .connected
@@ -694,11 +732,37 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func scanTarget() -> Bool {
+        if case .profile = scanTargetResult() {
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    func scanTargetResult() -> AppScanTargetResult {
         let value = scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return true }
-        scanDraft = ""
-        dispatch(.scanTarget(value: value))
-        return activeProfile == nil
+        guard !value.isEmpty else { return .empty }
+
+        let previousRoomIDs = Set(rooms.map(\.roomId))
+        let previousSelectedRoomID = state?.selectedRoomId
+        let dispatched = dispatch(.scanTarget(value: value))
+        guard dispatched else { return .unavailable }
+
+        if let profile = activeProfile {
+            scanDraft = ""
+            return .profile(profile)
+        }
+
+        if let room = selectedRoom,
+           state?.status == "invite scanned"
+            || room.roomId != previousSelectedRoomID
+            || !previousRoomIDs.contains(room.roomId)
+        {
+            scanDraft = ""
+            return .room(room)
+        }
+
+        return .unavailable
     }
 
     @discardableResult
@@ -1285,12 +1349,56 @@ final class AppModel: ObservableObject {
             event: Self.redactedDiagnosticValue(event),
             details: sanitizedDetails
         ))
+#if DEBUG
+        if let entry = developerDiagnostics.last {
+            persistDebugDiagnostic(entry)
+        }
+#endif
         if developerDiagnostics.count > Self.developerDiagnosticsLimit {
             developerDiagnostics.removeFirst(
                 developerDiagnostics.count - Self.developerDiagnosticsLimit
             )
         }
     }
+
+#if DEBUG
+    private func persistDebugDiagnostic(_ entry: DeveloperDiagnosticEntry) {
+        let supportURL: URL
+        if let applicationSupportURL {
+            supportURL = applicationSupportURL
+        } else if let defaultURL = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) {
+            supportURL = defaultURL
+        } else {
+            return
+        }
+        let details = entry.details
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+        let line: String
+        if details.isEmpty {
+            line = "seq=\(entry.id) ts=\(entry.timestampUnixSeconds) category=\(entry.category) event=\(entry.event)\n"
+        } else {
+            line = "seq=\(entry.id) ts=\(entry.timestampUnixSeconds) category=\(entry.category) event=\(entry.event) \(details)\n"
+        }
+        let url = supportURL.appendingPathComponent("finitechat_debug_diagnostics.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url)
+        {
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+#endif
 
     private func diagnosticErrorDetails(_ error: Error) -> [String: String] {
         diagnosticErrorDetails(String(describing: error))
@@ -1495,12 +1603,12 @@ final class AppModel: ObservableObject {
         var output = value.trimmingCharacters(in: .whitespacesAndNewlines)
         output = replacingMatches(
             in: output,
-            pattern: #"https?://[^\s]+"#,
+            pattern: #"https?://[^\s\)"]+"#,
             replacement: "[url]"
         )
         output = replacingMatches(
             in: output,
-            pattern: #"file://[^\s]+"#,
+            pattern: #"file://[^\s\)"]+"#,
             replacement: "[url]"
         )
         output = replacingMatches(

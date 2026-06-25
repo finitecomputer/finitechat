@@ -70,6 +70,8 @@ struct HomeView: View {
             }
             .scrollDismissesKeyboard(.interactively)
 
+            NoticeBar(text: model.actionNoticeText)
+
             HomeInputDock(
                 text: $intentionText,
                 isFocused: $intentionFocused,

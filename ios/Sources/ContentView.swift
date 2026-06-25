@@ -52,7 +52,7 @@ struct ContentView: View {
                 }
             }
         }
-        .task {
+        .task(id: model.requiresNostrLogin) {
             guard !model.requiresNostrLogin else { return }
             model.start()
             lastAppliedSelectedRoomID = model.state?.selectedRoomId
@@ -208,12 +208,14 @@ struct ContentView: View {
         schedulePathUpdate([selectedRoomID])
     }
 
-    private func startChatFromScannedProfile(_ profile: AppProfileSummary) {
-        guard model.startProfileChat(for: profile) else { return }
+    @discardableResult
+    private func startChatFromScannedProfile(_ profile: AppProfileSummary) -> Bool {
+        guard model.startProfileChat(for: profile) else { return false }
         if let room = model.selectedRoom {
             routeSelectedRoom(room.roomId)
         }
         sheet = nil
+        return true
     }
 
     private func schedulePathUpdate(_ nextPath: [String]) {
@@ -1569,12 +1571,19 @@ private struct UnavailableOnDeviceView: View {
 private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
-    let onStartProfileChat: (AppProfileSummary) -> Void
+    let onStartProfileChat: (AppProfileSummary) -> Bool
     @State private var showingCameraScanner = false
 
     var body: some View {
         NavigationStack {
             Form {
+                if let notice = model.actionNoticeText {
+                    Section {
+                        Label(notice, systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section {
                     if QRCodeScannerSheet.canUseCamera {
                         Button {
@@ -1614,8 +1623,9 @@ private struct ScanSheet: View {
                     Section("Profile") {
                         ProfileRow(profile: profile)
                         Button {
-                            dismiss()
-                            onStartProfileChat(profile)
+                            if onStartProfileChat(profile) {
+                                dismiss()
+                            }
                         } label: {
                             Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
                         }
@@ -1646,13 +1656,17 @@ private struct ScanSheet: View {
     }
 
     private func continueWithTarget() {
-        if model.scanTarget() {
+        switch model.scanTargetResult() {
+        case .empty:
             dismiss()
-            return
-        }
-        if let profile = model.activeProfile {
+        case .profile(let profile):
+            if onStartProfileChat(profile) {
+                dismiss()
+            }
+        case .room:
             dismiss()
-            onStartProfileChat(profile)
+        case .unavailable:
+            break
         }
     }
 }
@@ -1698,7 +1712,7 @@ private struct InviteSheet: View {
 private struct SettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
-    let onStartProfileChat: (AppProfileSummary) -> Void
+    let onStartProfileChat: (AppProfileSummary) -> Bool
     @State private var showingMyProfile = false
     @State private var showingScan = false
     @State private var confirmingSignOut = false

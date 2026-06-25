@@ -33,6 +33,9 @@ targets:
         CODE_SIGN_ENTITLEMENTS: FiniteChat.entitlements
         ENABLE_TESTABILITY: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
     dependencies:
       - framework: Frameworks/FinitechatCore.xcframework
         embed: false
