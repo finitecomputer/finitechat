@@ -283,7 +283,7 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(relaunched.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(relaunched.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(relaunched.deviceID)
         XCTAssertFalse(relaunched.usesTransientStore)
     }
 
@@ -304,12 +304,12 @@ final class RuntimeConfigTests: XCTestCase {
             )
 
             XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer", serverURL)
-            XCTAssertEqual(loaded.deviceID, "ios", serverURL)
+            assertGeneratedDefaultDeviceID(loaded.deviceID)
             XCTAssertFalse(loaded.usesTransientStore, serverURL)
 
             let persisted = try persistedConfig(at: url)
             XCTAssertEqual(persisted.serverURL, "https://chat.finite.computer", serverURL)
-            XCTAssertEqual(persisted.deviceID, "ios", serverURL)
+            XCTAssertEqual(persisted.deviceID, loaded.deviceID, serverURL)
         }
     }
 
@@ -341,7 +341,7 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(relaunched.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(relaunched.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(relaunched.deviceID)
         XCTAssertFalse(relaunched.usesTransientStore)
     }
 
@@ -399,7 +399,7 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(loaded.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(loaded.deviceID)
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
@@ -422,7 +422,7 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(loaded.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(loaded.deviceID)
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
@@ -480,7 +480,7 @@ final class RuntimeConfigTests: XCTestCase {
         )
 
         XCTAssertEqual(loaded.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(loaded.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(loaded.deviceID)
         XCTAssertEqual(try persistedConfig(at: url), loaded)
     }
 
@@ -593,6 +593,15 @@ final class RuntimeConfigTests: XCTestCase {
     private func persistedConfig(at url: URL) throws -> RuntimeConfig {
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(RuntimeConfig.self, from: data)
+    }
+
+    private func assertGeneratedDefaultDeviceID(
+        _ deviceID: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(deviceID.hasPrefix("ios-"), file: file, line: line)
+        XCTAssertEqual(deviceID.count, 16, file: file, line: line)
     }
 }
 
@@ -1263,7 +1272,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(model.state)
         XCTAssertNil(model.runtimeStorePath)
         XCTAssertEqual(model.serverURL, "https://chat.finite.computer")
-        XCTAssertEqual(model.deviceID, "ios")
+        assertGeneratedDefaultDeviceID(model.deviceID)
     }
 
     func testSignOutRemovesPushTokenBeforeClearingRuntime() throws {
@@ -3196,6 +3205,15 @@ final class AppModelPersistenceTests: XCTestCase {
     private func persistedConfig(at url: URL) throws -> RuntimeConfig {
         let data = try Data(contentsOf: url)
         return try JSONDecoder().decode(RuntimeConfig.self, from: data)
+    }
+
+    private func assertGeneratedDefaultDeviceID(
+        _ deviceID: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(deviceID.hasPrefix("ios-"), file: file, line: line)
+        XCTAssertEqual(deviceID.count, 16, file: file, line: line)
     }
 }
 

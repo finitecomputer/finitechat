@@ -10,7 +10,7 @@ struct RuntimeConfig: Codable, Equatable {
     let persistsRuntimeIdentityUpdates: Bool
 
     static let defaultServerURL = "https://chat.finite.computer"
-    private static let defaultDeviceID = "ios"
+    private static let generatedDeviceIDPrefix = "ios-"
     private static let transientConfigArgument = "--finitechat-transient-config"
     private static let transientConfigEnvironmentKey = "FINITECHAT_TRANSIENT_CONFIG"
     private static let persistLaunchConfigArgument = "--finitechat-persist-launch-config"
@@ -59,7 +59,7 @@ struct RuntimeConfig: Codable, Equatable {
         let persisted = loadPersisted(storageURL: storageURL)
         let fallback = RuntimeConfig(
             serverURL: persisted.serverURL ?? defaultServerURL,
-            deviceID: persisted.deviceID ?? defaultDeviceID
+            deviceID: persisted.deviceID ?? generatedDefaultDeviceID()
         )
         let hostedUnitTest = storageURL == nil && environment["XCTestConfigurationFilePath"] != nil
         let persistLaunchOverride = argumentFlag(persistLaunchConfigArgument, in: args)
@@ -125,6 +125,18 @@ struct RuntimeConfig: Codable, Equatable {
             create: true
         )
         return support.appendingPathComponent("finitechat_config.json")
+    }
+
+    private static func generatedDefaultDeviceID() -> String {
+        let installID = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+        let normalized = installID
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+        let suffix = normalized.prefix(12)
+        if suffix.isEmpty {
+            return "\(generatedDeviceIDPrefix)\(UUID().uuidString.lowercased().prefix(12))"
+        }
+        return "\(generatedDeviceIDPrefix)\(suffix)"
     }
 
     enum ConfigError: Error {
