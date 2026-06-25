@@ -1449,6 +1449,10 @@ impl AppRuntimeState {
         } else {
             label.to_owned()
         };
+        self.remember_profile_hint(
+            &account_id,
+            profile_name_hint_from_chat_label(&display_name, &account_id).as_deref(),
+        )?;
 
         if let Some(room_id) = self.existing_profile_chat_room_id(&account_id) {
             self.app.selected_room_id = Some(room_id);
@@ -1572,6 +1576,9 @@ impl AppRuntimeState {
             MAX_STAGED_WELCOMES_PER_COMMIT,
         )
         .map_err(client_error)?;
+        for account_id in &member_account_ids {
+            self.remember_profile_hint(account_id, None)?;
+        }
 
         let label = display_name.trim();
         if label.len() > MAX_INVITE_DISPLAY_NAME_BYTES as usize {
@@ -1709,6 +1716,9 @@ impl AppRuntimeState {
             MAX_STAGED_WELCOMES_PER_COMMIT,
         )
         .map_err(client_error)?;
+        for account_id in &member_account_ids {
+            self.remember_profile_hint(account_id, None)?;
+        }
 
         let claimed: Result<Option<Vec<ClaimKeyPackageResult>>, FiniteChatCoreError> = {
             let mut delivery = self.core.home_delivery();
@@ -2670,7 +2680,33 @@ impl AppRuntimeState {
         &mut self,
         account_id: &str,
     ) -> Result<(), FiniteChatCoreError> {
-        let profile = placeholder_profile(account_id);
+        self.remember_profile_hint(account_id, None)
+    }
+
+    fn remember_profile_hint(
+        &mut self,
+        account_id: &str,
+        display_name_hint: Option<&str>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let existing = self.profile_cache.get(account_id);
+        if existing
+            .map(|profile| !profile.stale && profile_has_useful_name(profile, account_id))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let mut profile = existing
+            .cloned()
+            .unwrap_or_else(|| placeholder_profile(account_id));
+        if let Some(display_name) =
+            normalize_profile_display_name_hint(display_name_hint, account_id)
+        {
+            profile.display_name = display_name;
+        } else if profile.display_name.trim().is_empty() {
+            profile.display_name = short_account_label(account_id);
+        }
+        profile.stale = true;
         self.persist_profile(&profile)?;
         self.profile_cache.insert(account_id.to_owned(), profile);
         self.sync_profile_state();
@@ -3274,6 +3310,34 @@ fn placeholder_profile(account_id: &str) -> AppProfileSummary {
         picture: None,
         stale: true,
     }
+}
+
+fn profile_name_hint_from_chat_label(label: &str, account_id: &str) -> Option<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chat_prefix = "Chat with ";
+    if let Some(name) = trimmed.strip_prefix(chat_prefix) {
+        return normalize_profile_display_name_hint(Some(name), account_id);
+    }
+    normalize_profile_display_name_hint(Some(trimmed), account_id)
+}
+
+fn normalize_profile_display_name_hint(
+    display_name_hint: Option<&str>,
+    account_id: &str,
+) -> Option<String> {
+    let display_name = display_name_hint?.trim();
+    if display_name.is_empty() || display_name == account_id {
+        return None;
+    }
+    Some(display_name.to_owned())
+}
+
+fn profile_has_useful_name(profile: &AppProfileSummary, account_id: &str) -> bool {
+    let name = profile.display_name.trim();
+    !name.is_empty() && name != short_account_label(account_id) && name != account_id
 }
 
 fn room_member_summaries(
@@ -7569,7 +7633,7 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
-            server_url,
+            server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
@@ -7580,7 +7644,7 @@ mod tests {
 
         let state = alice
             .dispatch(AppAction::StartProfileChat {
-                account_id,
+                account_id: account_id.clone(),
                 display_name: "Chat with Missing".to_owned(),
             })
             .unwrap();
@@ -7590,6 +7654,23 @@ mod tests {
             Some("No available Finite Chat device was found for that profile")
         );
         assert!(state.rooms.is_empty());
+        let profile = app_profile(&state, &account_id);
+        assert_eq!(profile.display_name, "Missing");
+        assert!(profile.stale);
+        drop(alice);
+
+        let reopened_alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened_alice.state().unwrap();
+        let reopened_profile = app_profile(&reopened_state, &account_id);
+        assert_eq!(reopened_profile.display_name, "Missing");
+        assert!(reopened_profile.stale);
     }
 
     #[test]
@@ -7738,7 +7819,7 @@ mod tests {
 
         let state = alice
             .dispatch(AppAction::StartGroupChat {
-                account_ids: vec![bob_account_id, missing_account_id],
+                account_ids: vec![bob_account_id, missing_account_id.clone()],
                 display_name: "Broken group".to_owned(),
             })
             .unwrap();
@@ -7748,6 +7829,7 @@ mod tests {
             Some("No available Finite Chat device was found for one or more selected people")
         );
         assert!(state.rooms.is_empty());
+        assert!(app_profile(&state, &missing_account_id).stale);
     }
 
     #[test]
@@ -7887,7 +7969,7 @@ mod tests {
         let state = alice
             .dispatch(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
-                account_ids: vec![missing_account_id],
+                account_ids: vec![missing_account_id.clone()],
             })
             .unwrap();
         assert_eq!(state.status, "chat unavailable");
@@ -7898,6 +7980,7 @@ mod tests {
         assert_eq!(state.rooms.len(), 1);
         assert_eq!(app_room(&state, &room_id).display_name, "Existing room");
         assert_eq!(app_room(&state, &room_id).state, AppRoomState::Connected);
+        assert!(app_profile(&state, &missing_account_id).stale);
     }
 
     #[test]
@@ -10704,6 +10787,14 @@ mod tests {
             .iter()
             .find(|room| room.room_id == room_id)
             .unwrap_or_else(|| panic!("missing app room {room_id}"))
+    }
+
+    fn app_profile<'a>(state: &'a AppState, account_id: &str) -> &'a AppProfileSummary {
+        state
+            .profiles
+            .iter()
+            .find(|profile| profile.account_id == account_id)
+            .unwrap_or_else(|| panic!("missing app profile {account_id}"))
     }
 
     fn assert_outbound_undelivered(message: &ChatMessage) {
