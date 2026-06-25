@@ -188,6 +188,7 @@ final class NostrPeopleTests: XCTestCase {
                 return []
             }
         )
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
         let model = NostrPeopleModel(
             service: relayService,
             inviteAvailabilityService: FiniteInviteAvailabilityService(
@@ -195,7 +196,7 @@ final class NostrPeopleTests: XCTestCase {
                     Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
                 }
             ),
-            cache: NostrPeopleCache(directory: temporaryCacheDirectory())
+            cache: cache
         )
 
         await model.loadIfNeeded(
@@ -628,6 +629,82 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(model.statusText, "Loaded 1 of 1 follows from 1 relays.")
     }
 
+    func testPeopleModelShowsFollowRowsBeforeMetadataRefreshFinishes() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let metadataGate = MetadataFetchGate()
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_060,
+                            kind: 3,
+                            tags: [["p", bob, "", "Bobby"]],
+                            content: ""
+                        ),
+                    ]
+                }
+                if filter.kinds == [0] {
+                    await metadataGate.enterAndWait()
+                    return [
+                        NostrRelayEvent(
+                            pubkey: bob,
+                            createdAt: 1_800_000_061,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Fresh Bob","name":"freshbob"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: FiniteInviteAvailabilityService(
+                availabilityLoader: { _, accountIDs in
+                    Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
+                }
+            ),
+            cache: cache
+        )
+
+        let refresh = Task {
+            await model.refresh(
+                identity: AppNostrIdentity(material: material),
+                serverURL: "https://chat.example"
+            )
+        }
+        await metadataGate.waitUntilEntered()
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Bobby"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.unknown])
+        XCTAssertEqual(
+            model.statusText,
+            "Loaded 1 of 1 follows from 1 relays. Updating profiles..."
+        )
+        let cachedBeforeMetadata = await cache.load(
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        XCTAssertEqual(cachedBeforeMetadata?.profiles.map(\.displayName), ["Bobby"])
+        XCTAssertEqual(cachedBeforeMetadata?.profiles.map(\.inviteAvailability), [.unknown])
+
+        await metadataGate.release()
+        await refresh.value
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(model.profiles.map(\.username), ["freshbob"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+        XCTAssertEqual(model.statusText, "Loaded 1 of 1 follows from 1 relays.")
+    }
+
     func testPeopleModelNoFollowsStatusNamesAccountAndExpandedRelayCount() async throws {
         let owner = String(repeating: "a", count: 64)
         let npub = try npubFromAccountId(accountId: owner)
@@ -829,6 +906,41 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].pictureURL, "https://example.com/bob.jpg")
         XCTAssertEqual(result.profiles[0].relayHint, "wss://relay.example")
         XCTAssertEqual(result.profiles[1].displayName, result.profiles[1].shortenedNpub)
+    }
+
+    func testFetchFollowProfileSeedsDoesNotWaitForMetadata() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let filterRecorder = RelayFilterRecorder()
+        let service = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                await filterRecorder.record(filter)
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_062,
+                            kind: 3,
+                            tags: [["p", bob, "wss://profile.example", "Bobby"]],
+                            content: ""
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+
+        let seeds = try await service.fetchFollowProfileSeeds(forAccountID: owner)
+
+        XCTAssertEqual(seeds.relayCount, 1)
+        XCTAssertEqual(seeds.followedPubkeyCount, 1)
+        XCTAssertEqual(seeds.metadataRelays, ["wss://relay.example", "wss://profile.example"])
+        XCTAssertEqual(seeds.profiles.map(\.pubkey), [bob])
+        XCTAssertEqual(seeds.profiles.map(\.displayName), ["Bobby"])
+        let sawMetadataFetch = await filterRecorder.sawMetadataFetch
+        XCTAssertFalse(sawMetadataFetch)
     }
 
     func testFetchFollowProfilesUsesNewestContactListEvent() async throws {
@@ -1219,6 +1331,53 @@ private actor MetadataChunkOverlapProbe {
 
     func recordMetadataChunk() {
         metadataChunkCount += 1
+    }
+}
+
+private actor RelayFilterRecorder {
+    private var filters: [NostrRelayFilter] = []
+
+    var sawMetadataFetch: Bool {
+        filters.contains { $0.kinds == [0] }
+    }
+
+    func record(_ filter: NostrRelayFilter) {
+        filters.append(filter)
+    }
+}
+
+private actor MetadataFetchGate {
+    private var entered = false
+    private var released = false
+    private var entryContinuations: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            entryContinuations.append(continuation)
+        }
+    }
+
+    func enterAndWait() async {
+        entered = true
+        for continuation in entryContinuations {
+            continuation.resume()
+        }
+        entryContinuations.removeAll()
+        if !released {
+            await withCheckedContinuation { continuation in
+                releaseContinuations.append(continuation)
+            }
+        }
+    }
+
+    func release() {
+        released = true
+        for continuation in releaseContinuations {
+            continuation.resume()
+        }
+        releaseContinuations.removeAll()
     }
 }
 

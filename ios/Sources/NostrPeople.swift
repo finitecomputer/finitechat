@@ -133,6 +133,21 @@ struct NostrFollowFetchResult: Equatable, Sendable {
     let followedPubkeyCount: Int
 }
 
+struct NostrFollowSeedResult: Equatable, Sendable {
+    let profiles: [NostrFollowProfile]
+    let metadataRelays: [String]
+    let relayCount: Int
+    let followedPubkeyCount: Int
+
+    var fetchResult: NostrFollowFetchResult {
+        NostrFollowFetchResult(
+            profiles: profiles,
+            relayCount: relayCount,
+            followedPubkeyCount: followedPubkeyCount
+        )
+    }
+}
+
 actor NostrPeopleCache: Sendable {
     static let shared = NostrPeopleCache()
 
@@ -427,30 +442,30 @@ final class NostrPeopleModel: ObservableObject {
         defer { isLoading = false }
         statusText = nil
         do {
-            let fetchedResult = try await service.fetchFollowProfiles(forAccountID: accountID)
-            let result = await cache?.enrich(fetchedResult) ?? fetchedResult
+            let seedResult = try await service.fetchFollowProfileSeeds(forAccountID: accountID)
+            let cachedSeedResult = await cache?.enrich(seedResult.fetchResult) ?? seedResult.fetchResult
             guard isCurrent(accountID: accountID, serverURL: serverURL) else { return }
-            if result.profiles.isEmpty, !profiles.isEmpty {
-                await cache?.save(
-                    result,
+            if cachedSeedResult.profiles.isEmpty {
+                await handleEmptyRefreshResult(
+                    cachedSeedResult,
                     accountID: accountID,
-                    serverURL: serverURL,
-                    preserveNonEmptyOnEmptyResult: true
+                    serverURL: serverURL
                 )
-                await refreshInviteAvailability(serverURL: serverURL)
-                await cache?.save(
-                    NostrFollowFetchResult(
-                        profiles: profiles,
-                        relayCount: result.relayCount,
-                        followedPubkeyCount: max(result.followedPubkeyCount, profiles.count)
-                    ),
-                    accountID: accountID,
-                    serverURL: serverURL,
-                    preserveNonEmptyOnEmptyResult: true
-                )
-                statusText = "Showing cached people. Refresh found no follows across \(result.relayCount) Nostr relays."
                 return
             }
+
+            profiles = cachedSeedResult.profiles
+            statusText = "Loaded \(cachedSeedResult.profiles.count) of \(cachedSeedResult.followedPubkeyCount) follows from \(cachedSeedResult.relayCount) relays. Updating profiles..."
+            await cache?.save(
+                cachedSeedResult,
+                accountID: accountID,
+                serverURL: serverURL,
+                preserveNonEmptyOnEmptyResult: true
+            )
+
+            let fetchedResult = await service.enrichFollowProfileSeeds(seedResult)
+            let result = await cache?.enrich(fetchedResult) ?? fetchedResult
+            guard isCurrent(accountID: accountID, serverURL: serverURL) else { return }
             profiles = result.profiles
             await cache?.save(
                 result,
@@ -458,6 +473,7 @@ final class NostrPeopleModel: ObservableObject {
                 serverURL: serverURL,
                 preserveNonEmptyOnEmptyResult: true
             )
+
             await refreshInviteAvailability(serverURL: serverURL)
             await cache?.save(
                 NostrFollowFetchResult(
@@ -490,6 +506,44 @@ final class NostrPeopleModel: ObservableObject {
                 statusText = "Could not refresh people: \(error.localizedDescription)"
             }
         }
+    }
+
+    @MainActor
+    private func handleEmptyRefreshResult(
+        _ result: NostrFollowFetchResult,
+        accountID: String,
+        serverURL: String
+    ) async {
+        if !profiles.isEmpty {
+            await cache?.save(
+                result,
+                accountID: accountID,
+                serverURL: serverURL,
+                preserveNonEmptyOnEmptyResult: true
+            )
+            await refreshInviteAvailability(serverURL: serverURL)
+            await cache?.save(
+                NostrFollowFetchResult(
+                    profiles: profiles,
+                    relayCount: result.relayCount,
+                    followedPubkeyCount: max(result.followedPubkeyCount, profiles.count)
+                ),
+                accountID: accountID,
+                serverURL: serverURL,
+                preserveNonEmptyOnEmptyResult: true
+            )
+            statusText = "Showing cached people. Refresh found no follows across \(result.relayCount) Nostr relays."
+            return
+        }
+
+        profiles = []
+        await cache?.save(
+            result,
+            accountID: accountID,
+            serverURL: serverURL,
+            preserveNonEmptyOnEmptyResult: true
+        )
+        statusText = "No follows found for \(accountDisplay(accountID)) across \(result.relayCount) Nostr relays."
     }
 
     @MainActor
@@ -722,6 +776,11 @@ final class NostrRelayProfileService: Sendable {
     }
 
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
+        let seeds = try await fetchFollowProfileSeeds(forAccountID: accountID)
+        return await enrichFollowProfileSeeds(seeds)
+    }
+
+    func fetchFollowProfileSeeds(forAccountID accountID: String) async throws -> NostrFollowSeedResult {
         let primaryContactRelays = await contactListRelays(
             forAccountID: accountID,
             bootstrapRelays: relays
@@ -742,18 +801,45 @@ final class NostrRelayProfileService: Sendable {
             left.pubkey < right.pubkey
         }
         guard !followed.isEmpty else {
-            return NostrFollowFetchResult(
+            return NostrFollowSeedResult(
                 profiles: [],
+                metadataRelays: contactRelays,
                 relayCount: contactRelays.count,
                 followedPubkeyCount: 0
             )
         }
         let primaryMetadataRelays = Self.mergedRelays(contactRelays + followed.compactMap(\.relayHint))
-        let metadata = await fetchMetadataWithDiscoveryFallback(
-            forPubkeys: followed.map(\.pubkey),
-            primaryRelays: primaryMetadataRelays
+        let profiles = Self.followProfiles(from: followed, metadata: [:])
+        return NostrFollowSeedResult(
+            profiles: profiles,
+            metadataRelays: primaryMetadataRelays,
+            relayCount: contactRelays.count,
+            followedPubkeyCount: followed.count
         )
-        let profiles = followed.compactMap { contact -> NostrFollowProfile? in
+    }
+
+    func enrichFollowProfileSeeds(_ seeds: NostrFollowSeedResult) async -> NostrFollowFetchResult {
+        let followedPubkeys = seeds.profiles.map(\.pubkey)
+        guard !followedPubkeys.isEmpty else {
+            return seeds.fetchResult
+        }
+        let metadata = await fetchMetadataWithDiscoveryFallback(
+            forPubkeys: followedPubkeys,
+            primaryRelays: seeds.metadataRelays
+        )
+        let profiles = Self.followProfiles(from: seeds.profiles, metadata: metadata)
+        return NostrFollowFetchResult(
+            profiles: profiles,
+            relayCount: seeds.relayCount,
+            followedPubkeyCount: seeds.followedPubkeyCount
+        )
+    }
+
+    private static func followProfiles(
+        from contacts: [NostrContact],
+        metadata: [String: NostrProfileMetadata]
+    ) -> [NostrFollowProfile] {
+        let profiles = contacts.compactMap { contact -> NostrFollowProfile? in
             guard let npub = try? npubFromAccountId(accountId: contact.pubkey) else { return nil }
             let profile = metadata[contact.pubkey]
             return NostrFollowProfile(
@@ -766,7 +852,31 @@ final class NostrRelayProfileService: Sendable {
                 relayHint: contact.relayHint
             )
         }
-        .sorted { left, right in
+        return sortedFollowProfiles(profiles)
+    }
+
+    private static func followProfiles(
+        from seeds: [NostrFollowProfile],
+        metadata: [String: NostrProfileMetadata]
+    ) -> [NostrFollowProfile] {
+        let profiles = seeds.map { seed in
+            let profile = metadata[seed.pubkey]
+            return NostrFollowProfile(
+                pubkey: seed.pubkey,
+                npub: seed.npub,
+                name: profile?.displayName ?? profile?.name ?? seed.name,
+                username: profile?.name ?? seed.username,
+                about: profile?.about ?? seed.about,
+                pictureURL: profile?.pictureURL ?? seed.pictureURL,
+                relayHint: seed.relayHint,
+                inviteAvailability: seed.inviteAvailability
+            )
+        }
+        return sortedFollowProfiles(profiles)
+    }
+
+    private static func sortedFollowProfiles(_ profiles: [NostrFollowProfile]) -> [NostrFollowProfile] {
+        profiles.sorted { left, right in
             let leftNamed = left.hasProfileName
             let rightNamed = right.hasProfileName
             if leftNamed != rightNamed {
@@ -774,11 +884,6 @@ final class NostrRelayProfileService: Sendable {
             }
             return left.displayName.localizedCaseInsensitiveCompare(right.displayName) == .orderedAscending
         }
-        return NostrFollowFetchResult(
-            profiles: profiles,
-            relayCount: contactRelays.count,
-            followedPubkeyCount: followed.count
-        )
     }
 
     private func selectedContactFetch(
