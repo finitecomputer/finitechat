@@ -679,15 +679,17 @@ final class AppModel: ObservableObject {
         return state?.activeInvite?.roomId == room.roomId
     }
 
-    func createRoomAndInvite(for profile: AppProfileSummary) -> Bool {
+    func startProfileChat(for profile: AppProfileSummary) -> Bool {
         let existingRoomIDs = Set(rooms.map(\.roomId))
         let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
-        roomDraft = "Chat with \(displayName)"
-        createRoom()
+        dispatch(.startProfileChat(
+            accountId: profile.accountId,
+            displayName: "Chat with \(displayName)"
+        ))
         guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
             return false
         }
-        return createInvite(for: room)
+        return room.state == .connected
     }
 
     @discardableResult
@@ -1320,6 +1322,12 @@ final class AppModel: ObservableObject {
                 category: "transport",
                 name: "create_room",
                 details: [:]
+            )
+        case .startProfileChat(let accountId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "start_profile_chat",
+                details: ["account": accountId]
             )
         case .createInvite(let roomId):
             return DiagnosticActionSummary(

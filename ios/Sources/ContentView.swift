@@ -42,13 +42,13 @@ struct ContentView: View {
             switch destination {
             case .scan:
                 ScanSheet(model: model) { profile in
-                    startInviteFromScannedProfile(profile)
+                    startChatFromScannedProfile(profile)
                 }
             case .invite:
                 InviteSheet(invite: model.state?.activeInvite)
             case .settings:
                 SettingsSheet(model: model) { profile in
-                    startInviteFromScannedProfile(profile)
+                    startChatFromScannedProfile(profile)
                 }
             }
         }
@@ -208,16 +208,12 @@ struct ContentView: View {
         schedulePathUpdate([selectedRoomID])
     }
 
-    private func startInviteFromScannedProfile(_ profile: AppProfileSummary) {
-        guard model.createRoomAndInvite(for: profile) else { return }
+    private func startChatFromScannedProfile(_ profile: AppProfileSummary) {
+        guard model.startProfileChat(for: profile) else { return }
         if let room = model.selectedRoom {
             routeSelectedRoom(room.roomId)
         }
         sheet = nil
-        Task { @MainActor in
-            await Task.yield()
-            sheet = .invite
-        }
     }
 
     private func schedulePathUpdate(_ nextPath: [String]) {

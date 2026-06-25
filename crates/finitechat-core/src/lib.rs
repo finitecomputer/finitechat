@@ -460,6 +460,10 @@ pub enum AppAction {
     CreateRoom {
         display_name: String,
     },
+    StartProfileChat {
+        account_id: String,
+        display_name: String,
+    },
     CreateInvite {
         room_id: String,
     },
@@ -1027,6 +1031,10 @@ impl AppRuntimeState {
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
             AppAction::OpenRoom { room_id } => self.open_room(room_id)?,
             AppAction::CreateRoom { display_name } => self.create_room(display_name)?,
+            AppAction::StartProfileChat {
+                account_id,
+                display_name,
+            } => self.start_profile_chat(account_id, display_name)?,
             AppAction::CreateInvite { room_id } => self.create_invite(room_id)?,
             AppAction::ScanTarget { value } => self.scan_target(value)?,
             AppAction::SubmitInvitePin {
@@ -1231,9 +1239,41 @@ impl AppRuntimeState {
         let synced = self.core.sync_with_projection()?;
         self.apply_projection_events(synced.events);
         self.append_messages(synced.result.messages);
+        self.materialize_known_connected_rooms()?;
         self.drain_undelivered_outbox(MAX_OUTBOX_DRAIN_PER_TICK)?;
         self.try_finalize_pending_rooms()?;
         self.app.status = "ready".to_owned();
+        Ok(())
+    }
+
+    fn materialize_known_connected_rooms(&mut self) -> Result<(), FiniteChatCoreError> {
+        let mut known_app_rooms = self
+            .app
+            .rooms
+            .iter()
+            .map(|room| room.room_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut stored_rooms = Vec::new();
+        for room_id in self.core.known_room_ids() {
+            if !known_app_rooms.insert(room_id.clone()) {
+                continue;
+            }
+            let app_room = app_room_metadata(&room_id, None);
+            self.upsert_room(
+                &app_room.room_id,
+                &app_room.display_name,
+                AppRoomState::Connected,
+                "connected",
+            );
+            stored_rooms.push(app_room);
+        }
+        if !stored_rooms.is_empty() {
+            let owner = self.core.device.device_ref().clone();
+            self.core
+                .store
+                .save_app_rooms(&owner, &stored_rooms)
+                .map_err(store_error)?;
+        }
         Ok(())
     }
 
@@ -1284,6 +1324,124 @@ impl AppRuntimeState {
         self.persist_app_state()?;
         self.sync_selected_room_messages();
         self.app.status = "room created".to_owned();
+        Ok(())
+    }
+
+    fn start_profile_chat(
+        &mut self,
+        account_id: String,
+        display_name: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let account_id = account_id.trim().to_owned();
+        validate_string_bytes("profile.account_id", &account_id, MAX_OBJECT_ID_BYTES)
+            .map_err(client_error)?;
+        if account_id == self.app.identity.account_id {
+            self.set_online_action_unavailable(
+                "chat unavailable",
+                "This profile is already signed in on this device",
+            );
+            return Ok(());
+        }
+        let label = display_name.trim();
+        if label.len() > MAX_INVITE_DISPLAY_NAME_BYTES as usize {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!(
+                    "room display name must be at most {MAX_INVITE_DISPLAY_NAME_BYTES} bytes"
+                ),
+            });
+        }
+        let display_name = if label.is_empty() {
+            format!("Chat with {}", short_account_label(&account_id))
+        } else {
+            label.to_owned()
+        };
+
+        let claimed = {
+            let mut delivery = self.core.home_delivery();
+            match delivery.claim_key_package_for_account(&account_id) {
+                Ok(Some(claimed)) => claimed,
+                Ok(None) => {
+                    self.set_online_action_unavailable(
+                        "chat unavailable",
+                        "No available Finite Chat device was found for that profile",
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    let error = send_delivery_error(error);
+                    if online_action_failure(&error) {
+                        self.set_online_action_unavailable(
+                            "chat unavailable",
+                            "Profile chat could not be created",
+                        );
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+
+        let room_id = self.core.generate_object_id("room")?;
+        self.core
+            .bootstrap_room(&room_id, Some(display_name.clone()))?;
+        self.upsert_room(
+            &room_id,
+            &display_name,
+            AppRoomState::Connected,
+            "connected",
+        );
+        self.persist_room_projection(&room_id)?;
+
+        let welcome_id = self.core.generate_object_id("welcome")?;
+        let idempotency_key = self.core.generate_object_id("direct-add")?;
+        let prepared = self
+            .core
+            .device
+            .prepare_add_member_commit(&room_id, &claimed, welcome_id, idempotency_key)
+            .map_err(client_error)?;
+        self.core
+            .store
+            .save_device_state(&self.core.device)
+            .map_err(store_error)?;
+        let accepted = {
+            let mut delivery = self.core.home_delivery();
+            match delivery.submit_commit(prepared.request) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    let error = send_delivery_error(error);
+                    if online_action_failure(&error) {
+                        self.set_online_action_unavailable(
+                            "chat unavailable",
+                            "Profile chat could not be created",
+                        );
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        if accepted.message_id != prepared.message_id {
+            return Err(client_error(format!(
+                "commit acceptance message id {} did not match prepared message id {}",
+                accepted.message_id, prepared.message_id
+            )));
+        }
+
+        let synced = self.core.sync_with_projection()?;
+        self.apply_projection_events(synced.events);
+        self.append_messages(synced.result.messages);
+        self.materialize_known_connected_rooms()?;
+        self.app.selected_room_id = Some(room_id.clone());
+        self.upsert_room(
+            &room_id,
+            &display_name,
+            AppRoomState::Connected,
+            "connected",
+        );
+        self.persist_room_projection(&room_id)?;
+        self.persist_app_state()?;
+        self.sync_selected_room_messages();
+        self.app.status = "chat created".to_owned();
         Ok(())
     }
 
@@ -6660,6 +6818,95 @@ mod tests {
             app_room(&reopened_state, &room_id).last_message_preview,
             "hello from app actor"
         );
+    }
+
+    #[test]
+    fn app_profile_chat_claims_key_package_and_sends_welcome_without_invite_qr() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let bob_account_id = bob.state().unwrap().identity.account_id;
+        bob.dispatch(AppAction::StartRuntime)
+            .expect("bob publishes key packages");
+
+        let alice_state = alice
+            .dispatch(AppAction::StartProfileChat {
+                account_id: bob_account_id,
+                display_name: "Chat with Bob".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(alice_state.status, "chat created");
+        let room = alice_state.rooms.first().expect("direct room");
+        assert_eq!(room.display_name, "Chat with Bob");
+        assert_eq!(room.state, AppRoomState::Connected);
+        let room_id = room.room_id.clone();
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_room = app_room(&bob_state, &room_id);
+        assert_eq!(bob_room.state, AppRoomState::Connected);
+        bob.dispatch(AppAction::OpenRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        alice
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "hello direct".to_owned(),
+            })
+            .unwrap();
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            bob_state
+                .messages
+                .iter()
+                .any(|message| message.text == "hello direct")
+        );
+    }
+
+    #[test]
+    fn app_profile_chat_without_available_key_package_does_not_create_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let account_id =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned();
+
+        let state = alice
+            .dispatch(AppAction::StartProfileChat {
+                account_id,
+                display_name: "Chat with Missing".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(state.status, "chat unavailable");
+        assert_eq!(
+            state.toast.as_deref(),
+            Some("No available Finite Chat device was found for that profile")
+        );
+        assert!(state.rooms.is_empty());
     }
 
     #[test]

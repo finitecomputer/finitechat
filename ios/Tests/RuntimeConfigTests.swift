@@ -1951,7 +1951,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testCreateRoomAndInviteForProfileUsesExistingRoomInviteActions() throws {
+    func testStartProfileChatDispatchesDirectProfileChatAction() throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -1966,7 +1966,7 @@ final class AppModelPersistenceTests: XCTestCase {
         ) { action, currentState in
             var state = currentState
             switch action {
-            case .createRoom(let displayName):
+            case .startProfileChat(_, let displayName):
                 let room = AppRoomSummary(
                     roomId: "room-bob",
                     displayName: displayName,
@@ -1979,13 +1979,7 @@ final class AppModelPersistenceTests: XCTestCase {
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
-            case .createInvite(let roomId):
-                state.activeInvite = AppInviteState(
-                    roomId: roomId,
-                    inviteUrl: "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-bob&i=invite-bob&t=token&a=npub1bob",
-                    pin: "123456"
-                )
-                state.status = "invite ready"
+                state.status = "chat created"
             default:
                 break
             }
@@ -2001,17 +1995,16 @@ final class AppModelPersistenceTests: XCTestCase {
 
         model.start()
 
-        XCTAssertTrue(model.createRoomAndInvite(for: profile))
+        XCTAssertTrue(model.startProfileChat(for: profile))
         XCTAssertEqual(
             runtime.dispatchedActions,
             [
                 .startRuntime,
-                .createRoom(displayName: "Chat with Bob"),
-                .createInvite(roomId: "room-bob"),
+                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
             ]
         )
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
-        XCTAssertEqual(model.state?.activeInvite?.pin, "123456")
+        XCTAssertNil(model.state?.activeInvite)
     }
 
     private func savedChatState(

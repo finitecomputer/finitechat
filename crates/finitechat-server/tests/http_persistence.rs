@@ -12,14 +12,15 @@ use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckPushWakeRequest, AckPushWakeResponse,
     AckWelcomeRequest, AckWelcomeResponse, ApplicationEffectCountsResponse,
     ApplicationEffectRequest, BootstrapAccountRoomRequest, BootstrapAccountRoomResponse,
-    ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
-    ClaimLinkPayloadResponse, ClaimPushWakesRequest, ClaimPushWakesResponse, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
-    ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, FailPushWakeRequest,
-    FailPushWakeResponse, FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest,
-    GetDeviceLivenessResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
-    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    ClaimKeyPackageForAccountRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimPushWakesRequest,
+    ClaimPushWakesResponse, ClaimWelcomesRequest, CreateInviteSessionRequest,
+    CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse, ExpireInviteSessionRequest,
+    ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse,
+    ExpireLinkSessionRequest, FailPushWakeRequest, FailPushWakeResponse,
+    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
+    GetInviteAvailabilityRequest, GetInviteAvailabilityResponse, GetLinkSessionRequest,
+    GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
     HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
     HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
     HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
@@ -317,6 +318,81 @@ async fn sqlite_key_package_claim_uses_route_owner_and_preserves_opaque_payload(
         app,
         "/key-packages/claim",
         &ClaimKeyPackageRequest { owner: route_owner },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    assert_eq!(claimed, None);
+}
+
+#[tokio::test]
+async fn sqlite_key_package_account_claim_selects_available_unrevoked_device() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+    let phone = DeviceRef::new(account_id.clone(), "phone");
+    let laptop = DeviceRef::new(account_id.clone(), "laptop");
+    let other = DeviceRef::new(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "phone",
+    );
+    let publications = [
+        finite_key_package_publication(
+            &phone,
+            "kp-account-phone",
+            "ref-phone",
+            "hash-phone",
+            b"phone",
+        ),
+        finite_key_package_publication(
+            &laptop,
+            "kp-account-laptop",
+            "ref-laptop",
+            "hash-laptop",
+            b"laptop",
+        ),
+        finite_key_package_publication(
+            &other,
+            "kp-other-phone",
+            "ref-other",
+            "hash-other",
+            b"other",
+        ),
+    ];
+
+    let app = persistent_app(&db_path);
+    for publication in &publications {
+        assert_eq!(
+            post_json(app.clone(), "/key-packages", publication)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    revoke_device(&app, &laptop).await;
+
+    let response = post_json(
+        app.clone(),
+        "/key-packages/claim-account",
+        &ClaimKeyPackageForAccountRequest {
+            account_id: account_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claimed: Option<HttpClaimedKeyPackage> = read_json(response).await;
+    let claimed = claimed.expect("account claim finds unrevoked phone package");
+    assert_eq!(claimed.owner, member_for_device(&phone));
+    assert_eq!(claimed.key_package_id.as_slice(), b"kp-account-phone");
+    assert_inventory(app.clone(), member_for_device(&phone), 0, 1).await;
+    assert_inventory(app.clone(), member_for_device(&laptop), 1, 0).await;
+    assert_inventory(app.clone(), member_for_device(&other), 1, 0).await;
+
+    let app = persistent_app(&db_path);
+    let response = post_json(
+        app,
+        "/key-packages/claim-account",
+        &ClaimKeyPackageForAccountRequest { account_id },
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

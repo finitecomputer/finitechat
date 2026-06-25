@@ -305,6 +305,11 @@ pub struct ClaimKeyPackageRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimKeyPackageForAccountRequest {
+    pub account_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpireKeyPackageLeaseRequest {
     pub key_package_id: HttpKeyPackageId,
 }

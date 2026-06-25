@@ -21,20 +21,20 @@ pub use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckPushWakeRequest, AckPushWakeResponse,
     AckWelcomeRequest, AckWelcomeResponse, ApplicationEffectCountsResponse,
     ApplicationEffectRequest, BootstrapAccountRoomRequest, BootstrapAccountRoomResponse,
-    ClaimKeyPackageRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
-    ClaimLinkPayloadResponse, ClaimPushWakesRequest, ClaimPushWakesResponse, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse,
-    ExpireInviteSessionRequest, ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest,
-    ExpireKeyPackageLeaseResponse, ExpireLinkSessionRequest, ExpireLinkSessionResponse,
-    FailPushWakeRequest, FailPushWakeResponse, FiniteAccountRoomCommitProjection,
-    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetEphemeralActivitiesRequest,
-    GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
-    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
-    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
-    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
-    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
-    InviteAvailabilityEntry, InviteJoinStatusRequest, InviteJoinStatusResponse,
-    KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
+    ClaimKeyPackageForAccountRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
+    ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimPushWakesRequest,
+    ClaimPushWakesResponse, ClaimWelcomesRequest, CreateInviteSessionRequest,
+    CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse, ExpireInviteSessionRequest,
+    ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse,
+    ExpireLinkSessionRequest, ExpireLinkSessionResponse, FailPushWakeRequest, FailPushWakeResponse,
+    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
+    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest,
+    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
+    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
+    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, InviteAvailabilityEntry, InviteJoinStatusRequest,
+    InviteJoinStatusResponse, KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
     ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileCacheEntry,
     NostrProfileRecord, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
@@ -466,6 +466,42 @@ impl HttpServerState {
             .is_some()
             .then_some(PersistedOperation::ClaimKeyPackage {
                 owner: request.owner,
+            });
+        if let Some(store) = &self.store {
+            store.append_key_package_claim_mutation(
+                operation.as_ref(),
+                None,
+                changed.as_slice(),
+            )?;
+        }
+        *inventory = candidate;
+        Ok(claimed)
+    }
+
+    pub fn claim_key_package_for_account(
+        &self,
+        request: ClaimKeyPackageForAccountRequest,
+    ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
+        validate_invite_availability_account_id(&request.account_id)?;
+        let mut inventory = self
+            .key_package_inventory
+            .lock()
+            .expect("HTTP KeyPackage inventory mutex");
+        let revoked_devices = self.revoked_device_keys();
+        let mut candidate = inventory.clone();
+        let claimed = claim_next_key_package_for_account_from_inventory(
+            &mut candidate,
+            &request.account_id,
+            &revoked_devices,
+        );
+        let changed = claimed
+            .as_ref()
+            .and_then(|package| candidate.get(&package.key_package_id).cloned());
+        let changed = changed.into_iter().collect::<Vec<_>>();
+        let operation = claimed
+            .as_ref()
+            .map(|package| PersistedOperation::ClaimKeyPackage {
+                owner: package.owner.clone(),
             });
         if let Some(store) = &self.store {
             store.append_key_package_claim_mutation(
@@ -3115,6 +3151,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
         .route("/key-packages/claim", post(claim_key_package))
+        .route(
+            "/key-packages/claim-account",
+            post(claim_key_package_for_account),
+        )
         .route("/key-packages/claims", post(claim_key_packages))
         .route(
             "/key-packages/leases/expire",
@@ -3421,6 +3461,14 @@ async fn claim_key_package(
     Json(request): Json<ClaimKeyPackageRequest>,
 ) -> Result<Json<Option<HttpClaimedKeyPackage>>, ServerHttpError> {
     let claimed = state.claim_key_package(request)?;
+    Ok(Json(claimed))
+}
+
+async fn claim_key_package_for_account(
+    State(state): State<HttpServerState>,
+    Json(request): Json<ClaimKeyPackageForAccountRequest>,
+) -> Result<Json<Option<HttpClaimedKeyPackage>>, ServerHttpError> {
+    let claimed = state.claim_key_package_for_account(request)?;
     Ok(Json(claimed))
 }
 
@@ -6457,6 +6505,37 @@ fn claim_next_key_package_from_inventory(
     let record = inventory
         .get_mut(&key_package_id)
         .expect("selected KeyPackage must exist before claim");
+    record.state = KeyPackageInventoryState::Claimed;
+    Some(HttpClaimedKeyPackage {
+        key_package_id,
+        owner: record.owner.clone(),
+        key_package: record.key_package.clone(),
+    })
+}
+
+fn claim_next_key_package_for_account_from_inventory(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    account_id: &str,
+    revoked_devices: &BTreeSet<String>,
+) -> Option<HttpClaimedKeyPackage> {
+    let selected = inventory
+        .iter()
+        .filter(|(_, record)| {
+            if record.state != KeyPackageInventoryState::Available {
+                return false;
+            }
+            let Some(device) = finite_device_for_member_id(&record.owner) else {
+                return false;
+            };
+            device.account_id == account_id
+                && !revoked_devices.contains(&DeviceMembership::key(&device))
+        })
+        .map(|(key_package_id, _)| key_package_id.clone())
+        .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
+    let key_package_id = selected?;
+    let record = inventory
+        .get_mut(&key_package_id)
+        .expect("selected KeyPackage must exist before account claim");
     record.state = KeyPackageInventoryState::Claimed;
     Some(HttpClaimedKeyPackage {
         key_package_id,

@@ -3,11 +3,11 @@ use finitechat_delivery::{
 };
 use finitechat_http::{
     AckWelcomeRequest, AckWelcomeResponse, BootstrapAccountRoomRequest,
-    BootstrapAccountRoomResponse, ClaimKeyPackageRequest, ClaimWelcomesRequest,
-    CreateInviteSessionRequest, FiniteAccountRoomCommitProjection, GetEphemeralActivitiesRequest,
-    GetEphemeralActivitiesResponse, GetNostrProfilesRequest, GetNostrProfilesResponse,
-    GroupSyncRequest, HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState,
-    HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
+    BootstrapAccountRoomResponse, ClaimKeyPackageForAccountRequest, ClaimKeyPackageRequest,
+    ClaimWelcomesRequest, CreateInviteSessionRequest, FiniteAccountRoomCommitProjection,
+    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpKeyPackageInventory, InviteJoinStatusRequest,
     InviteJoinStatusResponse, KeyPackageInventoryRequest, ListAccountRoomDirectoryRequest,
     ListAccountRoomDirectoryResponse, ListInviteJoinRequestsRequest,
     ListInviteJoinRequestsResponse, NostrProfileRecord, PublishKeyPackageResponse, PushPlatform,
@@ -3832,6 +3832,11 @@ pub trait RuntimeDelivery {
         owner: &DeviceRef,
     ) -> Result<Option<ClaimKeyPackageResult>, Self::Error>;
 
+    fn claim_key_package_for_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error>;
+
     fn submit_commit(
         &mut self,
         request: SubmitCommitRequest,
@@ -4263,29 +4268,38 @@ impl<T: HttpRuntimeTransport> RuntimeDelivery for HttpRuntimeDelivery<T> {
         )?;
         claimed
             .map(|claimed| {
-                let request: UploadKeyPackageRequest =
-                    serde_json::from_slice(claimed.key_package.bytes())
-                        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
-                if claimed.key_package_id.as_slice() != request.key_package_id.as_bytes() {
-                    return Err(HttpRuntimeDeliveryError::KeyPackageIdMismatch {
-                        envelope_id: claimed.key_package_id.as_slice().to_vec(),
-                        body_id: request.key_package_id,
-                    });
-                }
-                if request.owner != *owner {
+                let result = claimed_key_package_result_from_http(claimed)?;
+                if result.owner != *owner {
                     return Err(HttpRuntimeDeliveryError::KeyPackageOwnerMismatch {
                         expected: owner.clone(),
-                        actual: request.owner,
+                        actual: result.owner,
                     });
                 }
-                Ok(ClaimKeyPackageResult {
-                    lease_token: lease_token_for(&request.key_package_id, &request.owner),
-                    key_package_id: request.key_package_id,
-                    owner: request.owner,
-                    key_package_ref: request.key_package_ref,
-                    key_package_hash: request.key_package_hash,
-                    key_package_payload: request.key_package_payload,
-                })
+                Ok(result)
+            })
+            .transpose()
+    }
+
+    fn claim_key_package_for_account(
+        &mut self,
+        account_id: &str,
+    ) -> Result<Option<ClaimKeyPackageResult>, Self::Error> {
+        let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> = self.post_json(
+            "/key-packages/claim-account",
+            &ClaimKeyPackageForAccountRequest {
+                account_id: account_id.to_owned(),
+            },
+        )?;
+        claimed
+            .map(|claimed| {
+                let result = claimed_key_package_result_from_http(claimed)?;
+                if result.owner.account_id != account_id {
+                    return Err(HttpRuntimeDeliveryError::KeyPackageAccountMismatch {
+                        expected: account_id.to_owned(),
+                        actual: result.owner,
+                    });
+                }
+                Ok(result)
             })
             .transpose()
     }
@@ -4500,6 +4514,10 @@ pub enum HttpRuntimeDeliveryError<E> {
         expected: DeviceRef,
         actual: DeviceRef,
     },
+    KeyPackageAccountMismatch {
+        expected: String,
+        actual: DeviceRef,
+    },
     RoomEntryMismatch {
         expected: String,
         actual: String,
@@ -4534,6 +4552,10 @@ impl<E: fmt::Display> fmt::Display for HttpRuntimeDeliveryError<E> {
                 formatter,
                 "KeyPackage owner mismatch: expected {expected:?}, actual {actual:?}"
             ),
+            Self::KeyPackageAccountMismatch { expected, actual } => write!(
+                formatter,
+                "KeyPackage account mismatch: expected {expected}, actual {actual:?}"
+            ),
             Self::RoomEntryMismatch { expected, actual } => write!(
                 formatter,
                 "room log entry mismatch: expected {expected}, actual {actual}"
@@ -4557,6 +4579,7 @@ where
             | Self::WelcomeRecipientMismatch { .. }
             | Self::KeyPackageIdMismatch { .. }
             | Self::KeyPackageOwnerMismatch { .. }
+            | Self::KeyPackageAccountMismatch { .. }
             | Self::RoomEntryMismatch { .. }
             | Self::CommitValidation(_) => None,
         }
@@ -4571,6 +4594,27 @@ fn decode_http_room_log_entry<E>(
     }
     serde_json::from_slice(payload)
         .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+}
+
+fn claimed_key_package_result_from_http<E>(
+    claimed: finitechat_delivery::HttpClaimedKeyPackage,
+) -> Result<ClaimKeyPackageResult, HttpRuntimeDeliveryError<E>> {
+    let request: UploadKeyPackageRequest = serde_json::from_slice(claimed.key_package.bytes())
+        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))?;
+    if claimed.key_package_id.as_slice() != request.key_package_id.as_bytes() {
+        return Err(HttpRuntimeDeliveryError::KeyPackageIdMismatch {
+            envelope_id: claimed.key_package_id.as_slice().to_vec(),
+            body_id: request.key_package_id,
+        });
+    }
+    Ok(ClaimKeyPackageResult {
+        lease_token: lease_token_for(&request.key_package_id, &request.owner),
+        key_package_id: request.key_package_id,
+        owner: request.owner,
+        key_package_ref: request.key_package_ref,
+        key_package_hash: request.key_package_hash,
+        key_package_payload: request.key_package_payload,
+    })
 }
 
 fn http_member_id_for_device<E>(
