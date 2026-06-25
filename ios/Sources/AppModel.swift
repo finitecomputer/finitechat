@@ -730,6 +730,24 @@ final class AppModel: ObservableObject {
         return room.state == .connected
     }
 
+    func startGroupChat(named rawName: String, with profiles: [AppProfileSummary]) -> Bool {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let accountIDs = profiles
+            .map(\.accountId)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !name.isEmpty, !accountIDs.isEmpty else { return false }
+        let existingRoomIDs = Set(rooms.map(\.roomId))
+        dispatch(.startGroupChat(accountIds: accountIDs, displayName: name))
+        guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
+            if userNoticeText == nil {
+                errorText = "Group chat could not be created."
+            }
+            return false
+        }
+        return room.state == .connected
+    }
+
     @discardableResult
     func scanTarget() -> Bool {
         if case .profile = scanTargetResult() {
@@ -1436,6 +1454,12 @@ final class AppModel: ObservableObject {
                 category: "transport",
                 name: "start_profile_chat",
                 details: ["account": accountId]
+            )
+        case .startGroupChat(let accountIds, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "start_group_chat",
+                details: ["members": "\(accountIds.count)"]
             )
         case .createInvite(let roomId):
             return DiagnosticActionSummary(

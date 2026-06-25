@@ -32,14 +32,14 @@ use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     AppendEphemeralActivityRequest, ApplicationDeliveryPolicy, AttachmentBlobMetadataV1,
     AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1,
-    CreateRoomRequest, DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DeviceRef,
-    DurableAppEventKind, EphemeralActivityActionV1, EphemeralActivityIngressContext,
-    EphemeralActivityProjection, EphemeralActivityProjectionEntry,
+    ClaimKeyPackageResult, CreateRoomRequest, DecryptedApplicationEventV1,
+    DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind, EphemeralActivityActionV1,
+    EphemeralActivityIngressContext, EphemeralActivityProjection, EphemeralActivityProjectionEntry,
     FINITECHAT_ACTIVITY_KIND_THINKING, FINITECHAT_ACTIVITY_KIND_TYPING,
     FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, InviteCodeV1, ListAccountRoomsRequest,
-    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, RoomProtocol, RuntimeActivityClearV1,
-    invite_current_pin, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
-    validate_string_bytes,
+    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT,
+    RoomProtocol, RuntimeActivityClearV1, invite_current_pin, npub_decode, npub_encode,
+    nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -462,6 +462,10 @@ pub enum AppAction {
     },
     StartProfileChat {
         account_id: String,
+        display_name: String,
+    },
+    StartGroupChat {
+        account_ids: Vec<String>,
         display_name: String,
     },
     CreateInvite {
@@ -1035,6 +1039,10 @@ impl AppRuntimeState {
                 account_id,
                 display_name,
             } => self.start_profile_chat(account_id, display_name)?,
+            AppAction::StartGroupChat {
+                account_ids,
+                display_name,
+            } => self.start_group_chat(account_ids, display_name)?,
             AppAction::CreateInvite { room_id } => self.create_invite(room_id)?,
             AppAction::ScanTarget { value } => self.scan_target(value)?,
             AppAction::SubmitInvitePin {
@@ -1406,6 +1414,153 @@ impl AppRuntimeState {
                         self.set_online_action_unavailable(
                             "chat unavailable",
                             "Profile chat could not be created",
+                        );
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        if accepted.message_id != prepared.message_id {
+            return Err(client_error(format!(
+                "commit acceptance message id {} did not match prepared message id {}",
+                accepted.message_id, prepared.message_id
+            )));
+        }
+
+        let synced = self.core.sync_with_projection()?;
+        self.apply_projection_events(synced.events);
+        self.append_messages(synced.result.messages);
+        self.materialize_known_connected_rooms()?;
+        self.app.selected_room_id = Some(room_id.clone());
+        self.upsert_room(
+            &room_id,
+            &display_name,
+            AppRoomState::Connected,
+            "connected",
+        );
+        self.persist_room_projection(&room_id)?;
+        self.persist_app_state()?;
+        self.sync_selected_room_messages();
+        self.app.status = "chat created".to_owned();
+        Ok(())
+    }
+
+    fn start_group_chat(
+        &mut self,
+        account_ids: Vec<String>,
+        display_name: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let mut seen = BTreeSet::new();
+        let mut member_account_ids = Vec::new();
+        for account_id in account_ids {
+            let account_id = account_id.trim().to_owned();
+            if account_id.is_empty() || account_id == self.app.identity.account_id {
+                continue;
+            }
+            validate_string_bytes("group.account_id", &account_id, MAX_OBJECT_ID_BYTES)
+                .map_err(client_error)?;
+            if seen.insert(account_id.clone()) {
+                member_account_ids.push(account_id);
+            }
+        }
+        if member_account_ids.is_empty() {
+            self.set_online_action_unavailable(
+                "chat unavailable",
+                "Choose at least one other person to start a chat",
+            );
+            return Ok(());
+        }
+        validate_item_count(
+            "group.account_ids",
+            member_account_ids.len(),
+            MAX_STAGED_WELCOMES_PER_COMMIT,
+        )
+        .map_err(client_error)?;
+
+        let label = display_name.trim();
+        if label.len() > MAX_INVITE_DISPLAY_NAME_BYTES as usize {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!(
+                    "room display name must be at most {MAX_INVITE_DISPLAY_NAME_BYTES} bytes"
+                ),
+            });
+        }
+        let display_name = if label.is_empty() {
+            format!("Group with {}", short_account_label(&member_account_ids[0]))
+        } else {
+            label.to_owned()
+        };
+
+        let claimed: Result<Option<Vec<ClaimKeyPackageResult>>, FiniteChatCoreError> = {
+            let mut delivery = self.core.home_delivery();
+            let mut claimed = Vec::with_capacity(member_account_ids.len());
+            let mut missing_package = false;
+            for account_id in &member_account_ids {
+                match delivery.claim_key_package_for_account(account_id) {
+                    Ok(Some(package)) => claimed.push(package),
+                    Ok(None) => {
+                        missing_package = true;
+                        break;
+                    }
+                    Err(error) => return Err(send_delivery_error(error)),
+                }
+            }
+            if missing_package {
+                Ok(None)
+            } else {
+                Ok(Some(claimed))
+            }
+        };
+        let claimed = match claimed {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                self.set_online_action_unavailable(
+                    "chat unavailable",
+                    "No available Finite Chat device was found for one or more selected people",
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if online_action_failure(&error) {
+                    self.set_online_action_unavailable(
+                        "chat unavailable",
+                        "Group chat could not be created",
+                    );
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+
+        let room_id = self.core.generate_object_id("room")?;
+        self.core
+            .bootstrap_room(&room_id, Some(display_name.clone()))?;
+
+        let mut welcome_ids = Vec::with_capacity(claimed.len());
+        for _ in &claimed {
+            welcome_ids.push(self.core.generate_object_id("welcome")?);
+        }
+        let idempotency_key = self.core.generate_object_id("group-add")?;
+        let prepared = self
+            .core
+            .device
+            .prepare_add_members_commit(&room_id, &claimed, &welcome_ids, idempotency_key)
+            .map_err(client_error)?;
+        self.core
+            .store
+            .save_device_state(&self.core.device)
+            .map_err(store_error)?;
+        let accepted = {
+            let mut delivery = self.core.home_delivery();
+            match delivery.submit_commit(prepared.request) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    let error = send_delivery_error(error);
+                    if online_action_failure(&error) {
+                        self.set_online_action_unavailable(
+                            "chat unavailable",
+                            "Group chat could not be created",
                         );
                         return Ok(());
                     }
@@ -6916,6 +7071,139 @@ mod tests {
         assert_eq!(
             state.toast.as_deref(),
             Some("No available Finite Chat device was found for that profile")
+        );
+        assert!(state.rooms.is_empty());
+    }
+
+    #[test]
+    fn app_group_chat_claims_key_packages_and_sends_welcomes_without_invite_qr() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let carol = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("carol").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "carol-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let bob_account_id = bob.state().unwrap().identity.account_id;
+        let carol_account_id = carol.state().unwrap().identity.account_id;
+        bob.dispatch(AppAction::StartRuntime)
+            .expect("bob publishes key packages");
+        carol
+            .dispatch(AppAction::StartRuntime)
+            .expect("carol publishes key packages");
+
+        let alice_state = alice
+            .dispatch(AppAction::StartGroupChat {
+                account_ids: vec![bob_account_id, carol_account_id],
+                display_name: "Weekend plans".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(alice_state.status, "chat created");
+        let room = alice_state.rooms.first().expect("group room");
+        assert_eq!(room.display_name, "Weekend plans");
+        assert_eq!(room.state, AppRoomState::Connected);
+        let room_id = room.room_id.clone();
+
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&bob_state, &room_id).state,
+            AppRoomState::Connected
+        );
+        bob.dispatch(AppAction::OpenRoom {
+            room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&carol_state, &room_id).state,
+            AppRoomState::Connected
+        );
+        carol
+            .dispatch(AppAction::OpenRoom {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+
+        alice
+            .dispatch(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "hello group".to_owned(),
+            })
+            .unwrap();
+        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            bob_state
+                .messages
+                .iter()
+                .any(|message| message.text == "hello group")
+        );
+        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        assert!(
+            carol_state
+                .messages
+                .iter()
+                .any(|message| message.text == "hello group")
+        );
+    }
+
+    #[test]
+    fn app_group_chat_with_missing_key_package_does_not_create_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let bob_account_id = bob.state().unwrap().identity.account_id;
+        bob.dispatch(AppAction::StartRuntime)
+            .expect("bob publishes key packages");
+        let missing_account_id =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned();
+
+        let state = alice
+            .dispatch(AppAction::StartGroupChat {
+                account_ids: vec![bob_account_id, missing_account_id],
+                display_name: "Broken group".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(state.status, "chat unavailable");
+        assert_eq!(
+            state.toast.as_deref(),
+            Some("No available Finite Chat device was found for one or more selected people")
         );
         assert!(state.rooms.is_empty());
     }

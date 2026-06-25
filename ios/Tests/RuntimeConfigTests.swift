@@ -2097,6 +2097,115 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
     }
 
+    func testStartGroupChatDispatchesBackedGroupAction() async throws {
+        await MainActor.run {
+            let bob = AppProfileSummary(
+                accountId: "bob-account",
+                npub: "npub1bob",
+                displayName: "Bob",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let carol = AppProfileSummary(
+                accountId: "carol-account",
+                npub: "npub1carol",
+                displayName: "Carol",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let runtime = FakeFiniteChatRuntime(
+                initialState: emptyChatState(),
+                startRuntimeState: emptyChatState()
+            ) { action, currentState in
+                var state = currentState
+                switch action {
+                case .startGroupChat(_, let displayName):
+                    let room = AppRoomSummary(
+                        roomId: "room-group",
+                        displayName: displayName,
+                        state: .connected,
+                        status: "connected",
+                        userStatusText: "Connected",
+                        lastMessagePreview: "",
+                        unreadCount: 0,
+                        canLoadOlder: false
+                    )
+                    state.rooms = [room]
+                    state.selectedRoomId = room.roomId
+                    state.status = "chat created"
+                default:
+                    break
+                }
+                return state
+            }
+            let model = AppModel(
+                config: RuntimeConfig(
+                    serverURL: "https://chat.finite.computer",
+                    deviceID: "alice-phone"
+                ),
+                startsUpdateLoop: false
+            ) { _ in runtime }
+
+            model.start()
+
+            XCTAssertTrue(model.startGroupChat(named: "Weekend plans", with: [bob, carol]))
+            XCTAssertEqual(
+                runtime.dispatchedActions,
+                [
+                    .startRuntime,
+                    .startGroupChat(
+                        accountIds: ["bob-account", "carol-account"],
+                        displayName: "Weekend plans"
+                    ),
+                ]
+            )
+            XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
+        }
+    }
+
+    func testStartGroupChatFailureKeepsNoticeVisibleWithoutRooms() async throws {
+        await MainActor.run {
+            let bob = AppProfileSummary(
+                accountId: "bob-account",
+                npub: "npub1bob",
+                displayName: "Bob",
+                about: nil,
+                picture: nil,
+                stale: false
+            )
+            let runtime = FakeFiniteChatRuntime(
+                initialState: emptyChatState(),
+                startRuntimeState: emptyChatState()
+            ) { action, currentState in
+                var state = currentState
+                if case .startGroupChat = action {
+                    state.status = "chat unavailable"
+                    state.toast = "No available Finite Chat device was found for one or more selected people"
+                }
+                return state
+            }
+            let model = AppModel(
+                config: RuntimeConfig(
+                    serverURL: "https://chat.finite.computer",
+                    deviceID: "alice-phone"
+                ),
+                startsUpdateLoop: false
+            ) { _ in runtime }
+
+            model.start()
+
+            XCTAssertFalse(model.startGroupChat(named: "Weekend plans", with: [bob]))
+            XCTAssertTrue(model.rooms.isEmpty)
+            XCTAssertEqual(
+                model.userNoticeText,
+                "No available Finite Chat device was found for one or more selected people"
+            )
+            XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
+        }
+    }
+
     @MainActor
     func testScanTargetResultKeepsFailedProfileCodeVisible() throws {
         let runtime = FakeFiniteChatRuntime(

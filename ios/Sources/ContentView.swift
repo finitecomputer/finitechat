@@ -295,12 +295,8 @@ private struct RoomListView: View {
                 .accessibilityLabel("Scan code")
                 .accessibilityIdentifier("ChatsScanButton")
 
-                Menu {
-                    Button {
-                        showingNewRoom = true
-                    } label: {
-                        Label("New Group Chat", systemImage: "person.2.badge.plus")
-                    }
+                Button {
+                    showingNewRoom = true
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -322,32 +318,73 @@ private struct RoomListView: View {
             prompt: "Search chats"
         )
         .sheet(isPresented: $showingNewRoom) {
-            NewRoomSheet { name in
-                createRoom(named: name)
+            NewGroupChatSheet(model: model) { room in
+                open(room)
             }
         }
         .safeAreaInset(edge: .bottom) {
             NoticeBar(text: model.userNoticeText)
         }
     }
-
-    private func createRoom(named rawName: String) {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        let existingRoomIDs = Set(model.rooms.map(\.roomId))
-        model.roomDraft = name
-        model.createRoom()
-        if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
-            open(room)
-        }
-    }
 }
 
-private struct NewRoomSheet: View {
+private struct NewGroupChatSheet: View {
     @Environment(\.dismiss) private var dismiss
-    let onCreate: (String) -> Void
+    @ObservedObject var model: AppModel
+    let onCreated: (AppRoomSummary) -> Void
+
+    @StateObject private var people = NostrPeopleModel()
     @State private var roomName = ""
+    @State private var memberCode = ""
+    @State private var selectedProfiles: [AppProfileSummary] = []
+    @State private var searchText = ""
+    @State private var showingCameraScanner = false
+    @State private var parseError: String?
     @FocusState private var focused: Bool
+
+    private var selfAccountID: String? {
+        model.nostrIdentity?.accountID ?? model.state?.identity.accountId
+    }
+
+    private var selectedIDs: Set<String> {
+        Set(selectedProfiles.map(\.accountId))
+    }
+
+    private var filteredFollowProfiles: [NostrFollowProfile] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return people.profiles
+            .filter { profile in
+                profile.pubkey != selfAccountID && !selectedIDs.contains(profile.pubkey)
+            }
+            .filter { profile in
+                guard !query.isEmpty else { return true }
+                return profile.displayName.lowercased().contains(query)
+                    || profile.npub.lowercased().contains(query)
+                    || profile.pubkey.lowercased().contains(query)
+                    || (profile.about?.lowercased().contains(query) ?? false)
+            }
+    }
+
+    private var filteredKnownProfiles: [AppProfileSummary] {
+        let followIDs = Set(people.profiles.map(\.pubkey))
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return (model.state?.profiles ?? [])
+            .filter { profile in
+                profile.accountId != selfAccountID
+                    && !selectedIDs.contains(profile.accountId)
+                    && !followIDs.contains(profile.accountId)
+            }
+            .filter { profile in
+                guard !query.isEmpty else { return true }
+                return profile.displayName.lowercased().contains(query)
+                    || profile.npub.lowercased().contains(query)
+                    || profile.accountId.lowercased().contains(query)
+                    || (profile.about?.lowercased().contains(query) ?? false)
+            }
+            .sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+    }
 
     var body: some View {
         NavigationStack {
@@ -361,9 +398,95 @@ private struct NewRoomSheet: View {
                 } header: {
                     Text("Group Chat")
                 }
+
+                if let notice = model.actionNoticeText {
+                    Section {
+                        Label(notice, systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let parseError {
+                    Section {
+                        Label(parseError, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                Section {
+                    if QRCodeScannerSheet.canUseCamera {
+                        Button {
+                            showingCameraScanner = true
+                        } label: {
+                            Label("Scan Profile Code", systemImage: "qrcode.viewfinder")
+                        }
+                    }
+
+                    Button {
+                        addCode(UIPasteboard.general.string ?? "")
+                    } label: {
+                        Label("Paste Profile Code", systemImage: "doc.on.clipboard")
+                    }
+
+                    TextField("npub or profile code", text: $memberCode, axis: .vertical)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .lineLimit(2...4)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            addCode(memberCode)
+                        }
+                        .accessibilityIdentifier("NewRoomMemberCodeField")
+
+                    Button {
+                        addCode(memberCode)
+                    } label: {
+                        Label("Add Entered Profile", systemImage: "person.badge.plus")
+                    }
+                    .disabled(memberCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } header: {
+                    Text("Add People")
+                }
+
+                if !selectedProfiles.isEmpty {
+                    Section("Selected People") {
+                        ForEach(selectedProfiles, id: \.accountId) { profile in
+                            HStack(spacing: 8) {
+                                ProfileRow(profile: profile)
+
+                                Button(role: .destructive) {
+                                    removeProfile(profile)
+                                } label: {
+                                    Image(systemName: "minus.circle.fill")
+                                        .frame(width: 34, height: 34)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Remove \(profile.displayName)")
+                            }
+                        }
+                    }
+                }
+
+                peopleSection
             }
             .navigationTitle("New Chat")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(
+                text: $searchText,
+                placement: .navigationBarDrawer(displayMode: .automatic),
+                prompt: "Search people"
+            )
+            .task(id: "\(model.nostrIdentity?.accountID ?? "")|\(model.serverURL)") {
+                await people.loadIfNeeded(identity: model.nostrIdentity, serverURL: model.serverURL)
+            }
+            .refreshable {
+                await people.refresh(identity: model.nostrIdentity, serverURL: model.serverURL)
+            }
+            .sheet(isPresented: $showingCameraScanner) {
+                QRCodeScannerSheet { value in
+                    addCode(value)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -372,7 +495,7 @@ private struct NewRoomSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create", action: create)
-                        .disabled(trimmedName.isEmpty)
+                        .disabled(trimmedName.isEmpty || selectedProfiles.isEmpty)
                         .accessibilityIdentifier("NewRoomCreateButton")
                 }
             }
@@ -386,10 +509,209 @@ private struct NewRoomSheet: View {
         roomName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    @ViewBuilder
+    private var peopleSection: some View {
+        if people.isLoading && people.profiles.isEmpty && filteredKnownProfiles.isEmpty {
+            Section {
+                HStack {
+                    Spacer()
+                    ProgressView("Loading people...")
+                    Spacer()
+                }
+            }
+        } else {
+            if !filteredFollowProfiles.isEmpty {
+                Section("Nostr Follows") {
+                    ForEach(filteredFollowProfiles) { profile in
+                        Button {
+                            addProfile(profile.appProfileSummary)
+                        } label: {
+                            NewGroupFollowRow(profile: profile)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            if !filteredKnownProfiles.isEmpty {
+                Section("Known in Finite Chat") {
+                    ForEach(filteredKnownProfiles, id: \.accountId) { profile in
+                        Button {
+                            addProfile(profile)
+                        } label: {
+                            ProfileRow(profile: profile)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            if filteredFollowProfiles.isEmpty && filteredKnownProfiles.isEmpty {
+                Section {
+                    ContentUnavailableView(
+                        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "No people yet"
+                            : "No matches",
+                        systemImage: "person.crop.circle.badge.questionmark",
+                        description: Text(people.statusText ?? "Paste or scan a profile code.")
+                    )
+                }
+            }
+        }
+    }
+
+    private func addCode(_ rawValue: String) {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            let npub = try extractNpub(from: trimmed)
+            let accountID = try accountIdFromNpub(npub: npub)
+            if accountID == selfAccountID {
+                parseError = "That is your own profile code."
+                return
+            }
+            addProfile(profileSummary(accountID: accountID, npub: npub))
+            memberCode = ""
+            parseError = nil
+        } catch {
+            parseError = "That code is not a valid profile npub."
+        }
+    }
+
+    private func addProfile(_ profile: AppProfileSummary) {
+        guard profile.accountId != selfAccountID else {
+            parseError = "That is your own profile code."
+            return
+        }
+        guard !selectedIDs.contains(profile.accountId) else {
+            parseError = nil
+            return
+        }
+        selectedProfiles.append(profile)
+        parseError = nil
+    }
+
+    private func removeProfile(_ profile: AppProfileSummary) {
+        selectedProfiles.removeAll { $0.accountId == profile.accountId }
+    }
+
+    private func profileSummary(accountID: String, npub: String) -> AppProfileSummary {
+        if let profile = model.state?.profiles.first(where: { $0.accountId == accountID }) {
+            return profile
+        }
+        if let follow = people.profiles.first(where: { $0.pubkey == accountID }) {
+            return follow.appProfileSummary
+        }
+        return AppProfileSummary(
+            accountId: accountID,
+            npub: npub,
+            displayName: shortenedDisplayNpub(npub),
+            about: nil,
+            picture: nil,
+            stale: true
+        )
+    }
+
     private func create() {
-        guard !trimmedName.isEmpty else { return }
-        onCreate(trimmedName)
+        guard !trimmedName.isEmpty, !selectedProfiles.isEmpty else { return }
+        let existingRoomIDs = Set(model.rooms.map(\.roomId))
+        guard model.startGroupChat(named: trimmedName, with: selectedProfiles) else { return }
+        if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
+            ?? model.selectedRoom
+        {
+            onCreated(room)
+        }
         dismiss()
+    }
+
+    private func extractNpub(from value: String) throws -> String {
+        var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidate.lowercased().hasPrefix("nostr:") {
+            candidate = String(candidate.dropFirst("nostr:".count))
+        }
+        if candidate.lowercased().hasPrefix("npub1") {
+            return candidate
+        }
+        if let components = URLComponents(string: candidate) {
+            for item in components.queryItems ?? [] {
+                if item.name.lowercased() == "npub",
+                   let value = item.value,
+                   value.lowercased().hasPrefix("npub1")
+                {
+                    return value
+                }
+            }
+        }
+        guard let range = candidate.range(of: "npub1", options: [.caseInsensitive]) else {
+            throw NewGroupChatCodeError.missingNpub
+        }
+        let suffix = candidate[range.lowerBound...]
+        let separators = CharacterSet.whitespacesAndNewlines
+            .union(CharacterSet(charactersIn: "\"'<>"))
+        let npub = suffix.prefix { character in
+            !character.unicodeScalars.contains { scalar in
+                separators.contains(scalar)
+            }
+        }
+        return String(npub)
+    }
+}
+
+private enum NewGroupChatCodeError: Error {
+    case missingNpub
+}
+
+private struct NewGroupFollowRow: View {
+    let profile: NostrFollowProfile
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color(.tertiarySystemFill))
+
+                if let url = profile.pictureURL.flatMap(URL.init(string:)) {
+                    CachedRemoteImage(url: url) { image in
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    } placeholder: {
+                        initials
+                    }
+                } else {
+                    initials
+                }
+            }
+            .frame(width: 40, height: 40)
+            .clipShape(Circle())
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(profile.displayName)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Text(profile.about ?? profile.shortenedNpub)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Image(systemName: "plus.circle")
+                .foregroundStyle(.secondary)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+    }
+
+    private var initials: some View {
+        Text(profile.displayName.prefix(1).uppercased())
+            .font(.headline)
+            .foregroundStyle(.secondary)
     }
 }
 
