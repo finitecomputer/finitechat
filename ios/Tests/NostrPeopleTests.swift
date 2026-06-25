@@ -673,6 +673,53 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].displayName, "Read Relay Follow")
     }
 
+    func testFetchFollowProfilesFallsBackToDiscoveryRelaysForMissingMetadata() async throws {
+        let owner = String(repeating: "8", count: 64)
+        let followed = String(repeating: "9", count: 64)
+
+        let service = NostrRelayProfileService(
+            relays: ["wss://contacts.example"],
+            discoveryRelays: ["wss://metadata.example"],
+            eventLoader: { relay, filter, _, _ in
+                if filter.kinds == [3],
+                   relay == "wss://contacts.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_025,
+                            kind: 3,
+                            tags: [["p", followed]],
+                            content: ""
+                        ),
+                    ]
+                }
+
+                if filter.kinds == [0],
+                   relay == "wss://metadata.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: followed,
+                            createdAt: 1_800_000_026,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Metadata Relay Friend","name":"metadatafriend"}"#
+                        ),
+                    ]
+                }
+
+                return []
+            }
+        )
+
+        let result = try await service.fetchFollowProfiles(forAccountID: owner)
+
+        XCTAssertEqual(result.followedPubkeyCount, 1)
+        XCTAssertEqual(result.profiles[0].displayName, "Metadata Relay Friend")
+        XCTAssertEqual(result.profiles[0].username, "metadatafriend")
+    }
+
     func testFetchFollowProfilesFallsBackToDiscoveryRelaysWhenPrimaryMissesContacts() async throws {
         let owner = String(repeating: "6", count: 64)
         let followed = String(repeating: "7", count: 64)

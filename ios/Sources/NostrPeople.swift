@@ -568,10 +568,10 @@ final class NostrRelayProfileService: Sendable {
                 followedPubkeyCount: 0
             )
         }
-        let metadataRelays = Self.mergedRelays(contactRelays + followed.compactMap(\.relayHint))
-        let metadata = await fetchMetadata(
+        let primaryMetadataRelays = Self.mergedRelays(contactRelays + followed.compactMap(\.relayHint))
+        let metadata = await fetchMetadataWithDiscoveryFallback(
             forPubkeys: followed.map(\.pubkey),
-            relays: metadataRelays
+            primaryRelays: primaryMetadataRelays
         )
         let profiles = followed.compactMap { contact -> NostrFollowProfile? in
             guard let npub = try? npubFromAccountId(accountId: contact.pubkey) else { return nil }
@@ -687,6 +687,29 @@ final class NostrRelayProfileService: Sendable {
             contacts: contacts,
             allRelayAttemptsFailed: batch.allAttemptsFailed
         )
+    }
+
+    private func fetchMetadataWithDiscoveryFallback(
+        forPubkeys pubkeys: [String],
+        primaryRelays: [String]
+    ) async -> [String: NostrProfileMetadata] {
+        var metadata = await fetchMetadata(forPubkeys: pubkeys, relays: primaryRelays)
+        let missingPubkeys = pubkeys.filter { metadata[$0] == nil }
+        guard !missingPubkeys.isEmpty else { return metadata }
+
+        let fallbackRelays = Self.mergedRelays(discoveryRelays.filter { relay in
+            !primaryRelays.contains { $0.caseInsensitiveCompare(relay) == .orderedSame }
+        })
+        guard !fallbackRelays.isEmpty else { return metadata }
+
+        let fallbackMetadata = await fetchMetadata(
+            forPubkeys: missingPubkeys,
+            relays: fallbackRelays
+        )
+        metadata.merge(fallbackMetadata) { current, fallback in
+            current.createdAt >= fallback.createdAt ? current : fallback
+        }
+        return metadata
     }
 
     private func fetchMetadata(forPubkeys pubkeys: [String], relays: [String]) async -> [String: NostrProfileMetadata] {
