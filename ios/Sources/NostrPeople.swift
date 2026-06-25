@@ -277,7 +277,7 @@ final class NostrPeopleModel: ObservableObject {
                 preserveNonEmptyOnEmptyResult: true
             )
             if result.followedPubkeyCount == 0 {
-                statusText = "No follows found on the configured Nostr relays."
+                statusText = "No follows found across \(result.relayCount) Nostr relays."
             } else {
                 statusText = "Loaded \(result.profiles.count) of \(result.followedPubkeyCount) follows from \(result.relayCount) relays."
             }
@@ -466,6 +466,9 @@ final class NostrRelayProfileService: Sendable {
         "wss://relay.primal.net",
         "wss://nos.lol",
         "wss://relay.damus.io",
+        "wss://relay.nostr.band",
+        "wss://relay.snort.social",
+        "wss://offchain.pub",
         "wss://us-east.nostr.pikachat.org",
         "wss://eu.nostr.pikachat.org",
     ]
@@ -507,7 +510,7 @@ final class NostrRelayProfileService: Sendable {
                 followedPubkeyCount: 0
             )
         }
-        let metadataRelays = mergedRelays(relays + followed.compactMap(\.relayHint))
+        let metadataRelays = mergedRelays(contactRelays + followed.compactMap(\.relayHint))
         let metadata = await fetchMetadata(
             forPubkeys: followed.map(\.pubkey),
             relays: metadataRelays
@@ -555,13 +558,15 @@ final class NostrRelayProfileService: Sendable {
             return relays
         }
 
-        let writeRelays = latest.tags.compactMap { tag -> String? in
+        let advertisedRelays = latest.tags.compactMap { tag -> String? in
             guard tag.count >= 2, tag[0] == "r" else { return nil }
-            let marker = tag.count >= 3 ? tag[2].lowercased() : ""
-            guard marker.isEmpty || marker == "write" else { return nil }
+            let marker = tag.count >= 3
+                ? tag[2].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                : ""
+            guard marker.isEmpty || marker == "write" || marker == "read" else { return nil }
             return tag[1].nostrNonEmptyTrimmed
         }
-        return mergedRelays(relays + writeRelays)
+        return mergedRelays(relays + advertisedRelays)
     }
 
     private func fetchContacts(forAccountID accountID: String, relays: [String]) async -> NostrContactFetchResult {

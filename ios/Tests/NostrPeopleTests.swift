@@ -553,7 +553,7 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].displayName, "Newer")
     }
 
-    func testFetchFollowProfilesUsesNip65WriteRelaysForContactList() async throws {
+    func testFetchFollowProfilesUsesNip65RelaysForContactListAndMetadata() async throws {
         let owner = String(repeating: "d", count: 64)
         let followed = String(repeating: "e", count: 64)
 
@@ -579,15 +579,29 @@ final class NostrPeopleTests: XCTestCase {
                 }
 
                 if filter.kinds == [3],
-                   relay == "wss://write.example"
+                   relay == "wss://read-only.example"
                 {
                     return [
                         NostrRelayEvent(
                             pubkey: owner,
                             createdAt: 1_800_000_011,
                             kind: 3,
-                            tags: [["p", followed, "", "Relay Follow"]],
+                            tags: [["p", followed]],
                             content: ""
+                        ),
+                    ]
+                }
+
+                if filter.kinds == [0],
+                   relay == "wss://read-only.example"
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: followed,
+                            createdAt: 1_800_000_012,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Read Relay Follow"}"#
                         ),
                     ]
                 }
@@ -598,9 +612,9 @@ final class NostrPeopleTests: XCTestCase {
 
         let result = try await service.fetchFollowProfiles(forAccountID: owner)
 
-        XCTAssertEqual(result.relayCount, 3)
+        XCTAssertEqual(result.relayCount, 4)
         XCTAssertEqual(result.followedPubkeyCount, 1)
-        XCTAssertEqual(result.profiles[0].displayName, "Relay Follow")
+        XCTAssertEqual(result.profiles[0].displayName, "Read Relay Follow")
     }
 
     func testFetchFollowProfilesUsesContactRelayHintForMetadata() async throws {
