@@ -72,9 +72,34 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
         return false
     }
 
+    var hasProfileMetadata: Bool {
+        for candidate in [name, username, about, pictureURL] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty
+            {
+                return true
+            }
+        }
+        return false
+    }
+
     var shortenedNpub: String {
         guard npub.count > 18 else { return npub }
         return "\(npub.prefix(10))...\(npub.suffix(4))"
+    }
+
+    func withCachedMetadata(_ metadata: NostrCachedProfileMetadata?) -> NostrFollowProfile {
+        guard let metadata else { return self }
+        return NostrFollowProfile(
+            pubkey: pubkey,
+            npub: npub,
+            name: name.nostrPreferredValue(over: metadata.name),
+            username: username.nostrPreferredValue(over: metadata.username),
+            about: about.nostrPreferredValue(over: metadata.about),
+            pictureURL: pictureURL.nostrPreferredValue(over: metadata.pictureURL),
+            relayHint: relayHint,
+            inviteAvailability: inviteAvailability
+        )
     }
 
     func withInviteAvailability(_ availability: InviteAvailability) -> NostrFollowProfile {
@@ -114,6 +139,7 @@ actor NostrPeopleCache: Sendable {
     private let directory: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let profileMetadataFileName = "profile-metadata.json"
 
     init(directory: URL? = nil) {
         if let directory {
@@ -128,14 +154,19 @@ actor NostrPeopleCache: Sendable {
     }
 
     func load(accountID: String, serverURL: String) -> NostrFollowFetchResult? {
+        let metadata = loadProfileMetadata()
         for url in [
             cacheURL(accountID: accountID),
             legacyCacheURL(accountID: accountID, serverURL: serverURL),
         ] {
             guard let result = load(from: url) else { continue }
-            return result
+            return enrich(result, metadata: metadata)
         }
         return nil
+    }
+
+    func enrich(_ result: NostrFollowFetchResult) -> NostrFollowFetchResult {
+        enrich(result, metadata: loadProfileMetadata())
     }
 
     func save(
@@ -167,6 +198,7 @@ actor NostrPeopleCache: Sendable {
                 to: cacheURL(accountID: accountID),
                 options: [.atomic]
             )
+            saveProfileMetadata(from: result.profiles)
         } catch {
             // Cache failures must not block the People surface.
         }
@@ -185,8 +217,87 @@ actor NostrPeopleCache: Sendable {
         )
     }
 
+    private func enrich(
+        _ result: NostrFollowFetchResult,
+        metadata: [String: NostrCachedProfileMetadata]
+    ) -> NostrFollowFetchResult {
+        NostrFollowFetchResult(
+            profiles: result.profiles.map { profile in
+                let key = profile.pubkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return profile.withCachedMetadata(metadata[key])
+            },
+            relayCount: result.relayCount,
+            followedPubkeyCount: result.followedPubkeyCount
+        )
+    }
+
+    private func loadProfileMetadata() -> [String: NostrCachedProfileMetadata] {
+        guard let data = try? Data(contentsOf: profileMetadataURL()),
+              let envelope = try? decoder.decode(NostrProfileMetadataCacheEnvelope.self, from: data)
+        else {
+            return [:]
+        }
+        var result: [String: NostrCachedProfileMetadata] = [:]
+        for profile in envelope.profiles {
+            let key = profile.pubkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !key.isEmpty else { continue }
+            result[key] = profile.withPubkey(key)
+        }
+        return result
+    }
+
+    private func saveProfileMetadata(from profiles: [NostrFollowProfile]) {
+        var metadata = loadProfileMetadata()
+        let now = Date()
+        var changed = false
+        for profile in profiles {
+            let key = profile.pubkey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !key.isEmpty else { continue }
+            if profile.hasProfileMetadata {
+                let existing = metadata[key]
+                metadata[key] = NostrCachedProfileMetadata(
+                    pubkey: key,
+                    name: profile.name.nostrPreferredValue(over: existing?.name),
+                    username: profile.username.nostrPreferredValue(over: existing?.username),
+                    about: profile.about.nostrPreferredValue(over: existing?.about),
+                    pictureURL: profile.pictureURL.nostrPreferredValue(over: existing?.pictureURL),
+                    cachedAt: now
+                )
+                changed = true
+            } else if metadata[key] == nil {
+                metadata[key] = NostrCachedProfileMetadata(
+                    pubkey: key,
+                    name: nil,
+                    username: nil,
+                    about: nil,
+                    pictureURL: nil,
+                    cachedAt: now
+                )
+                changed = true
+            }
+        }
+        guard changed else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let envelope = NostrProfileMetadataCacheEnvelope(
+                profiles: metadata.values.sorted { $0.pubkey < $1.pubkey }
+            )
+            let data = try encoder.encode(envelope)
+            try data.write(to: profileMetadataURL(), options: [.atomic])
+        } catch {
+            // Profile metadata cache failures must not block People rendering.
+        }
+    }
+
     private func cacheURL(accountID: String) -> URL {
         directory.appendingPathComponent("\(accountCacheKey(accountID)).json")
+    }
+
+    private func profileMetadataURL() -> URL {
+        directory.appendingPathComponent(profileMetadataFileName)
     }
 
     private func legacyCacheURL(accountID: String, serverURL: String) -> URL {
@@ -211,6 +322,45 @@ private struct NostrPeopleCacheEnvelope: Codable {
     let relayCount: Int
     let followedPubkeyCount: Int
     let cachedAt: Date
+}
+
+struct NostrCachedProfileMetadata: Codable, Equatable, Sendable {
+    let pubkey: String
+    let name: String?
+    let username: String?
+    let about: String?
+    let pictureURL: String?
+    let cachedAt: Date
+
+    func withPubkey(_ pubkey: String) -> NostrCachedProfileMetadata {
+        NostrCachedProfileMetadata(
+            pubkey: pubkey,
+            name: name,
+            username: username,
+            about: about,
+            pictureURL: pictureURL,
+            cachedAt: cachedAt
+        )
+    }
+}
+
+private struct NostrProfileMetadataCacheEnvelope: Codable {
+    let profiles: [NostrCachedProfileMetadata]
+}
+
+private extension Optional where Wrapped == String {
+    var nostrNormalizedProfileValue: String? {
+        guard let value = self?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+            return nil
+        }
+        return value
+    }
+
+    func nostrPreferredValue(over fallback: String?) -> String? {
+        nostrNormalizedProfileValue ?? fallback.nostrNormalizedProfileValue
+    }
 }
 
 final class NostrPeopleModel: ObservableObject {
@@ -277,7 +427,8 @@ final class NostrPeopleModel: ObservableObject {
         defer { isLoading = false }
         statusText = nil
         do {
-            let result = try await service.fetchFollowProfiles(forAccountID: accountID)
+            let fetchedResult = try await service.fetchFollowProfiles(forAccountID: accountID)
+            let result = await cache?.enrich(fetchedResult) ?? fetchedResult
             guard isCurrent(accountID: accountID, serverURL: serverURL) else { return }
             if result.profiles.isEmpty, !profiles.isEmpty {
                 await cache?.save(

@@ -413,6 +413,113 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Cached Bob"])
     }
 
+    func testPeopleCacheRestoresProfileMetadataAfterRawFollowRefresh() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: "cachedbob",
+                        about: "cached profile",
+                        pictureURL: "https://example.com/cached.jpg",
+                        relayHint: "wss://relay.example",
+                        inviteAvailability: .available
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: nil,
+                        username: nil,
+                        about: nil,
+                        pictureURL: nil,
+                        relayHint: "wss://relay.example",
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+
+        let loaded = await cache.load(accountID: owner, serverURL: "https://chat.example")
+
+        XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Cached Bob"])
+        XCTAssertEqual(loaded?.profiles.map(\.username), ["cachedbob"])
+        XCTAssertEqual(loaded?.profiles.map(\.about), ["cached profile"])
+        XCTAssertEqual(loaded?.profiles.map(\.pictureURL), ["https://example.com/cached.jpg"])
+        XCTAssertEqual(loaded?.profiles.map(\.inviteAvailability), [.unknown])
+    }
+
+    func testPeopleCacheMergesPartialProfileMetadataRefresh() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: "cachedbob",
+                        about: "cached profile",
+                        pictureURL: "https://example.com/cached.jpg",
+                        relayHint: nil,
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Fresh Bob",
+                        username: nil,
+                        about: nil,
+                        pictureURL: nil,
+                        relayHint: nil,
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+
+        let loaded = await cache.load(accountID: owner, serverURL: "https://chat.example")
+
+        XCTAssertEqual(loaded?.profiles.map(\.displayName), ["Fresh Bob"])
+        XCTAssertEqual(loaded?.profiles.map(\.username), ["cachedbob"])
+        XCTAssertEqual(loaded?.profiles.map(\.about), ["cached profile"])
+        XCTAssertEqual(loaded?.profiles.map(\.pictureURL), ["https://example.com/cached.jpg"])
+    }
+
     func testPeopleModelKeepsVisibleProfilesWhenRefreshFindsNoFollows() async throws {
         let material = try createNostrIdentity()
         let owner = material.accountId
@@ -452,6 +559,73 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(model.profiles.map(\.displayName), ["Fresh Bob"])
         XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
         XCTAssertEqual(model.statusText, "Showing cached people. Refresh found no follows across 1 Nostr relays.")
+    }
+
+    func testPeopleModelEnrichesRawRefreshWithCachedProfileMetadata() async throws {
+        let material = try createNostrIdentity()
+        let owner = material.accountId
+        let bob = String(repeating: "b", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.save(
+            NostrFollowFetchResult(
+                profiles: [
+                    NostrFollowProfile(
+                        pubkey: bob,
+                        npub: try npubFromAccountId(accountId: bob),
+                        name: "Cached Bob",
+                        username: "cachedbob",
+                        about: "cached profile",
+                        pictureURL: "https://example.com/cached.jpg",
+                        relayHint: nil,
+                        inviteAvailability: .unknown
+                    ),
+                ],
+                relayCount: 1,
+                followedPubkeyCount: 1
+            ),
+            accountID: owner,
+            serverURL: "https://chat.example"
+        )
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [3] {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_050,
+                            kind: 3,
+                            tags: [["p", bob]],
+                            content: ""
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let availabilityService = FiniteInviteAvailabilityService(
+            availabilityLoader: { _, accountIDs in
+                Dictionary(uniqueKeysWithValues: accountIDs.map { ($0, true) })
+            }
+        )
+        let model = NostrPeopleModel(
+            service: relayService,
+            inviteAvailabilityService: availabilityService,
+            cache: cache
+        )
+
+        await model.refresh(
+            identity: AppNostrIdentity(material: material),
+            serverURL: "https://chat.example"
+        )
+
+        XCTAssertEqual(model.profiles.map(\.displayName), ["Cached Bob"])
+        XCTAssertEqual(model.profiles.map(\.username), ["cachedbob"])
+        XCTAssertEqual(model.profiles.map(\.about), ["cached profile"])
+        XCTAssertEqual(model.profiles.map(\.pictureURL), ["https://example.com/cached.jpg"])
+        XCTAssertEqual(model.profiles.map(\.inviteAvailability), [.available])
+        XCTAssertEqual(model.statusText, "Loaded 1 of 1 follows from 1 relays.")
     }
 
     func testPeopleModelNoFollowsStatusNamesAccountAndExpandedRelayCount() async throws {
