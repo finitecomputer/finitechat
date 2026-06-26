@@ -1944,7 +1944,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send to the visible thread only")
     }
 
-    func testOpeningRoomMarksItRead() throws {
+    func testOpeningRoomMarksItRead() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
@@ -1967,6 +1967,10 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
         let room = try XCTUnwrap(model.rooms.first)
         model.openRoom(room)
+
+        try await waitUntil {
+            runtime.dispatchedActions.count >= 3
+        }
 
         XCTAssertEqual(
             runtime.dispatchedActions,
@@ -2051,6 +2055,110 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.outboundText, "this should not send yet")
         XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
         XCTAssertNil(model.errorText)
+    }
+
+    func testScanningExistingInviteRoomSurfacesWhereUserLanded() throws {
+        let config = RuntimeConfig(
+            serverURL: "https://chat.finite.computer",
+            deviceID: "qt433"
+        )
+        let readyState = savedChatState()
+        let scannedState = savedChatState(
+            status: "invite scanned",
+            roomState: .waitingForApproval,
+            roomStatus: "enter PIN to request admission"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: readyState,
+            startRuntimeState: readyState
+        ) { action, current in
+            if case .scanTarget = action {
+                return scannedState
+            }
+            return current
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        model.scanDraft = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3"
+
+        guard case .room(let room) = model.scanTargetResult() else {
+            return XCTFail("scan should resolve to the selected room")
+        }
+
+        XCTAssertEqual(room.roomId, "room-main")
+        XCTAssertEqual(model.state?.selectedRoomId, "room-main")
+        XCTAssertEqual(model.scanDraft, "")
+        XCTAssertEqual(
+            model.userNoticeText,
+            "Opened Main Room. Enter the current PIN to request access."
+        )
+    }
+
+    func testInvitePinSubmitDoesNotClearPinWhileAdmissionIsPending() async throws {
+        let config = RuntimeConfig(
+            serverURL: "https://chat.finite.computer",
+            deviceID: "qt433"
+        )
+        let pendingState = savedChatState(
+            status: "invite scanned",
+            roomState: .waitingForApproval,
+            roomStatus: "enter PIN to request admission"
+        )
+        let admissionPendingState = savedChatState(
+            status: "pin submitted",
+            roomState: .waitingForApproval,
+            roomStatus: "waiting for room admission"
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: pendingState,
+            startRuntimeState: pendingState
+        ) { action, current in
+            if case .submitInvitePin = action {
+                return admissionPendingState
+            }
+            return current
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        let room = try XCTUnwrap(model.selectedRoom)
+        model.pinDraft = "123456"
+
+        XCTAssertTrue(model.submitPin(for: room))
+        XCTAssertEqual(model.invitePinSubmissionRoomID, "room-main")
+
+        try await waitUntil {
+            model.invitePinSubmissionRoomID == nil
+        }
+
+        XCTAssertEqual(model.pinDraft, "123456")
+        XCTAssertEqual(model.state?.rooms.first?.status, "waiting for room admission")
+        XCTAssertEqual(
+            model.userNoticeText,
+            "PIN submitted for Main Room. Waiting for the agent to approve this device."
+        )
+        XCTAssertNil(model.developerErrorText)
+        XCTAssertTrue(runtime.dispatchedActions.contains {
+            if case .submitInvitePin(let pendingRoomId, let pin) = $0 {
+                return pendingRoomId == "room-main" && pin == "123456"
+            }
+            return false
+        })
     }
 
     func testRetryMessageDispatchesOnlyForFailedLocalOutbound() async throws {

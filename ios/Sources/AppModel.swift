@@ -418,6 +418,8 @@ final class AppModel: ObservableObject {
     @Published var scanDraft: String = ""
     @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
+    @Published private(set) var localNoticeText: String?
+    @Published private(set) var invitePinSubmissionRoomID: String?
     @Published private(set) var runtimeStorePath: String?
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
     @Published private(set) var nostrIdentity: AppNostrIdentity?
@@ -540,9 +542,9 @@ final class AppModel: ObservableObject {
     var userNoticeText: String? {
         let toast = state?.toast?.nonEmptyTrimmed
         if toast == "Showing saved chats. Connection will retry." {
-            return nil
+            return localNoticeText
         }
-        return toast
+        return toast ?? localNoticeText
     }
 
     var actionNoticeText: String? {
@@ -957,6 +959,7 @@ final class AppModel: ObservableObject {
     func scanTargetResult() -> AppScanTargetResult {
         let value = scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return .empty }
+        localNoticeText = nil
 
         let previousRoomIDs = Set(rooms.map(\.roomId))
         let previousSelectedRoomID = state?.selectedRoomId
@@ -965,6 +968,7 @@ final class AppModel: ObservableObject {
 
         if let profile = activeProfile {
             scanDraft = ""
+            localNoticeText = "Profile opened."
             return .profile(profile)
         }
 
@@ -974,6 +978,7 @@ final class AppModel: ObservableObject {
             || !previousRoomIDs.contains(room.roomId)
         {
             scanDraft = ""
+            localNoticeText = inviteScanNotice(for: room)
             return .room(room)
         }
 
@@ -983,11 +988,125 @@ final class AppModel: ObservableObject {
     @discardableResult
     func submitPin(for room: AppRoomSummary) -> Bool {
         guard room.state == .waitingForApproval else { return false }
+        guard invitePinSubmissionRoomID != room.roomId else { return false }
         let pin = pinDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !pin.isEmpty else { return false }
-        pinDraft = ""
-        dispatch(.submitInvitePin(pendingRoomId: room.roomId, pin: pin))
+        let action = AppAction.submitInvitePin(pendingRoomId: room.roomId, pin: pin)
+        let diagnostic = diagnosticAction(action)
+        appendDiagnostic(
+            category: diagnostic.category,
+            event: "\(diagnostic.name).requested",
+            details: diagnostic.details
+        )
+        let runtime: any FiniteChatRuntimeProtocol
+        let runtimeKey: String
+        do {
+            runtime = try currentRuntime()
+            runtimeKey = openKey
+        } catch {
+            appendDiagnostic(
+                category: diagnostic.category,
+                event: "\(diagnostic.name).failed",
+                details: diagnosticErrorDetails(error)
+            )
+            let message = invitePinFailureMessage(error)
+            localNoticeText = message
+            errorText = message
+            return false
+        }
+
+        let pendingRoomID = room.roomId
+        invitePinSubmissionRoomID = pendingRoomID
+        localNoticeText = "Submitting PIN..."
+
+        Task { @MainActor [weak self, runtime, runtimeKey, action, diagnostic, pendingRoomID] in
+            guard let self else { return }
+            defer {
+                if self.invitePinSubmissionRoomID == pendingRoomID {
+                    self.invitePinSubmissionRoomID = nil
+                }
+            }
+            do {
+                let nextState = try await Task.detached(priority: .userInitiated) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard self.openKey == runtimeKey else { return }
+                self.state = nextState
+                self.errorText = nil
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).succeeded",
+                    details: diagnostic.details
+                )
+                if let room = nextState.rooms.first(where: { $0.roomId == pendingRoomID }) {
+                    self.localNoticeText = self.invitePinNotice(for: room)
+                    if room.state == .connected {
+                        self.pinDraft = ""
+                    }
+                } else {
+                    self.localNoticeText = "Invite request submitted."
+                }
+                self.restartUpdateLoopIfEnabled()
+            } catch {
+                let message = self.invitePinFailureMessage(error)
+                self.localNoticeText = message
+                self.errorText = message
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).failed",
+                    details: self.diagnosticErrorDetails(error)
+                )
+            }
+        }
         return true
+    }
+
+    private func inviteScanNotice(for room: AppRoomSummary) -> String {
+        let name = room.displayName.nonEmptyTrimmed ?? "this room"
+        switch room.state {
+        case .connected:
+            return "Opened \(name). This invite points to a room already on this device."
+        case .waitingForApproval:
+            if room.status.localizedCaseInsensitiveContains("waiting for room admission") {
+                return "Opened \(name). Your join request is waiting for agent approval."
+            }
+            return "Opened \(name). Enter the current PIN to request access."
+        case .joining:
+            return "Opened \(name). Finishing room setup."
+        case .unavailableOnDevice:
+            return "\(name) is unavailable on this device."
+        }
+    }
+
+    private func invitePinNotice(for room: AppRoomSummary) -> String {
+        let name = room.displayName.nonEmptyTrimmed ?? "this room"
+        switch room.state {
+        case .connected:
+            return "Joined \(name)."
+        case .joining:
+            return "Joining \(name)..."
+        case .waitingForApproval:
+            if room.status.localizedCaseInsensitiveContains("waiting for room admission") {
+                return "PIN submitted for \(name). Waiting for the agent to approve this device."
+            }
+            if room.status.localizedCaseInsensitiveContains("pin") {
+                return "Enter the current PIN for \(name)."
+            }
+            return room.status.nonEmptyTrimmed ?? room.userStatusText
+        case .unavailableOnDevice:
+            return "\(name) is unavailable on this device."
+        }
+    }
+
+    private func invitePinFailureMessage(_ error: Error) -> String {
+        let raw = String(describing: error)
+        if raw.localizedCaseInsensitiveContains("pin") {
+            return "That PIN did not complete the join. Check the current PIN and try again."
+        }
+        if raw.localizedCaseInsensitiveContains("invite") {
+            return "The invite could not be joined. Check that the invite is still valid."
+        }
+        return "The join request failed. Check the current PIN and try again."
     }
 
     @discardableResult
@@ -1024,12 +1143,15 @@ final class AppModel: ObservableObject {
     }
 
     func refreshDevices() {
-        dispatch(.refreshDevices)
+        dispatchInBackground(.refreshDevices, priority: .utility)
     }
 
     func revokeDevice(_ device: AppDeviceSummary) {
         guard !device.currentDevice, !device.revoked else { return }
-        dispatch(.revokeDevice(accountId: device.accountId, deviceId: device.deviceId))
+        dispatchInBackground(
+            .revokeDevice(accountId: device.accountId, deviceId: device.deviceId),
+            priority: .utility
+        )
     }
 
     @discardableResult
@@ -1231,29 +1353,40 @@ final class AppModel: ObservableObject {
     }
 
     func loadOlderMessages(roomID: String, beforeMessageID: String) {
-        dispatch(.loadOlderMessages(
-            roomId: roomID,
-            beforeMessageId: beforeMessageID,
-            limit: 50
-        ))
+        dispatchInBackground(
+            .loadOlderMessages(
+                roomId: roomID,
+                beforeMessageId: beforeMessageID,
+                limit: 50
+            ),
+            priority: .utility
+        )
     }
 
     func react(to message: ChatMessage, emoji: String) {
-        dispatch(.reactToMessage(
-            roomId: message.roomId,
-            messageId: message.messageId,
-            emoji: emoji
-        ))
+        dispatchInBackground(
+            .reactToMessage(
+                roomId: message.roomId,
+                messageId: message.messageId,
+                emoji: emoji
+            ),
+            priority: .utility
+        )
     }
 
     func markRoomRead(_ room: AppRoomSummary) {
-        dispatch(.markRoomRead(roomId: room.roomId))
+        dispatchInBackground(.markRoomRead(roomId: room.roomId), priority: .utility)
     }
 
     func setTyping(roomID: String, isTyping: Bool) {
         guard lastTypingIntentByRoom[roomID] != isTyping else { return }
         lastTypingIntentByRoom[roomID] = isTyping
-        dispatch(.setTyping(roomId: roomID, isTyping: isTyping))
+        dispatchInBackground(
+            .setTyping(roomId: roomID, isTyping: isTyping),
+            priority: .utility,
+            showsError: false,
+            restartsUpdateLoop: false
+        )
     }
 
     private func applyNostrIdentity(
@@ -1374,6 +1507,68 @@ final class AppModel: ObservableObject {
         }
         restartUpdateLoopIfEnabled()
         return succeeded
+    }
+
+    @discardableResult
+    private func dispatchInBackground(
+        _ action: AppAction,
+        priority: TaskPriority = .userInitiated,
+        showsError: Bool = true,
+        restartsUpdateLoop: Bool = true
+    ) -> Bool {
+        let diagnostic = diagnosticAction(action)
+        appendDiagnostic(
+            category: diagnostic.category,
+            event: "\(diagnostic.name).requested",
+            details: diagnostic.details
+        )
+        let runtime: any FiniteChatRuntimeProtocol
+        let runtimeKey: String
+        do {
+            runtime = try currentRuntime()
+            runtimeKey = openKey
+        } catch {
+            appendDiagnostic(
+                category: diagnostic.category,
+                event: "\(diagnostic.name).failed",
+                details: diagnosticErrorDetails(error)
+            )
+            if showsError {
+                errorText = String(describing: error)
+            }
+            return false
+        }
+
+        Task { @MainActor [weak self, runtime, runtimeKey, action, diagnostic] in
+            guard let self else { return }
+            do {
+                let nextState = try await Task.detached(priority: priority) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard self.openKey == runtimeKey else { return }
+                self.state = nextState
+                self.errorText = nil
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).succeeded",
+                    details: diagnostic.details
+                )
+                if restartsUpdateLoop {
+                    self.restartUpdateLoopIfEnabled()
+                }
+            } catch {
+                guard self.openKey == runtimeKey else { return }
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).failed",
+                    details: self.diagnosticErrorDetails(error)
+                )
+                if showsError {
+                    self.errorText = String(describing: error)
+                }
+            }
+        }
+        return true
     }
 
     private func restartUpdateLoopIfEnabled() {

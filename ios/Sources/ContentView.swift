@@ -2414,6 +2414,18 @@ private struct PendingRoomView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            if let detailText {
+                Text(detailText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            if let notice = model.userNoticeText {
+                Label(notice, systemImage: isSubmitting ? "hourglass" : "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
 
             TextField("PIN", text: $model.pinDraft)
                 .keyboardType(.numberPad)
@@ -2421,16 +2433,33 @@ private struct PendingRoomView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 180)
                 .accessibilityLabel("PIN")
+                .disabled(isSubmitting)
 
             Button {
                 model.submitPin(for: room)
             } label: {
-                Label("Join", systemImage: "arrow.right.circle.fill")
+                Label(
+                    isSubmitting ? "Joining" : "Join",
+                    systemImage: isSubmitting ? "hourglass" : "arrow.right.circle.fill"
+                )
             }
             .buttonStyle(.borderedProminent)
+            .disabled(isSubmitting || model.pinDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var isSubmitting: Bool {
+        model.invitePinSubmissionRoomID == room.roomId
+    }
+
+    private var detailText: String? {
+        let status = room.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !status.isEmpty else { return nil }
+        guard status != room.userStatusText else { return nil }
+        guard status != room.userStatusText.lowercased() else { return nil }
+        return status
     }
 }
 

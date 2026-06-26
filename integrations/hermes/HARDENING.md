@@ -36,6 +36,55 @@ persistence constraints, not hide basic adapter defects.
   supervised.
 - Prefer machine-readable JSON contracts over logs as the test oracle.
 
+## RCA: 2026-06-26 Tinfoil Join Pending Failure
+
+Symptom: the iOS app reached "Waiting for approval / waiting for room
+admission" for `room-39a1162b6b515f8e`, and a throwaway CLI client reproduced
+the same state against the live Tinfoil canary invite. That means scan/PIN
+submission worked; the failing boundary was the owner-side agent admission loop.
+
+Facts established:
+
+- The live canary `finite-agent-tinfoil-user-canary-v022` was running Tinfoil
+  package tag `v0.1.10` even though the container name suggested a later v022
+  run.
+- A local Hermes 0.17 gateway using the current `finite-platform` plugin,
+  `finitechat hermes serve`, and the same Tinfoil-shaped plugin install path
+  (`plugins/finite` with `plugins.enabled: finite-platform`) admitted a
+  throwaway client in 3.7s via
+  `scripts/hermes-real-gateway-admission-smoke.py`.
+- The previous "Hermes media" and Docker smokes did not prove the exact
+  Tinfoil path. The media smoke imported `adapter.py` directly and installed an
+  echo handler. The Docker smoke ran `containers/agent/echo_agent.py`, not
+  `hermes gateway run`. Those were useful bridge/runtime tests, but they were
+  not a real Hermes gateway admission gate.
+- The runtime `/status` endpoint exposed only coarse process readiness and
+  invite presence. It did not expose image tag, finitechat/Hermes versions,
+  plugin load status, gateway platform status, or an admission probe result.
+- A simulator run through the visible app UI, with no launch auto-join flags,
+  could scan/type an invite URL, enter a fresh PIN, reach the chat composer, and
+  receive Hermes messages. With no provider env, Hermes returned a clear "No LLM
+  provider configured" error through chat; with provider env loaded, the same
+  path received a model reply.
+- The iOS UI responsiveness issue had a separate root: several fire-and-forget
+  actions, especially `setTyping`, synchronously called `runtime.dispatch` on
+  the main actor. These actions now use background dispatch so typing, taps, and
+  room read markers do not wait behind Rust/network work.
+
+Current root-cause classification: artifact/source drift plus insufficient
+release evidence. Current code can admit locally through real Hermes 0.17, but
+the live Tinfoil canary was on an older package tag and the release gate did
+not include an owner-side admission probe. Before asking a human to try iOS
+again, run the live canary admission probe from finitecomputer:
+
+```bash
+scripts/tinfoil_agent_admission_probe.sh --json --timeout-ms 30000
+```
+
+That probe fetches the running canary invite, creates a throwaway local
+`finitechat` client, submits the current PIN, and fails unless the agent admits
+the join. It would have caught this failure without involving the iOS app.
+
 ## Phases
 
 Each phase should run both vertically through the stack and horizontally across
@@ -164,6 +213,7 @@ Current local smoke:
 scripts/hermes-adapter-regression-report.py
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
+scripts/hermes-real-gateway-admission-smoke.py
 scripts/ios-hermes-agent-media-e2e.sh
 scripts/ios-hermes-docker-runtime-e2e.sh
 ```
@@ -171,6 +221,11 @@ scripts/ios-hermes-docker-runtime-e2e.sh
 They write `target/hermes-adapter-regressions/report.json`,
 `target/hermes-sidecar-smoke/report.json`, and
 `target/hermes-agent-media-e2e/report.json`.
+`scripts/hermes-real-gateway-admission-smoke.py` writes
+`target/hermes-real-gateway-admission-smoke/report.json`; its pass condition is
+that Hermes 0.17 `gateway run --replace` admits a normal invite/PIN join through
+the installed `finite-platform` plugin with no direct adapter import and no echo
+handler.
 The iOS Simulator script writes
 `target/ios-hermes-agent-media-e2e/report.json`; it requires a booted
 simulator or `IOS_SIMULATOR_UDID`.
@@ -180,11 +235,12 @@ booted simulator or `IOS_SIMULATOR_UDID`.
 Together they prove finitechat-server, `finitechat hermes` CLI, encrypted
 client stores, `finitechat hermes serve`, `/v1/hermes/inbound` NDJSON,
 ack/drain, adapter redelivery/ack/fallback/filter/group/receipt regressions,
-agent reply, Hermes adapter media materialization through the real
-`hermes-agent` package, native iOS app join/send/decrypt, agent text and image
-replies, real Docker runtime image pairing with native iOS, runtime receipt of
-iOS media, runtime reply decrypt in the app, and user decrypt. This is the
-local baseline future Docker and Tinfoil smokes should match or explain.
+and native iOS app runtime plumbing. They do not, by themselves, prove the
+production `hermes gateway run` path: the Hermes media smoke imports the
+adapter directly and installs a test handler, and the Docker/iOS Docker smokes
+use the echo-agent harness. The required additional local gate is a real Hermes
+0.17 gateway admission smoke where a user joins through the invite/PIN flow and
+the agent's platform adapter admits the join without a test handler.
 
 ### Phase 5: Prove The Real Runtime Image In Docker
 
@@ -211,13 +267,14 @@ scripts/ios-hermes-docker-runtime-e2e.sh
 It builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts the
 echo agent in Docker, drives a second `finitechat` CLI user in Docker, and
 writes `target/hermes-docker-smoke/report.json`. This proves the packaged Linux
-image has the plugin, binary, Hermes runtime, invite/PIN flow, encrypted echo
-round trip, restic encrypted repository init, entrypoint-owned encrypted agent
-state backup on controlled shutdown, repository check, local agent volume wipe,
-latest-by-tag snapshot restore into a fresh volume/container, same agent npub,
-same room, runtime `/healthz`, and a second encrypted echo round trip. Both
-backup and restore are performed by the runtime image entrypoint, which matches
-the future Tinfoil empty-disk startup and controlled-restart shape.
+image has the plugin files, binary, Hermes runtime dependency, invite/PIN flow,
+encrypted echo round trip, restic encrypted repository init, entrypoint-owned
+encrypted agent state backup on controlled shutdown, repository check, local
+agent volume wipe, latest-by-tag snapshot restore into a fresh
+volume/container, same agent npub, same room, runtime `/healthz`, and a second
+encrypted echo round trip. It does not prove `hermes gateway run` in the final
+Tinfoil runtime image unless the image entrypoint is the same as the Tinfoil
+entrypoint and the report records gateway platform readiness.
 The iOS Docker runtime smoke builds the same runtime image, starts the agent in
 Docker, rewrites the invite server URL for the iOS Simulator, sends encrypted
 image media from the native app, waits for the runtime agent to log media
@@ -391,10 +448,18 @@ Tinfoil canary runbook draft:
    `FINITE_SERVER_URL=https://chat.finite.computer`,
    `FINITECHAT_HERMES_INBOUND_STREAM=1`, and AWS-style object-storage secrets.
 6. Start from empty local disk, let the runtime entrypoint restore the latest
-   restic snapshot tagged `finite-agent-state`, print invite URL/PIN, chat once
-   from Finite Chat and record the event ID, stop cleanly so the entrypoint
-   writes a fresh backup, restart the container, restore latest by tag again,
-   verify the same npub, and chat again with a second recorded event ID.
+   restic snapshot tagged `finite-agent-state`, and fetch invite URL/PIN from
+   the runtime endpoint. Before handing the invite to a human, run the
+   owner-side admission probe:
+
+   ```bash
+   finitecomputer/scripts/tinfoil_agent_admission_probe.sh --json --timeout-ms 30000
+   ```
+
+   Only after that passes should a human join from Finite Chat, chat once and
+   record the event ID, stop cleanly so the entrypoint writes a fresh backup,
+   restart the container, restore latest by tag again, verify the same npub,
+   and chat again with a second recorded event ID.
 7. Write those observations to
    `target/hermes-docker-smoke/tinfoil-canary/container.json` and
    `target/hermes-docker-smoke/tinfoil-canary/health.json`, then build
@@ -441,6 +506,8 @@ Tinfoil canary runbook draft:
 - Rust integration tests use a live local Finite Chat server and real encrypted
   client stores.
 - iOS simulator tests prove the native client can decrypt agent replies.
+- `scripts/hermes-real-gateway-admission-smoke.py` proves real Hermes 0.17
+  owner-side invite admission before Docker or Tinfoil.
 - Docker tests prove the packaged runtime has the right Hermes version,
   plugin layout, binaries, env, state directories, and native iOS chat path.
 - Restart/restore tests wipe local container state, restore encrypted backup,
