@@ -125,6 +125,14 @@ REQUIRED_CANARY_SECRET_ENV = {
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
 }
+REQUIRED_GITHUB_PUBLISH_ARTIFACTS = {
+    "target/hermes-hardening-audit.json",
+    "target/hermes-docker-smoke/report.json",
+    "target/hermes-docker-smoke/restic-preflight.json",
+    "target/hermes-docker-smoke/image-publish.json",
+    "target/hermes-docker-smoke/tinfoil-handoff.json",
+    "target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json",
+}
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -251,6 +259,66 @@ def validate_canary_summary(
         )
         if missing_runbook:
             errors.append(f"runbook missing snippets: {', '.join(missing_runbook)}")
+    return errors
+
+
+def path_matches_artifact(value: str, artifact: str) -> bool:
+    normalized = value.replace("\\", "/")
+    return normalized == artifact or normalized.endswith(f"/{artifact}")
+
+
+def validate_github_publish_gate(github_publish_gate: dict[str, Any] | None) -> list[str]:
+    if not github_publish_gate:
+        return ["requires pushed branch and successful GitHub publish-gate run"]
+
+    errors: list[str] = []
+    if github_publish_gate.get("status") != "passed":
+        report_errors = list_detail(github_publish_gate.get("errors"))
+        errors.append(report_errors or f"publish-gate status={github_publish_gate.get('status')!r}")
+
+    for key in ("run_id", "run_url"):
+        if not non_empty_str(github_publish_gate.get(key)):
+            errors.append(f"publish-gate {key} is required")
+
+    for key in ("watch_exit_code", "download_exit_code", "local_audit_exit_code"):
+        if github_publish_gate.get(key) != 0:
+            errors.append(f"publish-gate {key}={github_publish_gate.get(key)!r}; expected 0")
+
+    downloaded_files = github_publish_gate.get("downloaded_files")
+    if not isinstance(downloaded_files, list) or not downloaded_files:
+        errors.append("publish-gate downloaded_files must be non-empty")
+
+    artifact_ingest = github_publish_gate.get("artifact_ingest")
+    if not isinstance(artifact_ingest, dict):
+        errors.append("publish-gate artifact_ingest is required")
+        return errors
+
+    if artifact_ingest.get("status") != "ok":
+        errors.append(f"publish-gate artifact_ingest status={artifact_ingest.get('status')!r}")
+    missing = artifact_ingest.get("missing")
+    if isinstance(missing, list) and missing:
+        errors.append(
+            f"publish-gate artifact_ingest missing: {', '.join(str(item) for item in missing)}"
+        )
+    elif not isinstance(missing, list):
+        errors.append("publish-gate artifact_ingest missing must be a list")
+
+    copied = artifact_ingest.get("copied")
+    if not isinstance(copied, list):
+        errors.append("publish-gate artifact_ingest copied must be a list")
+        return errors
+    destinations = {
+        str(item.get("destination"))
+        for item in copied
+        if isinstance(item, dict) and non_empty_str(item.get("destination"))
+    }
+    missing_copied = sorted(
+        artifact
+        for artifact in REQUIRED_GITHUB_PUBLISH_ARTIFACTS
+        if not any(path_matches_artifact(destination, artifact) for destination in destinations)
+    )
+    if missing_copied:
+        errors.append(f"publish-gate artifact_ingest copied missing: {', '.join(missing_copied)}")
     return errors
 
 
@@ -507,21 +575,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         detail=None if github_setup_ready or s3_smoke else github_setup_detail,
     )
 
-    github_publish_gate_ready = (
-        bool(github_publish_gate) and github_publish_gate.get("status") == "passed"
-    )
-    github_publish_gate_detail = (
-        "requires pushed branch and successful GitHub publish-gate run"
-        if not github_publish_gate
-        else list_detail(github_publish_gate.get("errors"))
-        or f"publish-gate status={github_publish_gate.get('status')!r}"
-    )
+    github_publish_gate_errors = validate_github_publish_gate(github_publish_gate)
+    github_publish_gate_ready = not github_publish_gate_errors
     add_check(
         checks,
         name="github_publish_gate_ready",
-        status="passed" if github_publish_gate_ready or s3_smoke else "missing",
+        status="passed" if github_publish_gate_ready else "missing",
         evidence=str(github_publish_gate_path) if github_publish_gate else None,
-        detail=None if github_publish_gate_ready or s3_smoke else github_publish_gate_detail,
+        detail=None if github_publish_gate_ready else "; ".join(github_publish_gate_errors),
     )
 
     add_check(

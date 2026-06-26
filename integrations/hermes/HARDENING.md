@@ -307,6 +307,11 @@ Current CI shape:
   `target/...` paths and refreshes the hardening audit. It refuses to dispatch
   from a dirty local worktree or a missing remote branch because GitHub Actions
   can only prove the pushed ref.
+  The hardening audit rejects a placeholder publish-gate `{"status":"passed"}`
+  report: it requires the dispatched run id/URL, successful watch/download
+  exits, a local audit refresh, and copied canonical artifacts for the Docker
+  smoke, restic preflight, image publish report, Tinfoil handoff, and canary
+  summary.
   After the S3-backed smoke passes, it logs into GHCR, tags the exact
   `facts.image_id` from the passing smoke report as
   `ghcr.io/<owner>/finite-chat-hermes-runtime:<commit-sha>`, pushes it, and

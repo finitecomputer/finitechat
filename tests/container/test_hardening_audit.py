@@ -15,6 +15,14 @@ IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:
 CONFIG_REPO = "finitecomputer/tinfoil-agent-runtime-canary"
 RELEASE_TAG = "v0.1.0"
 CONTAINER_NAME = "finite-agent-tinfoil-user-canary"
+GITHUB_PUBLISH_ARTIFACTS = [
+    "target/hermes-hardening-audit.json",
+    "target/hermes-docker-smoke/report.json",
+    "target/hermes-docker-smoke/restic-preflight.json",
+    "target/hermes-docker-smoke/image-publish.json",
+    "target/hermes-docker-smoke/tinfoil-handoff.json",
+    "target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json",
+]
 
 SIDECAR_LAYERS = [
     "finitechat-server",
@@ -311,6 +319,31 @@ def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> No
     )
 
 
+def github_publish_gate_report() -> dict:
+    return {
+        "status": "passed",
+        "run_id": "28222040402",
+        "run_url": "https://github.com/finitecomputer/finitechat/actions/runs/28222040402",
+        "watch_exit_code": 0,
+        "download_exit_code": 0,
+        "local_audit_exit_code": 0,
+        "downloaded_files": [
+            f"hermes-docker-smoke-report/{artifact}" for artifact in GITHUB_PUBLISH_ARTIFACTS
+        ],
+        "artifact_ingest": {
+            "status": "ok",
+            "missing": [],
+            "copied": [
+                {
+                    "source": f"/tmp/artifacts/hermes-docker-smoke-report/{artifact}",
+                    "destination": f"/repo/{artifact}",
+                }
+                for artifact in GITHUB_PUBLISH_ARTIFACTS
+            ],
+        },
+    }
+
+
 def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
     args = [
         str(AUDIT_SCRIPT),
@@ -384,7 +417,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "docker-ios.json", docker_ios_report())
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -414,7 +447,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "docker-ios.json", docker_ios_report())
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -433,7 +466,7 @@ class HardeningAuditTest(unittest.TestCase):
         self.assertEqual(audit["status"], "incomplete")
         self.assertIn("tinfoil_canary_runtime", audit["missing"])
 
-    def test_audit_rejects_placeholder_canary_summary(self) -> None:
+    def test_audit_rejects_placeholder_github_publish_gate_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
             write_json(tmp / "adapter-regressions.json", adapter_regression_report())
@@ -445,6 +478,38 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("github_publish_gate_ready", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("run_id", details["github_publish_gate_ready"])
+
+    def test_audit_rejects_placeholder_canary_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "docker-ios.json", docker_ios_report())
+            write_json(tmp / "s3-emulator.json", s3_emulator_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -513,7 +578,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "docker-ios.json", docker_ios_report())
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -547,7 +612,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "docker-ios.json", docker_ios_report())
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -585,7 +650,7 @@ class HardeningAuditTest(unittest.TestCase):
             )
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
@@ -615,7 +680,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "docker-ios.json", docker_ios_report())
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
             write_json(
                 tmp / "publish.json",
