@@ -261,12 +261,14 @@ struct ContentView: View {
 
     @discardableResult
     private func startChatFromScannedProfile(_ profile: AppProfileSummary) -> Bool {
-        guard model.startProfileChat(for: profile) else { return false }
-        if let room = model.selectedRoom {
+        let queued = model.startProfileChat(for: profile) { room in
             routeSelectedRoom(room.roomId)
+            sheet = nil
         }
-        sheet = nil
-        return true
+        if queued {
+            sheet = nil
+        }
+        return queued
     }
 
     private func schedulePathUpdate(_ nextPath: [String]) {
@@ -890,17 +892,15 @@ private struct ChatPeoplePickerSheet: View {
     private func create() {
         guard !selectedProfiles.isEmpty else { return }
         if let existingRoom {
-            guard model.addMembers(to: existingRoom, profiles: selectedProfiles) else { return }
+            guard model.addMembers(to: existingRoom, profiles: selectedProfiles, onSuccess: {
+                dismiss()
+            }) else { return }
         } else {
-            let existingRoomIDs = Set(model.rooms.map(\.roomId))
-            guard model.startNewChat(named: trimmedName, with: selectedProfiles) else { return }
-            if let room = model.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
-                ?? model.selectedRoom
-            {
+            guard model.startNewChat(named: trimmedName, with: selectedProfiles, onCreated: { room in
                 onCreated(room)
-            }
+                dismiss()
+            }) else { return }
         }
-        dismiss()
     }
 
 }
@@ -1396,8 +1396,9 @@ private struct RoomThreadView: View {
                     showRoomOptions = false
                     Task { @MainActor in
                         if let room {
-                            _ = model.createInvite(for: room)
-                            showInvite()
+                            _ = model.createInvite(for: room) {
+                                showInvite()
+                            }
                         }
                     }
                 },
@@ -1436,8 +1437,9 @@ private struct RoomThreadView: View {
                 },
                 onCreateInvite: {
                     if let room {
-                        _ = model.createInvite(for: room)
-                        showInvite()
+                        _ = model.createInvite(for: room) {
+                            showInvite()
+                        }
                     }
                 },
                 onAddPeople: {
@@ -1745,7 +1747,7 @@ private struct RoomThreadView: View {
 
     private func sendComposerDraft() {
         if stagedAttachments.isEmpty {
-            if model.sendInBackground(roomID: roomID, text: composerText, replyTo: replyDraftMessage) {
+            if model.send(roomID: roomID, text: composerText, replyTo: replyDraftMessage) {
                 composerText = ""
                 model.setTyping(roomID: roomID, isTyping: false)
                 replyDraftMessage = nil
@@ -2501,6 +2503,7 @@ private struct ScanSheet: View {
     let onStartProfileChat: (AppProfileSummary) -> Bool
     @State private var showingCameraScanner = false
     @State private var scanError: String?
+    @State private var scanInFlight = false
 
     var body: some View {
         NavigationStack {
@@ -2544,11 +2547,14 @@ private struct ScanSheet: View {
                     Button {
                         continueWithTarget()
                     } label: {
-                        Label("Continue", systemImage: "arrow.right.circle")
+                        Label(
+                            scanInFlight ? "Opening" : "Continue",
+                            systemImage: scanInFlight ? "hourglass" : "arrow.right.circle"
+                        )
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(scanDraftIsEmpty)
+                    .disabled(scanDraftIsEmpty || scanInFlight)
                     .accessibilityIdentifier("ScanInlineContinueButton")
                 } header: {
                     Text("Invite or Profile Code")
@@ -2600,10 +2606,10 @@ private struct ScanSheet: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Continue") {
+                    Button(scanInFlight ? "Opening" : "Continue") {
                         continueWithTarget()
                     }
-                    .disabled(scanDraftIsEmpty)
+                    .disabled(scanDraftIsEmpty || scanInFlight)
                     .accessibilityIdentifier("ScanContinueButton")
                 }
             }
@@ -2636,7 +2642,16 @@ private struct ScanSheet: View {
             return
         }
 
-        switch model.scanTargetResult() {
+        guard !scanInFlight else { return }
+        scanInFlight = true
+        model.scanTarget { result in
+            scanInFlight = false
+            handleScanResult(result)
+        }
+    }
+
+    private func handleScanResult(_ result: AppScanTargetResult) {
+        switch result {
         case .empty:
             scanError = nil
             dismiss()

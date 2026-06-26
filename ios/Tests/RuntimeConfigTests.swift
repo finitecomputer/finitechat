@@ -668,7 +668,7 @@ final class ChatTimelineTypingTests: XCTestCase {
 
 @MainActor
 final class AppModelPersistenceTests: XCTestCase {
-    func testForceCloseStyleRelaunchUsesSameStableStoreAndKeepsSavedProjection() throws {
+    func testForceCloseStyleRelaunchUsesSameStableStoreAndKeepsSavedProjection() async throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")
         let config = RuntimeConfig(
@@ -700,6 +700,7 @@ final class AppModelPersistenceTests: XCTestCase {
         }
 
         firstLaunch.start()
+        try await waitForActions(firstRuntime, [.startRuntime])
 
         XCTAssertEqual(firstLaunch.rooms.map(\.roomId), ["room-main"])
         XCTAssertEqual(firstLaunch.selectedRoom?.roomId, "room-main")
@@ -734,6 +735,7 @@ final class AppModelPersistenceTests: XCTestCase {
         }
 
         relaunch.start()
+        try await waitForActions(secondRuntime, [.startRuntime])
 
         XCTAssertEqual(openedOptions.count, 2)
         XCTAssertEqual(openedOptions[0].serverUrl, "http://192.168.1.226:8789")
@@ -830,10 +832,9 @@ final class AppModelPersistenceTests: XCTestCase {
             }
         }
         XCTAssertEqual(
-            Array(runtime.dispatchedActions.prefix(3)),
+            Array(runtime.dispatchedActions.prefix(2)),
             [
                 .startRuntime,
-                .openRoom(roomId: "room-main"),
                 .sendMessage(
                     roomId: "room-main",
                     text: "foreground launch automation message"
@@ -1086,7 +1087,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(model.runtimeStorePath)
     }
 
-    func testNostrNsecSignInOpensRuntimeWithAccountSecret() throws {
+    func testNostrNsecSignInOpensRuntimeWithAccountSecret() async throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1126,10 +1127,10 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
         XCTAssertEqual(openedOptions.count, 1)
         XCTAssertEqual(openedOptions[0].accountSecretHex, material.accountSecretHex)
-        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+        try await waitForActions(runtime, [.startRuntime])
     }
 
-    func testExistingStableRuntimeStoreAutoRecoversWithoutLoginPrompt() throws {
+    func testExistingStableRuntimeStoreAutoRecoversWithoutLoginPrompt() async throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
@@ -1180,10 +1181,10 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
         XCTAssertEqual(model.activeAccountID, material.accountId)
         XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
-        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+        try await waitForActions(runtime, [.startRuntime])
     }
 
-    func testExplicitExistingDeviceAccountRecoveryRestoresKeychainIdentity() throws {
+    func testExplicitExistingDeviceAccountRecoveryRestoresKeychainIdentity() async throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
@@ -1234,10 +1235,10 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.nostrIdentity?.accountID, material.accountId)
         XCTAssertEqual(model.activeAccountID, material.accountId)
         XCTAssertEqual(identityStore.load()?.nsec, material.nsec)
-        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+        try await waitForActions(runtime, [.startRuntime])
     }
 
-    func testPushTokenReceivedBeforeNostrLoginRegistersAfterSignIn() throws {
+    func testPushTokenReceivedBeforeNostrLoginRegistersAfterSignIn() async throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1274,8 +1275,8 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.signInWithNsec(material.nsec))
 
         XCTAssertEqual(openedOptions.count, 1)
-        XCTAssertEqual(
-            runtime.dispatchedActions,
+        try await waitForActions(
+            runtime,
             [.startRuntime, .setPushToken(token: "00010f10ff")]
         )
     }
@@ -1322,7 +1323,7 @@ final class AppModelPersistenceTests: XCTestCase {
         assertGeneratedDefaultDeviceID(model.deviceID)
     }
 
-    func testSignOutRemovesPushTokenBeforeClearingRuntime() throws {
+    func testSignOutRemovesPushTokenBeforeClearingRuntime() async throws {
         let material = try createNostrIdentity()
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1351,10 +1352,15 @@ final class AppModelPersistenceTests: XCTestCase {
 
         model.start()
         model.registerPushToken("apns-token")
+        try await waitForActions(
+            runtime,
+            [.startRuntime, .setPushToken(token: "apns-token")]
+        )
+
         model.signOutAndDeleteEverything()
 
-        XCTAssertEqual(
-            runtime.dispatchedActions,
+        try await waitForActions(
+            runtime,
             [.startRuntime, .setPushToken(token: "apns-token"), .removePushToken]
         )
         XCTAssertNil(identityStore.load())
@@ -1436,7 +1442,7 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         try await waitUntil {
-            runtime.dispatchedActions.count >= 3
+            runtime.dispatchedActions.count >= 2
         }
         guard case .sendAttachments(
             let roomID,
@@ -1548,7 +1554,6 @@ final class AppModelPersistenceTests: XCTestCase {
                     accountId: bobAccountID,
                     displayName: "Chat with \(shortenedDisplayNpub(bobNpub))"
                 ),
-                .openRoom(roomId: "room-bob"),
                 .sendMessage(
                     roomId: "room-bob",
                     text: "hello from profile automation"
@@ -1589,7 +1594,7 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         try await waitUntil {
-            runtime.dispatchedActions.count >= 3
+            runtime.dispatchedActions.count >= 2
         }
         guard case .sendAttachments(
             let roomID,
@@ -1641,7 +1646,7 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         try await waitUntil {
-            runtime.dispatchedActions.count >= 3
+            runtime.dispatchedActions.count >= 2
         }
         guard case .sendAttachments(
             let roomID,
@@ -1725,7 +1730,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(downloadAttachmentID, "attachment-1")
     }
 
-    func testDownloadAttachmentDispatchesOnlyForExplicitCacheMissCandidate() throws {
+    func testDownloadAttachmentDispatchesOnlyForExplicitCacheMissCandidate() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
@@ -1787,7 +1792,7 @@ final class AppModelPersistenceTests: XCTestCase {
             attachment: attachment(downloadProgressPerMille: 0)
         )
 
-        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+        try await waitForActions(runtime, [.startRuntime])
     }
 
     func testOfflineNoticeIsSuppressedWhenThereAreNoSavedChats() throws {
@@ -1857,7 +1862,7 @@ final class AppModelPersistenceTests: XCTestCase {
         )
     }
 
-    func testConnectedSavedRoomCanSendWhileRuntimeStatusIsOffline() throws {
+    func testConnectedSavedRoomCanSendWhileRuntimeStatusIsOffline() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
@@ -1888,7 +1893,13 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.canSend)
         XCTAssertTrue(model.send())
         XCTAssertEqual(model.outboundText, "")
-        XCTAssertEqual(runtime.dispatchedActions.count, 2)
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendMessage = $0 { return true }
+                return false
+            }
+        }
         guard case .sendMessage(
             let roomID,
             let text
@@ -1899,7 +1910,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send through local membership")
     }
 
-    func testSendUsesExplicitRoomIDInsteadOfSelectedRoom() throws {
+    func testSendUsesExplicitRoomIDInsteadOfSelectedRoom() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
@@ -1934,6 +1945,12 @@ final class AppModelPersistenceTests: XCTestCase {
         model.outboundText = "send to the visible thread only"
         XCTAssertTrue(model.send(roomID: "room-secondary"))
 
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendMessage = $0 { return true }
+                return false
+            }
+        }
         guard case .sendMessage(
             let roomID,
             let text
@@ -1973,7 +1990,7 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
         let startedAt = Date()
 
-        XCTAssertTrue(model.sendInBackground(roomID: "room-main", text: "slow send"))
+        XCTAssertTrue(model.send(roomID: "room-main", text: "slow send"))
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
 
         await fulfillment(of: [sendStarted], timeout: 1)
@@ -2012,14 +2029,11 @@ final class AppModelPersistenceTests: XCTestCase {
             runtime.dispatchedActions.count >= 3
         }
 
-        XCTAssertEqual(
-            runtime.dispatchedActions,
-            [
-                .startRuntime,
-                .openRoom(roomId: "room-main"),
-                .markRoomRead(roomId: "room-main"),
-            ]
-        )
+        let actions = runtime.dispatchedActions
+        XCTAssertTrue(actions.contains(.startRuntime))
+        let openIndex = try XCTUnwrap(actions.firstIndex(of: .openRoom(roomId: "room-main")))
+        let markReadIndex = try XCTUnwrap(actions.firstIndex(of: .markRoomRead(roomId: "room-main")))
+        XCTAssertLessThan(openIndex, markReadIndex)
     }
 
     func testNoticeBarPresentationExposesStableAccessibilityOnlyWhenVisible() {
@@ -2031,7 +2045,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertNil(hidden.visibleText)
     }
 
-    func testUnavailableSavedRoomKeepsCachedMessagesButCannotSend() throws {
+    func testUnavailableSavedRoomKeepsCachedMessagesButCannotSend() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
@@ -2093,11 +2107,11 @@ final class AppModelPersistenceTests: XCTestCase {
             captionOverride: "blocked"
         ))
         XCTAssertEqual(model.outboundText, "this should not send yet")
-        XCTAssertEqual(runtime.dispatchedActions, [.startRuntime])
+        try await waitForActions(runtime, [.startRuntime])
         XCTAssertNil(model.errorText)
     }
 
-    func testScanningExistingInviteRoomSurfacesWhereUserLanded() throws {
+    func testScanningExistingInviteRoomSurfacesWhereUserLanded() async throws {
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
             deviceID: "qt433"
@@ -2129,7 +2143,16 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
         model.scanDraft = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3"
 
-        guard case .room(let room) = model.scanTargetResult() else {
+        var scanResult: AppScanTargetResult?
+        XCTAssertTrue(model.scanTarget { result in
+            scanResult = result
+        })
+
+        try await waitUntil {
+            scanResult != nil
+        }
+
+        guard case .room(let room) = scanResult else {
             return XCTFail("scan should resolve to the selected room")
         }
 
@@ -2234,6 +2257,7 @@ final class AppModelPersistenceTests: XCTestCase {
             runtime
         }
         model.start()
+        try await waitForActions(runtime, [.startRuntime])
 
         func message(
             _ id: String,
@@ -2513,7 +2537,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testStartProfileChatDispatchesDirectProfileChatAction() throws {
+    func testStartProfileChatDispatchesDirectProfileChatAction() async throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -2558,19 +2582,21 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         XCTAssertTrue(model.startProfileChat(for: profile))
-        XCTAssertEqual(
-            runtime.dispatchedActions,
-            [
-                .startRuntime,
-                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
-            ]
-        )
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-bob"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
         XCTAssertNil(model.state?.activeInvite)
     }
 
     @MainActor
-    func testStartProfileChatTreatsOpenedExistingDirectRoomAsSuccess() throws {
+    func testStartProfileChatTreatsOpenedExistingDirectRoomAsSuccess() async throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -2614,20 +2640,22 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         XCTAssertTrue(model.startProfileChat(for: profile))
-        XCTAssertEqual(
-            runtime.dispatchedActions,
-            [
-                .startRuntime,
-                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
-            ]
-        )
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-bob"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
         XCTAssertEqual(model.rooms.count, 1)
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
         XCTAssertNil(model.developerErrorText)
     }
 
     @MainActor
-    func testStartProfileChatFailureKeepsNoticeVisibleWithoutRooms() throws {
+    func testStartProfileChatFailureKeepsNoticeVisibleWithoutRooms() async throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -2657,7 +2685,14 @@ final class AppModelPersistenceTests: XCTestCase {
 
         model.start()
 
-        XCTAssertFalse(model.startProfileChat(for: profile))
+        XCTAssertTrue(model.startProfileChat(for: profile))
+        try await waitUntil {
+            runtime.dispatchedActions == [
+                .startRuntime,
+                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            ]
+                && model.userNoticeText == "Ask them to open Finite Chat, then try again"
+        }
         XCTAssertTrue(model.rooms.isEmpty)
         XCTAssertEqual(
             model.userNoticeText,
@@ -2667,7 +2702,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testStartNewChatWithOneProfileStartsDirectChatWithoutRoomName() throws {
+    func testStartNewChatWithOneProfileStartsDirectChatWithoutRoomName() async throws {
         let bob = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -2709,6 +2744,14 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
 
         XCTAssertTrue(model.startNewChat(named: "", with: [bob]))
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-bob"
+        }
         XCTAssertEqual(
             runtime.dispatchedActions,
             [
@@ -2720,268 +2763,289 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     func testStartGroupChatDispatchesBackedGroupAction() async throws {
-        await MainActor.run {
-            let bob = AppProfileSummary(
-                accountId: "bob-account",
-                npub: "npub1bob",
-                displayName: "Bob",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let carol = AppProfileSummary(
-                accountId: "carol-account",
-                npub: "npub1carol",
-                displayName: "Carol",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let runtime = FakeFiniteChatRuntime(
-                initialState: emptyChatState(),
-                startRuntimeState: emptyChatState()
-            ) { action, currentState in
-                var state = currentState
-                switch action {
-                case .startGroupChat(_, let displayName):
-                    let room = AppRoomSummary(
-                        roomId: "room-group",
-                        displayName: displayName,
-                        state: .connected,
-                        status: "connected",
-                        userStatusText: "Connected",
-                        lastMessagePreview: "",
-                        unreadCount: 0,
-                        canLoadOlder: false
-                    )
-                    state.rooms = [room]
-                    state.selectedRoomId = room.roomId
-                    state.status = "chat created"
-                default:
-                    break
-                }
-                return state
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let carol = AppProfileSummary(
+            accountId: "carol-account",
+            npub: "npub1carol",
+            displayName: "Carol",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            switch action {
+            case .startGroupChat(_, let displayName):
+                let room = AppRoomSummary(
+                    roomId: "room-group",
+                    displayName: displayName,
+                    state: .connected,
+                    status: "connected",
+                    userStatusText: "Connected",
+                    lastMessagePreview: "",
+                    unreadCount: 0,
+                    canLoadOlder: false
+                )
+                state.rooms = [room]
+                state.selectedRoomId = room.roomId
+                state.status = "chat created"
+            default:
+                break
             }
-            let model = AppModel(
-                config: RuntimeConfig(
-                    serverURL: "https://chat.finite.computer",
-                    deviceID: "alice-phone"
-                ),
-                startsUpdateLoop: false
-            ) { _ in runtime }
-
-            model.start()
-
-            XCTAssertTrue(model.startGroupChat(named: "Weekend plans", with: [bob, carol]))
-            XCTAssertEqual(
-                runtime.dispatchedActions,
-                [
-                    .startRuntime,
-                    .startGroupChat(
-                        accountIds: ["bob-account", "carol-account"],
-                        displayName: "Weekend plans"
-                    ),
-                ]
-            )
-            XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
+            return state
         }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.startNewChat(named: "Weekend plans", with: [bob, carol]))
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startGroupChat(
+                accountIds: ["bob-account", "carol-account"],
+                displayName: "Weekend plans"
+            ),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-group"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
     }
 
     func testStartNewChatWithMultipleProfilesStartsNamedGroup() async throws {
-        await MainActor.run {
-            let bob = AppProfileSummary(
-                accountId: "bob-account",
-                npub: "npub1bob",
-                displayName: "Bob",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let carol = AppProfileSummary(
-                accountId: "carol-account",
-                npub: "npub1carol",
-                displayName: "Carol",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let runtime = FakeFiniteChatRuntime(
-                initialState: emptyChatState(),
-                startRuntimeState: emptyChatState()
-            ) { action, currentState in
-                var state = currentState
-                if case .startGroupChat(_, let displayName) = action {
-                    let room = AppRoomSummary(
-                        roomId: "room-group",
-                        displayName: displayName,
-                        state: .connected,
-                        status: "connected",
-                        userStatusText: "Connected",
-                        lastMessagePreview: "",
-                        unreadCount: 0,
-                        canLoadOlder: false
-                    )
-                    state.rooms = [room]
-                    state.selectedRoomId = room.roomId
-                    state.status = "chat created"
-                }
-                return state
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let carol = AppProfileSummary(
+            accountId: "carol-account",
+            npub: "npub1carol",
+            displayName: "Carol",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startGroupChat(_, let displayName) = action {
+                let room = AppRoomSummary(
+                    roomId: "room-group",
+                    displayName: displayName,
+                    state: .connected,
+                    status: "connected",
+                    userStatusText: "Connected",
+                    lastMessagePreview: "",
+                    unreadCount: 0,
+                    canLoadOlder: false
+                )
+                state.rooms = [room]
+                state.selectedRoomId = room.roomId
+                state.status = "chat created"
             }
-            let model = AppModel(
-                config: RuntimeConfig(
-                    serverURL: "https://chat.finite.computer",
-                    deviceID: "alice-phone"
-                ),
-                startsUpdateLoop: false
-            ) { _ in runtime }
-
-            model.start()
-
-            XCTAssertTrue(model.startNewChat(named: "Weekend plans", with: [bob, carol]))
-            XCTAssertEqual(
-                runtime.dispatchedActions,
-                [
-                    .startRuntime,
-                    .startGroupChat(
-                        accountIds: ["bob-account", "carol-account"],
-                        displayName: "Weekend plans"
-                    ),
-                ]
-            )
-            XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
+            return state
         }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.startNewChat(named: "Weekend plans", with: [bob, carol]))
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startGroupChat(
+                accountIds: ["bob-account", "carol-account"],
+                displayName: "Weekend plans"
+            ),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-group"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-group")
     }
 
     func testStartGroupChatFailureKeepsNoticeVisibleWithoutRooms() async throws {
-        await MainActor.run {
-            let bob = AppProfileSummary(
-                accountId: "bob-account",
-                npub: "npub1bob",
-                displayName: "Bob",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let runtime = FakeFiniteChatRuntime(
-                initialState: emptyChatState(),
-                startRuntimeState: emptyChatState()
-            ) { action, currentState in
-                var state = currentState
-                if case .startGroupChat = action {
-                    state.status = "chat unavailable"
-                    state.toast = "Ask everyone to open Finite Chat, then try again"
-                }
-                return state
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let carol = AppProfileSummary(
+            accountId: "carol-account",
+            npub: "npub1carol",
+            displayName: "Carol",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: emptyChatState(),
+            startRuntimeState: emptyChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .startGroupChat = action {
+                state.status = "chat unavailable"
+                state.toast = "Ask everyone to open Finite Chat, then try again"
             }
-            let model = AppModel(
-                config: RuntimeConfig(
-                    serverURL: "https://chat.finite.computer",
-                    deviceID: "alice-phone"
-                ),
-                startsUpdateLoop: false
-            ) { _ in runtime }
-
-            model.start()
-
-            XCTAssertFalse(model.startGroupChat(named: "Weekend plans", with: [bob]))
-            XCTAssertTrue(model.rooms.isEmpty)
-            XCTAssertEqual(
-                model.userNoticeText,
-                "Ask everyone to open Finite Chat, then try again"
-            )
-            XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
+            return state
         }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+
+        XCTAssertTrue(model.startNewChat(named: "Weekend plans", with: [bob, carol]))
+        try await waitUntil {
+            runtime.dispatchedActions == [
+                .startRuntime,
+                .startGroupChat(
+                    accountIds: ["bob-account", "carol-account"],
+                    displayName: "Weekend plans"
+                ),
+            ]
+                && model.userNoticeText == "Ask everyone to open Finite Chat, then try again"
+        }
+        XCTAssertTrue(model.rooms.isEmpty)
+        XCTAssertEqual(
+            model.userNoticeText,
+            "Ask everyone to open Finite Chat, then try again"
+        )
+        XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
     }
 
     func testAddRoomMembersDispatchesBackedMemberAction() async throws {
-        await MainActor.run {
-            let bob = AppProfileSummary(
-                accountId: "bob-account",
-                npub: "npub1bob",
-                displayName: "Bob",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let runtime = FakeFiniteChatRuntime(
-                initialState: savedChatState(),
-                startRuntimeState: savedChatState()
-            ) { action, currentState in
-                var state = currentState
-                if case .addRoomMembers(let roomID, _) = action {
-                    state.selectedRoomId = roomID
-                    state.status = "people added"
-                }
-                return state
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .addRoomMembers(let roomID, _) = action {
+                state.selectedRoomId = roomID
+                state.status = "people added"
             }
-            let model = AppModel(
-                config: RuntimeConfig(
-                    serverURL: "https://chat.finite.computer",
-                    deviceID: "alice-phone"
-                ),
-                startsUpdateLoop: false
-            ) { _ in runtime }
-
-            model.start()
-            let room = model.rooms[0]
-
-            XCTAssertTrue(model.addMembers(to: room, profiles: [bob]))
-            XCTAssertEqual(
-                runtime.dispatchedActions,
-                [
-                    .startRuntime,
-                    .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
-                ]
-            )
-            XCTAssertEqual(model.selectedRoom?.roomId, "room-main")
+            return state
         }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+        let room = model.rooms[0]
+
+        XCTAssertTrue(model.addMembers(to: room, profiles: [bob]))
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.state?.status == "people added"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
+        XCTAssertEqual(model.selectedRoom?.roomId, "room-main")
     }
 
     func testAddRoomMembersFailureKeepsNoticeVisibleAndExistingRoom() async throws {
-        await MainActor.run {
-            let bob = AppProfileSummary(
-                accountId: "bob-account",
-                npub: "npub1bob",
-                displayName: "Bob",
-                about: nil,
-                picture: nil,
-                stale: false
-            )
-            let runtime = FakeFiniteChatRuntime(
-                initialState: savedChatState(),
-                startRuntimeState: savedChatState()
-            ) { action, currentState in
-                var state = currentState
-                if case .addRoomMembers = action {
-                    state.status = "chat unavailable"
-                    state.toast = "Ask everyone to open Finite Chat, then try again"
-                }
-                return state
+        let bob = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: nil,
+            stale: false
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        ) { action, currentState in
+            var state = currentState
+            if case .addRoomMembers = action {
+                state.status = "chat unavailable"
+                state.toast = "Ask everyone to open Finite Chat, then try again"
             }
-            let model = AppModel(
-                config: RuntimeConfig(
-                    serverURL: "https://chat.finite.computer",
-                    deviceID: "alice-phone"
-                ),
-                startsUpdateLoop: false
-            ) { _ in runtime }
-
-            model.start()
-            let room = model.rooms[0]
-
-            XCTAssertFalse(model.addMembers(to: room, profiles: [bob]))
-            XCTAssertEqual(model.rooms.count, 1)
-            XCTAssertEqual(model.rooms[0].roomId, "room-main")
-            XCTAssertEqual(
-                model.userNoticeText,
-                "Ask everyone to open Finite Chat, then try again"
-            )
-            XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
+            return state
         }
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            startsUpdateLoop: false
+        ) { _ in runtime }
+
+        model.start()
+        let room = model.rooms[0]
+
+        XCTAssertTrue(model.addMembers(to: room, profiles: [bob]))
+        try await waitUntil {
+            runtime.dispatchedActions == [
+                .startRuntime,
+                .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
+            ]
+                && model.userNoticeText == "Ask everyone to open Finite Chat, then try again"
+        }
+        XCTAssertEqual(model.rooms.count, 1)
+        XCTAssertEqual(model.rooms[0].roomId, "room-main")
+        XCTAssertEqual(
+            model.userNoticeText,
+            "Ask everyone to open Finite Chat, then try again"
+        )
+        XCTAssertEqual(model.actionNoticeText, model.userNoticeText)
     }
 
     @MainActor
-    func testScanTargetResultKeepsFailedProfileCodeVisible() throws {
+    func testScanTargetResultKeepsFailedProfileCodeVisible() async throws {
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
             startRuntimeState: emptyChatState()
@@ -3004,7 +3068,14 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
         model.scanDraft = "npub1bob"
 
-        let result = model.scanTargetResult()
+        var result: AppScanTargetResult?
+        XCTAssertTrue(model.scanTarget { scanResult in
+            result = scanResult
+        })
+
+        try await waitUntil {
+            result != nil
+        }
 
         if case .unavailable = result {
             // Expected.
@@ -3016,7 +3087,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testScanTargetResultReturnsProfileWhenLookupFallsBackToPlaceholder() throws {
+    func testScanTargetResultReturnsProfileWhenLookupFallsBackToPlaceholder() async throws {
         let profile = AppProfileSummary(
             accountId: "bob-account",
             npub: "npub1bob",
@@ -3049,7 +3120,14 @@ final class AppModelPersistenceTests: XCTestCase {
         model.start()
         model.scanDraft = "npub1bob"
 
-        let result = model.scanTargetResult()
+        var result: AppScanTargetResult?
+        XCTAssertTrue(model.scanTarget { scanResult in
+            result = scanResult
+        })
+
+        try await waitUntil {
+            result != nil
+        }
 
         guard case .profile(let scanned) = result else {
             return XCTFail("expected scanned profile result")
@@ -3064,7 +3142,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testScannedProfileCodeBuildsDirectChatTargetWithoutLookup() throws {
+    func testScannedProfileCodeBuildsDirectChatTargetWithoutLookup() async throws {
         let bob = try createNostrIdentity()
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -3106,16 +3184,18 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(profile.npub, bob.npub)
         XCTAssertTrue(profile.stale)
         XCTAssertTrue(model.startProfileChat(for: profile))
-        XCTAssertEqual(
-            runtime.dispatchedActions,
-            [
-                .startRuntime,
-                .startProfileChat(
-                    accountId: bob.accountId,
-                    displayName: "Chat with \(profile.displayName)"
-                ),
-            ]
-        )
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startProfileChat(
+                accountId: bob.accountId,
+                displayName: "Chat with \(profile.displayName)"
+            ),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-bob"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
     }
 
     @MainActor
@@ -3148,7 +3228,7 @@ final class AppModelPersistenceTests: XCTestCase {
     }
 
     @MainActor
-    func testScannedNprofileCodeBuildsDirectChatTargetWithoutLookup() throws {
+    func testScannedNprofileCodeBuildsDirectChatTargetWithoutLookup() async throws {
         let bobAccountID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         let bobNpub = try npubFromAccountId(accountId: bobAccountID)
         let bobNprofile = "nprofile1qqsqzg69v7y6hn00qy352euf40x77qfrg4ncn27dauqjx3t83x4ummcs22eux"
@@ -3192,16 +3272,18 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(profile.npub, bobNpub)
         XCTAssertEqual(profile.displayName, shortenedDisplayNpub(bobNpub))
         XCTAssertTrue(model.startProfileChat(for: profile))
-        XCTAssertEqual(
-            runtime.dispatchedActions,
-            [
-                .startRuntime,
-                .startProfileChat(
-                    accountId: bobAccountID,
-                    displayName: "Chat with \(profile.displayName)"
-                ),
-            ]
-        )
+        let expectedActions: [AppAction] = [
+            .startRuntime,
+            .startProfileChat(
+                accountId: bobAccountID,
+                displayName: "Chat with \(profile.displayName)"
+            ),
+        ]
+        try await waitUntil {
+            runtime.dispatchedActions == expectedActions
+                && model.selectedRoom?.roomId == "room-bob"
+        }
+        XCTAssertEqual(runtime.dispatchedActions, expectedActions)
     }
 
     @MainActor
@@ -3924,10 +4006,17 @@ private struct RawDiagnosticError: Error, CustomStringConvertible {
 }
 
 private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked Sendable {
+    private let lock = NSRecursiveLock()
     private var currentState: AppState
     private var startRuntimeStates: [AppState]
     private let dispatchOverride: ((AppAction, AppState) -> AppState)?
-    private(set) var dispatchedActions: [AppAction] = []
+    private var dispatchedActionsStorage: [AppAction] = []
+
+    var dispatchedActions: [AppAction] {
+        withLock {
+            dispatchedActionsStorage
+        }
+    }
 
     init(
         initialState: AppState,
@@ -3950,25 +4039,37 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
     }
 
     func state() throws -> AppState {
-        currentState
+        withLock {
+            currentState
+        }
     }
 
     func dispatch(action: AppAction) throws -> AppState {
-        dispatchedActions.append(action)
-        if action == .startRuntime {
-            if startRuntimeStates.count > 1 {
-                currentState = startRuntimeStates.removeFirst()
-            } else if let startRuntimeState = startRuntimeStates.first {
-                currentState = startRuntimeState
+        withLock {
+            dispatchedActionsStorage.append(action)
+            if action == .startRuntime {
+                if startRuntimeStates.count > 1 {
+                    currentState = startRuntimeStates.removeFirst()
+                } else if let startRuntimeState = startRuntimeStates.first {
+                    currentState = startRuntimeState
+                }
+            } else if let dispatchOverride {
+                currentState = dispatchOverride(action, currentState)
             }
-        } else if let dispatchOverride {
-            currentState = dispatchOverride(action, currentState)
+            return currentState
         }
-        return currentState
     }
 
     func waitForUpdate(timeoutMillis: UInt64) throws -> AppState {
-        currentState
+        withLock {
+            currentState
+        }
+    }
+
+    private func withLock<T>(_ operation: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
     }
 }
 
@@ -4271,4 +4372,15 @@ private func waitUntil(
         try await Task.sleep(nanoseconds: 10_000_000)
     }
     XCTFail("timed out waiting for condition")
+}
+
+@MainActor
+private func waitForActions(
+    _ runtime: FakeFiniteChatRuntime,
+    _ expected: [AppAction],
+    timeout: TimeInterval = 2
+) async throws {
+    try await waitUntil(timeout: timeout) {
+        runtime.dispatchedActions == expected
+    }
 }

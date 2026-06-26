@@ -438,17 +438,20 @@ final class AppModel: ObservableObject {
     private let startsUpdateLoop: Bool
     private let nostrIdentityStore: AppNostrIdentityStoring
     private var updateTask: Task<Void, Never>?
+    private var runtimeCommandTail: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var postSendCatchUpTask: Task<Void, Never>?
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
     private var lastTypingIntentByRoom: [String: Bool] = [:]
     private var pendingPushToken: String?
+    private var pushTokenRegistrationInFlight: String?
     private var didRunLaunchAutomation = false
     private let launchConfigurationError: String?
 
     deinit {
         updateTask?.cancel()
+        runtimeCommandTail?.cancel()
         launchAutomationTask?.cancel()
         postSendCatchUpTask?.cancel()
     }
@@ -642,7 +645,7 @@ final class AppModel: ObservableObject {
         removePushTokenIfPossible()
         pendingPushToken = nil
         nostrIdentityStore.clear()
-        closeRuntime()
+        closeRuntime(cancelQueuedCommands: false)
         try? RuntimeDataStore.deleteDataDir(
             deviceID: deviceID,
             applicationSupportURL: applicationSupportURL,
@@ -715,19 +718,32 @@ final class AppModel: ObservableObject {
         appendDiagnostic(category: "runtime", event: "start.requested")
         do {
             let runtime = try currentRuntime()
+            let runtimeKey = openKey
             state = try runtime.state()
-            do {
-                state = try runtime.dispatch(action: .startRuntime)
-                appendDiagnostic(category: "runtime", event: "start.succeeded")
-                errorText = nil
-            } catch {
-                appendDiagnostic(
-                    category: "runtime",
-                    event: "start.failed",
-                    details: diagnosticErrorDetails(error)
-                )
-                errorText = String(describing: error)
-            }
+            enqueueRuntimeDispatch(
+                .startRuntime,
+                runtime: runtime,
+                runtimeKey: runtimeKey,
+                priority: .utility,
+                onSuccess: { [weak self] nextState in
+                    guard let self else { return }
+                    self.state = nextState
+                    self.appendDiagnostic(category: "runtime", event: "start.succeeded")
+                    self.errorText = nil
+                    self.restartUpdateLoopIfEnabled()
+                    self.flushPendingPushTokenIfPossible()
+                    self.runLaunchAutomationIfRequested()
+                },
+                onFailure: { [weak self] error in
+                    guard let self else { return }
+                    self.appendDiagnostic(
+                        category: "runtime",
+                        event: "start.failed",
+                        details: self.diagnosticErrorDetails(error)
+                    )
+                    self.errorText = String(describing: error)
+                }
+            )
         } catch {
             appendDiagnostic(
                 category: "runtime",
@@ -737,12 +753,7 @@ final class AppModel: ObservableObject {
             errorText = String(describing: error)
         }
         restartUpdateLoopIfEnabled()
-        if runtime != nil {
-            flushPendingPushTokenIfPossible()
-            runLaunchAutomationIfRequested()
-        }
     }
-
     func startFromForeground() {
         guard foregroundStartKey == nil else {
             appendDiagnostic(category: "runtime", event: "foreground_start.coalesced")
@@ -754,29 +765,28 @@ final class AppModel: ObservableObject {
             let runtimeKey = openKey
             state = try runtime.state()
             foregroundStartKey = runtimeKey
-            let foregroundStart = Task.detached(priority: .utility) { [runtime] in
-                try runtime.dispatch(action: .startRuntime)
-            }
-            Task { @MainActor [weak self, runtimeKey] in
-                do {
-                    let nextState = try await foregroundStart.value
+            enqueueRuntimeDispatch(
+                .startRuntime,
+                runtime: runtime,
+                runtimeKey: runtimeKey,
+                priority: .utility,
+                onSuccess: { [weak self] nextState in
                     guard let self else { return }
                     if self.foregroundStartKey == runtimeKey {
                         self.foregroundStartKey = nil
                     }
-                    guard self.openKey == runtimeKey else { return }
                     self.state = nextState
                     self.appendDiagnostic(category: "runtime", event: "foreground_start.succeeded")
                     self.errorText = nil
                     self.restartUpdateLoopIfEnabled()
                     self.flushPendingPushTokenIfPossible()
                     self.runLaunchAutomationIfRequested()
-                } catch {
+                },
+                onFailure: { [weak self] error in
                     guard let self else { return }
                     if self.foregroundStartKey == runtimeKey {
                         self.foregroundStartKey = nil
                     }
-                    guard self.openKey == runtimeKey else { return }
                     self.appendDiagnostic(
                         category: "runtime",
                         event: "foreground_start.failed",
@@ -784,7 +794,7 @@ final class AppModel: ObservableObject {
                     )
                     self.errorText = String(describing: error)
                 }
-            }
+            )
         } catch {
             appendDiagnostic(
                 category: "runtime",
@@ -857,8 +867,9 @@ final class AppModel: ObservableObject {
     }
 
     func openRoom(_ room: AppRoomSummary) {
-        guard dispatch(.openRoom(roomId: room.roomId)) else { return }
-        dispatch(.markRoomRead(roomId: room.roomId))
+        dispatchInBackground(.openRoom(roomId: room.roomId)) { [weak self] in
+            self?.markRoomRead(room)
+        }
     }
 
     func projection(for roomID: String) -> ChatRoomProjection {
@@ -869,103 +880,195 @@ final class AppModel: ObservableObject {
         let name = roomDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         roomDraft = ""
-        dispatch(.createRoom(displayName: name))
+        dispatchInBackground(.createRoom(displayName: name))
     }
 
-    func createInvite(for room: AppRoomSummary) -> Bool {
+    func createInvite(
+        for room: AppRoomSummary,
+        onCreated: (@MainActor () -> Void)? = nil
+    ) -> Bool {
         guard room.state == .connected else { return false }
-        dispatch(.createInvite(roomId: room.roomId))
-        return state?.activeInvite?.roomId == room.roomId
+        return dispatchInBackground(.createInvite(roomId: room.roomId)) { [weak self] in
+            guard let self else { return }
+            if self.state?.activeInvite?.roomId == room.roomId {
+                onCreated?()
+            }
+        }
     }
 
-    func startProfileChat(for profile: AppProfileSummary) -> Bool {
+    func startProfileChat(
+        for profile: AppProfileSummary,
+        onStarted: (@MainActor (AppRoomSummary) -> Void)? = nil
+    ) -> Bool {
         let existingRoomIDs = Set(rooms.map(\.roomId))
         let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
-        dispatch(.startProfileChat(
+        return dispatchInBackground(.startProfileChat(
             accountId: profile.accountId,
             displayName: "Chat with \(displayName)"
-        ))
-        if let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
-            return room.state == .connected
-        }
-        let status = state?.status.nonEmptyTrimmed
-        if let room = selectedRoom,
-           room.state == .connected,
-           status == "chat opened" || status == "chat created"
-        {
-            return true
-        }
-        if userNoticeText == nil {
-            errorText = "Chat could not be created."
-        }
-        return false
-    }
-
-    func startGroupChat(named rawName: String, with profiles: [AppProfileSummary]) -> Bool {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let accountIDs = profiles
-            .map(\.accountId)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !name.isEmpty, !accountIDs.isEmpty else { return false }
-        let existingRoomIDs = Set(rooms.map(\.roomId))
-        dispatch(.startGroupChat(accountIds: accountIDs, displayName: name))
-        guard let room = rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) else {
-            if userNoticeText == nil {
-                errorText = "Group chat could not be created."
+        )) { [weak self] in
+            guard let self else { return }
+            if let room = self.rooms.first(where: { !existingRoomIDs.contains($0.roomId) }) {
+                if room.state == .connected {
+                    onStarted?(room)
+                }
+                return
             }
-            return false
+            let status = self.state?.status.nonEmptyTrimmed
+            if let room = self.selectedRoom,
+               room.state == .connected,
+               status == "chat opened" || status == "chat created"
+            {
+                onStarted?(room)
+                return
+            }
+            if self.userNoticeText == nil {
+                self.errorText = "Chat could not be created."
+            }
         }
-        return room.state == .connected
     }
 
-    func startNewChat(named rawName: String, with profiles: [AppProfileSummary]) -> Bool {
+    func startNewChat(
+        named rawName: String,
+        with profiles: [AppProfileSummary],
+        onCreated: (@MainActor (AppRoomSummary) -> Void)? = nil
+    ) -> Bool {
         let candidates = profiles.filter {
             !$0.accountId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         guard !candidates.isEmpty else { return false }
+
+        let action: AppAction
         if candidates.count == 1, let profile = candidates.first {
-            return startProfileChat(for: profile)
+            let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
+            action = .startProfileChat(
+                accountId: profile.accountId,
+                displayName: "Chat with \(displayName)"
+            )
+        } else {
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let accountIDs = candidates
+                .map(\.accountId)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !name.isEmpty, !accountIDs.isEmpty else { return false }
+            action = .startGroupChat(accountIds: accountIDs, displayName: name)
         }
-        return startGroupChat(named: rawName, with: candidates)
+
+        let existingRoomIDs = Set(rooms.map(\.roomId))
+        return dispatchInBackground(action) { [weak self] in
+            guard let self else { return }
+            if let room = self.rooms.first(where: { !existingRoomIDs.contains($0.roomId) })
+                ?? self.selectedRoom
+            {
+                onCreated?(room)
+                return
+            }
+            if self.userNoticeText == nil {
+                self.errorText = "Chat could not be created."
+            }
+        }
     }
 
-    func addMembers(to room: AppRoomSummary, profiles: [AppProfileSummary]) -> Bool {
+    func addMembers(
+        to room: AppRoomSummary,
+        profiles: [AppProfileSummary],
+        onSuccess: (@MainActor () -> Void)? = nil
+    ) -> Bool {
         guard room.state == .connected else { return false }
         let accountIDs = profiles
             .map(\.accountId)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !accountIDs.isEmpty else { return false }
-        dispatch(.addRoomMembers(roomId: room.roomId, accountIds: accountIDs))
-        if state?.status == "people added" {
-            return true
+        return dispatchInBackground(
+            .addRoomMembers(roomId: room.roomId, accountIds: accountIDs)
+        ) { [weak self] in
+            guard let self else { return }
+            if self.state?.status == "people added" {
+                onSuccess?()
+                return
+            }
+            if self.userNoticeText == nil {
+                self.errorText = "People could not be added to this chat."
+            }
         }
-        if userNoticeText == nil {
-            errorText = "People could not be added to this chat."
-        }
-        return false
     }
 
     @discardableResult
-    func scanTarget() -> Bool {
-        if case .profile = scanTargetResult() {
+    func scanTarget(
+        onComplete: @escaping @MainActor (AppScanTargetResult) -> Void
+    ) -> Bool {
+        let value = scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            onComplete(.empty)
             return false
         }
-        return true
-    }
-
-    @discardableResult
-    func scanTargetResult() -> AppScanTargetResult {
-        let value = scanDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return .empty }
         localNoticeText = nil
 
         let previousRoomIDs = Set(rooms.map(\.roomId))
         let previousSelectedRoomID = state?.selectedRoomId
-        let dispatched = dispatch(.scanTarget(value: value))
-        guard dispatched else { return .unavailable }
+        let action = AppAction.scanTarget(value: value)
+        let diagnostic = diagnosticAction(action)
+        appendDiagnostic(
+            category: diagnostic.category,
+            event: "\(diagnostic.name).requested",
+            details: diagnostic.details
+        )
 
+        let runtime: any FiniteChatRuntimeProtocol
+        let runtimeKey: String
+        do {
+            runtime = try currentRuntime()
+            runtimeKey = openKey
+        } catch {
+            appendDiagnostic(
+                category: diagnostic.category,
+                event: "\(diagnostic.name).failed",
+                details: diagnosticErrorDetails(error)
+            )
+            errorText = String(describing: error)
+            onComplete(.unavailable)
+            return false
+        }
+
+        enqueueRuntimeDispatch(
+            action,
+            runtime: runtime,
+            runtimeKey: runtimeKey,
+            priority: .userInitiated,
+            onSuccess: { [weak self] nextState in
+                guard let self else { return }
+                self.state = nextState
+                self.errorText = nil
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).succeeded",
+                    details: diagnostic.details
+                )
+                self.restartUpdateLoopIfEnabled()
+                onComplete(self.scanTargetResultFromUpdatedState(
+                    previousRoomIDs: previousRoomIDs,
+                    previousSelectedRoomID: previousSelectedRoomID
+                ))
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
+                self.appendDiagnostic(
+                    category: diagnostic.category,
+                    event: "\(diagnostic.name).failed",
+                    details: self.diagnosticErrorDetails(error)
+                )
+                self.errorText = String(describing: error)
+                onComplete(.unavailable)
+            }
+        )
+        return true
+    }
+
+    private func scanTargetResultFromUpdatedState(
+        previousRoomIDs: Set<String>,
+        previousSelectedRoomID: String?
+    ) -> AppScanTargetResult {
         if let profile = activeProfile {
             scanDraft = ""
             localNoticeText = "Profile opened."
@@ -1019,18 +1122,18 @@ final class AppModel: ObservableObject {
         invitePinSubmissionRoomID = pendingRoomID
         localNoticeText = "Submitting PIN..."
 
-        Task { @MainActor [weak self, runtime, runtimeKey, action, diagnostic, pendingRoomID] in
-            guard let self else { return }
-            defer {
-                if self.invitePinSubmissionRoomID == pendingRoomID {
-                    self.invitePinSubmissionRoomID = nil
+        enqueueRuntimeDispatch(
+            action,
+            runtime: runtime,
+            runtimeKey: runtimeKey,
+            priority: .userInitiated,
+            onSuccess: { [weak self] nextState in
+                guard let self else { return }
+                defer {
+                    if self.invitePinSubmissionRoomID == pendingRoomID {
+                        self.invitePinSubmissionRoomID = nil
+                    }
                 }
-            }
-            do {
-                let nextState = try await Task.detached(priority: .userInitiated) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard self.openKey == runtimeKey else { return }
                 self.state = nextState
                 self.errorText = nil
                 self.appendDiagnostic(
@@ -1047,7 +1150,14 @@ final class AppModel: ObservableObject {
                     self.localNoticeText = "Invite request submitted."
                 }
                 self.restartUpdateLoopIfEnabled()
-            } catch {
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
+                defer {
+                    if self.invitePinSubmissionRoomID == pendingRoomID {
+                        self.invitePinSubmissionRoomID = nil
+                    }
+                }
                 let message = self.invitePinFailureMessage(error)
                 self.localNoticeText = message
                 self.errorText = message
@@ -1057,7 +1167,7 @@ final class AppModel: ObservableObject {
                     details: self.diagnosticErrorDetails(error)
                 )
             }
-        }
+        )
         return true
     }
 
@@ -1115,30 +1225,38 @@ final class AppModel: ObservableObject {
         let key = "\(message.roomId)|\(message.messageId)"
         guard !messageRetriesInFlight.contains(key) else { return false }
         messageRetriesInFlight.insert(key)
-
-        Task { [weak self] in
-            guard let self else { return }
-            defer {
-                messageRetriesInFlight.remove(key)
-            }
-            do {
-                let runtime = try currentRuntime()
-                let runtimeKey = openKey
-                let action = AppAction.retryMessage(
-                    roomId: message.roomId,
-                    messageId: message.messageId
-                )
-                let nextState = try await Task.detached(priority: .userInitiated) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard openKey == runtimeKey else { return }
-                state = nextState
-                errorText = nil
-                restartUpdateLoopIfEnabled()
-            } catch {
-                errorText = String(describing: error)
-            }
+        let runtime: any FiniteChatRuntimeProtocol
+        let runtimeKey: String
+        do {
+            runtime = try currentRuntime()
+            runtimeKey = openKey
+        } catch {
+            messageRetriesInFlight.remove(key)
+            errorText = String(describing: error)
+            return false
         }
+        let action = AppAction.retryMessage(
+            roomId: message.roomId,
+            messageId: message.messageId
+        )
+        enqueueRuntimeDispatch(
+            action,
+            runtime: runtime,
+            runtimeKey: runtimeKey,
+            priority: .userInitiated,
+            onSuccess: { [weak self] nextState in
+                guard let self else { return }
+                self.messageRetriesInFlight.remove(key)
+                self.state = nextState
+                self.errorText = nil
+                self.restartUpdateLoopIfEnabled()
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
+                self.messageRetriesInFlight.remove(key)
+                self.errorText = String(describing: error)
+            }
+        )
         return true
     }
 
@@ -1165,32 +1283,6 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func send(roomID: String, text rawText: String, replyTo message: ChatMessage? = nil) -> Bool {
-        guard roomAllowsComposition(roomID) else { return false }
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
-        let action: AppAction
-        if let message {
-            action = .sendReply(
-                roomId: roomID,
-                text: text,
-                replyToMessageId: message.messageId
-            )
-        } else {
-            action = .sendMessage(roomId: roomID, text: text)
-        }
-        let sent = dispatch(action)
-        if sent {
-            schedulePostSendCatchUp()
-        }
-        return sent
-    }
-
-    @discardableResult
-    func sendInBackground(
-        roomID: String,
-        text rawText: String,
-        replyTo message: ChatMessage? = nil
-    ) -> Bool {
         guard roomAllowsComposition(roomID) else { return false }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
@@ -1242,15 +1334,23 @@ final class AppModel: ObservableObject {
                     caption: caption,
                     replyToMessageId: message?.messageId
                 )
-                let nextState = try await Task.detached(priority: .userInitiated) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard openKey == runtimeKey else { return }
-                state = nextState
-                errorText = nil
-                onSuccess?()
-                restartUpdateLoopIfEnabled()
-                schedulePostSendCatchUp()
+                enqueueRuntimeDispatch(
+                    action,
+                    runtime: runtime,
+                    runtimeKey: runtimeKey,
+                    priority: .userInitiated,
+                    onSuccess: { [weak self] nextState in
+                        guard let self else { return }
+                        self.state = nextState
+                        self.errorText = nil
+                        onSuccess?()
+                        self.restartUpdateLoopIfEnabled()
+                        self.schedulePostSendCatchUp()
+                    },
+                    onFailure: { [weak self] error in
+                        self?.errorText = String(describing: error)
+                    }
+                )
             } catch {
                 errorText = String(describing: error)
             }
@@ -1281,18 +1381,26 @@ final class AppModel: ObservableObject {
                     caption: caption,
                     replyToMessageId: message?.messageId
                 )
-                let nextState = try await Task.detached(priority: .userInitiated) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard openKey == runtimeKey else { return }
-                state = nextState
-                if captionOverride == nil {
-                    outboundText = ""
-                }
-                errorText = nil
-                onSuccess?()
-                restartUpdateLoopIfEnabled()
-                schedulePostSendCatchUp()
+                enqueueRuntimeDispatch(
+                    action,
+                    runtime: runtime,
+                    runtimeKey: runtimeKey,
+                    priority: .userInitiated,
+                    onSuccess: { [weak self] nextState in
+                        guard let self else { return }
+                        self.state = nextState
+                        if captionOverride == nil {
+                            self.outboundText = ""
+                        }
+                        self.errorText = nil
+                        onSuccess?()
+                        self.restartUpdateLoopIfEnabled()
+                        self.schedulePostSendCatchUp()
+                    },
+                    onFailure: { [weak self] error in
+                        self?.errorText = String(describing: error)
+                    }
+                )
             } catch {
                 errorText = String(describing: error)
             }
@@ -1308,7 +1416,7 @@ final class AppModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !trimmedQuestion.isEmpty, trimmedOptions.count >= 2 else { return false }
-        return dispatch(.sendPoll(
+        return dispatchInBackground(.sendPoll(
             roomId: roomID,
             question: trimmedQuestion,
             options: trimmedOptions
@@ -1316,7 +1424,7 @@ final class AppModel: ObservableObject {
     }
 
     func votePoll(message: ChatMessage, option: ChatPollOption) {
-        dispatch(.votePoll(
+        dispatchInBackground(.votePoll(
             roomId: message.roomId,
             messageId: message.messageId,
             optionId: option.optionId
@@ -1339,41 +1447,56 @@ final class AppModel: ObservableObject {
         do {
             runtime = try currentRuntime()
             runtimeKey = openKey
-            state = try runtime.dispatch(action: .beginDownloadAttachment(
-                roomId: roomID,
-                messageId: messageID,
-                attachmentId: attachment.attachmentId
-            ))
-            errorText = nil
-            restartUpdateLoopIfEnabled()
         } catch {
             attachmentDownloadsInFlight.remove(key)
             errorText = String(describing: error)
             return
         }
 
-        Task { [weak self] in
-            guard let self else { return }
-            defer {
-                attachmentDownloadsInFlight.remove(key)
-            }
-            do {
-                let action = AppAction.downloadAttachment(
-                    roomId: roomID,
-                    messageId: messageID,
-                    attachmentId: attachment.attachmentId
+        enqueueRuntimeDispatch(
+            .beginDownloadAttachment(
+                roomId: roomID,
+                messageId: messageID,
+                attachmentId: attachment.attachmentId
+            ),
+            runtime: runtime,
+            runtimeKey: runtimeKey,
+            priority: .utility,
+            onSuccess: { [weak self] beginState in
+                guard let self else { return }
+                self.state = beginState
+                self.errorText = nil
+                self.restartUpdateLoopIfEnabled()
+
+                self.enqueueRuntimeDispatch(
+                    .downloadAttachment(
+                        roomId: roomID,
+                        messageId: messageID,
+                        attachmentId: attachment.attachmentId
+                    ),
+                    runtime: runtime,
+                    runtimeKey: runtimeKey,
+                    priority: .utility,
+                    onSuccess: { [weak self] nextState in
+                        guard let self else { return }
+                        self.attachmentDownloadsInFlight.remove(key)
+                        self.state = nextState
+                        self.errorText = nil
+                        self.restartUpdateLoopIfEnabled()
+                    },
+                    onFailure: { [weak self] error in
+                        guard let self else { return }
+                        self.attachmentDownloadsInFlight.remove(key)
+                        self.errorText = String(describing: error)
+                    }
                 )
-                let nextState = try await Task.detached(priority: .utility) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard openKey == runtimeKey else { return }
-                state = nextState
-                errorText = nil
-                restartUpdateLoopIfEnabled()
-            } catch {
-                errorText = String(describing: error)
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
+                self.attachmentDownloadsInFlight.remove(key)
+                self.errorText = String(describing: error)
             }
-        }
+        )
     }
 
     func loadOlderMessages(roomID: String, beforeMessageID: String) {
@@ -1435,36 +1558,39 @@ final class AppModel: ObservableObject {
 
     private func flushPendingPushTokenIfPossible() {
         guard let token = pendingPushToken else { return }
+        guard pushTokenRegistrationInFlight != token else { return }
+        pushTokenRegistrationInFlight = token
         appendDiagnostic(category: "push", event: "token.register.requested")
-        do {
-            let runtime = try currentRuntime()
-            state = try runtime.dispatch(action: .setPushToken(token: token))
-            pendingPushToken = nil
-            appendDiagnostic(category: "push", event: "token.register.succeeded")
-            restartUpdateLoopIfEnabled()
-        } catch {
-            appendDiagnostic(
-                category: "push",
-                event: "token.register.failed",
-                details: diagnosticErrorDetails(error)
-            )
+        dispatchInBackground(
+            .setPushToken(token: token),
+            priority: .utility,
+            showsError: false
+        ) { [weak self] in
+            guard let self else { return }
+            if self.pendingPushToken == token {
+                self.pendingPushToken = nil
+            }
+            if self.pushTokenRegistrationInFlight == token {
+                self.pushTokenRegistrationInFlight = nil
+            }
+            self.appendDiagnostic(category: "push", event: "token.register.succeeded")
+        } onFailure: { [weak self] _ in
+            guard let self else { return }
+            if self.pushTokenRegistrationInFlight == token {
+                self.pushTokenRegistrationInFlight = nil
+            }
         }
     }
 
     private func removePushTokenIfPossible() {
         guard runtime != nil else { return }
         appendDiagnostic(category: "push", event: "token.remove.requested")
-        do {
-            let runtime = try currentRuntime()
-            state = try runtime.dispatch(action: .removePushToken)
-            appendDiagnostic(category: "push", event: "token.remove.succeeded")
-            restartUpdateLoopIfEnabled()
-        } catch {
-            appendDiagnostic(
-                category: "push",
-                event: "token.remove.failed",
-                details: diagnosticErrorDetails(error)
-            )
+        dispatchInBackground(
+            .removePushToken,
+            priority: .utility,
+            showsError: false
+        ) { [weak self] in
+            self?.appendDiagnostic(category: "push", event: "token.remove.succeeded")
         }
     }
 
@@ -1501,36 +1627,31 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    private func dispatch(_ action: AppAction) -> Bool {
-        var succeeded = false
-        let diagnostic = diagnosticAction(action)
-        appendDiagnostic(
-            category: diagnostic.category,
-            event: "\(diagnostic.name).requested",
-            details: diagnostic.details
-        )
-        run {
-            let runtime = try currentRuntime()
-            self.state = try runtime.dispatch(action: action)
-            succeeded = true
+    private func enqueueRuntimeDispatch(
+        _ action: AppAction,
+        runtime: any FiniteChatRuntimeProtocol,
+        runtimeKey: String,
+        priority: TaskPriority,
+        onSuccess: @escaping @MainActor (AppState) -> Void,
+        onFailure: @escaping @MainActor (Error) -> Void
+    ) -> Bool {
+        let previousCommand = runtimeCommandTail
+        let command = Task { @MainActor [weak self, previousCommand, runtime, runtimeKey, action] in
+            await previousCommand?.value
+            guard !Task.isCancelled, let self else { return }
+            do {
+                let nextState = try await Task.detached(priority: priority) {
+                    try runtime.dispatch(action: action)
+                }.value
+                guard !Task.isCancelled, self.openKey == runtimeKey else { return }
+                onSuccess(nextState)
+            } catch {
+                guard !Task.isCancelled, self.openKey == runtimeKey else { return }
+                onFailure(error)
+            }
         }
-        if succeeded {
-            appendDiagnostic(
-                category: diagnostic.category,
-                event: "\(diagnostic.name).succeeded",
-                details: diagnostic.details
-            )
-        } else {
-            appendDiagnostic(
-                category: diagnostic.category,
-                event: "\(diagnostic.name).failed",
-                details: diagnostic.details.merging(diagnosticErrorDetails(errorText)) { current, _ in
-                    current
-                }
-            )
-        }
-        restartUpdateLoopIfEnabled()
-        return succeeded
+        runtimeCommandTail = command
+        return true
     }
 
     @discardableResult
@@ -1539,7 +1660,8 @@ final class AppModel: ObservableObject {
         priority: TaskPriority = .userInitiated,
         showsError: Bool = true,
         restartsUpdateLoop: Bool = true,
-        onSuccess: (@MainActor () -> Void)? = nil
+        onSuccess: (@MainActor () -> Void)? = nil,
+        onFailure: (@MainActor (Error) -> Void)? = nil
     ) -> Bool {
         let diagnostic = diagnosticAction(action)
         appendDiagnostic(
@@ -1564,13 +1686,13 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        Task { @MainActor [weak self, runtime, runtimeKey, action, diagnostic] in
-            guard let self else { return }
-            do {
-                let nextState = try await Task.detached(priority: priority) {
-                    try runtime.dispatch(action: action)
-                }.value
-                guard self.openKey == runtimeKey else { return }
+        return enqueueRuntimeDispatch(
+            action,
+            runtime: runtime,
+            runtimeKey: runtimeKey,
+            priority: priority,
+            onSuccess: { [weak self] nextState in
+                guard let self else { return }
                 self.state = nextState
                 self.errorText = nil
                 self.appendDiagnostic(
@@ -1582,8 +1704,9 @@ final class AppModel: ObservableObject {
                     self.restartUpdateLoopIfEnabled()
                 }
                 onSuccess?()
-            } catch {
-                guard self.openKey == runtimeKey else { return }
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
                 self.appendDiagnostic(
                     category: diagnostic.category,
                     event: "\(diagnostic.name).failed",
@@ -1592,9 +1715,9 @@ final class AppModel: ObservableObject {
                 if showsError {
                     self.errorText = String(describing: error)
                 }
+                onFailure?(error)
             }
-        }
-        return true
+        )
     }
 
     private func restartUpdateLoopIfEnabled() {
@@ -1704,8 +1827,12 @@ final class AppModel: ObservableObject {
         canRecoverRuntimeIdentity = false
     }
 
-    private func closeRuntime() {
+    private func closeRuntime(cancelQueuedCommands: Bool = true) {
         updateTask?.cancel()
+        if cancelQueuedCommands {
+            runtimeCommandTail?.cancel()
+            runtimeCommandTail = nil
+        }
         launchAutomationTask?.cancel()
         postSendCatchUpTask?.cancel()
         updateTask = nil
@@ -1715,6 +1842,7 @@ final class AppModel: ObservableObject {
         attachmentDownloadsInFlight.removeAll()
         messageRetriesInFlight.removeAll()
         lastTypingIntentByRoom.removeAll()
+        pushTokenRegistrationInFlight = nil
         runtime = nil
         openKey = ""
         state = nil
@@ -1727,20 +1855,6 @@ final class AppModel: ObservableObject {
             return
         }
         chatProjections = ChatTimeline.roomProjections(messages: state.messages)
-    }
-
-    private func run(_ operation: () throws -> Void) {
-        do {
-            try operation()
-            errorText = nil
-        } catch {
-            appendDiagnostic(
-                category: "runtime",
-                event: "operation.failed",
-                details: diagnosticErrorDetails(error)
-            )
-            errorText = String(describing: error)
-        }
     }
 
     private func appendStateDiagnostic(_ state: AppState, event: String) {
@@ -2158,8 +2272,7 @@ final class AppModel: ObservableObject {
                 self.createRoom()
             }
             if let inviteURL {
-                self.scanDraft = inviteURL
-                self.scanTarget()
+                _ = await self.scanLaunchAutomationInvite(inviteURL)
                 let roomID = requestedRoomID ?? self.state?.selectedRoomId
                 if let room = self.launchAutomationRoom(roomID: roomID) {
                     self.submitPin(for: room)
@@ -2202,6 +2315,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func scanLaunchAutomationInvite(_ inviteURL: String) async -> AppScanTargetResult {
+        await withCheckedContinuation { continuation in
+            var didResume = false
+            func finish(_ result: AppScanTargetResult) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: result)
+            }
+
+            scanDraft = inviteURL
+            _ = scanTarget { result in
+                finish(result)
+            }
+        }
+    }
+
     private func startLaunchAutomationProfileChat(npub rawNpub: String) {
         let npub = rawNpub.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
@@ -2232,9 +2361,7 @@ final class AppModel: ObservableObject {
         let deadline = Date().addingTimeInterval(90)
         while !Task.isCancelled, Date() < deadline {
             if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
-                dispatch(.openRoom(roomId: room.roomId))
-                outboundText = text
-                send()
+                send(roomID: room.roomId, text: text)
                 return
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -2253,7 +2380,6 @@ final class AppModel: ObservableObject {
         let deadline = Date().addingTimeInterval(90)
         while !Task.isCancelled, Date() < deadline {
             if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
-                dispatch(.openRoom(roomId: room.roomId))
                 let normalized = base64.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard let data = Data(base64Encoded: normalized) else {
                     errorText = "Launch automation attachment base64 was invalid"
@@ -2293,7 +2419,6 @@ final class AppModel: ObservableObject {
         let deadline = Date().addingTimeInterval(90)
         while !Task.isCancelled, Date() < deadline {
             if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
-                dispatch(.openRoom(roomId: room.roomId))
                 do {
                     let prepared = try await Task.detached(priority: .userInitiated) {
                         try Self.loadAttachment(from: fileURL)
@@ -2323,7 +2448,6 @@ final class AppModel: ObservableObject {
         let deadline = Date().addingTimeInterval(90)
         while !Task.isCancelled, Date() < deadline {
             if let room = launchAutomationRoom(roomID: roomID), room.state == .connected {
-                dispatch(.openRoom(roomId: room.roomId))
                 let attachment = OutboundAttachment(
                     filename: "launch-automation.txt",
                     mimeType: "text/plain",
