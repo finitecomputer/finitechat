@@ -639,6 +639,65 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(captured["body"], b"{}")
         self.assertEqual(captured["timeout"], 7)
 
+    def test_finitechat_json_retries_transient_service_transport_reset(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/false",
+                }
+            )
+        )
+        original_urlopen = self.module.urllib.request.urlopen
+        original_sleep = self.module.asyncio.sleep
+        calls = []
+        sleeps = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b'{"accepted":true}'
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) == 1:
+                raise self.module.urllib.error.URLError("connection reset")
+            return FakeResponse()
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        try:
+            self.module.urllib.request.urlopen = fake_urlopen
+            self.module.asyncio.sleep = fake_sleep
+            result = asyncio.run(
+                adapter._finitechat_json(
+                    "activity",
+                    {"room_id": "room-agent-1", "action": "clear"},
+                    timeout=7,
+                )
+            )
+        finally:
+            self.module.urllib.request.urlopen = original_urlopen
+            self.module.asyncio.sleep = original_sleep
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["accepted"], True)
+        self.assertEqual(
+            calls,
+            [
+                ("http://127.0.0.1:9999/v1/hermes/activity", 7),
+                ("http://127.0.0.1:9999/v1/hermes/activity", 7),
+            ],
+        )
+        self.assertEqual(sleeps, [self.module.SERVICE_TRANSPORT_RETRY_SECS])
+
     def test_finitechat_json_falls_back_to_cli_when_service_transport_fails(self):
         adapter = self.module.FiniteChatAdapter(
             PlatformConfig(
@@ -848,7 +907,9 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
             module = cast(Any, self.module)
             original_start_timeout = module.SERVICE_START_TIMEOUT_SECS
+            original_health = module._finitechat_service_health
             calls = []
+            health_calls = []
 
             class FakeProcess:
                 returncode = None
@@ -857,8 +918,13 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 calls.append(args)
                 return FakeProcess()
 
+            def fake_health(service_url, timeout):
+                health_calls.append((service_url, timeout))
+                return True
+
             try:
                 self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+                module._finitechat_service_health = fake_health
                 module.SERVICE_START_TIMEOUT_SECS = 0.0
                 started = asyncio.run(adapter._ensure_service())
                 Path(temp_dir, self.module.SERVICE_READY_FILE).write_text(
@@ -868,12 +934,68 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 rediscovered = asyncio.run(adapter._ensure_service())
             finally:
                 self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+                module._finitechat_service_health = original_health
                 module.SERVICE_START_TIMEOUT_SECS = original_start_timeout
 
         self.assertFalse(started)
         self.assertTrue(rediscovered)
         self.assertEqual(adapter.service_url, "http://127.0.0.1:7777")
+        self.assertEqual(health_calls, [("http://127.0.0.1:7777", 2)])
         self.assertEqual(len(calls), 1)
+
+    def test_ensure_service_waits_for_health_after_ready_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = self.module.FiniteChatAdapter(
+                PlatformConfig(
+                    extra={
+                        "home": temp_dir,
+                        "finitechat_bin": "/bin/finitechat",
+                        "service_addr": "127.0.0.1:0",
+                    }
+                )
+            )
+            original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+            original_sleep = self.module.asyncio.sleep
+            module = cast(Any, self.module)
+            original_start_timeout = module.SERVICE_START_TIMEOUT_SECS
+            original_health = module._finitechat_service_health
+            health_calls = []
+            sleeps = []
+
+            class FakeProcess:
+                returncode = None
+
+            async def fake_create_subprocess_exec(*args, **kwargs):
+                ready_file = Path(args[args.index("--ready-file") + 1])
+                ready_file.write_text('{"url":"http://127.0.0.1:7777"}', encoding="utf-8")
+                return FakeProcess()
+
+            def fake_health(service_url, timeout):
+                health_calls.append((service_url, timeout))
+                return len(health_calls) >= 2
+
+            async def fake_sleep(delay):
+                sleeps.append(delay)
+
+            try:
+                self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+                self.module.asyncio.sleep = fake_sleep
+                module._finitechat_service_health = fake_health
+                module.SERVICE_START_TIMEOUT_SECS = 1.0
+                started = asyncio.run(adapter._ensure_service())
+            finally:
+                self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+                self.module.asyncio.sleep = original_sleep
+                module._finitechat_service_health = original_health
+                module.SERVICE_START_TIMEOUT_SECS = original_start_timeout
+
+        self.assertTrue(started)
+        self.assertEqual(adapter.service_url, "http://127.0.0.1:7777")
+        self.assertEqual(
+            health_calls,
+            [("http://127.0.0.1:7777", 2), ("http://127.0.0.1:7777", 2)],
+        )
+        self.assertEqual(sleeps, [0.05])
 
     def test_ensure_service_starts_finitechat_serve_and_reads_ready_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -887,7 +1009,10 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 )
             )
             original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+            module = cast(Any, self.module)
+            original_health = module._finitechat_service_health
             calls = []
+            health_calls = []
 
             class FakeProcess:
                 returncode = None
@@ -913,15 +1038,22 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 ready_file.write_text('{"url":"http://127.0.0.1:7777"}', encoding="utf-8")
                 return fake_process
 
+            def fake_health(service_url, timeout):
+                health_calls.append((service_url, timeout))
+                return True
+
             try:
                 self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+                module._finitechat_service_health = fake_health
                 started = asyncio.run(adapter._ensure_service())
                 asyncio.run(adapter._stop_service())
             finally:
                 self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+                module._finitechat_service_health = original_health
 
         self.assertTrue(started)
         self.assertEqual(adapter.service_url, "http://127.0.0.1:7777")
+        self.assertEqual(health_calls, [("http://127.0.0.1:7777", 2)])
         self.assertEqual(calls[0][0:2], ("/bin/finitechat", "hermes"))
         self.assertIn("serve", calls[0])
         self.assertTrue(fake_process.terminated)

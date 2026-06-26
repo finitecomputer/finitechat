@@ -100,7 +100,8 @@ Current adapter regressions cover media payload mapping, inbound attachment
 materialization into Hermes media fields, room filtering, redelivery dedupe,
 ack retry without duplicate dispatch, transient poll recovery, service fallback,
 NDJSON inbound stream consumption/fallback, outbound edit thread-route
-preservation, and thread-scoped working activity set/clear routing.
+preservation, transient service transport retry before CLI fallback, and
+thread-scoped working activity set/clear routing.
 
 ### Phase 2: Make The Rust Sidecar The Normal Runtime Path
 
@@ -119,6 +120,9 @@ Current service regressions cover ready-file startup, `/healthz`, `/readyz`,
 serialized bridge actions behind the loopback service, home-channel actions,
 NDJSON inbound failure handling, and machine-classifiable structured error
 bodies for Hermes and usage failures.
+The adapter also requires `/healthz` to pass after the ready file appears
+before sending bridge actions to the service, closing the startup race that the
+live media smoke exposed.
 
 ### Phase 3: Add A Photon-Style Inbound Stream
 
@@ -156,13 +160,16 @@ Current local smoke:
 
 ```bash
 scripts/hermes-sidecar-smoke.sh
+scripts/hermes-agent-media-e2e.sh
 ```
 
-It writes `target/hermes-sidecar-smoke/report.json` and proves
+They write `target/hermes-sidecar-smoke/report.json` and
+`target/hermes-agent-media-e2e/report.json`. Together they prove
 finitechat-server, `finitechat hermes` CLI, encrypted client stores,
 `finitechat hermes serve`, `/v1/hermes/inbound` NDJSON, ack/drain, agent reply,
-and user decrypt. This is the local baseline future Docker and Tinfoil smokes
-should match or explain.
+Hermes adapter media materialization through the real `hermes-agent` package,
+agent text and image replies, and user decrypt. This is the local baseline
+future Docker and Tinfoil smokes should match or explain.
 
 ### Phase 5: Prove The Real Runtime Image In Docker
 

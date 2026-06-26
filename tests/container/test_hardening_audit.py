@@ -50,6 +50,15 @@ TINFOIL_LAYERS = [
     "same agent npub after restore",
     "Finite Chat round trip after restore",
 ]
+MEDIA_STEPS = [
+    "server_ready",
+    "agent_init",
+    "adapter_connect",
+    "user_join",
+    "user_send_media",
+    "agent_receive_media",
+    "user_receive_agent_replies",
+]
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -59,6 +68,20 @@ def write_json(path: Path, value: dict) -> None:
 
 def sidecar_report() -> dict:
     return {"status": "passed", "proof_layers": SIDECAR_LAYERS}
+
+
+def media_e2e_report() -> dict:
+    return {
+        "status": "passed",
+        "facts": {
+            "adapter_inbound_stream": True,
+            "adapter_service_url_present": True,
+            "agent_received_media_types": ["image/png"],
+            "user_received_text": ["agent text echo: user media hello", "agent media echo"],
+            "user_received_media_count": 1,
+        },
+        "steps": [{"name": name, "elapsed_ms": 1} for name in MEDIA_STEPS],
+    }
 
 
 def docker_report(restic_backend: str = "s3") -> dict:
@@ -97,6 +120,8 @@ def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
         str(AUDIT_SCRIPT),
         "--sidecar-report",
         str(tmp / "sidecar.json"),
+        "--media-e2e-report",
+        str(tmp / "media-e2e.json"),
         "--docker-report",
         str(tmp / "docker.json"),
         "--github-setup-report",
@@ -133,6 +158,7 @@ class HardeningAuditTest(unittest.TestCase):
 
         self.assertEqual(status, 2)
         self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("local_hermes_agent_media_e2e", audit["missing"])
         self.assertIn("github_actions_s3_setup_ready", audit["missing"])
         self.assertIn("github_publish_gate_ready", audit["missing"])
         self.assertIn("docker_runtime_s3_smoke", audit["missing"])
@@ -143,6 +169,7 @@ class HardeningAuditTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "docker.json", docker_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
@@ -168,6 +195,7 @@ class HardeningAuditTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "docker.json", docker_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
@@ -193,6 +221,7 @@ class HardeningAuditTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "docker.json", docker_report(restic_backend="local"))
             write_json(
                 tmp / "github-setup.json",

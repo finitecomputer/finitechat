@@ -65,11 +65,16 @@ For a local human smoke with JSON evidence:
 
 ```bash
 scripts/hermes-sidecar-smoke.sh
+scripts/hermes-agent-media-e2e.sh
 ```
 
 The script writes `target/hermes-sidecar-smoke/report.json` with timings for
 server startup, invite/join, sidecar readiness, inbound delivery, ack/drain,
 agent reply, and user decrypt.
+The media E2E writes `target/hermes-agent-media-e2e/report.json` and runs the
+real `hermes-agent` package against the Finite plugin with the sidecar inbound
+stream enabled. It proves an image sent by a Finite Chat user reaches Hermes as
+media and that the user decrypts both text and image replies from the agent.
 
 Validate the restic backup environment before the longer Docker smoke:
 

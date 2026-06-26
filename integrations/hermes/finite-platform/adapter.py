@@ -30,13 +30,14 @@ LOCAL_ENV_FILE = "finitechat.env"
 DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
 DEFAULT_ACTIVITY_REFRESH_SECS = 30.0
-ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 1000
+ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 100
 DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
 SERVICE_READY_FILE = "hermes-service.json"
 SERVICE_START_TIMEOUT_SECS = 5.0
 MAX_DELIVERED_EVENT_KEYS = 256
 MAX_OUTBOUND_MESSAGE_ROUTES = 256
 STREAM_RECONNECT_BACKOFF_SECS = 2.0
+SERVICE_TRANSPORT_RETRY_SECS = 0.1
 
 
 def _load_local_env_defaults(path: Path | None = None) -> None:
@@ -652,8 +653,25 @@ class FiniteChatAdapter(BasePlatformAdapter):
             )
             if result.ok or not result.transport_error:
                 return result
+            await asyncio.sleep(SERVICE_TRANSPORT_RETRY_SECS)
+            retry_result = await asyncio.to_thread(
+                _finitechat_service_json,
+                self.service_url,
+                action,
+                payload,
+                timeout,
+            )
+            if retry_result.ok or not retry_result.transport_error:
+                return retry_result
+            result = retry_result
+            action_detail = ""
+            if action == "activity" and isinstance(payload.get("action"), str):
+                action_detail = f"/{payload['action']}"
             logger.warning(
-                "[finite] Hermes service unavailable (%s); falling back to finitechat CLI",
+                "[finite] Hermes service unavailable during %s%s (%s); "
+                "falling back to finitechat CLI",
+                action,
+                action_detail,
                 result.error,
             )
         if not self._finitechat_cmd:
@@ -715,9 +733,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
             if self._service_ready_file is not None:
                 started = _read_service_ready_file(self._service_ready_file)
                 if started.get("url"):
-                    self.service_url = str(started["url"]).rstrip("/")
-                    logger.info("[finite] Hermes service ready at %s", self.service_url)
-                    return True
+                    candidate_url = str(started["url"]).rstrip("/")
+                    healthy = await asyncio.to_thread(_finitechat_service_health, candidate_url, 2)
+                    if healthy:
+                        self.service_url = candidate_url
+                        logger.info("[finite] Hermes service ready at %s", self.service_url)
+                        return True
             return bool(self.service_url)
         if not self.home or not self._finitechat_cmd:
             return False
@@ -761,9 +782,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 return False
             started = _read_service_ready_file(ready_file)
             if started.get("url"):
-                self.service_url = str(started["url"]).rstrip("/")
-                logger.info("[finite] Hermes service ready at %s", self.service_url)
-                return True
+                candidate_url = str(started["url"]).rstrip("/")
+                healthy = await asyncio.to_thread(_finitechat_service_health, candidate_url, 2)
+                if healthy:
+                    self.service_url = candidate_url
+                    logger.info("[finite] Hermes service ready at %s", self.service_url)
+                    return True
             await asyncio.sleep(0.05)
 
         logger.warning("[finite] Hermes service did not become ready; using CLI bridge")

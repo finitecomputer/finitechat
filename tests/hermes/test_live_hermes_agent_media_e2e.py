@@ -22,6 +22,7 @@ FINITECHAT_BIN = Path(os.environ.get("FINITECHAT_BIN", REPO_ROOT / "target/debug
 FINITECHAT_SERVER_BIN = Path(
     os.environ.get("FINITECHAT_SERVER_BIN", REPO_ROOT / "target/debug/finitechat-server")
 )
+DEFAULT_MEDIA_REPORT = REPO_ROOT / "target/hermes-agent-media-e2e/report.json"
 
 
 def run_json(args: list[str], *, timeout: int = 120) -> dict[str, Any]:
@@ -63,6 +64,38 @@ def load_adapter_module():
     return module
 
 
+class JsonSmokeReport:
+    def __init__(self, name: str, env_name: str, default_path: Path) -> None:
+        self.name = name
+        configured = os.environ.get(env_name)
+        self.path = Path(configured) if configured else default_path
+        self.started = time.monotonic()
+        self.facts: dict[str, Any] = {}
+        self.steps: list[dict[str, Any]] = []
+
+    def fact(self, key: str, value: Any) -> None:
+        self.facts[key] = value
+
+    def step(self, name: str, started: float) -> None:
+        self.steps.append(
+            {
+                "name": name,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            }
+        )
+
+    def finish(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "status": "passed",
+            "name": self.name,
+            "elapsed_ms": int((time.monotonic() - self.started) * 1000),
+            "facts": self.facts,
+            "steps": self.steps,
+        }
+        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 class RecordingPluginContext:
     def __init__(self) -> None:
         self.entries: list[dict[str, Any]] = []
@@ -80,6 +113,11 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         asyncio.get_running_loop().slow_callback_duration = 5
         self.assertTrue(FINITECHAT_BIN.exists(), f"missing {FINITECHAT_BIN}")
         self.assertTrue(FINITECHAT_SERVER_BIN.exists(), f"missing {FINITECHAT_SERVER_BIN}")
+        smoke = JsonSmokeReport(
+            "hermes_agent_media_e2e",
+            "FINITE_HERMES_AGENT_MEDIA_E2E_REPORT",
+            DEFAULT_MEDIA_REPORT,
+        )
 
         with tempfile.TemporaryDirectory(prefix="finite-hermes-agent-media-") as tmp_value:
             tmp = Path(tmp_value)
@@ -99,8 +137,11 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     text=True,
                 )
                 try:
+                    started = time.monotonic()
                     wait_for_health(f"{server_url}/health")
-                    await self._run_media_round_trip(tmp, server_url)
+                    smoke.step("server_ready", started)
+                    await self._run_media_round_trip(tmp, server_url, smoke)
+                    smoke.finish()
                 finally:
                     server.terminate()
                     with contextlib.suppress(subprocess.TimeoutExpired):
@@ -108,7 +149,9 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     if server.poll() is None:
                         server.kill()
 
-    async def _run_media_round_trip(self, tmp: Path, server_url: str) -> None:
+    async def _run_media_round_trip(
+        self, tmp: Path, server_url: str, smoke: JsonSmokeReport
+    ) -> None:
         from gateway.config import PlatformConfig
 
         agent_home = tmp / "agent-home"
@@ -118,7 +161,8 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         user_image.write_bytes(b"\x89PNG\r\n\x1a\nfinite-user-image")
         agent_image.write_bytes(b"\x89PNG\r\n\x1a\nfinite-agent-image")
 
-        await asyncio.to_thread(
+        started = time.monotonic()
+        init = await asyncio.to_thread(
             run_json,
             [
                 str(FINITECHAT_BIN),
@@ -130,6 +174,9 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 server_url,
             ],
         )
+        smoke.step("agent_init", started)
+        smoke.fact("agent_npub", init.get("npub"))
+        smoke.fact("server_url", server_url)
         adapter = self._build_adapter(agent_home, PlatformConfig)
         agent_received = asyncio.get_running_loop().create_future()
 
@@ -165,8 +212,12 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             adapter.handle_message = handle_agent_message
 
         with contextlib.redirect_stdout(io.StringIO()):
+            started = time.monotonic()
             connected = await adapter.connect()
+            smoke.step("adapter_connect", started)
         self.assertTrue(connected)
+        smoke.fact("adapter_inbound_stream", bool(getattr(adapter, "inbound_stream", False)))
+        smoke.fact("adapter_service_url_present", bool(getattr(adapter, "service_url", "")))
         try:
             pin_info = await asyncio.to_thread(
                 run_json,
@@ -184,6 +235,7 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     server_url,
                 ],
             )
+            started = time.monotonic()
             joined = await asyncio.to_thread(
                 run_json,
                 [
@@ -203,7 +255,10 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 ],
                 timeout=60,
             )
+            smoke.step("user_join", started)
             room_id = joined["room_id"]
+            smoke.fact("room_id", room_id)
+            started = time.monotonic()
             await asyncio.to_thread(
                 run_json,
                 [
@@ -234,8 +289,11 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 ],
                 timeout=60,
             )
+            smoke.step("user_send_media", started)
 
+            started = time.monotonic()
             received = await asyncio.wait_for(agent_received, timeout=30)
+            smoke.step("agent_receive_media", started)
             self.assertEqual(received["text"], "user media hello")
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
@@ -243,9 +301,11 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 received["agent_media_send_success"], received["agent_media_send_error"]
             )
+            smoke.fact("agent_received_media_types", received["media_types"])
 
             user_received_text: list[str] = []
             user_received_media_count = 0
+            started = time.monotonic()
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 poll = await asyncio.to_thread(
@@ -269,6 +329,9 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     and "agent media echo" in user_received_text
                     and user_received_media_count >= 1
                 ):
+                    smoke.step("user_receive_agent_replies", started)
+                    smoke.fact("user_received_text", user_received_text)
+                    smoke.fact("user_received_media_count", user_received_media_count)
                     return
 
             self.fail(
@@ -290,6 +353,7 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         except TypeError:
@@ -301,6 +365,7 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         return factory(config)

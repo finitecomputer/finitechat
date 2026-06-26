@@ -35,6 +35,15 @@ REQUIRED_SIDECAR_PROOF_LAYERS = {
     "agent reply",
     "user decrypt",
 }
+REQUIRED_MEDIA_E2E_STEPS = {
+    "server_ready",
+    "agent_init",
+    "adapter_connect",
+    "user_join",
+    "user_send_media",
+    "agent_receive_media",
+    "user_receive_agent_replies",
+}
 REQUIRED_TINFOIL_PROOF_LAYERS = {
     "Tinfoil container running",
     "digest-pinned runtime image",
@@ -84,8 +93,20 @@ def list_detail(value: Any) -> str:
     return str(value) if value else ""
 
 
+def step_names(report: dict[str, Any]) -> set[str]:
+    steps = report.get("steps")
+    if not isinstance(steps, list):
+        return set()
+    return {
+        str(step.get("name"))
+        for step in steps
+        if isinstance(step, dict) and isinstance(step.get("name"), str)
+    }
+
+
 def audit(args: argparse.Namespace) -> dict[str, Any]:
     sidecar_path = Path(args.sidecar_report)
+    media_e2e_path = Path(args.media_e2e_report)
     docker_path = Path(args.docker_report)
     github_setup_path = Path(args.github_setup_report)
     github_publish_gate_path = Path(args.github_publish_gate_report)
@@ -96,6 +117,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     tinfoil_result_path = Path(args.tinfoil_result)
 
     sidecar = load_optional_json(sidecar_path)
+    media_e2e = load_optional_json(media_e2e_path)
     docker = load_optional_json(docker_path)
     github_setup = load_optional_json(github_setup_path)
     github_publish_gate = load_optional_json(github_publish_gate_path)
@@ -118,6 +140,36 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         detail=None
         if sidecar and not missing_layers(sidecar, REQUIRED_SIDECAR_PROOF_LAYERS)
         else f"missing layers: {', '.join(missing_layers(sidecar or {}, REQUIRED_SIDECAR_PROOF_LAYERS))}",
+    )
+
+    media_facts = media_e2e.get("facts", {}) if isinstance(media_e2e, dict) else {}
+    media_steps_missing = sorted(REQUIRED_MEDIA_E2E_STEPS - step_names(media_e2e or {}))
+    media_texts = media_facts.get("user_received_text")
+    media_types = media_facts.get("agent_received_media_types")
+    media_passed = (
+        bool(media_e2e)
+        and media_e2e.get("status") == "passed"
+        and not media_steps_missing
+        and media_facts.get("adapter_inbound_stream") is True
+        and media_facts.get("adapter_service_url_present") is True
+        and isinstance(media_types, list)
+        and "image/png" in media_types
+        and isinstance(media_texts, list)
+        and "agent text echo: user media hello" in media_texts
+        and "agent media echo" in media_texts
+        and int(media_facts.get("user_received_media_count") or 0) >= 1
+    )
+    add_check(
+        checks,
+        name="local_hermes_agent_media_e2e",
+        status="passed" if media_passed else "missing",
+        evidence=str(media_e2e_path) if media_e2e else None,
+        detail=None
+        if media_passed
+        else (
+            "requires live hermes-agent media e2e report with sidecar stream, "
+            f"text and image replies, and user decrypt; missing steps: {', '.join(media_steps_missing)}"
+        ),
     )
 
     docker_missing = missing_layers(docker or {}, REQUIRED_DOCKER_PROOF_LAYERS)
@@ -274,6 +326,10 @@ def main() -> int:
     parser.add_argument(
         "--sidecar-report",
         default="target/hermes-sidecar-smoke/report.json",
+    )
+    parser.add_argument(
+        "--media-e2e-report",
+        default="target/hermes-agent-media-e2e/report.json",
     )
     parser.add_argument(
         "--docker-report",
