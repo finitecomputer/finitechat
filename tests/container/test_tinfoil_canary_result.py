@@ -24,6 +24,12 @@ def passing_evidence() -> dict:
             "status": "Running",
             "url": "https://finite-agent-tinfoil-user-canary.finite.containers.tinfoil.dev",
         },
+        "expected": {
+            "container_name": "finite-agent-tinfoil-user-canary",
+            "image_digest": IMAGE_DIGEST,
+            "storage_backend": "s3",
+            "restore_tag": "finite-agent-state",
+        },
         "image": {"digest": IMAGE_DIGEST},
         "storage": {"backend": "s3", "restore_tag": "finite-agent-state"},
         "health": {"ready": True, "npub": "npub1agent"},
@@ -72,7 +78,9 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(report["facts"]["agent_npub_before_restart"], "npub1agent")
         self.assertEqual(report["facts"]["agent_npub_after_restore"], "npub1agent")
         self.assertTrue(report["facts"]["chat_before_restart"])
+        self.assertEqual(report["facts"]["chat_before_message_id"], "event-before")
         self.assertTrue(report["facts"]["chat_after_restart"])
+        self.assertEqual(report["facts"]["chat_after_message_id"], "event-after")
 
     def test_fails_when_restore_does_not_keep_same_npub(self) -> None:
         evidence = passing_evidence()
@@ -94,6 +102,30 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(report["status"], "failed")
         self.assertIn("Finite Chat round trip after restore", report["missing_proof_layers"])
+
+    def test_fails_when_chat_event_id_is_missing(self) -> None:
+        evidence = passing_evidence()
+        evidence["chat"]["before_restart"] = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp_value:
+            result, report = run_result(Path(tmp_value), evidence)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("Finite Chat round trip before restart", report["missing_proof_layers"])
+        self.assertIn("message_id", " ".join(report["errors"]))
+
+    def test_fails_when_runtime_image_does_not_match_expected_handoff(self) -> None:
+        evidence = passing_evidence()
+        evidence["image"]["digest"] = (
+            "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:different"
+        )
+        with tempfile.TemporaryDirectory() as tmp_value:
+            result, report = run_result(Path(tmp_value), evidence)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("digest-pinned runtime image", report["missing_proof_layers"])
+        self.assertIn("expected.image_digest", " ".join(report["errors"]))
 
 
 if __name__ == "__main__":

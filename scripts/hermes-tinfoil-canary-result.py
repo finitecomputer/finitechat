@@ -32,12 +32,12 @@ def nested_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def truthy_evidence(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, dict):
-        return value.get("ok") is True or value.get("passed") is True
-    return False
+def chat_round_trip(value: Any) -> tuple[bool, str | None]:
+    if not isinstance(value, dict):
+        return False, None
+    message_id = non_empty_string(value.get("message_id"))
+    ok = value.get("ok") is True or value.get("passed") is True
+    return bool(ok and message_id), message_id
 
 
 def non_empty_string(value: Any) -> str | None:
@@ -70,6 +70,7 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     container = nested_dict(evidence.get("container"))
     image = nested_dict(evidence.get("image"))
     storage = nested_dict(evidence.get("storage"))
+    expected = nested_dict(evidence.get("expected"))
     health = nested_dict(evidence.get("health"))
     chat = nested_dict(evidence.get("chat"))
     restart_restore = nested_dict(evidence.get("restart_restore"))
@@ -80,37 +81,73 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     image_digest = non_empty_string(image.get("digest"))
     restic_backend = non_empty_string(storage.get("backend"))
     restore_tag = non_empty_string(storage.get("restore_tag"))
+    expected_container_name = non_empty_string(expected.get("container_name"))
+    expected_image_digest = non_empty_string(expected.get("image_digest"))
+    expected_storage_backend = non_empty_string(expected.get("storage_backend"))
+    expected_restore_tag = non_empty_string(expected.get("restore_tag"))
     health_ready = health.get("ready") is True
     health_npub = non_empty_string(health.get("npub"))
     before_npub = non_empty_string(restart_restore.get("npub_before_restart"))
     after_npub = non_empty_string(restart_restore.get("npub_after_restore"))
-    chat_before = truthy_evidence(chat.get("before_restart"))
-    chat_after = truthy_evidence(chat.get("after_restart"))
+    chat_before, chat_before_message_id = chat_round_trip(chat.get("before_restart"))
+    chat_after, chat_after_message_id = chat_round_trip(chat.get("after_restart"))
     backup_observed = restart_restore.get("backup_observed") is True
     restore_observed = restart_restore.get("restore_observed") is True
     same_npub_declared = restart_restore.get("same_npub") is True
     same_npub_observed = bool(before_npub and after_npub and before_npub == after_npub)
+    expected_container_matches = bool(
+        expected_container_name and container_name and expected_container_name == container_name
+    )
+    expected_image_matches = bool(
+        expected_image_digest and image_digest and expected_image_digest == image_digest
+    )
+    expected_storage_matches = bool(
+        expected_storage_backend
+        and restic_backend
+        and expected_storage_backend == restic_backend
+        and expected_restore_tag
+        and restore_tag
+        and expected_restore_tag == restore_tag
+    )
 
     add_layer(
         proof_layers,
         errors,
-        condition=bool(container_name and container_url and container_status == "running"),
+        condition=bool(
+            container_name
+            and container_url
+            and container_status == "running"
+            and expected_container_matches
+        ),
         layer="Tinfoil container running",
-        error="container.name, container.url, and container.status='running' are required",
+        error=(
+            "container.name, container.url, container.status='running', and "
+            "expected.container_name matching container.name are required"
+        ),
     )
     add_layer(
         proof_layers,
         errors,
-        condition=bool(image_digest and "@sha256:" in image_digest),
+        condition=bool(image_digest and "@sha256:" in image_digest and expected_image_matches),
         layer="digest-pinned runtime image",
-        error="image.digest must be a digest-pinned image reference containing @sha256:",
+        error=(
+            "image.digest must be digest-pinned with @sha256: and match "
+            "expected.image_digest from the generated handoff"
+        ),
     )
     add_layer(
         proof_layers,
         errors,
-        condition=restic_backend == "s3" and restore_tag == "finite-agent-state",
+        condition=(
+            restic_backend == "s3"
+            and restore_tag == "finite-agent-state"
+            and expected_storage_matches
+        ),
         layer="S3 restic repository",
-        error="storage.backend must be 's3' and storage.restore_tag must be 'finite-agent-state'",
+        error=(
+            "storage.backend must be 's3', storage.restore_tag must be "
+            "'finite-agent-state', and both must match expected storage values"
+        ),
     )
     add_layer(
         proof_layers,
@@ -131,7 +168,7 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         errors,
         condition=chat_before,
         layer="Finite Chat round trip before restart",
-        error="chat.before_restart must be true or {ok: true}",
+        error="chat.before_restart must be {ok: true, message_id: '<event-id>'}",
     )
     add_layer(
         proof_layers,
@@ -162,7 +199,7 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         errors,
         condition=chat_after,
         layer="Finite Chat round trip after restore",
-        error="chat.after_restart must be true or {ok: true}",
+        error="chat.after_restart must be {ok: true, message_id: '<event-id>'}",
     )
 
     status = "passed" if not errors else "failed"
@@ -180,12 +217,18 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "image_digest": image_digest,
             "restic_backend": restic_backend,
             "restore_tag": restore_tag,
+            "expected_container_name": expected_container_name,
+            "expected_image_digest": expected_image_digest,
+            "expected_storage_backend": expected_storage_backend,
+            "expected_restore_tag": expected_restore_tag,
             "health_ready": health_ready,
             "health_npub": health_npub,
             "agent_npub_before_restart": before_npub,
             "agent_npub_after_restore": after_npub,
             "chat_before_restart": chat_before,
+            "chat_before_message_id": chat_before_message_id,
             "chat_after_restart": chat_after,
+            "chat_after_message_id": chat_after_message_id,
             "backup_observed": backup_observed,
             "restore_observed": restore_observed,
             "same_npub": same_npub_declared and same_npub_observed,

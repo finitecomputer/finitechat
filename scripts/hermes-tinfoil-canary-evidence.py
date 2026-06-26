@@ -42,6 +42,13 @@ def object_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def source_artifact(path: str | None) -> dict[str, Any]:
+    return {
+        "path": path,
+        "present": bool(path and Path(path).exists()),
+    }
+
+
 def container_from_json(container: dict[str, Any]) -> dict[str, str | None]:
     return {
         "name": first_string(container.get("name"), container.get("container_name")),
@@ -64,6 +71,8 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
     handoff_restore = object_dict(handoff.get("restore"))
     summary_container_name = canary_summary.get("container_name")
     summary_image_digest = canary_summary.get("image_digest")
+    summary_config_repo = canary_summary.get("config_repo")
+    summary_release_tag = canary_summary.get("release_tag")
     container = container_from_json(container_json)
     health_ready = (
         args.health_ready if args.health_ready is not None else first_bool(health_json.get("ready"))
@@ -71,6 +80,10 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
     health_npub = first_string(args.health_npub, health_json.get("npub"))
     npub_before = first_string(args.npub_before_restart, health_npub)
     npub_after = first_string(args.npub_after_restore, health_npub)
+    expected_container_name = first_string(summary_container_name)
+    expected_image_digest = first_string(summary_image_digest, handoff_image.get("digest"))
+    expected_storage_backend = first_string(handoff_restore.get("backend"))
+    expected_restore_tag = first_string(handoff_restore.get("restore_tag"))
     evidence = {
         "generated_at_unix": int(time.time()),
         "sources": {
@@ -78,6 +91,20 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
             "canary_summary": args.canary_summary,
             "container_json": args.container_json,
             "health_json": args.health_json,
+        },
+        "source_artifacts": {
+            "handoff_report": source_artifact(args.handoff_report),
+            "canary_summary": source_artifact(args.canary_summary),
+            "container_json": source_artifact(args.container_json),
+            "health_json": source_artifact(args.health_json),
+        },
+        "expected": {
+            "container_name": expected_container_name,
+            "image_digest": expected_image_digest,
+            "storage_backend": expected_storage_backend,
+            "restore_tag": expected_restore_tag,
+            "config_repo": first_string(summary_config_repo),
+            "release_tag": first_string(summary_release_tag),
         },
         "container": {
             "name": first_string(args.container_name, container["name"], summary_container_name),

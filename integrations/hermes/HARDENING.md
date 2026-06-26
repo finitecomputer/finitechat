@@ -347,17 +347,20 @@ Tinfoil canary runbook draft:
    `FINITECHAT_HERMES_INBOUND_STREAM=1`, and AWS-style object-storage secrets.
 6. Start from empty local disk, let the runtime entrypoint restore the latest
    restic snapshot tagged `finite-agent-state`, print invite URL/PIN, chat once
-   from Finite Chat, stop cleanly so the entrypoint writes a fresh backup,
-   restart the container, restore latest by tag again, verify the same npub, and
-   chat again.
+   from Finite Chat and record the event ID, stop cleanly so the entrypoint
+   writes a fresh backup, restart the container, restore latest by tag again,
+   verify the same npub, and chat again with a second recorded event ID.
 7. Write those observations to
    `target/hermes-docker-smoke/tinfoil-canary/container.json` and
    `target/hermes-docker-smoke/tinfoil-canary/health.json`, then build
    `target/hermes-docker-smoke/tinfoil-canary-evidence.json` with
    `scripts/hermes-tinfoil-canary-evidence.py`. Then run
    `scripts/hermes-tinfoil-canary-result.py --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json --report target/hermes-docker-smoke/tinfoil-canary-result.json`.
-   The validator must pass before `scripts/hermes-hardening-audit.py
-   --require-complete` can pass.
+   The evidence builder records the generated handoff/config expectations for
+   container name, image digest, storage backend, and restore tag. The validator
+   must pass before `scripts/hermes-hardening-audit.py --require-complete` can
+   pass, and it rejects mismatched expectations or chat claims without concrete
+   event IDs.
 8. Treat `FINITE_AGENT_RESTIC_PASSWORD` as a temporary canary secret, not the
    production privacy posture. Tinfoil documents that container secrets are not
    public in the repo/dashboard, but are visible to Tinfoil infrastructure. The
@@ -395,7 +398,9 @@ Tinfoil canary runbook draft:
   the first place chat correctness is discovered.
 - Live Tinfoil canary evidence must be normalized by
   `scripts/hermes-tinfoil-canary-result.py`; a hand-written
-  `{"status":"passed"}` result is not enough.
+  `{"status":"passed"}` result is not enough. The normalized result must match
+  the generated handoff expectations and include concrete before/after chat
+  event IDs.
 - The hardening audit must report `complete` before this track is considered
   done. Local-only smoke evidence is not enough to satisfy the Tinfoil objective.
 

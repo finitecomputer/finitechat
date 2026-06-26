@@ -32,7 +32,15 @@ def run_evidence(tmp: Path) -> tuple[subprocess.CompletedProcess[str], dict]:
             "restore": {"backend": "s3", "restore_tag": "finite-agent-state"},
         },
     )
-    write_json(summary, {"container_name": "finite-agent-tinfoil-user-canary"})
+    write_json(
+        summary,
+        {
+            "container_name": "finite-agent-tinfoil-user-canary",
+            "image_digest": IMAGE_DIGEST,
+            "config_repo": "finitecomputer/tinfoil-agent-runtime-canary",
+            "release_tag": "v0.1.0",
+        },
+    )
     write_json(
         container,
         {
@@ -92,6 +100,8 @@ class TinfoilCanaryEvidenceTest(unittest.TestCase):
         self.assertEqual(validation.returncode, 0)
         self.assertEqual(report["status"], "passed")
         self.assertEqual(evidence["container"]["name"], "finite-agent-tinfoil-user-canary")
+        self.assertTrue(evidence["source_artifacts"]["handoff_report"]["present"])
+        self.assertEqual(evidence["expected"]["container_name"], "finite-agent-tinfoil-user-canary")
         self.assertEqual(evidence["image"]["digest"], IMAGE_DIGEST)
         self.assertTrue(evidence["restart_restore"]["same_npub"])
 

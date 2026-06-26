@@ -106,6 +106,9 @@ class TinfoilCanaryArtifactsTest(unittest.TestCase):
         self.assertIn("scripts/hermes-tinfoil-canary-evidence.py", runbook)
         self.assertIn("scripts/hermes-tinfoil-canary-result.py", runbook)
         self.assertIn("tinfoil-canary-evidence.json", runbook)
+        self.assertIn('"expected": {', runbook)
+        self.assertIn('"storage_backend": "s3"', runbook)
+        self.assertIn("event ID is recorded", runbook)
         self.assertIn("visible to Tinfoil infrastructure", runbook)
 
     def test_refuses_failed_handoff(self) -> None:
