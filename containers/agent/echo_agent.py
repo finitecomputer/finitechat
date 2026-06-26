@@ -161,9 +161,24 @@ async def main() -> None:
     async def echo_handler(event):
         text = getattr(event, "text", "") or ""
         chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        message_type = str(getattr(event, "message_type", "")).split(".")[-1].lower()
+        media_types = list(getattr(event, "media_types", []) or [])
         if not chat_id:
             return None
-        logger.info("inbound from %s: %r", chat_id, text)
+        logger.info(
+            "inbound from %s type=%s media_types=%s: %r",
+            chat_id,
+            message_type,
+            media_types,
+            text,
+        )
+        print(
+            "ECHO_AGENT_INBOUND "
+            f"message_type={message_type} "
+            f"media_types={','.join(media_types)} "
+            f"text={text}",
+            flush=True,
+        )
         result = await adapter.send(chat_id, f"echo: {text}")
         logger.info("echo sent: %s", result)
         return None

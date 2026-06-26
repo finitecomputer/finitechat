@@ -68,6 +68,7 @@ scripts/hermes-adapter-regression-report.py
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
 scripts/ios-hermes-agent-media-e2e.sh
+scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
 The adapter regression command writes
@@ -91,6 +92,12 @@ the Hermes text and image replies. It requires a booted simulator or
 The physical-device variant is `scripts/ios-device-hermes-agent-media-e2e.sh`;
 it writes `target/ios-device-hermes-agent-media-e2e/report.json` after pulling
 the app's store from an installed, unlocked phone.
+The Docker runtime iOS E2E writes
+`target/ios-hermes-docker-runtime-e2e/report.json`, builds the real runtime
+image, starts the echo agent in Docker, rewrites the invite server URL for the
+iOS Simulator, sends an encrypted image message from the native app, proves the
+runtime received it as media, and verifies the app decrypts the runtime reply.
+It requires Docker plus a booted simulator or `IOS_SIMULATOR_UDID`.
 
 Validate the restic backup environment before the longer Docker smoke:
 
@@ -115,6 +122,9 @@ encrypted restic repository, checks the repository, wipes the local agent
 volume, starts a fresh container whose entrypoint restores the latest tagged
 snapshot before the agent process starts, verifies the same npub, verifies the
 runtime `/healthz` endpoint, and chats again in the same room.
+The separate `scripts/ios-hermes-docker-runtime-e2e.sh` smoke covers the native
+iOS client against that real runtime image. The hardening audit treats CLI-only
+Docker evidence as incomplete for the full Docker acceptance bar.
 By default the restic repo is a local bind mount under
 `target/hermes-docker-smoke/restic-repo`. To run the same smoke against
 S3-compatible storage such as Latitude, provide an isolated repository prefix

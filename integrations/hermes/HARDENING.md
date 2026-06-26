@@ -165,6 +165,7 @@ scripts/hermes-adapter-regression-report.py
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
 scripts/ios-hermes-agent-media-e2e.sh
+scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
 They write `target/hermes-adapter-regressions/report.json`,
@@ -173,13 +174,17 @@ They write `target/hermes-adapter-regressions/report.json`,
 The iOS Simulator script writes
 `target/ios-hermes-agent-media-e2e/report.json`; it requires a booted
 simulator or `IOS_SIMULATOR_UDID`.
+The Docker runtime iOS script writes
+`target/ios-hermes-docker-runtime-e2e/report.json`; it requires Docker plus a
+booted simulator or `IOS_SIMULATOR_UDID`.
 Together they prove finitechat-server, `finitechat hermes` CLI, encrypted
 client stores, `finitechat hermes serve`, `/v1/hermes/inbound` NDJSON,
 ack/drain, adapter redelivery/ack/fallback/filter/group/receipt regressions,
 agent reply, Hermes adapter media materialization through the real
 `hermes-agent` package, native iOS app join/send/decrypt, agent text and image
-replies, and user decrypt. This is the local baseline future Docker and Tinfoil
-smokes should match or explain.
+replies, real Docker runtime image pairing with native iOS, runtime receipt of
+iOS media, runtime reply decrypt in the app, and user decrypt. This is the
+local baseline future Docker and Tinfoil smokes should match or explain.
 
 ### Phase 5: Prove The Real Runtime Image In Docker
 
@@ -199,6 +204,7 @@ Current Docker smoke:
 ```bash
 scripts/hermes-restic-preflight.py --report target/hermes-docker-smoke/restic-preflight.json
 scripts/hermes-sidecar-docker-smoke.sh
+scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
 It builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts the
@@ -211,6 +217,11 @@ latest-by-tag snapshot restore into a fresh volume/container, same agent npub,
 same room, runtime `/healthz`, and a second encrypted echo round trip. Both
 backup and restore are performed by the runtime image entrypoint, which matches
 the future Tinfoil empty-disk startup and controlled-restart shape.
+The iOS Docker runtime smoke builds the same runtime image, starts the agent in
+Docker, rewrites the invite server URL for the iOS Simulator, sends encrypted
+image media from the native app, waits for the runtime agent to log media
+receipt, and verifies the app decrypts the runtime echo reply. This closes the
+gap between Docker CLI acceptance and the product client humans will use.
 The smoke defaults to a local bind-mounted restic repository for CI, and can
 point the same restic contract at S3-compatible object storage with
 `FINITE_DOCKER_RESTIC_BACKEND=s3` plus
@@ -392,7 +403,7 @@ Tinfoil canary runbook draft:
   client stores.
 - iOS simulator tests prove the native client can decrypt agent replies.
 - Docker tests prove the packaged runtime has the right Hermes version,
-  plugin layout, binaries, env, and state directories.
+  plugin layout, binaries, env, state directories, and native iOS chat path.
 - Restart/restore tests wipe local container state, restore encrypted backup,
   and chat again using the same invite room.
 - Tinfoil canary is last. It should validate TEE/container integration, not be

@@ -25,6 +25,18 @@ REQUIRED_DOCKER_PROOF_LAYERS = {
     "runtime HTTP health endpoint after restore",
     "E2EE echo round trip after restore",
 }
+REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS = {
+    "docker image build",
+    "hermes-agent 0.17 runtime",
+    "finitechat binary in image",
+    "finite-platform plugin in image",
+    "finitechat-server on host",
+    "real Docker runtime agent container",
+    "iOS Simulator app joins runtime invite",
+    "iOS sends encrypted media message",
+    "runtime agent receives iOS media",
+    "iOS decrypts runtime agent reply",
+}
 REQUIRED_SIDECAR_PROOF_LAYERS = {
     "finitechat-server",
     "finitechat hermes CLI",
@@ -67,6 +79,15 @@ REQUIRED_IOS_MEDIA_E2E_STEPS = {
     "ios_app_launch",
     "agent_receive_ios_media",
     "ios_receive_agent_replies",
+}
+REQUIRED_DOCKER_IOS_RUNTIME_STEPS = {
+    "host_server_ready",
+    "docker_image_build",
+    "agent_container_start",
+    "agent_ready_log",
+    "ios_app_launch",
+    "agent_receive_ios_media",
+    "ios_receive_runtime_reply",
 }
 REQUIRED_TINFOIL_PROOF_LAYERS = {
     "Tinfoil container running",
@@ -134,6 +155,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     media_e2e_path = Path(args.media_e2e_report)
     ios_media_e2e_path = Path(args.ios_media_e2e_report)
     docker_path = Path(args.docker_report)
+    docker_ios_path = Path(args.docker_ios_report)
     github_setup_path = Path(args.github_setup_report)
     github_publish_gate_path = Path(args.github_publish_gate_report)
     preflight_path = Path(args.preflight_report)
@@ -147,6 +169,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     media_e2e = load_optional_json(media_e2e_path)
     ios_media_e2e = load_optional_json(ios_media_e2e_path)
     docker = load_optional_json(docker_path)
+    docker_ios = load_optional_json(docker_ios_path)
     github_setup = load_optional_json(github_setup_path)
     github_publish_gate = load_optional_json(github_publish_gate_path)
     preflight = load_optional_json(preflight_path)
@@ -269,6 +292,51 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         detail=None if docker_passed else f"missing layers: {', '.join(docker_missing)}",
     )
     s3_smoke = docker_passed and docker_facts.get("restic_backend") == "s3"
+
+    docker_ios_missing = missing_layers(docker_ios or {}, REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS)
+    docker_ios_facts = docker_ios.get("facts", {}) if isinstance(docker_ios, dict) else {}
+    docker_ios_steps_missing = sorted(
+        REQUIRED_DOCKER_IOS_RUNTIME_STEPS - step_names(docker_ios or {})
+    )
+    docker_ios_texts = docker_ios_facts.get("ios_received_text")
+    docker_ios_media_types = docker_ios_facts.get("agent_received_media_types")
+    docker_ios_health = (
+        docker_ios_facts.get("runtime_health")
+        if isinstance(docker_ios_facts.get("runtime_health"), dict)
+        else {}
+    )
+    docker_ios_passed = (
+        bool(docker_ios)
+        and docker_ios.get("status") == "passed"
+        and docker_ios.get("name") == "ios_simulator_docker_runtime_e2e"
+        and not docker_ios_missing
+        and not docker_ios_steps_missing
+        and docker_ios_facts.get("platform") == "ios_simulator"
+        and bool(docker_ios_facts.get("simulator_udid"))
+        and docker_ios_facts.get("hermes_agent_version_actual") == "0.17.0"
+        and docker_ios_facts.get("agent_received_message_type") == "photo"
+        and isinstance(docker_ios_media_types, list)
+        and "image/png" in docker_ios_media_types
+        and docker_ios_facts.get("invite_rewritten_for_ios") is True
+        and docker_ios_health.get("ready") is True
+        and docker_ios_health.get("npub") == docker_ios_facts.get("agent_npub")
+        and isinstance(docker_ios_texts, list)
+        and "echo: ios docker runtime hello" in docker_ios_texts
+    )
+    add_check(
+        checks,
+        name="docker_runtime_ios_e2e",
+        status="passed" if docker_ios_passed else "missing",
+        evidence=str(docker_ios_path) if docker_ios else None,
+        detail=None
+        if docker_ios_passed
+        else (
+            "requires iOS Simulator smoke against the real Docker runtime image "
+            "with native join, encrypted media send, runtime media receipt, and "
+            "iOS decrypt of runtime reply; missing layers: "
+            f"{', '.join(docker_ios_missing)}; missing steps: {', '.join(docker_ios_steps_missing)}"
+        ),
+    )
 
     github_setup_ready = (
         bool(github_setup)
@@ -421,6 +489,10 @@ def main() -> int:
     parser.add_argument(
         "--docker-report",
         default="target/hermes-docker-smoke/report.json",
+    )
+    parser.add_argument(
+        "--docker-ios-report",
+        default="target/ios-hermes-docker-runtime-e2e/report.json",
     )
     parser.add_argument(
         "--github-setup-report",
