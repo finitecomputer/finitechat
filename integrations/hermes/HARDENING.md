@@ -237,7 +237,12 @@ credentials, but the audit marks it separately as `docker_runtime_s3_emulator_sm
 and still requires a non-emulated S3 report for the actual Latitude/GitHub gate.
 The restic preflight fails before the image build when S3 env is incomplete,
 requires an explicit user-owned password for remote repos, and writes a JSON
-report that is uploaded alongside the Docker smoke report.
+report that is uploaded alongside the Docker smoke report. The hardening audit
+does not accept a status-only S3/preflight report: the Docker report must show
+the entrypoint-created encrypted restic backup, matching repository metadata,
+a latest-tagged snapshot for `/data/agent`, and a non-emulated S3 backend; the
+preflight report must show the derived `s3:` repository plus required password
+and AWS credential env presence.
 For local S3 runs, `scripts/hermes-sidecar-docker-smoke.sh` sources `.env` when
 present, promotes `FINITE_DOCKER_RESTIC_AWS_*` values to the `AWS_*` names used
 by restic, falls back to the standard AWS shared credentials/config profile
@@ -276,9 +281,10 @@ Current CI shape:
   `target/hermes-docker-smoke/restic-preflight.json`, plus the local encrypted
   restic repository when the default local backend is used. The report includes
   the local Docker image ID, image metadata, restic backend, restic snapshot
-  metadata, and repository metadata for the image it proved. This is the current
-  release-gate stand-in. Before generating the combined hardening audit, the
-  Docker job downloads the sidecar smoke artifact from the Rust/Hermes job so
+  metadata, repository metadata, encrypted backup flag, snapshot tag, and
+  backup source for the image it proved. This is the current release-gate
+  stand-in. Before generating the combined hardening audit, the Docker job
+  downloads the sidecar smoke artifact from the Rust/Hermes job so
   `target/hermes-hardening-audit.json` reflects the full CI evidence chain
   instead of only the files produced inside the Docker job.
 - Manual workflow dispatch with `publish_runtime_image=true` runs the Docker

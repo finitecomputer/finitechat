@@ -14,6 +14,9 @@ IMAGE_ID = "sha256:local-image"
 IMAGE_REF = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
 RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/hermes"
+EMULATOR_RESTIC_REPOSITORY = (
+    "s3:http://127.0.0.1:39000/finite-hermes-runtime-smoke/hermes-docker-smoke"
+)
 SNAPSHOT_ID = "88929f1f90c5fcadd1d19e33f26609e595af4c2afb1e72b724695435e051900f"
 CONFIG_REPO = "finitecomputer/tinfoil-agent-runtime-canary"
 RELEASE_TAG = "v0.1.0"
@@ -168,7 +171,50 @@ def ios_media_e2e_report() -> dict:
     }
 
 
-def docker_report(restic_backend: str = "s3") -> dict:
+def restic_repository_report(
+    restic_backend: str = "s3",
+    *,
+    repository: str = RESTIC_REPOSITORY,
+) -> dict:
+    if restic_backend == "local":
+        return {
+            "kind": "local",
+            "path": "/tmp/finite-hermes-restic-repo",
+            "size_bytes": 55149,
+        }
+    return {
+        "kind": "s3",
+        "repository": repository,
+        "size_bytes": None,
+    }
+
+
+def agent_state_backup_report(
+    restic_backend: str = "s3",
+    *,
+    repository: str = RESTIC_REPOSITORY,
+) -> dict:
+    return {
+        "backend": "restic",
+        "repository": restic_repository_report(restic_backend, repository=repository),
+        "snapshot": {
+            "id": SNAPSHOT_ID,
+            "short_id": "88929f1f",
+            "time": "2026-06-26T02:26:14Z",
+            "paths": ["/data/agent"],
+            "tags": ["finite-agent-state"],
+        },
+        "tag": "finite-agent-state",
+        "encrypted": True,
+        "source": "entrypoint_backup_on_exit",
+    }
+
+
+def docker_report(
+    restic_backend: str = "s3",
+    *,
+    repository: str = RESTIC_REPOSITORY,
+) -> dict:
     return {
         "status": "passed",
         "proof_layers": DOCKER_LAYERS,
@@ -177,16 +223,23 @@ def docker_report(restic_backend: str = "s3") -> dict:
             "image_id": IMAGE_ID,
             "restic_version": "restic 0.18.0 compiled with go1.24.4 on linux/arm64",
             "restic_backend": restic_backend,
+            "restic_repository": restic_repository_report(
+                restic_backend,
+                repository=repository,
+            ),
             "hermes_agent_version_actual": "0.17.0",
             "agent_npub": "npub1agent",
             "agent_npub_after_restore": "npub1agent",
-            "agent_state_backup": {"source": "entrypoint_backup_on_exit"},
+            "agent_state_backup": agent_state_backup_report(
+                restic_backend,
+                repository=repository,
+            ),
         },
     }
 
 
 def s3_emulator_report() -> dict:
-    report = docker_report(restic_backend="s3")
+    report = docker_report(restic_backend="s3", repository=EMULATOR_RESTIC_REPOSITORY)
     report["facts"]["s3_endpoint_kind"] = "local_emulator"
     report["facts"]["s3_emulator"] = {
         "endpoint": "http://127.0.0.1:39000",
@@ -301,6 +354,29 @@ def publish_report(restic_backend: str = "s3") -> dict:
             "agent_npub_after_restore": "npub1agent",
             "restic_backend": restic_backend,
         },
+    }
+
+
+def s3_preflight_report() -> dict:
+    return {
+        "status": "ok",
+        "backend": "s3",
+        "repository": RESTIC_REPOSITORY,
+        "env": {
+            "FINITE_DOCKER_RESTIC_BACKEND": True,
+            "FINITE_DOCKER_RESTIC_REPOSITORY": True,
+            "FINITE_DOCKER_RESTIC_PASSWORD": True,
+            "AWS_ACCESS_KEY_ID": True,
+            "AWS_SECRET_ACCESS_KEY": True,
+            "AWS_SESSION_TOKEN": False,
+            "AWS_REGION": True,
+            "AWS_DEFAULT_REGION": False,
+            "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": True,
+            "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY": True,
+            "FINITE_LATITUDE_STORAGE_BUCKET": False,
+        },
+        "warnings": [],
+        "errors": [],
     }
 
 
@@ -450,6 +526,31 @@ def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
     return result.returncode, json.loads((tmp / "audit.json").read_text(encoding="utf-8"))
 
 
+def write_complete_audit_inputs(
+    tmp: Path,
+    *,
+    docker: dict | None = None,
+    preflight: dict | None = None,
+) -> None:
+    write_json(tmp / "adapter-regressions.json", adapter_regression_report())
+    write_json(tmp / "sidecar.json", sidecar_report())
+    write_json(tmp / "media-e2e.json", media_e2e_report())
+    write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+    write_json(tmp / "docker.json", docker if docker is not None else docker_report())
+    write_json(tmp / "docker-ios.json", docker_ios_report())
+    write_json(tmp / "s3-emulator.json", s3_emulator_report())
+    write_json(tmp / "github-setup.json", {"status": "ready"})
+    write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
+    write_json(
+        tmp / "preflight.json",
+        preflight if preflight is not None else s3_preflight_report(),
+    )
+    write_json(tmp / "publish.json", publish_report())
+    write_json(tmp / "handoff.json", handoff_report())
+    write_canary_artifacts(tmp)
+    write_json(tmp / "tinfoil-result.json", tinfoil_result())
+
+
 class HardeningAuditTest(unittest.TestCase):
     def test_audit_marks_local_only_smoke_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
@@ -475,25 +576,63 @@ class HardeningAuditTest(unittest.TestCase):
     def test_audit_marks_complete_evidence_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
-            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
-            write_json(tmp / "sidecar.json", sidecar_report())
-            write_json(tmp / "media-e2e.json", media_e2e_report())
-            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
-            write_json(tmp / "docker.json", docker_report())
-            write_json(tmp / "docker-ios.json", docker_ios_report())
-            write_json(tmp / "s3-emulator.json", s3_emulator_report())
-            write_json(tmp / "github-setup.json", {"status": "ready"})
-            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(tmp / "publish.json", publish_report())
-            write_json(tmp / "handoff.json", handoff_report())
-            write_canary_artifacts(tmp)
-            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            write_complete_audit_inputs(tmp)
             status, audit = run_audit(tmp, require_complete=True)
 
         self.assertEqual(status, 0)
         self.assertEqual(audit["status"], "complete")
         self.assertEqual(audit["missing"], [])
+
+    def test_audit_rejects_s3_preflight_status_without_repository_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_complete_audit_inputs(tmp, preflight={"status": "ok", "backend": "s3"})
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertIn("s3_restic_preflight", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("repository", details["s3_restic_preflight"])
+
+    def test_audit_rejects_s3_smoke_without_snapshot_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            docker = docker_report()
+            del docker["facts"]["agent_state_backup"]["snapshot"]
+            write_complete_audit_inputs(tmp, docker=docker)
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertIn("docker_runtime_local_or_s3_smoke", audit["missing"])
+        self.assertIn("docker_runtime_s3_smoke", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("agent_state_backup.snapshot", details["docker_runtime_s3_smoke"])
+
+    def test_audit_rejects_s3_smoke_without_repository_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            docker = docker_report()
+            del docker["facts"]["restic_repository"]
+            write_complete_audit_inputs(tmp, docker=docker)
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertIn("docker_runtime_s3_smoke", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("restic_repository", details["docker_runtime_s3_smoke"])
+
+    def test_audit_rejects_unencrypted_s3_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            docker = docker_report()
+            docker["facts"]["agent_state_backup"]["encrypted"] = False
+            write_complete_audit_inputs(tmp, docker=docker)
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertIn("docker_runtime_s3_smoke", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("encrypted", details["docker_runtime_s3_smoke"])
 
     def test_audit_rejects_unvalidated_tinfoil_success_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
@@ -507,7 +646,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
@@ -530,7 +669,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
@@ -555,7 +694,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(
                 tmp / "publish.json",
                 {
@@ -588,7 +727,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", {"status": "ready"})
             write_canary_artifacts(tmp)
@@ -613,7 +752,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_json(tmp / "canary-summary.json", {"status": "ready"})
@@ -675,7 +814,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
@@ -702,7 +841,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
@@ -733,7 +872,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
@@ -756,7 +895,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "s3-emulator.json", s3_emulator_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
-            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "preflight.json", s3_preflight_report())
             write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)

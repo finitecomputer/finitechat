@@ -152,6 +152,8 @@ REQUIRED_PUBLISH_PROOF = {
     "hermes_agent_version_actual": "0.17.0",
     "restic_backend": "s3",
 }
+RESTIC_SNAPSHOT_TAG = "finite-agent-state"
+RESTIC_AGENT_STATE_PATH = "/data/agent"
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -338,6 +340,171 @@ def validate_github_publish_gate(github_publish_gate: dict[str, Any] | None) -> 
     )
     if missing_copied:
         errors.append(f"publish-gate artifact_ingest copied missing: {', '.join(missing_copied)}")
+    return errors
+
+
+def validate_restic_repository(
+    value: Any,
+    *,
+    expected_kind: str | None = None,
+    label: str,
+    require_local_size: bool = True,
+) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{label} is required"]
+
+    errors: list[str] = []
+    kind = value.get("kind")
+    if expected_kind and kind != expected_kind:
+        errors.append(f"{label}.kind={kind!r}; expected {expected_kind!r}")
+    elif not expected_kind and kind not in {"local", "s3"}:
+        errors.append(f"{label}.kind={kind!r}; expected 'local' or 's3'")
+
+    if kind == "s3":
+        repository = value.get("repository")
+        if not non_empty_str(repository) or not str(repository).startswith("s3:"):
+            errors.append(f"{label}.repository must be an s3: URL")
+    elif kind == "local":
+        if not non_empty_str(value.get("path")):
+            errors.append(f"{label}.path is required for local restic repositories")
+        size_bytes = value.get("size_bytes")
+        if require_local_size and (not isinstance(size_bytes, int) or size_bytes <= 0):
+            errors.append(f"{label}.size_bytes must be a positive integer")
+        elif not require_local_size and size_bytes is not None and not isinstance(size_bytes, int):
+            errors.append(f"{label}.size_bytes must be an integer when present")
+
+    return errors
+
+
+def restic_repository_identity(value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("kind")
+    if kind == "s3" and non_empty_str(value.get("repository")):
+        return ("s3", str(value["repository"]))
+    if kind == "local" and non_empty_str(value.get("path")):
+        return ("local", str(value["path"]))
+    return None
+
+
+def validate_restic_snapshot(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, dict):
+        return [f"{label} is required"]
+
+    errors: list[str] = []
+    for key in ("id", "short_id", "time"):
+        if not non_empty_str(value.get(key)):
+            errors.append(f"{label}.{key} is required")
+
+    paths = value.get("paths")
+    if not isinstance(paths, list) or RESTIC_AGENT_STATE_PATH not in {str(item) for item in paths}:
+        errors.append(f"{label}.paths must include {RESTIC_AGENT_STATE_PATH}")
+
+    tags = value.get("tags")
+    if not isinstance(tags, list) or RESTIC_SNAPSHOT_TAG not in {str(item) for item in tags}:
+        errors.append(f"{label}.tags must include {RESTIC_SNAPSHOT_TAG}")
+
+    return errors
+
+
+def validate_agent_state_backup(
+    facts: dict[str, Any],
+    *,
+    expected_repository_kind: str | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    restic_backend = facts.get("restic_backend")
+    if restic_backend not in {"local", "s3"}:
+        errors.append(f"restic_backend={restic_backend!r}; expected 'local' or 's3'")
+
+    backup = facts.get("agent_state_backup")
+    if not isinstance(backup, dict):
+        return [*errors, "agent_state_backup is required"]
+
+    if backup.get("backend") != "restic":
+        errors.append(f"agent_state_backup.backend={backup.get('backend')!r}; expected 'restic'")
+    if backup.get("source") != "entrypoint_backup_on_exit":
+        errors.append("agent_state_backup.source must be 'entrypoint_backup_on_exit'")
+    if backup.get("encrypted") is not True:
+        errors.append("agent_state_backup.encrypted must be true")
+    if backup.get("tag") != RESTIC_SNAPSHOT_TAG:
+        errors.append(
+            f"agent_state_backup.tag={backup.get('tag')!r}; expected {RESTIC_SNAPSHOT_TAG!r}"
+        )
+    if not non_empty_str(facts.get("restic_version")):
+        errors.append("restic_version is required")
+
+    repository_kind = expected_repository_kind or (
+        str(restic_backend) if restic_backend in {"local", "s3"} else None
+    )
+    errors.extend(
+        validate_restic_repository(
+            backup.get("repository"),
+            expected_kind=repository_kind,
+            label="agent_state_backup.repository",
+        )
+    )
+    errors.extend(
+        validate_restic_snapshot(backup.get("snapshot"), label="agent_state_backup.snapshot")
+    )
+
+    top_level_repository = facts.get("restic_repository")
+    errors.extend(
+        validate_restic_repository(
+            top_level_repository,
+            expected_kind=repository_kind,
+            label="restic_repository",
+            require_local_size=False,
+        )
+    )
+    backup_identity = restic_repository_identity(backup.get("repository"))
+    top_level_identity = restic_repository_identity(top_level_repository)
+    if backup_identity and top_level_identity and backup_identity != top_level_identity:
+        errors.append("agent_state_backup.repository does not match restic_repository")
+
+    return errors
+
+
+def validate_real_s3_smoke_facts(facts: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if facts.get("restic_backend") != "s3":
+        errors.append(f"restic_backend={facts.get('restic_backend')!r}; expected 's3'")
+    if facts.get("s3_endpoint_kind") == "local_emulator":
+        errors.append("s3_endpoint_kind='local_emulator'; expected real S3")
+    errors.extend(validate_agent_state_backup(facts, expected_repository_kind="s3"))
+    return errors
+
+
+def validate_s3_preflight(preflight: dict[str, Any] | None) -> list[str]:
+    if not preflight:
+        return ["requires S3 restic preflight report"]
+
+    errors: list[str] = []
+    if preflight.get("status") != "ok":
+        errors.append(f"preflight status={preflight.get('status')!r}; expected 'ok'")
+    if preflight.get("backend") != "s3":
+        errors.append(f"preflight backend={preflight.get('backend')!r}; expected 's3'")
+    repository = preflight.get("repository")
+    if not non_empty_str(repository) or not str(repository).startswith("s3:"):
+        errors.append("preflight repository must be an s3: URL")
+
+    report_errors = preflight.get("errors")
+    if isinstance(report_errors, list) and report_errors:
+        errors.append(f"preflight errors: {', '.join(str(item) for item in report_errors)}")
+
+    env = preflight.get("env")
+    if not isinstance(env, dict):
+        errors.append("preflight env is required")
+    else:
+        for key in (
+            "FINITE_DOCKER_RESTIC_REPOSITORY",
+            "FINITE_DOCKER_RESTIC_PASSWORD",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ):
+            if env.get(key) is not True:
+                errors.append(f"preflight env.{key} must be true")
+
     return errors
 
 
@@ -640,27 +807,30 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 
     docker_missing = missing_layers(docker or {}, REQUIRED_DOCKER_PROOF_LAYERS)
     docker_facts = docker.get("facts", {}) if isinstance(docker, dict) else {}
+    docker_backup_errors = validate_agent_state_backup(docker_facts)
     docker_passed = (
         bool(docker)
         and docker.get("status") == "passed"
         and not docker_missing
+        and not docker_backup_errors
         and docker_facts.get("hermes_agent_version_actual") == "0.17.0"
         and docker_facts.get("agent_npub") == docker_facts.get("agent_npub_after_restore")
-        and docker_facts.get("agent_state_backup", {}).get("source") == "entrypoint_backup_on_exit"
     )
     add_check(
         checks,
         name="docker_runtime_local_or_s3_smoke",
         status="passed" if docker_passed else "missing",
         evidence=str(docker_path) if docker else None,
-        detail=None if docker_passed else f"missing layers: {', '.join(docker_missing)}",
+        detail=None
+        if docker_passed
+        else (
+            f"missing layers: {', '.join(docker_missing)}; "
+            f"backup proof errors: {'; '.join(docker_backup_errors)}"
+        ),
     )
     s3_endpoint_kind = docker_facts.get("s3_endpoint_kind")
-    s3_smoke = (
-        docker_passed
-        and docker_facts.get("restic_backend") == "s3"
-        and s3_endpoint_kind != "local_emulator"
-    )
+    s3_smoke_errors = validate_real_s3_smoke_facts(docker_facts)
+    s3_smoke = docker_passed and not s3_smoke_errors
 
     docker_ios_missing = missing_layers(docker_ios or {}, REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS)
     docker_ios_facts = docker_ios.get("facts", {}) if isinstance(docker_ios, dict) else {}
@@ -709,16 +879,19 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 
     s3_emulator_missing = missing_layers(s3_emulator or {}, REQUIRED_DOCKER_PROOF_LAYERS)
     s3_emulator_facts = s3_emulator.get("facts", {}) if isinstance(s3_emulator, dict) else {}
+    s3_emulator_backup_errors = validate_agent_state_backup(
+        s3_emulator_facts,
+        expected_repository_kind="s3",
+    )
     s3_emulator_passed = (
         bool(s3_emulator)
         and s3_emulator.get("status") == "passed"
         and not s3_emulator_missing
+        and not s3_emulator_backup_errors
         and s3_emulator_facts.get("restic_backend") == "s3"
         and s3_emulator_facts.get("s3_endpoint_kind") == "local_emulator"
         and s3_emulator_facts.get("hermes_agent_version_actual") == "0.17.0"
         and s3_emulator_facts.get("agent_npub") == s3_emulator_facts.get("agent_npub_after_restore")
-        and s3_emulator_facts.get("agent_state_backup", {}).get("source")
-        == "entrypoint_backup_on_exit"
     )
     add_check(
         checks,
@@ -729,7 +902,8 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         if s3_emulator_passed or s3_smoke
         else (
             "requires local S3-compatible Docker smoke for the restic S3 code path; "
-            f"missing layers: {', '.join(s3_emulator_missing)}"
+            f"missing layers: {', '.join(s3_emulator_missing)}; "
+            f"backup proof errors: {'; '.join(s3_emulator_backup_errors)}"
         ),
     )
 
@@ -768,23 +942,23 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         name="docker_runtime_s3_smoke",
         status="passed" if s3_smoke else "missing",
         evidence=str(docker_path) if docker else None,
-        detail=(
+        detail=None
+        if s3_smoke
+        else (
             f"restic_backend={docker_facts.get('restic_backend')!r}, "
-            f"s3_endpoint_kind={s3_endpoint_kind!r}; expected real S3"
+            f"s3_endpoint_kind={s3_endpoint_kind!r}; expected real S3; "
+            f"proof errors: {'; '.join(s3_smoke_errors)}"
         ),
     )
 
-    preflight_s3 = (
-        bool(preflight) and preflight.get("status") == "ok" and preflight.get("backend") == "s3"
-    )
+    preflight_s3_errors = validate_s3_preflight(preflight)
+    preflight_s3 = not preflight_s3_errors
     add_check(
         checks,
         name="s3_restic_preflight",
         status="passed" if preflight_s3 else "missing",
         evidence=str(preflight_path) if preflight else None,
-        detail=None
-        if preflight_s3
-        else f"backend={preflight.get('backend') if preflight else None!r}",
+        detail=None if preflight_s3 else "; ".join(preflight_s3_errors),
     )
 
     publish_errors = validate_publish_report(publish, docker_facts=docker_facts)
