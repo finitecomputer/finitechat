@@ -115,6 +115,11 @@ preservation, and thread-scoped working activity set/clear routing.
 - Understanding: make `/healthz`, `/readyz`, and bridge responses useful enough
   for Docker, Tinfoil, and human debugging.
 
+Current service regressions cover ready-file startup, `/healthz`, `/readyz`,
+serialized bridge actions behind the loopback service, home-channel actions,
+NDJSON inbound failure handling, and machine-classifiable structured error
+bodies for Hermes and usage failures.
+
 ### Phase 3: Add A Photon-Style Inbound Stream
 
 - Quality: add `GET /v1/hermes/inbound?room_id=...` behind a feature flag using

@@ -320,6 +320,24 @@ fn hermes_serve_reports_process_health() {
         }),
         Err(error) => Err(error.clone()),
     };
+    let unknown_action_result = match &started_result {
+        Ok(started) => reqwest::blocking::Client::new()
+            .post(format!(
+                "{}/v1/hermes/not-a-real-action",
+                started["url"].as_str().unwrap()
+            ))
+            .json(&json!({}))
+            .send()
+            .map_err(|error| error.to_string())
+            .and_then(|response| {
+                let status = response.status();
+                response
+                    .json::<Value>()
+                    .map(|body| (status.as_u16(), body))
+                    .map_err(|error| error.to_string())
+            }),
+        Err(error) => Err(error.clone()),
+    };
     let _ = child.kill();
     child.wait().expect("wait hermes service");
 
@@ -344,7 +362,27 @@ fn hermes_serve_reports_process_health() {
     assert_eq!(inbound_status, 409);
     let inbound_error: Value = serde_json::from_str(&inbound_body).unwrap();
     assert_eq!(inbound_error["ok"], false);
+    assert_eq!(inbound_error["status"], "error");
+    assert_eq!(inbound_error["service"], "finitechat-hermes");
+    assert_eq!(inbound_error["http_status"], 409);
+    assert_eq!(inbound_error["error_kind"], "hermes");
+    assert_eq!(inbound_error["retryable"], false);
     assert!(!inbound_error["error"].as_str().unwrap().is_empty());
+    let (unknown_status, unknown_error) =
+        unknown_action_result.expect("Hermes service returned structured action error");
+    assert_eq!(unknown_status, 400);
+    assert_eq!(unknown_error["ok"], false);
+    assert_eq!(unknown_error["status"], "error");
+    assert_eq!(unknown_error["service"], "finitechat-hermes");
+    assert_eq!(unknown_error["http_status"], 400);
+    assert_eq!(unknown_error["error_kind"], "usage");
+    assert_eq!(unknown_error["retryable"], false);
+    assert!(
+        unknown_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown Hermes service action")
+    );
 }
 
 #[test]

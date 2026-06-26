@@ -405,10 +405,8 @@ async fn hermes_service_readyz(
         }))
     })
     .await
-    .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    result
-        .map(Json)
-        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
+    .map_err(|error| service_internal_error(error.to_string()))?;
+    result.map(Json).map_err(service_cli_error)
 }
 
 async fn hermes_service_action(
@@ -422,10 +420,8 @@ async fn hermes_service_action(
         handle_hermes_bridge_action(&home_dir, &action, payload)
     })
     .await
-    .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    result
-        .map(Json)
-        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
+    .map_err(|error| service_internal_error(error.to_string()))?;
+    result.map(Json).map_err(service_cli_error)
 }
 
 async fn hermes_service_inbound(
@@ -437,7 +433,7 @@ async fn hermes_service_inbound(
     let result =
         tokio::task::spawn_blocking(move || handle_hermes_inbound_stream(&home_dir, query))
             .await
-            .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            .map_err(|error| service_internal_error(error.to_string()))?;
     result
         .map(|body| {
             (
@@ -449,7 +445,7 @@ async fn hermes_service_inbound(
             )
                 .into_response()
         })
-        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
+        .map_err(service_cli_error)
 }
 
 fn handle_hermes_bridge_action(
@@ -552,8 +548,71 @@ fn status_for_cli_error(error: &CliError) -> StatusCode {
     }
 }
 
-fn service_error(status: StatusCode, error: String) -> (StatusCode, Json<Value>) {
-    (status, Json(json!({ "ok": false, "error": error })))
+fn service_cli_error(error: CliError) -> (StatusCode, Json<Value>) {
+    let status = status_for_cli_error(&error);
+    service_error(
+        status,
+        cli_error_kind(&error),
+        cli_error_retryable(&error),
+        error.to_string(),
+    )
+}
+
+fn service_internal_error(error: String) -> (StatusCode, Json<Value>) {
+    service_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", true, error)
+}
+
+fn service_error(
+    status: StatusCode,
+    error_kind: &'static str,
+    retryable: bool,
+    error: String,
+) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "status": "error",
+            "service": "finitechat-hermes",
+            "version": env!("CARGO_PKG_VERSION"),
+            "http_status": status.as_u16(),
+            "error_kind": error_kind,
+            "retryable": retryable,
+            "error": error,
+        })),
+    )
+}
+
+fn cli_error_kind(error: &CliError) -> &'static str {
+    match error {
+        CliError::Usage(_) => "usage",
+        CliError::Serialize(_) => "serialize",
+        CliError::Json(_) => "json",
+        CliError::Http(_) => "http",
+        CliError::Server { .. } => "server",
+        CliError::Output(_) => "output",
+        CliError::Hermes(_) => "hermes",
+        CliError::Identity(_) => "identity",
+        CliError::Core(_) => "core",
+    }
+}
+
+fn cli_error_retryable(error: &CliError) -> bool {
+    match error {
+        CliError::Http(_) => true,
+        CliError::Server { status, .. } => {
+            status.is_server_error()
+                || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        CliError::Usage(_)
+        | CliError::Serialize(_)
+        | CliError::Json(_)
+        | CliError::Output(_)
+        | CliError::Hermes(_)
+        | CliError::Identity(_)
+        | CliError::Core(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
