@@ -345,6 +345,48 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             {"room_id": "room-agent-1", "seq": 12, "message_id": "msg-12"},
         )
 
+    def test_group_poll_event_preserves_authenticated_sender_identity(self):
+        adapter = self.adapter(room_id=None)
+        calls = []
+        adapter._finitechat_json = self._record_json(calls)
+
+        raw_event = {
+            "room_id": "room-group-1",
+            "seq": 42,
+            "message_id": "msg-42",
+            "conversation_id": "topic-chat",
+            "text": "hello group",
+            "source": {
+                "platform": "finite",
+                "chat_id": "room-group-1",
+                "chat_name": "Agent Camp",
+                "chat_type": "group",
+                "user_id": "npub1alice",
+                "user_name": "Alice",
+                "thread_id": "topic-chat",
+                "chat_topic": "Agent Camp",
+                "user_id_alt": "alice-phone",
+                "chat_id_alt": "mls-group-id",
+                "is_bot": False,
+            },
+        }
+
+        asyncio.run(adapter._handle_finitechat_event(raw_event))
+
+        self.assertEqual(len(adapter.handled_messages), 1)
+        event = adapter.handled_messages[0]
+        self.assertEqual(event.source.chat_id, "room-group-1")
+        self.assertEqual(event.source.chat_name, "Agent Camp")
+        self.assertEqual(event.source.chat_type, "group")
+        self.assertEqual(event.source.user_id, "npub1alice")
+        self.assertEqual(event.source.user_name, "Alice")
+        self.assertEqual(event.source.user_id_alt, "alice-phone")
+        self.assertEqual(event.source.chat_id_alt, "mls-group-id")
+        self.assertFalse(event.source.is_bot)
+        self.assertEqual(event.source.thread_id, "topic-chat")
+        self.assertEqual(calls[0][0], "ack")
+        self.assertEqual(calls[0][1]["message_id"], "msg-42")
+
     def test_duplicate_redelivery_is_acked_without_second_dispatch(self):
         adapter = self.adapter()
         calls = []
@@ -839,6 +881,69 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(adapter.handled_messages[0].text, "hello from stream")
         self.assertEqual(ack_calls[0][0], "ack")
         self.assertEqual(ack_calls[0][1]["message_id"], "msg-12")
+
+    def test_stream_loop_skips_typed_receipt_records_without_dispatch_or_ack(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "room_id": "room-agent-1",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/false",
+                    "inbound_stream": True,
+                }
+            )
+        )
+        adapter._mark_connected()
+        module = cast(Any, self.module)
+        original_inbound = module._finitechat_service_inbound
+        calls = []
+
+        def fake_inbound(service_url, payload, timeout):
+            calls.append(("stream", payload))
+            adapter._mark_disconnected()
+            return self.module._FiniteChatResult(
+                True,
+                {
+                    "records": [
+                        {
+                            "type": "receipt",
+                            "room_id": "room-agent-1",
+                            "seq": 13,
+                            "message_id": "receipt-13",
+                            "read_message_id": "msg-12",
+                        },
+                        {
+                            "type": "event",
+                            "event": {
+                                "room_id": "room-agent-1",
+                                "seq": 14,
+                                "message_id": "msg-14",
+                                "text": "real message",
+                            },
+                        },
+                    ]
+                },
+                None,
+                False,
+            )
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload))
+            return self.module._FiniteChatResult(True, {"acked": True}, None, False)
+
+        try:
+            module._finitechat_service_inbound = fake_inbound
+            adapter._finitechat_json = fake_json
+            asyncio.run(adapter._stream_loop())
+        finally:
+            module._finitechat_service_inbound = original_inbound
+
+        self.assertEqual(len(adapter.handled_messages), 1)
+        self.assertEqual(adapter.handled_messages[0].text, "real message")
+        ack_calls = [call for call in calls if call[0] == "ack"]
+        self.assertEqual(len(ack_calls), 1)
+        self.assertEqual(ack_calls[0][1]["message_id"], "msg-14")
 
     def test_stream_loop_falls_back_to_poll_after_stream_transport_error(self):
         adapter = self.module.FiniteChatAdapter(

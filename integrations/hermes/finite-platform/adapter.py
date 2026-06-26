@@ -452,7 +452,13 @@ class FiniteChatAdapter(BasePlatformAdapter):
             if record_type == "joined":
                 logger.info("[finite] verified joiner admitted: %s", raw_record.get("account_id"))
                 continue
-            raw_event = raw_record.get("event") if record_type == "event" else raw_record
+            if record_type == "event":
+                raw_event = raw_record.get("event")
+            elif record_type:
+                logger.debug("[finite] ignored non-message inbound record type %s", record_type)
+                continue
+            else:
+                raw_event = raw_record
             await self._dispatch_raw_event(raw_event)
 
     async def _dispatch_raw_event(self, raw_event: Any) -> None:

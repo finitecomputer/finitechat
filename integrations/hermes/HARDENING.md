@@ -101,7 +101,9 @@ materialization into Hermes media fields, room filtering, redelivery dedupe,
 ack retry without duplicate dispatch, transient poll recovery, service fallback,
 NDJSON inbound stream consumption/fallback, outbound edit thread-route
 preservation, transient service transport retry before CLI fallback, and
-thread-scoped working activity set/clear routing.
+thread-scoped working activity set/clear routing. They also cover group-room
+sender identity mapping and fail-closed handling for typed non-message stream
+records such as receipts.
 
 ### Phase 2: Make The Rust Sidecar The Normal Runtime Path
 
