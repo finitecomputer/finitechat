@@ -156,6 +156,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     ios_media_e2e_path = Path(args.ios_media_e2e_report)
     docker_path = Path(args.docker_report)
     docker_ios_path = Path(args.docker_ios_report)
+    s3_emulator_path = Path(args.s3_emulator_report)
     github_setup_path = Path(args.github_setup_report)
     github_publish_gate_path = Path(args.github_publish_gate_report)
     preflight_path = Path(args.preflight_report)
@@ -170,6 +171,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     ios_media_e2e = load_optional_json(ios_media_e2e_path)
     docker = load_optional_json(docker_path)
     docker_ios = load_optional_json(docker_ios_path)
+    s3_emulator = load_optional_json(s3_emulator_path)
     github_setup = load_optional_json(github_setup_path)
     github_publish_gate = load_optional_json(github_publish_gate_path)
     preflight = load_optional_json(preflight_path)
@@ -291,7 +293,12 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         evidence=str(docker_path) if docker else None,
         detail=None if docker_passed else f"missing layers: {', '.join(docker_missing)}",
     )
-    s3_smoke = docker_passed and docker_facts.get("restic_backend") == "s3"
+    s3_endpoint_kind = docker_facts.get("s3_endpoint_kind")
+    s3_smoke = (
+        docker_passed
+        and docker_facts.get("restic_backend") == "s3"
+        and s3_endpoint_kind != "local_emulator"
+    )
 
     docker_ios_missing = missing_layers(docker_ios or {}, REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS)
     docker_ios_facts = docker_ios.get("facts", {}) if isinstance(docker_ios, dict) else {}
@@ -338,6 +345,32 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         ),
     )
 
+    s3_emulator_missing = missing_layers(s3_emulator or {}, REQUIRED_DOCKER_PROOF_LAYERS)
+    s3_emulator_facts = s3_emulator.get("facts", {}) if isinstance(s3_emulator, dict) else {}
+    s3_emulator_passed = (
+        bool(s3_emulator)
+        and s3_emulator.get("status") == "passed"
+        and not s3_emulator_missing
+        and s3_emulator_facts.get("restic_backend") == "s3"
+        and s3_emulator_facts.get("s3_endpoint_kind") == "local_emulator"
+        and s3_emulator_facts.get("hermes_agent_version_actual") == "0.17.0"
+        and s3_emulator_facts.get("agent_npub") == s3_emulator_facts.get("agent_npub_after_restore")
+        and s3_emulator_facts.get("agent_state_backup", {}).get("source")
+        == "entrypoint_backup_on_exit"
+    )
+    add_check(
+        checks,
+        name="docker_runtime_s3_emulator_smoke",
+        status="passed" if s3_emulator_passed or s3_smoke else "missing",
+        evidence=str(s3_emulator_path) if s3_emulator else None,
+        detail=None
+        if s3_emulator_passed or s3_smoke
+        else (
+            "requires local S3-compatible Docker smoke for the restic S3 code path; "
+            f"missing layers: {', '.join(s3_emulator_missing)}"
+        ),
+    )
+
     github_setup_ready = (
         bool(github_setup)
         and github_setup.get("status") in {"ready", "applied"}
@@ -380,7 +413,10 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         name="docker_runtime_s3_smoke",
         status="passed" if s3_smoke else "missing",
         evidence=str(docker_path) if docker else None,
-        detail=f"restic_backend={docker_facts.get('restic_backend')!r}; expected 's3'",
+        detail=(
+            f"restic_backend={docker_facts.get('restic_backend')!r}, "
+            f"s3_endpoint_kind={s3_endpoint_kind!r}; expected real S3"
+        ),
     )
 
     preflight_s3 = (
@@ -493,6 +529,10 @@ def main() -> int:
     parser.add_argument(
         "--docker-ios-report",
         default="target/ios-hermes-docker-runtime-e2e/report.json",
+    )
+    parser.add_argument(
+        "--s3-emulator-report",
+        default="target/hermes-docker-s3-emulator-smoke/report.json",
     )
     parser.add_argument(
         "--github-setup-report",

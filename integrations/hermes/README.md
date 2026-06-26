@@ -112,6 +112,7 @@ For the Docker runtime smoke:
 
 ```bash
 scripts/hermes-sidecar-docker-smoke.sh
+scripts/hermes-sidecar-docker-s3-emulator-smoke.sh
 ```
 
 That builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts
@@ -138,6 +139,12 @@ AWS_ACCESS_KEY_ID='...' \
 AWS_SECRET_ACCESS_KEY='...' \
 scripts/hermes-sidecar-docker-smoke.sh
 ```
+To exercise the same restic S3 code path before Latitude credentials are wired,
+run `scripts/hermes-sidecar-docker-s3-emulator-smoke.sh`. It starts a local
+MinIO service, writes `target/hermes-docker-s3-emulator-smoke/report.json`, and
+marks the report as `s3_endpoint_kind=local_emulator`. The hardening audit
+accepts that as local S3-compatible rehearsal evidence but rejects it as the
+real Latitude/GitHub S3 gate.
 `FINITE_DOCKER_RESTIC_PASSWORD` must be explicitly set for the S3 backend and
 must be the user-owned restore key, not the disposable local smoke default.
 For local runs, copy `.env.example` to `.env`; the smoke wrapper sources it

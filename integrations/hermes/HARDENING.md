@@ -204,6 +204,7 @@ Current Docker smoke:
 ```bash
 scripts/hermes-restic-preflight.py --report target/hermes-docker-smoke/restic-preflight.json
 scripts/hermes-sidecar-docker-smoke.sh
+scripts/hermes-sidecar-docker-s3-emulator-smoke.sh
 scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
@@ -229,6 +230,11 @@ point the same restic contract at S3-compatible object storage with
 `FINITE_DOCKER_RESTIC_PASSWORD`, and AWS-style credentials. The remaining
 Phase 5 storage gap is running that S3 path against the actual Latitude bucket
 and carrying the same env contract into the Tinfoil canary/runbook.
+`scripts/hermes-sidecar-docker-s3-emulator-smoke.sh` starts a local MinIO
+endpoint and runs the existing Docker smoke with `FINITE_DOCKER_RESTIC_BACKEND=s3`
+against it. This proves the runtime/restic S3 path without real object-storage
+credentials, but the audit marks it separately as `docker_runtime_s3_emulator_smoke`
+and still requires a non-emulated S3 report for the actual Latitude/GitHub gate.
 The restic preflight fails before the image build when S3 env is incomplete,
 requires an explicit user-owned password for remote repos, and writes a JSON
 report that is uploaded alongside the Docker smoke report.
