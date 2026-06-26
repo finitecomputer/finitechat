@@ -205,6 +205,14 @@ jobs:
         if: always()
         run: scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json
 
+      - name: Prepare Docker runtime smoke artifacts
+        if: always()
+        run: |
+          if [ -d target/hermes-docker-smoke ]; then
+            sudo chown -R "$(id -u):$(id -g)" target/hermes-docker-smoke
+            chmod -R u+rwX,go+rX target/hermes-docker-smoke
+          fi
+
       - name: Upload Docker runtime smoke report
         if: always()
         uses: actions/upload-artifact@v4
