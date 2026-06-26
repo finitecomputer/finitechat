@@ -112,11 +112,16 @@ def build_report(
     candidate_paths = classified["candidate_paths"]
     blocked_paths = classified["blocked_paths"]
     errors: list[str] = []
+    notes: list[str] = []
     if blocked_paths:
         errors.append("blocked generated or sensitive paths are present in git status")
-    if not candidate_paths:
-        errors.append("no source changes are available to publish")
-    status = "ready" if not errors else "blocked"
+    if errors:
+        status = "blocked"
+    elif candidate_paths:
+        status = "ready"
+    else:
+        status = "clean"
+        notes.append("no local source changes are available to publish")
     git_add = "git add " + " ".join(shell_quote(path) for path in candidate_paths)
     report = {
         "status": status,
@@ -129,13 +134,14 @@ def build_report(
         "ignored_count": classified["ignored_count"],
         "ignored_sample": classified["ignored_sample"],
         "errors": errors,
+        "notes": notes,
         "suggested_commands": {
             "stage": git_add if candidate_paths else None,
             "commit": f"git commit -m {shell_quote(commit_message)}" if candidate_paths else None,
             "push": f"git push -u origin {shell_quote(branch)}" if branch else None,
         },
     }
-    return (0 if status == "ready" else 2), report
+    return (0 if status in {"ready", "clean"} else 2), report
 
 
 def main() -> int:

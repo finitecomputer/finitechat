@@ -248,8 +248,10 @@ Current CI shape:
   checks the GitHub secret and variable names before the slow workflow is
   started without reading secret values. `scripts/hermes-branch-publication-readiness.py`
   checks the local worktree before that slow path by classifying publishable
-  source changes, blocking obvious generated or sensitive paths, and printing
-  the exact stage/commit/push commands without mutating git.
+  source changes, blocking obvious generated or sensitive paths, reporting clean
+  already-pushed worktrees distinctly from blocked ones, and printing the exact
+  stage/commit/push commands when there are source changes to publish without
+  mutating git.
   `scripts/hermes-github-publish-gate.py` then dispatches the manual workflow,
   watches it, downloads artifacts, and writes a local report so the S3
   smoke/publish gate can be driven from the repo rather than the Actions UI. On

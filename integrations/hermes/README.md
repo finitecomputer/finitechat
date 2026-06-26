@@ -179,8 +179,10 @@ scripts/hermes-branch-publication-readiness.py \
 That writes `target/hermes-branch-publication-readiness.json`, classifies the
 source files that should be staged, blocks obvious generated or sensitive paths
 such as `.env`, `target/`, caches, keys, and database files, and prints the
-exact `git add`, `git commit`, and `git push` commands to publish the branch.
-It does not stage, commit, or push anything.
+exact `git add`, `git commit`, and `git push` commands when there are source
+changes to publish. A clean worktree reports `status: clean` instead of
+`blocked`, because that means there is nothing local to stage. It does not
+stage, commit, or push anything.
 
 Once preflight is green, run the S3 smoke, publish, handoff, canary-artifact
 generation, and artifact download path from one local command:

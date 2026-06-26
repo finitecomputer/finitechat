@@ -58,6 +58,24 @@ class BranchPublicationReadinessTest(unittest.TestCase):
         self.assertIn("scripts/__pycache__/x.pyc", blocked)
         self.assertIn("blocked generated or sensitive paths", report["errors"][0])
 
+    def test_clean_worktree_is_not_blocked(self) -> None:
+        status, report = readiness.build_report(
+            branch="codex/hermes-sidecar-hardening",
+            status_lines=[],
+            include_ignored=False,
+            commit_message="Test commit",
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(report["status"], "clean")
+        self.assertEqual(report["candidate_paths"], [])
+        self.assertEqual(report["blocked_paths"], [])
+        self.assertEqual(report["errors"], [])
+        self.assertIn("no local source changes", report["notes"][0])
+        self.assertIsNone(report["suggested_commands"]["stage"])
+        self.assertIsNone(report["suggested_commands"]["commit"])
+        self.assertIn("git push -u origin", report["suggested_commands"]["push"])
+
     def test_ignored_paths_are_counted_but_not_blocking(self) -> None:
         status, report = readiness.build_report(
             branch="codex/hermes-sidecar-hardening",
