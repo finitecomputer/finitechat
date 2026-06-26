@@ -1910,10 +1910,10 @@ impl AppRuntimeState {
         let code = match parse_invite(trimmed) {
             Ok(code) => code,
             Err(invite_error) => {
-                if !starts_with_ascii_case_insensitive(trimmed, INVITE_URL_PREFIX) {
-                    if let Some(account_id) = embedded_profile_account_id(trimmed) {
-                        return self.scan_profile_account_id(account_id);
-                    }
+                if !starts_with_ascii_case_insensitive(trimmed, INVITE_URL_PREFIX)
+                    && let Some(account_id) = embedded_profile_account_id(trimmed)
+                {
+                    return self.scan_profile_account_id(account_id);
                 }
                 return Err(invite_error);
             }

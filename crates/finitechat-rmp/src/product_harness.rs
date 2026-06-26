@@ -153,18 +153,18 @@ fn ios_product_harness_with_ios_development_team_env(
     let mut server = HarnessServer::start(root, &server_addr, &server_sqlite, &server_log)?;
     server.wait_until_ready(&server_addr, HARNESS_SERVER_START_TIMEOUT)?;
     if scenario == "profile-dm" {
-        let assertions = run_profile_dm_harness(
-            &target,
-            &store_path,
-            &peer_store_path,
-            &support_root,
-            &server_url,
-            &device,
-            &peer_device,
-            &server_sqlite,
+        let assertions = run_profile_dm_harness(ProfileDmHarnessInput {
+            target: &target,
+            store_path: &store_path,
+            peer_store_path: &peer_store_path,
+            support_root: &support_root,
+            server_url: &server_url,
+            device: &device,
+            peer_device: &peer_device,
+            server_sqlite: &server_sqlite,
             verbose,
-            args.settle_seconds,
-        )?;
+            settle_seconds: args.settle_seconds,
+        })?;
         server.stop()?;
         render_harness_result(
             json,
@@ -503,18 +503,34 @@ fn ios_product_harness_with_ios_development_team_env(
     Ok(())
 }
 
-fn run_profile_dm_harness(
-    target: &HarnessIosTarget,
-    store_path: &Path,
-    peer_store_path: &Path,
-    support_root: &Path,
-    server_url: &str,
-    device: &str,
-    peer_device: &str,
-    server_sqlite: &Path,
+struct ProfileDmHarnessInput<'a> {
+    target: &'a HarnessIosTarget,
+    store_path: &'a Path,
+    peer_store_path: &'a Path,
+    support_root: &'a Path,
+    server_url: &'a str,
+    device: &'a str,
+    peer_device: &'a str,
+    server_sqlite: &'a Path,
     verbose: bool,
     settle_seconds: u64,
+}
+
+fn run_profile_dm_harness(
+    input: ProfileDmHarnessInput<'_>,
 ) -> Result<ProfileDmHarnessAssertions, CliError> {
+    let ProfileDmHarnessInput {
+        target,
+        store_path,
+        peer_store_path,
+        support_root,
+        server_url,
+        device,
+        peer_device,
+        server_sqlite,
+        verbose,
+        settle_seconds,
+    } = input;
     let peer = open_product_runtime(
         peer_store_path,
         server_url,

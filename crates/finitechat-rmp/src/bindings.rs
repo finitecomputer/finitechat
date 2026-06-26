@@ -731,7 +731,7 @@ fn build_android_so(
     if !sdk.is_empty() {
         let lp = root.join("android/local.properties");
         let _ = std::fs::create_dir_all(root.join("android"));
-        let contents = format!("sdk.dir={}\n", sdk);
+        let contents = format!("sdk.dir={sdk}\n");
         let _ = std::fs::write(lp, contents);
     }
 

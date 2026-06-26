@@ -1643,6 +1643,6 @@ fn swift_app_entry_name(display_name: &str) -> String {
     if cleaned.is_empty() {
         "MainApp".to_string()
     } else {
-        format!("{}App", cleaned)
+        format!("{cleaned}App")
     }
 }
