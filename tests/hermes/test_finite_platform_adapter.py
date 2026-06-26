@@ -456,7 +456,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["kind"], "status")
         self.assertEqual(calls[0][1]["status"], "complete")
 
-    def test_typing_activity_uses_ephemeral_bridge_not_status_messages(self):
+    def test_typing_activity_uses_ephemeral_bridge_and_clears_same_thread_route(self):
         adapter = self.adapter()
         calls = []
 
@@ -470,11 +470,12 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
         self.assertEqual(calls[0][0], "activity")
         self.assertEqual(calls[0][1]["action"], "set")
-        self.assertIsNone(calls[0][1]["conversation_id"])
+        self.assertEqual(calls[0][1]["conversation_id"], "topic-build")
         self.assertEqual(calls[0][1]["expires_in_millis"], 60 * 1000)
         self.assertEqual(calls[1][0], "activity")
         self.assertEqual(calls[1][1]["action"], "clear")
-        self.assertIsNone(calls[1][1]["conversation_id"])
+        self.assertEqual(calls[1][1]["conversation_id"], "topic-build")
+        self.assertEqual(adapter._activity_conversations, {})
 
     def test_poll_loop_uses_short_poll_while_agent_turn_is_active(self):
         adapter = self.adapter()

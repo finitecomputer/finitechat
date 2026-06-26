@@ -132,6 +132,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self._finitechat_lock = asyncio.Lock()
         self._delivered_event_keys: set[str] = set()
         self._delivered_event_order: list[str] = []
+        self._activity_conversations: dict[str, str | None] = {}
 
     async def connect(self) -> bool:
         if not self.home:
@@ -245,10 +246,26 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         payload = self._activity_payload(chat_id, metadata, action="set")
+        self._activity_conversations[payload["room_id"]] = payload["conversation_id"]
         await self._finitechat_json("activity", payload, timeout=15)
 
-    async def stop_typing(self, chat_id: str) -> None:
-        payload = self._activity_payload(chat_id, None, action="clear")
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        room_id = self._room_id(chat_id)
+        conversation_id = None
+        has_remembered_conversation = room_id in self._activity_conversations
+        if metadata is None and has_remembered_conversation:
+            conversation_id = self._activity_conversations[room_id]
+        payload = self._activity_payload(
+            chat_id,
+            metadata,
+            action="clear",
+            conversation_id=conversation_id,
+        )
+        if (
+            has_remembered_conversation
+            and self._activity_conversations.get(room_id) == payload["conversation_id"]
+        ):
+            self._activity_conversations.pop(room_id, None)
         await self._finitechat_json("activity", payload, timeout=15)
 
     async def _keep_typing(
@@ -554,10 +571,14 @@ class FiniteChatAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None,
         *,
         action: str,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
+        meta = self._message_metadata(metadata)
         return {
             "room_id": self._room_id(chat_id),
-            "conversation_id": None,
+            "conversation_id": conversation_id
+            if conversation_id is not None
+            else self._conversation_id(meta),
             "activity_kind": "working",
             "activity_id": None,
             "action": action,

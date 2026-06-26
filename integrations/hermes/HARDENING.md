@@ -96,6 +96,12 @@ are written down with a clear owner.
 - Understanding: document every failure mode as bridge input, expected JSON,
   observed output, and likely owner.
 
+Current adapter regressions cover media payload mapping, inbound attachment
+materialization into Hermes media fields, room filtering, redelivery dedupe,
+ack retry without duplicate dispatch, transient poll recovery, service fallback,
+NDJSON inbound stream consumption/fallback, and thread-scoped working activity
+set/clear routing.
+
 ### Phase 2: Make The Rust Sidecar The Normal Runtime Path
 
 - Quality: treat `finitechat hermes serve` as the primary path and CLI-per-call
