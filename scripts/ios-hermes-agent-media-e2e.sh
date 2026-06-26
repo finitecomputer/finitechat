@@ -16,6 +16,7 @@ cargo build -p finitechat-cli -p finitechat-server -p finitechat-rmp
 
 env \
     FINITE_IOS_HERMES_AGENT_MEDIA_E2E=1 \
+    FINITE_IOS_HERMES_AGENT_MEDIA_E2E_REPORT="$REPO_ROOT/target/ios-hermes-agent-media-e2e/report.json" \
     FINITECHAT_BIN="$REPO_ROOT/target/debug/finitechat" \
     FINITECHAT_SERVER_BIN="$REPO_ROOT/target/debug/finitechat-server" \
     FINITECHAT_RMP_BIN="$REPO_ROOT/target/debug/finitechat-rmp" \

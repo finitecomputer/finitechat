@@ -59,6 +59,14 @@ MEDIA_STEPS = [
     "agent_receive_media",
     "user_receive_agent_replies",
 ]
+IOS_MEDIA_STEPS = [
+    "server_ready",
+    "agent_init",
+    "adapter_connect",
+    "ios_app_launch",
+    "agent_receive_ios_media",
+    "ios_receive_agent_replies",
+]
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -81,6 +89,23 @@ def media_e2e_report() -> dict:
             "user_received_media_count": 1,
         },
         "steps": [{"name": name, "elapsed_ms": 1} for name in MEDIA_STEPS],
+    }
+
+
+def ios_media_e2e_report() -> dict:
+    return {
+        "status": "passed",
+        "name": "ios_simulator_hermes_agent_media_e2e",
+        "facts": {
+            "platform": "ios_simulator",
+            "simulator_udid": "booted-simulator",
+            "adapter_inbound_stream": True,
+            "adapter_service_url_present": True,
+            "agent_received_media_types": ["image/png"],
+            "ios_received_text": ["agent text echo: ios media hello", "agent media echo"],
+            "ios_received_media_count": 1,
+        },
+        "steps": [{"name": name, "elapsed_ms": 1} for name in IOS_MEDIA_STEPS],
     }
 
 
@@ -122,6 +147,8 @@ def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
         str(tmp / "sidecar.json"),
         "--media-e2e-report",
         str(tmp / "media-e2e.json"),
+        "--ios-media-e2e-report",
+        str(tmp / "ios-media-e2e.json"),
         "--docker-report",
         str(tmp / "docker.json"),
         "--github-setup-report",
@@ -159,6 +186,7 @@ class HardeningAuditTest(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(audit["status"], "incomplete")
         self.assertIn("local_hermes_agent_media_e2e", audit["missing"])
+        self.assertIn("ios_simulator_media_e2e", audit["missing"])
         self.assertIn("github_actions_s3_setup_ready", audit["missing"])
         self.assertIn("github_publish_gate_ready", audit["missing"])
         self.assertIn("docker_runtime_s3_smoke", audit["missing"])
@@ -170,6 +198,7 @@ class HardeningAuditTest(unittest.TestCase):
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
             write_json(tmp / "docker.json", docker_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
@@ -196,6 +225,7 @@ class HardeningAuditTest(unittest.TestCase):
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
             write_json(tmp / "docker.json", docker_report())
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
@@ -222,6 +252,7 @@ class HardeningAuditTest(unittest.TestCase):
             tmp = Path(tmp_value)
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
             write_json(tmp / "docker.json", docker_report(restic_backend="local"))
             write_json(
                 tmp / "github-setup.json",
@@ -243,6 +274,39 @@ class HardeningAuditTest(unittest.TestCase):
         details = {check["name"]: check["detail"] for check in audit["checks"]}
         self.assertIn("FINITE_DOCKER_RESTIC_PASSWORD", details["github_actions_s3_setup_ready"])
         self.assertIn("remote workflow ref is missing", details["github_publish_gate_ready"])
+
+    def test_audit_rejects_ios_success_flag_without_native_store_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(
+                tmp / "ios-media-e2e.json",
+                {
+                    "status": "passed",
+                    "name": "ios_simulator_hermes_agent_media_e2e",
+                },
+            )
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", {"status": "ready"})
+            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("ios_simulator_media_e2e", audit["missing"])
 
 
 if __name__ == "__main__":

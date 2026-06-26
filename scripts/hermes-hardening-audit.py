@@ -44,6 +44,14 @@ REQUIRED_MEDIA_E2E_STEPS = {
     "agent_receive_media",
     "user_receive_agent_replies",
 }
+REQUIRED_IOS_MEDIA_E2E_STEPS = {
+    "server_ready",
+    "agent_init",
+    "adapter_connect",
+    "ios_app_launch",
+    "agent_receive_ios_media",
+    "ios_receive_agent_replies",
+}
 REQUIRED_TINFOIL_PROOF_LAYERS = {
     "Tinfoil container running",
     "digest-pinned runtime image",
@@ -107,6 +115,7 @@ def step_names(report: dict[str, Any]) -> set[str]:
 def audit(args: argparse.Namespace) -> dict[str, Any]:
     sidecar_path = Path(args.sidecar_report)
     media_e2e_path = Path(args.media_e2e_report)
+    ios_media_e2e_path = Path(args.ios_media_e2e_report)
     docker_path = Path(args.docker_report)
     github_setup_path = Path(args.github_setup_report)
     github_publish_gate_path = Path(args.github_publish_gate_report)
@@ -118,6 +127,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 
     sidecar = load_optional_json(sidecar_path)
     media_e2e = load_optional_json(media_e2e_path)
+    ios_media_e2e = load_optional_json(ios_media_e2e_path)
     docker = load_optional_json(docker_path)
     github_setup = load_optional_json(github_setup_path)
     github_publish_gate = load_optional_json(github_publish_gate_path)
@@ -169,6 +179,39 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         else (
             "requires live hermes-agent media e2e report with sidecar stream, "
             f"text and image replies, and user decrypt; missing steps: {', '.join(media_steps_missing)}"
+        ),
+    )
+
+    ios_facts = ios_media_e2e.get("facts", {}) if isinstance(ios_media_e2e, dict) else {}
+    ios_steps_missing = sorted(REQUIRED_IOS_MEDIA_E2E_STEPS - step_names(ios_media_e2e or {}))
+    ios_texts = ios_facts.get("ios_received_text")
+    ios_media_types = ios_facts.get("agent_received_media_types")
+    ios_passed = (
+        bool(ios_media_e2e)
+        and ios_media_e2e.get("status") == "passed"
+        and ios_media_e2e.get("name") == "ios_simulator_hermes_agent_media_e2e"
+        and not ios_steps_missing
+        and ios_facts.get("platform") == "ios_simulator"
+        and ios_facts.get("adapter_inbound_stream") is True
+        and ios_facts.get("adapter_service_url_present") is True
+        and bool(ios_facts.get("simulator_udid"))
+        and isinstance(ios_media_types, list)
+        and "image/png" in ios_media_types
+        and isinstance(ios_texts, list)
+        and "agent text echo: ios media hello" in ios_texts
+        and "agent media echo" in ios_texts
+        and int(ios_facts.get("ios_received_media_count") or 0) >= 1
+    )
+    add_check(
+        checks,
+        name="ios_simulator_media_e2e",
+        status="passed" if ios_passed else "missing",
+        evidence=str(ios_media_e2e_path) if ios_media_e2e else None,
+        detail=None
+        if ios_passed
+        else (
+            "requires live iOS Simulator media e2e report with sidecar stream, "
+            f"native store decrypt, and text/image replies; missing steps: {', '.join(ios_steps_missing)}"
         ),
     )
 
@@ -330,6 +373,10 @@ def main() -> int:
     parser.add_argument(
         "--media-e2e-report",
         default="target/hermes-agent-media-e2e/report.json",
+    )
+    parser.add_argument(
+        "--ios-media-e2e-report",
+        default="target/ios-hermes-agent-media-e2e/report.json",
     )
     parser.add_argument(
         "--docker-report",

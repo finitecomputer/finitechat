@@ -66,6 +66,7 @@ For a local human smoke with JSON evidence:
 ```bash
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
+scripts/ios-hermes-agent-media-e2e.sh
 ```
 
 The script writes `target/hermes-sidecar-smoke/report.json` with timings for
@@ -75,6 +76,14 @@ The media E2E writes `target/hermes-agent-media-e2e/report.json` and runs the
 real `hermes-agent` package against the Finite plugin with the sidecar inbound
 stream enabled. It proves an image sent by a Finite Chat user reaches Hermes as
 media and that the user decrypts both text and image replies from the agent.
+The iOS Simulator E2E writes
+`target/ios-hermes-agent-media-e2e/report.json`, drives the native app through
+the product harness, and proves that the app's encrypted local store contains
+the Hermes text and image replies. It requires a booted simulator or
+`IOS_SIMULATOR_UDID`.
+The physical-device variant is `scripts/ios-device-hermes-agent-media-e2e.sh`;
+it writes `target/ios-device-hermes-agent-media-e2e/report.json` after pulling
+the app's store from an installed, unlocked phone.
 
 Validate the restic backup environment before the longer Docker smoke:
 
@@ -284,12 +293,15 @@ scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json
 The audit also reads `target/hermes-github-secrets-setup.json` and
 `target/hermes-github-publish-gate/report.json` so missing GitHub secrets, dirty
 local worktrees, and missing remote branches show up before the S3 evidence
-exists. In CI, the Docker runtime job downloads the sidecar smoke artifact from
-the Rust/Hermes job before generating the audit, so the uploaded audit reflects
-both the local sidecar contract and the packaged-runtime proof. Add
+exists. It also requires
+`target/ios-hermes-agent-media-e2e/report.json` for the Phase 4 native-client
+gate; this is intentionally manual/local because CI does not currently boot the
+Finite Chat iOS harness. In CI, the Docker runtime job downloads the sidecar
+smoke artifact from the Rust/Hermes job before generating the audit, so the
+uploaded audit reflects both the local sidecar contract and the packaged-runtime proof. Add
 `--require-complete` only when the S3-backed smoke, published digest, handoff,
-generated canary artifacts, and live Tinfoil canary result are all expected to
-be present.
+generated canary artifacts, iOS Simulator media E2E report, and live Tinfoil
+canary result are all expected to be present.
 
 ## How the pieces divide (ADR 0002)
 

@@ -17,6 +17,7 @@ from typing import Any
 from tests.hermes.test_live_hermes_agent_media_e2e import (
     FINITECHAT_BIN,
     FINITECHAT_SERVER_BIN,
+    JsonSmokeReport,
     RecordingPluginContext,
     free_local_port,
     load_adapter_module,
@@ -28,12 +29,14 @@ from tests.hermes.test_live_ios_simulator_hermes_media_e2e import (
     AGENT_TEXT,
     IOS_CAPTION,
     PNG_1X1,
+    ios_agent_reply_summary,
     ios_state_has_agent_replies,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE_ID = os.environ.get("FINITECHAT_IOS_BUNDLE_ID", "computer.finite.finitechat")
 IOS_DEVICE_IDENTITY = "ios-hermes-media-phone"
+DEFAULT_IOS_DEVICE_MEDIA_REPORT = REPO_ROOT / "target/ios-device-hermes-agent-media-e2e/report.json"
 
 
 def run_cmd(args: list[str], *, timeout: int = 180) -> subprocess.CompletedProcess[str]:
@@ -227,6 +230,15 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(FINITECHAT_SERVER_BIN.exists(), f"missing {FINITECHAT_SERVER_BIN}")
         device = available_device_identifier()
         assert_app_installed(device)
+        smoke = JsonSmokeReport(
+            "ios_device_hermes_agent_media_e2e",
+            "FINITE_IOS_DEVICE_HERMES_AGENT_MEDIA_E2E_REPORT",
+            DEFAULT_IOS_DEVICE_MEDIA_REPORT,
+        )
+        smoke.fact("platform", "ios_device")
+        smoke.fact("bundle_id", BUNDLE_ID)
+        smoke.fact("ios_device_id", IOS_DEVICE_IDENTITY)
+        smoke.fact("device_identifier", device)
 
         with tempfile.TemporaryDirectory(prefix="finite-ios-device-hermes-media-") as tmp_value:
             tmp = Path(tmp_value)
@@ -249,8 +261,11 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     text=True,
                 )
                 try:
+                    started = time.monotonic()
                     wait_for_health(f"http://127.0.0.1:{port}/health")
-                    await self._run_phone_round_trip(tmp, store_path, server_url, device)
+                    smoke.step("server_ready", started)
+                    await self._run_phone_round_trip(tmp, store_path, server_url, device, smoke)
+                    smoke.finish()
                 finally:
                     server.terminate()
                     with contextlib.suppress(subprocess.TimeoutExpired):
@@ -264,10 +279,12 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         store_path: Path,
         server_url: str,
         device: str,
+        smoke: JsonSmokeReport,
     ) -> None:
         from gateway.config import PlatformConfig
 
         agent_home = tmp / "agent-home"
+        started = time.monotonic()
         await asyncio.to_thread(
             run_json,
             [
@@ -280,6 +297,7 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 server_url,
             ],
         )
+        smoke.step("agent_init", started)
         adapter = self._build_adapter(agent_home, PlatformConfig)
         agent_received = asyncio.get_running_loop().create_future()
 
@@ -313,14 +331,20 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             adapter.handle_message = handle_agent_message
 
         with contextlib.redirect_stdout(io.StringIO()):
+            started = time.monotonic()
             connected = await adapter.connect()
+            smoke.step("adapter_connect", started)
         self.assertTrue(connected)
+        smoke.fact("adapter_inbound_stream", bool(getattr(adapter, "inbound_stream", False)))
+        smoke.fact("adapter_service_url_present", bool(getattr(adapter, "service_url", "")))
         pid: int | None = None
         try:
             pin_info = await asyncio.to_thread(
                 run_json,
                 [str(FINITECHAT_BIN), "hermes", "--home", str(agent_home), "pin"],
             )
+            smoke.fact("invite_url_present", bool(pin_info.get("url")))
+            smoke.fact("pin_present", bool(pin_info.get("pin")))
             launch_args = [
                 "--finitechat-server",
                 server_url,
@@ -344,9 +368,13 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     IOS_CAPTION,
                 ]
             )
+            started = time.monotonic()
             pid = await asyncio.to_thread(launch_phone_app, device, launch_args)
+            smoke.step("ios_device_app_launch", started)
 
+            started = time.monotonic()
             received = await asyncio.wait_for(agent_received, timeout=120)
+            smoke.step("agent_receive_ios_media", started)
             self.assertEqual(received["text"], IOS_CAPTION)
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
@@ -354,9 +382,11 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 received["agent_media_send_success"], received["agent_media_send_error"]
             )
+            smoke.fact("agent_received_media_types", received["media_types"])
 
             deadline = time.monotonic() + 75
             last_state: dict[str, Any] | None = None
+            started = time.monotonic()
             while time.monotonic() < deadline:
                 if pid is not None:
                     terminate_phone_app(device, pid)
@@ -364,6 +394,10 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.to_thread(pull_phone_store, device, store_path)
                 last_state = await asyncio.to_thread(read_phone_state, store_path, server_url)
                 if ios_state_has_agent_replies(last_state):
+                    summary = ios_agent_reply_summary(last_state)
+                    smoke.step("ios_device_store_receives_agent_replies", started)
+                    smoke.fact("ios_received_text", summary["texts"])
+                    smoke.fact("ios_received_media_count", summary["media_reply_count"])
                     return
                 pid = await asyncio.to_thread(
                     launch_phone_app,
@@ -399,6 +433,7 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         except TypeError:
@@ -410,6 +445,7 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         return factory(config)

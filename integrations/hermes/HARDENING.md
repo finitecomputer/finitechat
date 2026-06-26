@@ -161,15 +161,20 @@ Current local smoke:
 ```bash
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
+scripts/ios-hermes-agent-media-e2e.sh
 ```
 
 They write `target/hermes-sidecar-smoke/report.json` and
-`target/hermes-agent-media-e2e/report.json`. Together they prove
-finitechat-server, `finitechat hermes` CLI, encrypted client stores,
-`finitechat hermes serve`, `/v1/hermes/inbound` NDJSON, ack/drain, agent reply,
-Hermes adapter media materialization through the real `hermes-agent` package,
-agent text and image replies, and user decrypt. This is the local baseline
-future Docker and Tinfoil smokes should match or explain.
+`target/hermes-agent-media-e2e/report.json`.
+The iOS Simulator script writes
+`target/ios-hermes-agent-media-e2e/report.json`; it requires a booted
+simulator or `IOS_SIMULATOR_UDID`.
+Together they prove finitechat-server, `finitechat hermes` CLI, encrypted
+client stores, `finitechat hermes serve`, `/v1/hermes/inbound` NDJSON,
+ack/drain, agent reply, Hermes adapter media materialization through the real
+`hermes-agent` package, native iOS app join/send/decrypt, agent text and image
+replies, and user decrypt. This is the local baseline future Docker and Tinfoil
+smokes should match or explain.
 
 ### Phase 5: Prove The Real Runtime Image In Docker
 
@@ -293,11 +298,11 @@ Current CI shape:
   dry-run, non-S3, or non-digest-pinned reports.
 - Unittest discovery covers the Tinfoil handoff fail-closed provenance checks
   plus the generated config/runbook contract consumed by the runtime entrypoint.
-- `scripts/hermes-hardening-audit.py` reads the sidecar, Docker, GitHub setup,
-  GitHub publish-gate, preflight, publish, handoff, canary-artifact, and
-  live-canary reports and emits a single evidence matrix. Use
-  `--require-complete` only for the final gate where all S3/publish/Tinfoil
-  evidence is expected to exist.
+- `scripts/hermes-hardening-audit.py` reads the sidecar, Hermes-agent media,
+  iOS Simulator media, Docker, GitHub setup, GitHub publish-gate, preflight,
+  publish, handoff, canary-artifact, and live-canary reports and emits a single
+  evidence matrix. Use `--require-complete` only for the final gate where all
+  native-client, S3, publish, and Tinfoil evidence is expected to exist.
 
 ### Phase 7: Tinfoil Canary Last
 

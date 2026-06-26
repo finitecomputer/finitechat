@@ -16,6 +16,7 @@ from typing import Any
 from tests.hermes.test_live_hermes_agent_media_e2e import (
     FINITECHAT_BIN,
     FINITECHAT_SERVER_BIN,
+    JsonSmokeReport,
     RecordingPluginContext,
     free_local_port,
     load_adapter_module,
@@ -24,6 +25,7 @@ from tests.hermes.test_live_hermes_agent_media_e2e import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_IOS_MEDIA_REPORT = REPO_ROOT / "target/ios-hermes-agent-media-e2e/report.json"
 FINITECHAT_RMP_BIN = Path(
     os.environ.get("FINITECHAT_RMP_BIN", REPO_ROOT / "target/debug/finitechat-rmp")
 )
@@ -116,12 +118,21 @@ def read_ios_app_state(support_root: Path, server_url: str) -> dict[str, Any]:
 
 
 def ios_state_has_agent_replies(state: dict[str, Any]) -> bool:
+    summary = ios_agent_reply_summary(state)
+    return (
+        AGENT_TEXT in summary["texts"]
+        and AGENT_MEDIA_CAPTION in summary["texts"]
+        and summary["media_reply_count"] >= 1
+    )
+
+
+def ios_agent_reply_summary(state: dict[str, Any]) -> dict[str, Any]:
     texts = [message.get("text") or "" for message in state.get("messages", [])]
     media_reply_count = 0
     for message in state.get("messages", []):
         if message.get("text") == AGENT_MEDIA_CAPTION and message.get("media"):
             media_reply_count += len(message.get("media") or [])
-    return AGENT_TEXT in texts and AGENT_MEDIA_CAPTION in texts and media_reply_count >= 1
+    return {"texts": texts, "media_reply_count": media_reply_count}
 
 
 @unittest.skipUnless(
@@ -134,6 +145,15 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(FINITECHAT_SERVER_BIN.exists(), f"missing {FINITECHAT_SERVER_BIN}")
         self.assertTrue(FINITECHAT_RMP_BIN.exists(), f"missing {FINITECHAT_RMP_BIN}")
         udid = booted_simulator_udid()
+        smoke = JsonSmokeReport(
+            "ios_simulator_hermes_agent_media_e2e",
+            "FINITE_IOS_HERMES_AGENT_MEDIA_E2E_REPORT",
+            DEFAULT_IOS_MEDIA_REPORT,
+        )
+        smoke.fact("platform", "ios_simulator")
+        smoke.fact("bundle_id", BUNDLE_ID)
+        smoke.fact("ios_device_id", IOS_DEVICE_ID)
+        smoke.fact("simulator_udid", udid)
 
         with tempfile.TemporaryDirectory(prefix="finite-ios-hermes-media-") as tmp_value:
             tmp = Path(tmp_value)
@@ -159,10 +179,13 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     text=True,
                 )
                 try:
+                    started = time.monotonic()
                     wait_for_health(f"{server_url}/health")
+                    smoke.step("server_ready", started)
                     await self._run_ios_round_trip(
-                        tmp, support_root, server_url, agent_image, ios_image, udid
+                        tmp, support_root, server_url, agent_image, ios_image, udid, smoke
                     )
+                    smoke.finish()
                 finally:
                     subprocess.run(
                         ["xcrun", "simctl", "terminate", udid, BUNDLE_ID],
@@ -183,10 +206,12 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
         agent_image: Path,
         ios_image: Path,
         udid: str,
+        smoke: JsonSmokeReport,
     ) -> None:
         from gateway.config import PlatformConfig
 
         agent_home = tmp / "agent-home"
+        started = time.monotonic()
         await asyncio.to_thread(
             run_json,
             [
@@ -199,6 +224,7 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 server_url,
             ],
         )
+        smoke.step("agent_init", started)
         adapter = self._build_adapter(agent_home, PlatformConfig)
         agent_received = asyncio.get_running_loop().create_future()
 
@@ -230,13 +256,20 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             adapter.handle_message = handle_agent_message
 
         with contextlib.redirect_stdout(io.StringIO()):
+            started = time.monotonic()
             connected = await adapter.connect()
+            smoke.step("adapter_connect", started)
         self.assertTrue(connected)
+        smoke.fact("adapter_inbound_stream", bool(getattr(adapter, "inbound_stream", False)))
+        smoke.fact("adapter_service_url_present", bool(getattr(adapter, "service_url", "")))
         try:
             pin_info = await asyncio.to_thread(
                 run_json,
                 [str(FINITECHAT_BIN), "hermes", "--home", str(agent_home), "pin"],
             )
+            smoke.fact("invite_url_present", bool(pin_info.get("url")))
+            smoke.fact("pin_present", bool(pin_info.get("pin")))
+            started = time.monotonic()
             await asyncio.to_thread(
                 launch_ios_app,
                 udid=udid,
@@ -246,8 +279,11 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 pin=pin_info["pin"],
                 image_path=ios_image,
             )
+            smoke.step("ios_app_launch", started)
 
+            started = time.monotonic()
             received = await asyncio.wait_for(agent_received, timeout=90)
+            smoke.step("agent_receive_ios_media", started)
             self.assertEqual(received["text"], IOS_CAPTION)
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
@@ -255,12 +291,18 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 received["agent_media_send_success"], received["agent_media_send_error"]
             )
+            smoke.fact("agent_received_media_types", received["media_types"])
 
             deadline = time.monotonic() + 45
             last_state: dict[str, Any] | None = None
+            started = time.monotonic()
             while time.monotonic() < deadline:
                 last_state = await asyncio.to_thread(read_ios_app_state, support_root, server_url)
                 if ios_state_has_agent_replies(last_state):
+                    summary = ios_agent_reply_summary(last_state)
+                    smoke.step("ios_receive_agent_replies", started)
+                    smoke.fact("ios_received_text", summary["texts"])
+                    smoke.fact("ios_received_media_count", summary["media_reply_count"])
                     return
                 await asyncio.sleep(1)
 
@@ -283,6 +325,7 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         except TypeError:
@@ -294,6 +337,7 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                     "home": str(agent_home),
                     "finitechat_bin": str(FINITECHAT_BIN),
                     "poll_timeout_secs": 1,
+                    "inbound_stream": True,
                 },
             )
         return factory(config)

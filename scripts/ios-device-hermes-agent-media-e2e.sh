@@ -25,6 +25,7 @@ cargo build -p finitechat-cli -p finitechat-server
 
 env \
     FINITE_IOS_DEVICE_HERMES_AGENT_MEDIA_E2E=1 \
+    FINITE_IOS_DEVICE_HERMES_AGENT_MEDIA_E2E_REPORT="$REPO_ROOT/target/ios-device-hermes-agent-media-e2e/report.json" \
     FINITECHAT_BIN="$REPO_ROOT/target/debug/finitechat" \
     FINITECHAT_SERVER_BIN="$REPO_ROOT/target/debug/finitechat-server" \
     uvx --no-config --with hermes-agent python -m unittest \
