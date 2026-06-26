@@ -99,8 +99,8 @@ are written down with a clear owner.
 Current adapter regressions cover media payload mapping, inbound attachment
 materialization into Hermes media fields, room filtering, redelivery dedupe,
 ack retry without duplicate dispatch, transient poll recovery, service fallback,
-NDJSON inbound stream consumption/fallback, and thread-scoped working activity
-set/clear routing.
+NDJSON inbound stream consumption/fallback, outbound edit thread-route
+preservation, and thread-scoped working activity set/clear routing.
 
 ### Phase 2: Make The Rust Sidecar The Normal Runtime Path
 

@@ -225,6 +225,45 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(payload["metadata"], {"priority": "low"})
 
+    def test_edit_reuses_thread_route_from_original_send(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            if action == "send":
+                return self.module._FiniteChatResult(True, {"message_id": "out-1"}, None, False)
+            return self.module._FiniteChatResult(True, {"message_id": "edit-1"}, None, False)
+
+        adapter._finitechat_json = fake_json
+
+        send_result = asyncio.run(
+            adapter.send(
+                "room-agent-1",
+                "running draft",
+                metadata={"thread_id": "topic-build"},
+            )
+        )
+        edit_result = asyncio.run(
+            adapter.edit_message(
+                "room-agent-1",
+                "out-1",
+                "final answer",
+                finalize=True,
+            )
+        )
+
+        self.assertTrue(send_result.success)
+        self.assertTrue(edit_result.success)
+        self.assertEqual(edit_result.message_id, "edit-1")
+        self.assertEqual([call[0] for call in calls], ["send", "edit"])
+        self.assertEqual(calls[1][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[1][1]["message_id"], "out-1")
+        self.assertEqual(calls[1][1]["status"], "complete")
+        self.assertTrue(calls[1][1]["finalize"])
+        self.assertEqual(adapter._outbound_message_conversations["out-1"], "topic-build")
+        self.assertEqual(adapter._outbound_message_conversations["edit-1"], "topic-build")
+
     def test_media_send_uses_typed_attachment_payload(self):
         adapter = self.adapter()
         calls = []

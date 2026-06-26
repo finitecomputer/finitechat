@@ -35,6 +35,7 @@ DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
 SERVICE_READY_FILE = "hermes-service.json"
 SERVICE_START_TIMEOUT_SECS = 5.0
 MAX_DELIVERED_EVENT_KEYS = 256
+MAX_OUTBOUND_MESSAGE_ROUTES = 256
 STREAM_RECONNECT_BACKOFF_SECS = 2.0
 
 
@@ -133,6 +134,8 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self._delivered_event_keys: set[str] = set()
         self._delivered_event_order: list[str] = []
         self._activity_conversations: dict[str, str | None] = {}
+        self._outbound_message_conversations: dict[str, str | None] = {}
+        self._outbound_message_order: list[str] = []
 
     async def connect(self) -> bool:
         if not self.home:
@@ -212,9 +215,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
         result = await self._finitechat_json("send", payload, timeout=30)
         if not result.ok:
             return SendResult(success=False, error=result.error, retryable=result.retryable)
+        message_id = str(result.data.get("message_id") or result.data.get("id") or "") or None
+        if message_id:
+            self._remember_outbound_message_conversation(message_id, payload["conversation_id"])
         return SendResult(
             success=True,
-            message_id=str(result.data.get("message_id") or result.data.get("id") or "") or None,
+            message_id=message_id,
             raw_response=result.data,
         )
 
@@ -226,9 +232,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
+        conversation_id = self._outbound_message_conversations.get(str(message_id))
         payload = {
             "room_id": self._room_id(chat_id),
-            "conversation_id": self._conversation_id(None),
+            "conversation_id": conversation_id,
             "message_id": str(message_id),
             "text": str(content),
             "status": "complete" if finalize else "running",
@@ -238,9 +245,13 @@ class FiniteChatAdapter(BasePlatformAdapter):
         result = await self._finitechat_json("edit", payload, timeout=30)
         if not result.ok:
             return SendResult(success=False, error=result.error, retryable=result.retryable)
+        edited_message_id = str(result.data.get("message_id") or message_id)
+        self._remember_outbound_message_conversation(str(message_id), conversation_id)
+        if edited_message_id:
+            self._remember_outbound_message_conversation(edited_message_id, conversation_id)
         return SendResult(
             success=True,
-            message_id=str(result.data.get("message_id") or message_id),
+            message_id=edited_message_id,
             raw_response=result.data,
         )
 
@@ -523,6 +534,20 @@ class FiniteChatAdapter(BasePlatformAdapter):
         while len(self._delivered_event_order) > MAX_DELIVERED_EVENT_KEYS:
             evicted = self._delivered_event_order.pop(0)
             self._delivered_event_keys.discard(evicted)
+
+    def _remember_outbound_message_conversation(
+        self,
+        message_id: str,
+        conversation_id: str | None,
+    ) -> None:
+        if message_id in self._outbound_message_conversations:
+            self._outbound_message_conversations[message_id] = conversation_id
+            return
+        self._outbound_message_conversations[message_id] = conversation_id
+        self._outbound_message_order.append(message_id)
+        while len(self._outbound_message_order) > MAX_OUTBOUND_MESSAGE_ROUTES:
+            evicted = self._outbound_message_order.pop(0)
+            self._outbound_message_conversations.pop(evicted, None)
 
     async def _send_media(
         self,
