@@ -201,6 +201,13 @@ jobs:
             --config-repo "${{ inputs.tinfoil_config_repo }}" \
             --tag "${{ inputs.tinfoil_release_tag }}"
 
+      - name: Download Hermes sidecar smoke report
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-sidecar-smoke-report
+          path: target/hermes-sidecar-smoke
+
       - name: Build hardening evidence audit
         if: always()
         run: scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json

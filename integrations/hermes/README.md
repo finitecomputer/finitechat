@@ -277,9 +277,12 @@ scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json
 The audit also reads `target/hermes-github-secrets-setup.json` and
 `target/hermes-github-publish-gate/report.json` so missing GitHub secrets, dirty
 local worktrees, and missing remote branches show up before the S3 evidence
-exists. Add `--require-complete` only when the S3-backed smoke, published
-digest, handoff, generated canary artifacts, and live Tinfoil canary result are
-all expected to be present.
+exists. In CI, the Docker runtime job downloads the sidecar smoke artifact from
+the Rust/Hermes job before generating the audit, so the uploaded audit reflects
+both the local sidecar contract and the packaged-runtime proof. Add
+`--require-complete` only when the S3-backed smoke, published digest, handoff,
+generated canary artifacts, and live Tinfoil canary result are all expected to
+be present.
 
 ## How the pieces divide (ADR 0002)
 

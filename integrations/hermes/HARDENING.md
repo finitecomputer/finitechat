@@ -231,7 +231,10 @@ Current CI shape:
   restic repository when the default local backend is used. The report includes
   the local Docker image ID, image metadata, restic backend, restic snapshot
   metadata, and repository metadata for the image it proved. This is the current
-  release-gate stand-in.
+  release-gate stand-in. Before generating the combined hardening audit, the
+  Docker job downloads the sidecar smoke artifact from the Rust/Hermes job so
+  `target/hermes-hardening-audit.json` reflects the full CI evidence chain
+  instead of only the files produced inside the Docker job.
 - Manual workflow dispatch with `publish_runtime_image=true` runs the Docker
   smoke first and requires `restic_backend=s3`. The workflow accepts either a
   full `restic_repository` input or derives the repository from
