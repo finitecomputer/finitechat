@@ -85,8 +85,10 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     container_url = non_empty_string(container.get("url"))
     container_status = normalize_status(container.get("status"))
     image_digest = non_empty_string(image.get("digest"))
+    image_source = non_empty_string(image.get("source"))
     restic_backend = non_empty_string(storage.get("backend"))
     restore_tag = non_empty_string(storage.get("restore_tag"))
+    storage_source = non_empty_string(storage.get("source"))
     expected_container_name = non_empty_string(expected.get("container_name"))
     expected_image_digest = non_empty_string(expected.get("image_digest"))
     expected_storage_backend = non_empty_string(expected.get("storage_backend"))
@@ -143,14 +145,16 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         condition=bool(
             image_digest
             and "@sha256:" in image_digest
+            and image_source in {"container_json", "operator_arg"}
             and expected_image_matches
             and handoff_source_present
             and summary_source_present
         ),
         layer="digest-pinned runtime image",
         error=(
-            "image.digest must be digest-pinned with @sha256: and match "
-            "expected.image_digest from source handoff/summary artifacts"
+            "image.digest must be observed from container_json or operator_arg, "
+            "be digest-pinned with @sha256:, and match expected.image_digest "
+            "from source handoff/summary artifacts"
         ),
     )
     add_layer(
@@ -159,14 +163,16 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         condition=(
             restic_backend == "s3"
             and restore_tag == "finite-agent-state"
+            and storage_source in {"health_or_container_json", "operator_arg"}
             and expected_storage_matches
             and handoff_source_present
         ),
         layer="S3 restic repository",
         error=(
-            "storage.backend must be 's3', storage.restore_tag must be "
-            "'finite-agent-state', and both must match expected storage values "
-            "from source_artifacts.handoff_report"
+            "storage.backend/restic tag must be observed from health_or_container_json "
+            "or operator_arg, storage.backend must be 's3', storage.restore_tag "
+            "must be 'finite-agent-state', and both must match expected storage "
+            "values from source_artifacts.handoff_report"
         ),
     )
     add_layer(
@@ -235,8 +241,10 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "container_url": container_url,
             "container_status": container_status or None,
             "image_digest": image_digest,
+            "image_source": image_source,
             "restic_backend": restic_backend,
             "restore_tag": restore_tag,
+            "storage_source": storage_source,
             "expected_container_name": expected_container_name,
             "expected_image_digest": expected_image_digest,
             "expected_storage_backend": expected_storage_backend,

@@ -295,6 +295,9 @@ scripts/hermes-tinfoil-canary-evidence.py \
   --canary-summary target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json \
   --container-json target/hermes-docker-smoke/tinfoil-canary/container.json \
   --health-json target/hermes-docker-smoke/tinfoil-canary/health.json \
+  --image-digest '<digest-observed-from-tinfoil-container-json>' \
+  --storage-backend s3 \
+  --restore-tag finite-agent-state \
   --chat-before-message-id '<finite-chat-event-id-before-restart>' \
   --chat-after-message-id '<finite-chat-event-id-after-restart>' \
   --backup-observed \
@@ -313,10 +316,11 @@ scripts/hermes-tinfoil-canary-result.py \
 That validator fails unless the evidence preserves the raw handoff, summary,
 container, and health source artifact references; the canary used the generated
 handoff expectations for container name, digest-pinned image, S3 restic state,
-and restore tag; a running Tinfoil container; `/healthz` readiness with the
-restored npub; concrete Finite Chat event IDs before and after restart; an
-observed clean-stop backup; an observed latest-by-tag restore; and the same
-agent npub after restore.
+and restore tag; the observed image digest and storage fields are sourced from
+container/health JSON or explicit operator observations; a running Tinfoil
+container; `/healthz` readiness with the restored npub; concrete Finite Chat
+event IDs before and after restart; an observed clean-stop backup; an observed
+latest-by-tag restore; and the same agent npub after restore.
 
 To see exactly which hardening gates are proven by the reports on disk:
 

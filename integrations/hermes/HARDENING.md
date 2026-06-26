@@ -378,7 +378,10 @@ Tinfoil canary runbook draft:
    `scripts/hermes-tinfoil-canary-result.py --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json --report target/hermes-docker-smoke/tinfoil-canary-result.json`.
    The evidence builder records the source artifact paths plus the generated
    handoff/config expectations for container name, image digest, storage
-   backend, and restore tag. The validator must pass before
+   backend, and restore tag. The observed image digest and storage fields must
+   come from container/health JSON or explicit operator observations; expected
+   handoff values are not reused as observed runtime facts. The validator must
+   pass before
    `scripts/hermes-hardening-audit.py --require-complete` can pass, and it
    rejects missing source artifacts, mismatched expectations, or chat claims
    without concrete event IDs.
@@ -421,7 +424,8 @@ Tinfoil canary runbook draft:
   `scripts/hermes-tinfoil-canary-result.py`; a hand-written
   `{"status":"passed"}` result is not enough. The normalized result must
   preserve raw source artifact references, match the generated handoff
-  expectations, and include concrete before/after chat event IDs.
+  expectations, include observed image/storage sources, and include concrete
+  before/after chat event IDs.
 - The hardening audit must report `complete` before this track is considered
   done. Local-only smoke evidence is not enough to satisfy the Tinfoil objective.
 

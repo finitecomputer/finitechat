@@ -42,6 +42,43 @@ def object_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def image_digest_from_container_json(container: dict[str, Any]) -> str | None:
+    image = object_dict(container.get("image"))
+    return first_string(
+        container.get("image_digest"),
+        container.get("imageDigest"),
+        container.get("image_ref"),
+        container.get("imageRef"),
+        container.get("repo_digest"),
+        container.get("repoDigest"),
+        image.get("digest"),
+        image.get("repo_digest"),
+        image.get("repoDigest"),
+        image.get("ref"),
+        image.get("reference"),
+        container.get("image") if isinstance(container.get("image"), str) else None,
+    )
+
+
+def storage_from_json(*values: dict[str, Any]) -> dict[str, str | None]:
+    for value in values:
+        storage = object_dict(value.get("storage"))
+        backend = first_string(
+            value.get("storage_backend"),
+            value.get("restic_backend"),
+            storage.get("backend"),
+        )
+        restore_tag = first_string(
+            value.get("restore_tag"),
+            value.get("restic_restore_tag"),
+            storage.get("restore_tag"),
+            storage.get("restic_restore_tag"),
+        )
+        if backend or restore_tag:
+            return {"backend": backend, "restore_tag": restore_tag}
+    return {"backend": None, "restore_tag": None}
+
+
 def source_artifact(path: str | None) -> dict[str, Any]:
     return {
         "path": path,
@@ -59,6 +96,7 @@ def container_from_json(container: dict[str, Any]) -> dict[str, str | None]:
             container.get("containerUrl"),
             container.get("containerURL"),
         ),
+        "image_digest": image_digest_from_container_json(container),
     }
 
 
@@ -74,6 +112,7 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
     summary_config_repo = canary_summary.get("config_repo")
     summary_release_tag = canary_summary.get("release_tag")
     container = container_from_json(container_json)
+    observed_storage = storage_from_json(health_json, container_json)
     health_ready = (
         args.health_ready if args.health_ready is not None else first_bool(health_json.get("ready"))
     )
@@ -84,6 +123,23 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
     expected_image_digest = first_string(summary_image_digest, handoff_image.get("digest"))
     expected_storage_backend = first_string(handoff_restore.get("backend"))
     expected_restore_tag = first_string(handoff_restore.get("restore_tag"))
+    image_digest = first_string(args.image_digest, container["image_digest"])
+    image_source = (
+        "operator_arg"
+        if first_string(args.image_digest)
+        else "container_json"
+        if first_string(container["image_digest"])
+        else None
+    )
+    storage_backend = first_string(args.storage_backend, observed_storage["backend"])
+    storage_restore_tag = first_string(args.restore_tag, observed_storage["restore_tag"])
+    storage_source = (
+        "operator_arg"
+        if first_string(args.storage_backend, args.restore_tag)
+        else "health_or_container_json"
+        if first_string(observed_storage["backend"], observed_storage["restore_tag"])
+        else None
+    )
     evidence = {
         "generated_at_unix": int(time.time()),
         "sources": {
@@ -112,13 +168,13 @@ def build_evidence(args: argparse.Namespace) -> dict[str, Any]:
             "url": first_string(args.container_url, container["url"]),
         },
         "image": {
-            "digest": first_string(
-                args.image_digest, summary_image_digest, handoff_image.get("digest")
-            ),
+            "digest": image_digest,
+            "source": image_source,
         },
         "storage": {
-            "backend": first_string(args.storage_backend, handoff_restore.get("backend")),
-            "restore_tag": first_string(args.restore_tag, handoff_restore.get("restore_tag")),
+            "backend": storage_backend,
+            "restore_tag": storage_restore_tag,
+            "source": storage_source,
         },
         "health": {
             "ready": health_ready is True,

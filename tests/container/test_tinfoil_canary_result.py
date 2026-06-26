@@ -36,8 +36,12 @@ def passing_evidence() -> dict:
             "container_json": {"path": "container.json", "present": True},
             "health_json": {"path": "health.json", "present": True},
         },
-        "image": {"digest": IMAGE_DIGEST},
-        "storage": {"backend": "s3", "restore_tag": "finite-agent-state"},
+        "image": {"digest": IMAGE_DIGEST, "source": "container_json"},
+        "storage": {
+            "backend": "s3",
+            "restore_tag": "finite-agent-state",
+            "source": "operator_arg",
+        },
         "health": {"ready": True, "npub": "npub1agent"},
         "chat": {
             "before_restart": {"ok": True, "message_id": "event-before"},
@@ -81,6 +85,8 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["missing_proof_layers"], [])
         self.assertEqual(report["facts"]["restic_backend"], "s3")
+        self.assertEqual(report["facts"]["image_source"], "container_json")
+        self.assertEqual(report["facts"]["storage_source"], "operator_arg")
         self.assertEqual(report["facts"]["agent_npub_before_restart"], "npub1agent")
         self.assertEqual(report["facts"]["agent_npub_after_restore"], "npub1agent")
         self.assertTrue(report["facts"]["container_json_source_present"])
@@ -134,6 +140,28 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertIn("digest-pinned runtime image", report["missing_proof_layers"])
         self.assertIn("expected.image_digest", " ".join(report["errors"]))
+
+    def test_fails_when_runtime_image_has_no_observation_source(self) -> None:
+        evidence = passing_evidence()
+        evidence["image"]["source"] = None
+        with tempfile.TemporaryDirectory() as tmp_value:
+            result, report = run_result(Path(tmp_value), evidence)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("digest-pinned runtime image", report["missing_proof_layers"])
+        self.assertIn("container_json or operator_arg", " ".join(report["errors"]))
+
+    def test_fails_when_storage_has_no_observation_source(self) -> None:
+        evidence = passing_evidence()
+        evidence["storage"]["source"] = None
+        with tempfile.TemporaryDirectory() as tmp_value:
+            result, report = run_result(Path(tmp_value), evidence)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("S3 restic repository", report["missing_proof_layers"])
+        self.assertIn("health_or_container_json or operator_arg", " ".join(report["errors"]))
 
     def test_fails_when_raw_health_artifact_is_missing(self) -> None:
         evidence = passing_evidence()

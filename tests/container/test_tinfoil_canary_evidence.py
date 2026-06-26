@@ -18,7 +18,9 @@ def write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value) + "\n", encoding="utf-8")
 
 
-def run_evidence(tmp: Path) -> tuple[subprocess.CompletedProcess[str], dict]:
+def run_evidence(
+    tmp: Path, *, include_container_image_digest: bool = True
+) -> tuple[subprocess.CompletedProcess[str], dict]:
     handoff = tmp / "handoff.json"
     summary = tmp / "summary.json"
     container = tmp / "container.json"
@@ -41,13 +43,13 @@ def run_evidence(tmp: Path) -> tuple[subprocess.CompletedProcess[str], dict]:
             "release_tag": "v0.1.0",
         },
     )
-    write_json(
-        container,
-        {
-            "status": "Running",
-            "container_url": "https://finite-agent-tinfoil-user-canary.finite.containers.tinfoil.dev",
-        },
-    )
+    container_payload = {
+        "status": "Running",
+        "container_url": "https://finite-agent-tinfoil-user-canary.finite.containers.tinfoil.dev",
+    }
+    if include_container_image_digest:
+        container_payload["image_digest"] = IMAGE_DIGEST
+    write_json(container, container_payload)
     write_json(health, {"ready": True, "npub": "npub1agent"})
     result = subprocess.run(
         [
@@ -60,6 +62,10 @@ def run_evidence(tmp: Path) -> tuple[subprocess.CompletedProcess[str], dict]:
             str(container),
             "--health-json",
             str(health),
+            "--storage-backend",
+            "s3",
+            "--restore-tag",
+            "finite-agent-state",
             "--chat-before-message-id",
             "event-before",
             "--chat-after-message-id",
@@ -103,6 +109,8 @@ class TinfoilCanaryEvidenceTest(unittest.TestCase):
         self.assertTrue(evidence["source_artifacts"]["handoff_report"]["present"])
         self.assertEqual(evidence["expected"]["container_name"], "finite-agent-tinfoil-user-canary")
         self.assertEqual(evidence["image"]["digest"], IMAGE_DIGEST)
+        self.assertEqual(evidence["image"]["source"], "container_json")
+        self.assertEqual(evidence["storage"]["source"], "operator_arg")
         self.assertTrue(evidence["restart_restore"]["same_npub"])
 
     def test_missing_chat_after_restart_still_emits_invalid_evidence(self) -> None:
@@ -129,6 +137,32 @@ class TinfoilCanaryEvidenceTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(validation.returncode, 2)
+
+    def test_expected_digest_is_not_used_as_observed_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            result, evidence = run_evidence(tmp, include_container_image_digest=False)
+            evidence_path = tmp / "evidence.json"
+            report_path = tmp / "result.json"
+            validation = subprocess.run(
+                [
+                    str(RESULT_SCRIPT),
+                    "--evidence-json",
+                    str(evidence_path),
+                    "--report",
+                    str(report_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(evidence["image"]["digest"])
+        self.assertIsNone(evidence["image"]["source"])
+        self.assertEqual(validation.returncode, 2)
+        self.assertIn("digest-pinned runtime image", report["missing_proof_layers"])
 
 
 if __name__ == "__main__":
