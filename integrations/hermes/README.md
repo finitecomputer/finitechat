@@ -149,8 +149,11 @@ real Latitude/GitHub S3 gate.
 must be the user-owned restore key, not the disposable local smoke default.
 For local runs, copy `.env.example` to `.env`; the smoke wrapper sources it
 before preflight and promotes `FINITE_DOCKER_RESTIC_AWS_*` values to the
-`AWS_*` names restic expects. If `FINITE_DOCKER_RESTIC_REPOSITORY` is empty,
-the wrapper can derive it from `FINITE_LATITUDE_STORAGE_BUCKET`,
+`AWS_*` names restic expects. If those values are still unset, it reads the
+standard AWS shared credentials/config files using `AWS_PROFILE` or the
+`default` profile. Set `FINITE_DOCKER_RESTIC_USE_AWS_SHARED_CONFIG=0` to
+disable that fallback. If `FINITE_DOCKER_RESTIC_REPOSITORY` is empty, the
+wrapper can derive it from `FINITE_LATITUDE_STORAGE_BUCKET`,
 `FINITE_LATITUDE_OBJECT_ENDPOINT`, and `FINITE_DOCKER_RESTIC_PREFIX`.
 
 To publish the exact local image proven by a passing Docker smoke report:

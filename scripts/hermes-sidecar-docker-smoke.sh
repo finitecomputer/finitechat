@@ -32,6 +32,11 @@ fi
 if [[ -z "${AWS_DEFAULT_REGION:-}" && -n "${FINITE_DOCKER_RESTIC_AWS_DEFAULT_REGION:-}" ]]; then
     export AWS_DEFAULT_REGION="$FINITE_DOCKER_RESTIC_AWS_DEFAULT_REGION"
 fi
+if [[ "${FINITE_DOCKER_RESTIC_USE_AWS_SHARED_CONFIG:-1}" != "0" ]]; then
+    eval "$("$REPO_ROOT/scripts/hermes-restic-preflight.py" \
+        --aws-profile "${AWS_PROFILE:-default}" \
+        --export-aws-shared-env)"
+fi
 if [[ "${FINITE_DOCKER_RESTIC_BACKEND:-local}" == "s3" && -z "${FINITE_DOCKER_RESTIC_REPOSITORY:-}" && -n "${FINITE_LATITUDE_STORAGE_BUCKET:-}" ]]; then
     LATITUDE_ENDPOINT="${FINITE_LATITUDE_OBJECT_ENDPOINT:-https://objects.nyc.storage.sh}"
     LATITUDE_PREFIX="${FINITE_DOCKER_RESTIC_PREFIX:-hermes-docker-smoke}"

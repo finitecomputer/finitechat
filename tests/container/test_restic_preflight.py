@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,96 @@ spec.loader.exec_module(preflight)
 
 
 class ResticPreflightTest(unittest.TestCase):
+    def test_parse_aws_shared_config_reads_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            credentials_file = tmp / "credentials"
+            config_file = tmp / "config"
+            credentials_file.write_text(
+                "\n".join(
+                    [
+                        "[finite]",
+                        "aws_access_key_id = profile-access",
+                        "aws_secret_access_key = profile-secret",
+                        "aws_session_token = profile-session",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config_file.write_text(
+                "\n".join(
+                    [
+                        "[profile finite]",
+                        "region = us-east-1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            values = preflight.parse_aws_shared_config(
+                credentials_file=credentials_file,
+                config_file=config_file,
+                profile="finite",
+            )
+
+        self.assertEqual(values["AWS_ACCESS_KEY_ID"], "profile-access")
+        self.assertEqual(values["AWS_SECRET_ACCESS_KEY"], "profile-secret")
+        self.assertEqual(values["AWS_SESSION_TOKEN"], "profile-session")
+        self.assertEqual(values["AWS_REGION"], "us-east-1")
+
+    def test_aws_shared_config_does_not_override_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            credentials_file = tmp / "credentials"
+            config_file = tmp / "config"
+            credentials_file.write_text(
+                "\n".join(
+                    [
+                        "[default]",
+                        "aws_access_key_id = profile-access",
+                        "aws_secret_access_key = profile-secret",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            values = preflight.merge_aws_shared_config(
+                {"AWS_ACCESS_KEY_ID": "env-access"},
+                credentials_file=credentials_file,
+                config_file=config_file,
+                profile="default",
+            )
+
+        self.assertEqual(values["AWS_ACCESS_KEY_ID"], "env-access")
+        self.assertEqual(values["AWS_SECRET_ACCESS_KEY"], "profile-secret")
+
+    def test_aws_shared_shell_exports_only_missing_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            credentials_file = tmp / "credentials"
+            config_file = tmp / "config"
+            credentials_file.write_text(
+                "\n".join(
+                    [
+                        "[default]",
+                        "aws_access_key_id = profile-access",
+                        "aws_secret_access_key = profile secret with spaces",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            text = preflight.aws_shared_shell_exports(
+                {"AWS_ACCESS_KEY_ID": "env-access"},
+                credentials_file=credentials_file,
+                config_file=config_file,
+                profile="default",
+            )
+
+        self.assertNotIn("AWS_ACCESS_KEY_ID", text)
+        self.assertIn("AWS_SECRET_ACCESS_KEY=", text)
+        self.assertIn("'profile secret with spaces'", text)
+
     def test_accepts_finite_prefixed_aws_credentials(self) -> None:
         status, report = preflight.validate(
             {

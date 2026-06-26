@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -19,6 +21,93 @@ AWS_ENV_ALIASES = {
     "AWS_REGION": "FINITE_DOCKER_RESTIC_AWS_REGION",
     "AWS_DEFAULT_REGION": "FINITE_DOCKER_RESTIC_AWS_DEFAULT_REGION",
 }
+AWS_SHARED_ENV_NAMES = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
+)
+
+
+def aws_config_section(profile: str) -> str:
+    if profile == "default":
+        return "default"
+    return f"profile {profile}"
+
+
+def parse_aws_shared_config(
+    *,
+    credentials_file: Path,
+    config_file: Path,
+    profile: str,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    profile = profile or "default"
+
+    credentials = configparser.ConfigParser()
+    credentials.read(credentials_file)
+    if credentials.has_section(profile):
+        section = credentials[profile]
+        access_key = section.get("aws_access_key_id")
+        secret_key = section.get("aws_secret_access_key")
+        session_token = section.get("aws_session_token")
+        region = section.get("region")
+        if access_key:
+            values["AWS_ACCESS_KEY_ID"] = access_key
+        if secret_key:
+            values["AWS_SECRET_ACCESS_KEY"] = secret_key
+        if session_token:
+            values["AWS_SESSION_TOKEN"] = session_token
+        if region:
+            values["AWS_REGION"] = region
+
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    section_name = aws_config_section(profile)
+    if config.has_section(section_name):
+        region = config[section_name].get("region")
+        if region:
+            values["AWS_REGION"] = region
+    return values
+
+
+def merge_aws_shared_config(
+    env: dict[str, str],
+    *,
+    credentials_file: Path,
+    config_file: Path,
+    profile: str,
+) -> dict[str, str]:
+    merged = dict(env)
+    shared = parse_aws_shared_config(
+        credentials_file=credentials_file,
+        config_file=config_file,
+        profile=profile,
+    )
+    for name, value in shared.items():
+        if not merged.get(name) and value:
+            merged[name] = value
+    return merged
+
+
+def aws_shared_shell_exports(
+    env: dict[str, str],
+    *,
+    credentials_file: Path,
+    config_file: Path,
+    profile: str,
+) -> str:
+    shared = parse_aws_shared_config(
+        credentials_file=credentials_file,
+        config_file=config_file,
+        profile=profile,
+    )
+    lines: list[str] = []
+    for name in AWS_SHARED_ENV_NAMES:
+        value = shared.get(name)
+        if value and not env.get(name):
+            lines.append(f"export {name}={shlex.quote(value)}")
+    return "\n".join(lines)
 
 
 def redact_repository(repository: str) -> str:
@@ -146,8 +235,51 @@ def finish(report: dict[str, object]) -> tuple[int, dict[str, object]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", help="optional JSON report path")
+    parser.add_argument(
+        "--aws-profile",
+        default=os.environ.get("AWS_PROFILE", "default"),
+        help="AWS shared credentials/config profile to read before validation.",
+    )
+    parser.add_argument(
+        "--aws-credentials-file",
+        default=str(Path.home() / ".aws" / "credentials"),
+        help="AWS shared credentials file used as a low-precedence input source.",
+    )
+    parser.add_argument(
+        "--aws-config-file",
+        default=str(Path.home() / ".aws" / "config"),
+        help="AWS shared config file used as a low-precedence input source.",
+    )
+    parser.add_argument(
+        "--no-aws-shared-config",
+        action="store_true",
+        help="Do not read AWS shared credentials/config files.",
+    )
+    parser.add_argument(
+        "--export-aws-shared-env",
+        action="store_true",
+        help="Print shell exports for missing AWS_* values from shared AWS config.",
+    )
     args = parser.parse_args()
-    status, report = validate(dict(os.environ))
+    env = dict(os.environ)
+    if args.export_aws_shared_env:
+        text = aws_shared_shell_exports(
+            env,
+            credentials_file=Path(args.aws_credentials_file),
+            config_file=Path(args.aws_config_file),
+            profile=args.aws_profile,
+        )
+        if text:
+            print(text)
+        return 0
+    if not args.no_aws_shared_config:
+        env = merge_aws_shared_config(
+            env,
+            credentials_file=Path(args.aws_credentials_file),
+            config_file=Path(args.aws_config_file),
+            profile=args.aws_profile,
+        )
+    status, report = validate(env)
     text = json.dumps(report, indent=2) + "\n"
     if args.report:
         path = Path(args.report)

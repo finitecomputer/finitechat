@@ -240,10 +240,11 @@ requires an explicit user-owned password for remote repos, and writes a JSON
 report that is uploaded alongside the Docker smoke report.
 For local S3 runs, `scripts/hermes-sidecar-docker-smoke.sh` sources `.env` when
 present, promotes `FINITE_DOCKER_RESTIC_AWS_*` values to the `AWS_*` names used
-by restic, and can derive `FINITE_DOCKER_RESTIC_REPOSITORY` from
-`FINITE_LATITUDE_STORAGE_BUCKET`, `FINITE_LATITUDE_OBJECT_ENDPOINT`, and
-`FINITE_DOCKER_RESTIC_PREFIX`. `.env.example` documents those fields without
-shipping secrets.
+by restic, falls back to the standard AWS shared credentials/config profile
+when the AWS env is still unset, and can derive
+`FINITE_DOCKER_RESTIC_REPOSITORY` from `FINITE_LATITUDE_STORAGE_BUCKET`,
+`FINITE_LATITUDE_OBJECT_ENDPOINT`, and `FINITE_DOCKER_RESTIC_PREFIX`.
+`.env.example` documents those fields without shipping secrets.
 `scripts/hermes-publish-proven-image.py` then turns a passing smoke report into
 a publish artifact by validating that the local Docker image id still matches
 the proven `facts.image_id`, tagging that exact image, and optionally pushing
