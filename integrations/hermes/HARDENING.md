@@ -323,6 +323,9 @@ Current CI shape:
   dry-run, non-S3, or non-digest-pinned reports.
 - Unittest discovery covers the Tinfoil handoff fail-closed provenance checks
   plus the generated config/runbook contract consumed by the runtime entrypoint.
+  The hardening audit rejects a placeholder `{"status":"ready"}` canary summary:
+  it requires readable generated config/runbook files, a digest-pinned image,
+  required restore/backup env, required secret names, and handoff digest match.
 - `scripts/hermes-hardening-audit.py` reads the adapter-regression, sidecar,
   Hermes-agent media, iOS Simulator media, Docker, GitHub setup, GitHub
   publish-gate, preflight, publish, handoff, canary-artifact, and live-canary

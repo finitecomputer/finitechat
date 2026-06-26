@@ -101,6 +101,30 @@ REQUIRED_TINFOIL_PROOF_LAYERS = {
     "same agent npub after restore",
     "Finite Chat round trip after restore",
 }
+REQUIRED_CANARY_CONFIG_SNIPPETS = {
+    "FINITE_AGENT_RESTORE_ON_START",
+    "FINITE_AGENT_RESTORE_LATEST",
+    "FINITE_AGENT_BACKUP_ON_EXIT",
+    "FINITE_AGENT_RESTIC_REPOSITORY",
+    "FINITE_AGENT_RESTIC_BACKUP_TAG",
+    "FINITECHAT_HERMES_INBOUND_STREAM",
+    "/healthz",
+    "upstream-port: 8080",
+}
+REQUIRED_CANARY_RUNBOOK_SNIPPETS = {
+    "scripts/hermes-tinfoil-canary-evidence.py",
+    "scripts/hermes-tinfoil-canary-result.py",
+    "--image-digest",
+    "--storage-backend s3",
+    "--restore-tag finite-agent-state",
+    "--chat-before-message-id",
+    "--chat-after-message-id",
+}
+REQUIRED_CANARY_SECRET_ENV = {
+    "FINITE_AGENT_RESTIC_PASSWORD",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+}
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -136,6 +160,98 @@ def list_detail(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(item) for item in value)
     return str(value) if value else ""
+
+
+def non_empty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def resolve_summary_artifact_path(summary_path: Path, value: Any) -> Path | None:
+    if not non_empty_str(value):
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path
+    sibling = summary_path.parent / path.name
+    if sibling.exists():
+        return sibling
+    return path
+
+
+def read_existing_text(path: Path | None) -> str | None:
+    if path is None or not path.exists() or not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def validate_canary_summary(
+    canary_summary: dict[str, Any] | None,
+    canary_summary_path: Path,
+    handoff: dict[str, Any] | None,
+) -> list[str]:
+    if not canary_summary:
+        return ["requires generated digest-pinned Tinfoil config/runbook"]
+
+    errors: list[str] = []
+    if canary_summary.get("status") != "ready":
+        errors.append(f"summary status={canary_summary.get('status')!r}")
+
+    image_digest = canary_summary.get("image_digest")
+    if not non_empty_str(image_digest) or "@sha256:" not in str(image_digest):
+        errors.append("summary image_digest must pin sha256")
+
+    handoff_image = handoff.get("image") if isinstance(handoff, dict) else None
+    handoff_digest = handoff_image.get("digest") if isinstance(handoff_image, dict) else None
+    if (
+        isinstance(handoff, dict)
+        and handoff.get("status") == "ready"
+        and non_empty_str(handoff_digest)
+        and image_digest != handoff_digest
+    ):
+        errors.append("summary image_digest does not match handoff image.digest")
+
+    for key in ("config_repo", "release_tag", "container_name", "finite_server_url"):
+        if not non_empty_str(canary_summary.get(key)):
+            errors.append(f"summary {key} is required")
+    config_repo = canary_summary.get("config_repo")
+    if non_empty_str(config_repo) and "/" not in str(config_repo):
+        errors.append("summary config_repo must be owner/repo")
+
+    secret_env = canary_summary.get("secret_env")
+    if not isinstance(secret_env, list):
+        errors.append("summary secret_env must be a list")
+    else:
+        missing_secret_env = sorted(REQUIRED_CANARY_SECRET_ENV - {str(item) for item in secret_env})
+        if missing_secret_env:
+            errors.append(f"summary secret_env missing: {', '.join(missing_secret_env)}")
+
+    config_path = resolve_summary_artifact_path(canary_summary_path, canary_summary.get("config"))
+    runbook_path = resolve_summary_artifact_path(canary_summary_path, canary_summary.get("runbook"))
+    config_text = read_existing_text(config_path)
+    runbook_text = read_existing_text(runbook_path)
+    if config_text is None:
+        errors.append("summary config path is missing or unreadable")
+    else:
+        if non_empty_str(image_digest) and str(image_digest) not in config_text:
+            errors.append("config does not contain summary image_digest")
+        missing_config = sorted(
+            snippet for snippet in REQUIRED_CANARY_CONFIG_SNIPPETS if snippet not in config_text
+        )
+        if missing_config:
+            errors.append(f"config missing snippets: {', '.join(missing_config)}")
+    if runbook_text is None:
+        errors.append("summary runbook path is missing or unreadable")
+    else:
+        if non_empty_str(image_digest) and str(image_digest) not in runbook_text:
+            errors.append("runbook does not contain summary image_digest")
+        missing_runbook = sorted(
+            snippet for snippet in REQUIRED_CANARY_RUNBOOK_SNIPPETS if snippet not in runbook_text
+        )
+        if missing_runbook:
+            errors.append(f"runbook missing snippets: {', '.join(missing_runbook)}")
+    return errors
 
 
 def step_names(report: dict[str, Any]) -> set[str]:
@@ -459,13 +575,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         else "requires ready handoff from S3 smoke and published digest",
     )
 
-    canary_ready = bool(canary_summary) and canary_summary.get("status") == "ready"
+    canary_errors = validate_canary_summary(canary_summary, canary_summary_path, handoff)
+    canary_ready = not canary_errors
     add_check(
         checks,
         name="tinfoil_canary_artifacts_ready",
         status="passed" if canary_ready else "missing",
         evidence=str(canary_summary_path) if canary_summary else None,
-        detail=None if canary_ready else "requires generated digest-pinned Tinfoil config/runbook",
+        detail=None if canary_ready else "; ".join(canary_errors),
     )
 
     tinfoil_missing = missing_layers(tinfoil_result or {}, REQUIRED_TINFOIL_PROOF_LAYERS)

@@ -12,6 +12,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_SCRIPT = REPO_ROOT / "scripts" / "hermes-hardening-audit.py"
 IMAGE_ID = "sha256:local-image"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
+CONFIG_REPO = "finitecomputer/tinfoil-agent-runtime-canary"
+RELEASE_TAG = "v0.1.0"
+CONTAINER_NAME = "finite-agent-tinfoil-user-canary"
 
 SIDECAR_LAYERS = [
     "finitechat-server",
@@ -216,6 +219,98 @@ def tinfoil_result() -> dict:
     }
 
 
+def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
+    return {
+        "status": "ready",
+        "image": {
+            "source_image_id": IMAGE_ID,
+            "target_ref": "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0",
+            "digest": image_digest,
+        },
+    }
+
+
+def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> None:
+    output_dir = tmp / "tinfoil-canary"
+    config_path = output_dir / "tinfoil-config.yml"
+    runbook_path = output_dir / "tinfoil-canary-runbook.md"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                'cvm-version: "0.7.5"',
+                "cpus: 4",
+                "memory: 16384",
+                "containers:",
+                f'  - name: "{CONTAINER_NAME}"',
+                f'    image: "{image_digest}"',
+                "    env:",
+                '      - FINITE_AGENT_RESTORE_ON_START: "1"',
+                '      - FINITE_AGENT_RESTORE_LATEST: "1"',
+                '      - FINITE_AGENT_BACKUP_ON_EXIT: "1"',
+                (
+                    "      - FINITE_AGENT_RESTIC_REPOSITORY: "
+                    '"s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/hermes"'
+                ),
+                '      - FINITE_AGENT_RESTIC_BACKUP_TAG: "finite-agent-state"',
+                '      - FINITECHAT_HERMES_INBOUND_STREAM: "1"',
+                "    secrets:",
+                "      - FINITE_AGENT_RESTIC_PASSWORD",
+                "      - AWS_ACCESS_KEY_ID",
+                "      - AWS_SECRET_ACCESS_KEY",
+                "    healthcheck:",
+                '      test: ["CMD", "python", "-c", "curl /healthz"]',
+                "shim:",
+                "  upstream-port: 8080",
+                "  paths:",
+                "    - /healthz",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runbook_path.write_text(
+        "\n".join(
+            [
+                "# Tinfoil Hermes Canary Runbook",
+                f"- Config repo: `{CONFIG_REPO}`",
+                f"- Release tag: `{RELEASE_TAG}`",
+                f"- Container name: `{CONTAINER_NAME}`",
+                f"- Image digest: `{image_digest}`",
+                "scripts/hermes-tinfoil-canary-evidence.py \\",
+                "  --image-digest '<digest-observed-from-tinfoil-container-json>' \\",
+                "  --storage-backend s3 \\",
+                "  --restore-tag finite-agent-state \\",
+                "  --chat-before-message-id '<finite-chat-event-id-before-restart>' \\",
+                "  --chat-after-message-id '<finite-chat-event-id-after-restart>'",
+                "scripts/hermes-tinfoil-canary-result.py \\",
+                "  --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    write_json(
+        tmp / "canary-summary.json",
+        {
+            "status": "ready",
+            "generated_at_unix": 1,
+            "config": str(config_path),
+            "runbook": str(runbook_path),
+            "config_repo": CONFIG_REPO,
+            "release_tag": RELEASE_TAG,
+            "container_name": CONTAINER_NAME,
+            "image_digest": image_digest,
+            "finite_server_url": "https://chat.finite.computer",
+            "secret_env": [
+                "FINITE_AGENT_RESTIC_PASSWORD",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+            ],
+        },
+    )
+
+
 def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
     args = [
         str(AUDIT_SCRIPT),
@@ -299,8 +394,8 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
             status, audit = run_audit(tmp, require_complete=True)
 
@@ -329,14 +424,46 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", {"status": "passed"})
             status, audit = run_audit(tmp, require_complete=True)
 
         self.assertEqual(status, 2)
         self.assertEqual(audit["status"], "incomplete")
         self.assertIn("tinfoil_canary_runtime", audit["missing"])
+
+    def test_audit_rejects_placeholder_canary_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "docker-ios.json", docker_ios_report())
+            write_json(tmp / "s3-emulator.json", s3_emulator_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", handoff_report())
+            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("tinfoil_canary_artifacts_ready", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("image_digest", details["tinfoil_canary_artifacts_ready"])
 
     def test_audit_reports_github_setup_errors_before_s3_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
@@ -396,8 +523,8 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
             status, audit = run_audit(tmp, require_complete=True)
 
@@ -430,8 +557,8 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
             status, audit = run_audit(tmp, require_complete=True)
 
@@ -468,8 +595,8 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
             status, audit = run_audit(tmp, require_complete=True)
 
@@ -498,8 +625,8 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
-            write_json(tmp / "handoff.json", {"status": "ready"})
-            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
             status, audit = run_audit(tmp, require_complete=True)
 
