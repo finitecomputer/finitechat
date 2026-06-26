@@ -50,9 +50,236 @@ Pass `--service-url URL` to also write `FINITECHAT_HERMES_SERVICE_URL` for a
 supervisor-managed `finitechat hermes serve` process.
 
 For the supervised Rust bridge work, `finitechat hermes serve` starts the
-loopback service boundary and exposes `GET /healthz`. The current plugin still
-starts that service itself when no `FINITECHAT_HERMES_SERVICE_URL` is set, and
-falls back to the CLI-per-call bridge when the service is unreachable.
+loopback service boundary and exposes `GET /healthz` plus `GET /readyz`. The
+current plugin still starts that service itself when no
+`FINITECHAT_HERMES_SERVICE_URL` is set, and falls back to the CLI-per-call
+bridge when the service is unreachable.
+Set `FINITECHAT_HERMES_INBOUND_STREAM=1` to make the adapter consume the
+sidecar's experimental `GET /v1/hermes/inbound` NDJSON long-poll endpoint
+instead of POSTing `poll`; transport failures fall back to the existing poll
+path.
+See [HARDENING.md](./HARDENING.md) for the adapter reliability plan and
+acceptance matrix.
+
+For a local human smoke with JSON evidence:
+
+```bash
+scripts/hermes-sidecar-smoke.sh
+```
+
+The script writes `target/hermes-sidecar-smoke/report.json` with timings for
+server startup, invite/join, sidecar readiness, inbound delivery, ack/drain,
+agent reply, and user decrypt.
+
+Validate the restic backup environment before the longer Docker smoke:
+
+```bash
+scripts/hermes-restic-preflight.py --report target/hermes-docker-smoke/restic-preflight.json
+```
+
+The preflight writes JSON, fails before any expensive image build when required
+S3 env is missing, and redacts URL userinfo from the repository field.
+
+For the Docker runtime smoke:
+
+```bash
+scripts/hermes-sidecar-docker-smoke.sh
+```
+
+That builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts
+the agent in Docker, drives a second `finitechat` CLI user in Docker, and writes
+`target/hermes-docker-smoke/report.json`. It also stops the first agent
+container cleanly so the runtime entrypoint snapshots agent state to an
+encrypted restic repository, checks the repository, wipes the local agent
+volume, starts a fresh container whose entrypoint restores the latest tagged
+snapshot before the agent process starts, verifies the same npub, verifies the
+runtime `/healthz` endpoint, and chats again in the same room.
+By default the restic repo is a local bind mount under
+`target/hermes-docker-smoke/restic-repo`. To run the same smoke against
+S3-compatible storage such as Latitude, provide an isolated repository prefix
+and AWS-style credentials:
+
+```bash
+FINITE_DOCKER_RESTIC_BACKEND=s3 \
+FINITE_DOCKER_RESTIC_REPOSITORY=s3:https://objects.nyc.storage.sh/YOUR_BUCKET/hermes-docker-smoke \
+FINITE_DOCKER_RESTIC_PASSWORD='user-owned-restore-key' \
+AWS_ACCESS_KEY_ID='...' \
+AWS_SECRET_ACCESS_KEY='...' \
+scripts/hermes-sidecar-docker-smoke.sh
+```
+`FINITE_DOCKER_RESTIC_PASSWORD` must be explicitly set for the S3 backend and
+must be the user-owned restore key, not the disposable local smoke default.
+For local runs, copy `.env.example` to `.env`; the smoke wrapper sources it
+before preflight and promotes `FINITE_DOCKER_RESTIC_AWS_*` values to the
+`AWS_*` names restic expects. If `FINITE_DOCKER_RESTIC_REPOSITORY` is empty,
+the wrapper can derive it from `FINITE_LATITUDE_STORAGE_BUCKET`,
+`FINITE_LATITUDE_OBJECT_ENDPOINT`, and `FINITE_DOCKER_RESTIC_PREFIX`.
+
+To publish the exact local image proven by a passing Docker smoke report:
+
+```bash
+scripts/hermes-publish-proven-image.py \
+  --report target/hermes-docker-smoke/report.json \
+  --image-ref ghcr.io/finitecomputer/finite-chat-hermes-runtime:canary \
+  --publish-report target/hermes-docker-smoke/image-publish.json
+```
+
+Add `--push` only after logging in to the registry. In GitHub Actions this is
+available as the manual `publish_runtime_image` input, which pushes the image
+ID recorded in the passing smoke report and uploads `image-publish.json`.
+Publishing requires the manual `restic_backend=s3` path. The workflow can use a
+full `restic_repository` dispatch input, or derive it from
+`latitude_storage_bucket`, `latitude_object_endpoint`, and `restic_prefix`.
+For hands-free dispatches, set these repository variables or secrets:
+
+- `FINITE_LATITUDE_STORAGE_BUCKET`
+- `FINITE_LATITUDE_OBJECT_ENDPOINT`, optional when using the default
+  `https://objects.nyc.storage.sh`
+- `FINITE_DOCKER_RESTIC_PREFIX`, optional when using the default
+  `hermes-docker-smoke`
+
+Configure these repository secrets before using the publish gate:
+
+- `FINITE_DOCKER_RESTIC_PASSWORD`
+- `FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID`
+- `FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY`
+- `FINITE_DOCKER_RESTIC_AWS_REGION` if the provider requires one
+
+If the values are present in `.env` or the current process environment, install
+the GitHub secrets/variables without printing secret values:
+
+```bash
+scripts/hermes-github-secrets-setup.py \
+  --repo finitecomputer/finitechat \
+  --env-file .env \
+  --apply
+```
+
+Omit `--apply` for a redacted dry run. Existing GitHub secret or variable names
+are preserved, so the script only requires local values for names that are not
+already configured remotely.
+
+Check that the GitHub-side names are configured before starting the slow manual
+publish workflow:
+
+```bash
+scripts/hermes-github-ci-preflight.py --repo finitecomputer/finitechat
+```
+
+This writes `target/hermes-github-ci-preflight.json` and reports missing secret
+or variable names without reading or printing secret values.
+
+Before dispatching CI, check that the local branch is publishable:
+
+```bash
+scripts/hermes-branch-publication-readiness.py \
+  --branch codex/hermes-sidecar-hardening
+```
+
+That writes `target/hermes-branch-publication-readiness.json`, classifies the
+source files that should be staged, blocks obvious generated or sensitive paths
+such as `.env`, `target/`, caches, keys, and database files, and prints the
+exact `git add`, `git commit`, and `git push` commands to publish the branch.
+It does not stage, commit, or push anything.
+
+Once preflight is green, run the S3 smoke, publish, handoff, canary-artifact
+generation, and artifact download path from one local command:
+
+```bash
+scripts/hermes-github-publish-gate.py \
+  --repo finitecomputer/finitechat \
+  --ref codex/hermes-sidecar-hardening
+```
+
+That command dispatches the manual CI workflow with `docker_smoke=true`,
+`publish_runtime_image=true`, and `restic_backend=s3`, watches the run, downloads
+artifacts into `target/hermes-github-publish-gate/artifacts`, and writes
+`target/hermes-github-publish-gate/report.json`. On a passing workflow it also
+copies the downloaded reports back into their canonical `target/...` paths and
+reruns `scripts/hermes-hardening-audit.py`, so local audit state reflects the CI
+evidence. Use `--dry-run` to inspect the exact `gh` commands without starting
+the workflow. The non-dry-run path fails before dispatch when the local worktree
+has uncommitted changes or the requested branch does not exist on GitHub; CI can
+only prove the pushed ref, not local edits.
+
+After publish, build the redacted Tinfoil handoff report:
+
+```bash
+scripts/hermes-tinfoil-handoff.py \
+  --smoke-report target/hermes-docker-smoke/report.json \
+  --preflight-report target/hermes-docker-smoke/restic-preflight.json \
+  --publish-report target/hermes-docker-smoke/image-publish.json \
+  --handoff-report target/hermes-docker-smoke/tinfoil-handoff.json
+```
+
+It fails unless the smoke used `restic_backend=s3`, the image was actually
+published, and the published source image id matches the image proven by the
+Docker smoke.
+The handoff's restore section uses the runtime env names consumed by
+`/opt/agent-entrypoint.sh`: `FINITE_AGENT_RESTORE_ON_START=1`,
+`FINITE_AGENT_RESTORE_LATEST=1`, `FINITE_AGENT_BACKUP_ON_EXIT=1`,
+`FINITE_AGENT_RESTIC_REPOSITORY`, `FINITE_AGENT_RESTIC_BACKUP_TAG`, and
+`FINITE_AGENT_RESTIC_PASSWORD`.
+
+After a ready S3/published handoff, generate the Tinfoil canary config and
+runbook:
+
+```bash
+scripts/hermes-tinfoil-canary-artifacts.py \
+  --handoff-report target/hermes-docker-smoke/tinfoil-handoff.json \
+  --output-dir target/hermes-docker-smoke/tinfoil-canary \
+  --config-repo finitecomputer/tinfoil-agent-runtime-canary \
+  --tag v0.1.0
+```
+
+The generated `tinfoil-config.yml` pins the published image digest, exposes
+`/healthz` on port 8080, and restores the latest restic snapshot tagged
+`finite-agent-state` so clean shutdown backups become the next restore point.
+This canary still uses Tinfoil secrets for the restic password and storage
+credentials; that validates plumbing, not the final user-mediated key-release
+privacy posture.
+
+After the live Tinfoil canary has been run, save the observed Tinfoil container
+JSON and runtime health JSON, then build a local evidence file:
+
+```bash
+scripts/hermes-tinfoil-canary-evidence.py \
+  --handoff-report target/hermes-docker-smoke/tinfoil-handoff.json \
+  --canary-summary target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json \
+  --container-json target/hermes-docker-smoke/tinfoil-canary/container.json \
+  --health-json target/hermes-docker-smoke/tinfoil-canary/health.json \
+  --chat-before-message-id '<finite-chat-event-id-before-restart>' \
+  --chat-after-message-id '<finite-chat-event-id-after-restart>' \
+  --backup-observed \
+  --restore-observed \
+  --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json
+```
+
+Then normalize it into the only runtime result accepted by the hardening audit:
+
+```bash
+scripts/hermes-tinfoil-canary-result.py \
+  --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json \
+  --report target/hermes-docker-smoke/tinfoil-canary-result.json
+```
+
+That validator fails unless the canary used a digest-pinned image, S3 restic
+state, a running Tinfoil container, `/healthz` readiness with the restored npub,
+Finite Chat round trips before and after restart, an observed clean-stop backup,
+an observed latest-by-tag restore, and the same agent npub after restore.
+
+To see exactly which hardening gates are proven by the reports on disk:
+
+```bash
+scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json
+```
+
+The audit also reads `target/hermes-github-secrets-setup.json` and
+`target/hermes-github-publish-gate/report.json` so missing GitHub secrets, dirty
+local worktrees, and missing remote branches show up before the S3 evidence
+exists. Add `--require-complete` only when the S3-backed smoke, published
+digest, handoff, generated canary artifacts, and live Tinfoil canary result are
+all expected to be present.
 
 ## How the pieces divide (ADR 0002)
 

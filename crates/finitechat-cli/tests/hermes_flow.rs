@@ -17,8 +17,9 @@ use finitechat_proto::{
 };
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USER_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [41; NOSTR_SECRET_KEY_BYTES];
 const USER2_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [42; NOSTR_SECRET_KEY_BYTES];
@@ -104,6 +105,67 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+struct SmokeReport {
+    name: String,
+    path: Option<PathBuf>,
+    started: Instant,
+    facts: serde_json::Map<String, Value>,
+    steps: Vec<Value>,
+}
+
+impl SmokeReport {
+    fn from_env(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            path: std::env::var_os("FINITE_HERMES_SIDECAR_SMOKE_REPORT").map(PathBuf::from),
+            started: Instant::now(),
+            facts: serde_json::Map::new(),
+            steps: Vec::new(),
+        }
+    }
+
+    fn fact(&mut self, key: &str, value: Value) {
+        if self.path.is_some() {
+            self.facts.insert(key.to_owned(), value);
+        }
+    }
+
+    fn time<T>(&mut self, name: &str, action: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let value = action();
+        self.step(name, started.elapsed());
+        value
+    }
+
+    fn step(&mut self, name: &str, elapsed: Duration) {
+        if self.path.is_some() {
+            self.steps.push(json!({
+                "name": name,
+                "elapsed_ms": elapsed.as_millis() as u64,
+            }));
+        }
+    }
+
+    fn finish(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create smoke report directory");
+        }
+        let report = json!({
+            "status": "passed",
+            "name": self.name,
+            "elapsed_ms": self.started.elapsed().as_millis() as u64,
+            "facts": self.facts,
+            "steps": self.steps,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&report).unwrap())
+            .expect("write Hermes sidecar smoke report");
+        println!("Hermes sidecar smoke report: {}", path.display());
+    }
 }
 
 #[test]
@@ -210,6 +272,15 @@ fn hermes_serve_reports_process_health() {
         }
         Err(error) => Err(error.clone()),
     };
+    let ready_result = match &started_result {
+        Ok(started) => {
+            let ready_url = format!("{}/readyz", started["url"].as_str().unwrap());
+            reqwest::blocking::get(ready_url)
+                .map_err(|error| error.to_string())
+                .and_then(|response| response.json::<Value>().map_err(|error| error.to_string()))
+        }
+        Err(error) => Err(error.clone()),
+    };
     let recover_result = match &started_result {
         Ok(started) => reqwest::blocking::Client::new()
             .post(format!(
@@ -234,6 +305,21 @@ fn hermes_serve_reports_process_health() {
             .and_then(|response| response.json::<Value>().map_err(|error| error.to_string())),
         Err(error) => Err(error.clone()),
     };
+    let inbound_result = match &started_result {
+        Ok(started) => reqwest::blocking::get(format!(
+            "{}/v1/hermes/inbound?timeout_millis=0",
+            started["url"].as_str().unwrap()
+        ))
+        .map_err(|error| error.to_string())
+        .and_then(|response| {
+            let status = response.status();
+            response
+                .text()
+                .map(|body| (status.as_u16(), body))
+                .map_err(|error| error.to_string())
+        }),
+        Err(error) => Err(error.clone()),
+    };
     let _ = child.kill();
     child.wait().expect("wait hermes service");
 
@@ -243,10 +329,22 @@ fn hermes_serve_reports_process_health() {
     assert_eq!(response["service"], "finitechat-hermes");
     assert_eq!(response["agent_home"], home.display().to_string());
     assert_eq!(response["account_id"], started["account_id"]);
+    let ready = ready_result.expect("Hermes service reported readiness");
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["service"], "finitechat-hermes");
+    assert_eq!(ready["store"], "ok");
+    assert_eq!(ready["agent_home"], home.display().to_string());
+    assert_eq!(ready["account_id"], started["account_id"]);
     let recover = recover_result.expect("Hermes service handled bridge action");
     assert_eq!(recover["recovered"], 0);
     let home_channel = home_channel_result.expect("Hermes service handled home-channel action");
     assert_eq!(home_channel["home_channel"], Value::Null);
+    let (inbound_status, inbound_body) =
+        inbound_result.expect("Hermes service handled inbound stream action");
+    assert_eq!(inbound_status, 409);
+    let inbound_error: Value = serde_json::from_str(&inbound_body).unwrap();
+    assert_eq!(inbound_error["ok"], false);
+    assert!(!inbound_error["error"].as_str().unwrap().is_empty());
 }
 
 #[test]
@@ -356,22 +454,28 @@ fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {
 #[test]
 fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let dir = tempfile::tempdir().unwrap();
+    let mut smoke =
+        SmokeReport::from_env("hermes_cli_inits_invites_admits_and_round_trips_messages");
     let server_db = dir.path().join("server.sqlite3");
-    let server_url = spawn_live_http_server(&server_db);
+    let server_url = smoke.time("server_start", || spawn_live_http_server(&server_db));
     let home = dir.path().join("agent-home");
     let home_arg = home.display().to_string();
 
     // init: fresh nostr identity, encrypted store, 0600 secrets.
-    let init = hermes(&[
-        "hermes",
-        "--home",
-        &home_arg,
-        "init",
-        "--server",
-        &server_url,
-    ]);
+    let init = smoke.time("agent_init", || {
+        hermes(&[
+            "hermes",
+            "--home",
+            &home_arg,
+            "init",
+            "--server",
+            &server_url,
+        ])
+    });
     let agent_account = init["account_id"].as_str().unwrap().to_owned();
     assert!(init["npub"].as_str().unwrap().starts_with("npub1"));
+    smoke.fact("agent_account_id", json!(agent_account.clone()));
+    smoke.fact("agent_npub", init["npub"].clone());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -383,17 +487,20 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     }
 
     // invite: creates the room, prints URL + QR + PIN.
-    let invite = hermes(&[
-        "hermes",
-        "--home",
-        &home_arg,
-        "invite",
-        "--room-name",
-        "Hermes Agent",
-        "--json",
-    ]);
+    let invite = smoke.time("invite_create", || {
+        hermes(&[
+            "hermes",
+            "--home",
+            &home_arg,
+            "invite",
+            "--room-name",
+            "Hermes Agent",
+            "--json",
+        ])
+    });
     let url = invite["url"].as_str().unwrap();
     let room_id = invite["room_id"].as_str().unwrap().to_owned();
+    smoke.fact("room_id", json!(room_id.clone()));
     assert!(!invite["qr"].as_str().unwrap().is_empty());
     assert_eq!(invite["pin"].as_str().unwrap().len(), 6);
     let code = InviteCodeV1::parse(url).expect("printed URL is a valid invite code");
@@ -426,26 +533,30 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let mut user_delivery =
         HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
     let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
-    submit_invite_join_request(
-        &mut user_store,
-        &mut user,
-        &mut user_delivery,
-        &code,
-        &pin,
-        Some("Paul".to_owned()),
-        now_ms(),
-    )
-    .unwrap();
+    smoke.time("user_submit_join", || {
+        submit_invite_join_request(
+            &mut user_store,
+            &mut user,
+            &mut user_delivery,
+            &code,
+            &pin,
+            Some("Paul".to_owned()),
+            now_ms(),
+        )
+        .unwrap();
+    });
 
     // poll admits the verified join (and merges the agent's own commit).
-    let poll = hermes(&[
-        "hermes",
-        "--home",
-        &home_arg,
-        "poll",
-        "--request-json",
-        r#"{"timeout_millis":0}"#,
-    ]);
+    let poll = smoke.time("agent_poll_admits_join", || {
+        hermes(&[
+            "hermes",
+            "--home",
+            &home_arg,
+            "poll",
+            "--request-json",
+            r#"{"timeout_millis":0}"#,
+        ])
+    });
     assert_eq!(
         poll["joined"].as_array().unwrap(),
         &vec![Value::String(user.device_ref().account_id.clone())]
@@ -456,10 +567,14 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         key_package_target_available: 0,
         max_sync_pages_per_room: 4,
     };
-    let report =
-        run_runtime_sync_tick(&mut user_store, &mut user, &mut user_delivery, &options).unwrap();
+    let report = smoke.time("user_finalize_invite", || {
+        let report =
+            run_runtime_sync_tick(&mut user_store, &mut user, &mut user_delivery, &options)
+                .unwrap();
+        finalize_invited_room(&mut user_store, &mut user, &code).unwrap();
+        report
+    });
     assert_eq!(report.claimed_welcomes, 1);
-    finalize_invited_room(&mut user_store, &mut user, &code).unwrap();
 
     // Agent sends through the bridge; the user reads it decrypted.
     let send_request = json!({
@@ -470,29 +585,34 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         "status": "complete",
         "reply_to_message_id": null,
     });
-    let sent = hermes(&[
-        "hermes",
-        "--home",
-        &home_arg,
-        "send",
-        "--request-json",
-        &send_request.to_string(),
-    ]);
+    let sent = smoke.time("agent_send_first_message", || {
+        hermes(&[
+            "hermes",
+            "--home",
+            &home_arg,
+            "send",
+            "--request-json",
+            &send_request.to_string(),
+        ])
+    });
     let agent_message_id = sent["message_id"].as_str().unwrap().to_owned();
 
-    let report =
-        run_runtime_sync_tick(&mut user_store, &mut user, &mut user_delivery, &options).unwrap();
+    let report = smoke.time("user_decrypt_first_message", || {
+        run_runtime_sync_tick(&mut user_store, &mut user, &mut user_delivery, &options).unwrap()
+    });
     // The user's room is pinned to its room server; in this test home and
     // room server are the same process, so use the room-server tick.
     let report = if report.applied_entries.is_empty() {
-        finitechat_client::run_room_server_sync_tick(
-            &mut user_store,
-            &mut user,
-            &mut user_delivery,
-            &options,
-            &server_url,
-        )
-        .unwrap()
+        smoke.time("user_room_server_sync_first_message", || {
+            finitechat_client::run_room_server_sync_tick(
+                &mut user_store,
+                &mut user,
+                &mut user_delivery,
+                &options,
+                &server_url,
+            )
+            .unwrap()
+        })
     } else {
         report
     };
@@ -642,15 +762,55 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
         .unwrap();
 
-    let poll = hermes(&[
-        "hermes",
-        "--home",
-        &home_arg,
-        "poll",
-        "--request-json",
-        r#"{"timeout_millis":5000}"#,
-    ]);
-    let events = poll["events"].as_array().unwrap();
+    let stream_ready_file = dir.path().join("inbound-stream-ready.json");
+    let stream_ready_arg = stream_ready_file.display().to_string();
+    let mut stream_child = Command::new(env!("CARGO_BIN_EXE_finitechat"))
+        .args([
+            "hermes",
+            "--agent-home",
+            &home_arg,
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--ready-file",
+            &stream_ready_arg,
+            "--json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn finitechat hermes serve for inbound stream");
+    let stream_started = smoke.time("sidecar_ready", || {
+        wait_for_ready_file(&stream_ready_file).expect("stream ready file")
+    });
+    smoke.fact("sidecar_url", stream_started["url"].clone());
+    let stream_body = smoke.time("sidecar_inbound_plain_ios_message", || {
+        let stream_response = reqwest::blocking::Client::new()
+            .get(format!(
+                "{}/v1/hermes/inbound",
+                stream_started["url"].as_str().unwrap()
+            ))
+            .query(&[
+                ("room_id", code.room_id.as_str()),
+                ("timeout_millis", "5000"),
+                ("limit", "10"),
+            ])
+            .send()
+            .expect("inbound stream response");
+        assert_eq!(stream_response.status().as_u16(), 200);
+        stream_response.text().expect("inbound stream body")
+    });
+    let _ = stream_child.kill();
+    stream_child.wait().expect("wait inbound stream service");
+    let events = stream_body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter_map(|record| {
+            (record.get("type").and_then(Value::as_str) == Some("event"))
+                .then(|| record.get("event").cloned())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["text"], "plain hello from iOS");
     assert_eq!(
@@ -659,7 +819,45 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     );
     assert_eq!(events[0]["source"]["user_id_alt"], "user_phone");
     assert_eq!(events[0]["source"]["user_name"], Value::Null);
-    hermes_ack(&home_arg, &events[0]);
+    smoke.time("ack_stream_event", || {
+        let ack = hermes_ack(&home_arg, &events[0]);
+        assert_eq!(ack["acked"], true);
+    });
+
+    let drained = smoke.time("post_stream_ack_drain", || {
+        hermes(&[
+            "hermes",
+            "--home",
+            &home_arg,
+            "poll",
+            "--request-json",
+            r#"{"timeout_millis":0}"#,
+        ])
+    });
+    assert_eq!(drained["events"].as_array().unwrap().len(), 0);
+
+    let report = smoke.time("agent_reply_after_stream", || {
+        hermes_send_text(&home_arg, &room_id, "reply after inbound poll");
+        finitechat_client::run_room_server_sync_tick(
+            &mut user_store,
+            &mut user,
+            &mut user_delivery,
+            &options,
+            &server_url,
+        )
+        .unwrap()
+    });
+    let reply_after_poll = report
+        .applied_entries
+        .iter()
+        .find_map(|entry| match &entry.entry {
+            AppliedLogEntry::Application { plaintext, .. } => {
+                HermesMessagePayloadV1::decode(plaintext).unwrap()
+            }
+            _ => None,
+        })
+        .expect("agent reply after inbound poll");
+    assert_eq!(reply_after_poll.text, "reply after inbound poll");
 
     // Streaming edit finalization lands as a new payload superseding the
     // original message id.
@@ -735,6 +933,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .expect("joined user decrypts Hermes activity");
     let projected: DecryptedEphemeralActivityV1 = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(projected.activity_kind, "working");
+    smoke.finish();
 }
 
 #[test]

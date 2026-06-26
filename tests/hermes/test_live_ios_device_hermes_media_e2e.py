@@ -40,10 +40,7 @@ def run_cmd(args: list[str], *, timeout: int = 180) -> subprocess.CompletedProce
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise AssertionError(
-            "command failed:\n"
-            f"  args={args!r}\n"
-            f"  stdout={result.stdout}\n"
-            f"  stderr={result.stderr}"
+            f"command failed:\n  args={args!r}\n  stdout={result.stdout}\n  stderr={result.stderr}"
         )
     return result
 
@@ -73,7 +70,9 @@ def mac_lan_ip() -> str:
     if explicit:
         return explicit
     for interface in ("en0", "en1"):
-        result = subprocess.run(["ipconfig", "getifaddr", interface], capture_output=True, text=True)
+        result = subprocess.run(
+            ["ipconfig", "getifaddr", interface], capture_output=True, text=True
+        )
         candidate = result.stdout.strip()
         if result.returncode == 0 and candidate and not candidate.startswith("127."):
             return candidate
@@ -190,7 +189,9 @@ def pull_phone_store(device: str, store_path: Path) -> None:
     copied_store = pull_parent / "FiniteChatStore"
     if copied_store.is_dir():
         source = copied_store
-    elif (pull_parent / "account-secret.hex").is_file() and (pull_parent / "client.sqlite3").is_file():
+    elif (pull_parent / "account-secret.hex").is_file() and (
+        pull_parent / "client.sqlite3"
+    ).is_file():
         source = pull_parent
     else:
         raise AssertionError(f"devicectl copy did not produce FiniteChatStore under {pull_parent}")
@@ -350,7 +351,9 @@ class LiveIosDeviceHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
             self.assertTrue(received["agent_text_send_success"])
-            self.assertTrue(received["agent_media_send_success"], received["agent_media_send_error"])
+            self.assertTrue(
+                received["agent_media_send_success"], received["agent_media_send_error"]
+            )
 
             deadline = time.monotonic() + 75
             last_state: dict[str, Any] | None = None

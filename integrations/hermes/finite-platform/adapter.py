@@ -34,6 +34,8 @@ ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 1000
 DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
 SERVICE_READY_FILE = "hermes-service.json"
 SERVICE_START_TIMEOUT_SECS = 5.0
+MAX_DELIVERED_EVENT_KEYS = 256
+STREAM_RECONNECT_BACKOFF_SECS = 2.0
 
 
 def _load_local_env_defaults(path: Path | None = None) -> None:
@@ -107,18 +109,29 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 maximum=120,
             )
         )
-        self.service_url = str(
-            extra.get("service_url") or os.getenv("FINITECHAT_HERMES_SERVICE_URL") or ""
-        ).strip().rstrip("/")
+        self.service_url = (
+            str(extra.get("service_url") or os.getenv("FINITECHAT_HERMES_SERVICE_URL") or "")
+            .strip()
+            .rstrip("/")
+        )
         self.service_addr = str(
             extra.get("service_addr")
             or os.getenv("FINITECHAT_HERMES_SERVICE_ADDR")
             or DEFAULT_SERVICE_ADDR
         ).strip()
+        self.inbound_stream = _bounded_bool(
+            extra.get("inbound_stream")
+            if "inbound_stream" in extra
+            else os.getenv("FINITECHAT_HERMES_INBOUND_STREAM"),
+            default=False,
+        )
         self._poll_task: asyncio.Task | None = None
         self._service_proc: asyncio.subprocess.Process | None = None
+        self._service_ready_file: Path | None = None
         self._finitechat_cmd = _resolve_finitechat_command(str(extra.get("finitechat_bin") or ""))
         self._finitechat_lock = asyncio.Lock()
+        self._delivered_event_keys: set[str] = set()
+        self._delivered_event_order: list[str] = []
 
     async def connect(self) -> bool:
         if not self.home:
@@ -132,11 +145,15 @@ class FiniteChatAdapter(BasePlatformAdapter):
         await self._recover_interrupted_turns()
         await self._surface_invite()
         self._mark_connected()
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        if self.inbound_stream and self.service_url:
+            self._poll_task = asyncio.create_task(self._stream_loop())
+        else:
+            self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
-            "[finite] connected (home=%s%s)",
+            "[finite] connected (home=%s%s%s)",
             self.home,
             f", room filter={self.room_id}" if self.room_id else "",
+            ", inbound stream=on" if self.inbound_stream and self.service_url else "",
         )
         return True
 
@@ -345,33 +362,75 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def _poll_loop(self) -> None:
         while self.is_connected:
-            timeout_millis = self.poll_timeout_secs * 1000
-            if self._has_active_turn():
-                timeout_millis = min(timeout_millis, ACTIVE_TURN_POLL_TIMEOUT_MILLIS)
-            payload: dict[str, Any] = {
-                "limit": self.poll_limit,
-                "timeout_millis": timeout_millis,
-            }
-            if self.room_id:
-                payload["room_id"] = self.room_id
-            result = await self._finitechat_json(
-                "poll",
-                payload,
-                timeout=self.poll_timeout_secs + 15,
-            )
-            if not result.ok:
-                logger.warning("[finite] poll failed: %s", result.error)
+            if not await self._poll_once():
                 await asyncio.sleep(2.0)
-                continue
 
-            for account in result.data.get("joined") or []:
-                logger.info("[finite] verified joiner admitted: %s", account)
-            events = result.data.get("events") or []
-            for raw_event in events:
-                try:
-                    await self._handle_finitechat_event(raw_event)
-                except Exception as exc:
-                    logger.error("[finite] failed to dispatch event: %s", exc, exc_info=True)
+    async def _poll_once(self) -> bool:
+        result = await self._finitechat_json(
+            "poll",
+            self._inbound_request_payload(),
+            timeout=self.poll_timeout_secs + 15,
+        )
+        if not result.ok:
+            logger.warning("[finite] poll failed: %s", result.error)
+            return False
+        await self._process_poll_payload(result.data)
+        return True
+
+    async def _stream_loop(self) -> None:
+        while self.is_connected:
+            if not self.service_url and not await self._ensure_service():
+                if not await self._poll_once():
+                    await asyncio.sleep(STREAM_RECONNECT_BACKOFF_SECS)
+                continue
+            result = await asyncio.to_thread(
+                _finitechat_service_inbound,
+                self.service_url,
+                self._inbound_request_payload(),
+                self.poll_timeout_secs + 15,
+            )
+            if result.ok:
+                await self._process_inbound_records(result.data.get("records") or [])
+                continue
+            logger.warning("[finite] inbound stream failed: %s", result.error)
+            if result.transport_error:
+                self.service_url = ""
+            await asyncio.sleep(STREAM_RECONNECT_BACKOFF_SECS)
+
+    def _inbound_request_payload(self) -> dict[str, Any]:
+        timeout_millis = self.poll_timeout_secs * 1000
+        if self._has_active_turn():
+            timeout_millis = min(timeout_millis, ACTIVE_TURN_POLL_TIMEOUT_MILLIS)
+        payload: dict[str, Any] = {
+            "limit": self.poll_limit,
+            "timeout_millis": timeout_millis,
+        }
+        if self.room_id:
+            payload["room_id"] = self.room_id
+        return payload
+
+    async def _process_poll_payload(self, data: dict[str, Any]) -> None:
+        for account in data.get("joined") or []:
+            logger.info("[finite] verified joiner admitted: %s", account)
+        for raw_event in data.get("events") or []:
+            await self._dispatch_raw_event(raw_event)
+
+    async def _process_inbound_records(self, records: list[Any]) -> None:
+        for raw_record in records:
+            if not isinstance(raw_record, dict):
+                continue
+            record_type = str(raw_record.get("type") or "")
+            if record_type == "joined":
+                logger.info("[finite] verified joiner admitted: %s", raw_record.get("account_id"))
+                continue
+            raw_event = raw_record.get("event") if record_type == "event" else raw_record
+            await self._dispatch_raw_event(raw_event)
+
+    async def _dispatch_raw_event(self, raw_event: Any) -> None:
+        try:
+            await self._handle_finitechat_event(raw_event)
+        except Exception as exc:
+            logger.error("[finite] failed to dispatch event: %s", exc, exc_info=True)
 
     async def _handle_finitechat_event(self, raw_event: dict[str, Any]) -> None:
         if not isinstance(raw_event, dict):
@@ -384,6 +443,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
         message_id = str(raw_event.get("message_id") or "")
         if not message_id:
             logger.warning("[finite] ignored event without message_id")
+            return
+        event_key = _adapter_event_key(room_id, seq, message_id)
+        if event_key and event_key in self._delivered_event_keys:
+            await self._ack_finitechat_event(room_id, seq, message_id)
             return
 
         raw_source = raw_event.get("source")
@@ -420,14 +483,29 @@ class FiniteChatAdapter(BasePlatformAdapter):
             internal=bool(raw_event.get("internal") or False),
         )
         await self.handle_message(event)
-        if isinstance(seq, int):
-            ack = await self._finitechat_json(
-                "ack",
-                {"room_id": room_id, "seq": seq, "message_id": message_id},
-                timeout=15,
-            )
-            if not ack.ok:
-                logger.warning("[finite] failed to ack %s/%s: %s", room_id, seq, ack.error)
+        if event_key:
+            self._remember_delivered_event(event_key)
+        await self._ack_finitechat_event(room_id, seq, message_id)
+
+    async def _ack_finitechat_event(self, room_id: str, seq: Any, message_id: str) -> None:
+        if not isinstance(seq, int):
+            return
+        ack = await self._finitechat_json(
+            "ack",
+            {"room_id": room_id, "seq": seq, "message_id": message_id},
+            timeout=15,
+        )
+        if not ack.ok:
+            logger.warning("[finite] failed to ack %s/%s: %s", room_id, seq, ack.error)
+
+    def _remember_delivered_event(self, event_key: str) -> None:
+        if event_key in self._delivered_event_keys:
+            return
+        self._delivered_event_keys.add(event_key)
+        self._delivered_event_order.append(event_key)
+        while len(self._delivered_event_order) > MAX_DELIVERED_EVENT_KEYS:
+            evicted = self._delivered_event_order.pop(0)
+            self._delivered_event_keys.discard(evicted)
 
     async def _send_media(
         self,
@@ -515,10 +593,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         *,
         timeout: int,
     ) -> _FiniteChatResult:
-        if (
-            self._service_proc is not None
-            and self._service_proc.returncode is not None
-        ):
+        if self._service_proc is not None and self._service_proc.returncode is not None:
             self.service_url = ""
             await self._ensure_service()
         if self.service_url:
@@ -574,9 +649,13 @@ class FiniteChatAdapter(BasePlatformAdapter):
             return _FiniteChatResult(True, json.loads(stdout_text), None, False)
         except json.JSONDecodeError as exc:
             try:
-                return _FiniteChatResult(True, json.loads(stdout_text.splitlines()[-1]), None, False)
+                return _FiniteChatResult(
+                    True, json.loads(stdout_text.splitlines()[-1]), None, False
+                )
             except json.JSONDecodeError:
-                return _FiniteChatResult(False, {}, f"finitechat returned invalid JSON: {exc}", False)
+                return _FiniteChatResult(
+                    False, {}, f"finitechat returned invalid JSON: {exc}", False
+                )
 
     async def _ensure_service(self) -> bool:
         if self.service_url:
@@ -587,11 +666,18 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 return False
             self.service_url = ""
         if self._service_proc is not None and self._service_proc.returncode is None:
+            if self._service_ready_file is not None:
+                started = _read_service_ready_file(self._service_ready_file)
+                if started.get("url"):
+                    self.service_url = str(started["url"]).rstrip("/")
+                    logger.info("[finite] Hermes service ready at %s", self.service_url)
+                    return True
             return bool(self.service_url)
         if not self.home or not self._finitechat_cmd:
             return False
 
         ready_file = Path(self.home) / SERVICE_READY_FILE
+        self._service_ready_file = ready_file
         with contextlib.suppress(FileNotFoundError):
             ready_file.unlink()
         command = [
@@ -625,6 +711,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
                     self._service_proc.returncode,
                 )
                 self._service_proc = None
+                self._service_ready_file = None
                 return False
             started = _read_service_ready_file(ready_file)
             if started.get("url"):
@@ -639,6 +726,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
     async def _stop_service(self) -> None:
         proc = self._service_proc
         self._service_proc = None
+        self._service_ready_file = None
         if proc is None or proc.returncode is not None:
             return
         proc.terminate()
@@ -713,7 +801,60 @@ def _finitechat_service_json(
     try:
         return _FiniteChatResult(True, json.loads(body), None, False)
     except json.JSONDecodeError as exc:
-        return _FiniteChatResult(False, {}, f"finitechat service returned invalid JSON: {exc}", False)
+        return _FiniteChatResult(
+            False, {}, f"finitechat service returned invalid JSON: {exc}", False
+        )
+
+
+def _finitechat_service_inbound(
+    service_url: str,
+    payload: dict[str, Any],
+    timeout: int,
+) -> _FiniteChatResult:
+    query = urllib.parse.urlencode(
+        {key: value for key, value in payload.items() if value is not None and value != ""}
+    )
+    url = f"{service_url}/v1/hermes/inbound"
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/x-ndjson, application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        return _FiniteChatResult(
+            False,
+            {},
+            _service_error_body(body) or f"finitechat service returned HTTP {exc.code}",
+            _is_retryable_cli_error(body),
+            False,
+        )
+    except TimeoutError as exc:
+        return _FiniteChatResult(False, {}, str(exc), True, False)
+    except (urllib.error.URLError, OSError) as exc:
+        return _FiniteChatResult(False, {}, str(exc), True, True)
+
+    records: list[Any] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            return _FiniteChatResult(
+                False,
+                {},
+                f"finitechat inbound stream returned invalid JSON: {exc}",
+                False,
+            )
+        records.append(record)
+    return _FiniteChatResult(True, {"records": records}, None, False)
 
 
 def _service_error_body(body: str) -> str | None:
@@ -740,6 +881,12 @@ def _finitechat_service_health(service_url: str, timeout: int) -> bool:
     except Exception:
         return False
     return isinstance(data, dict) and data.get("status") == "ok"
+
+
+def _adapter_event_key(room_id: str, seq: Any, message_id: str) -> str | None:
+    if not isinstance(seq, int):
+        return None
+    return f"{room_id}\x1f{seq}\x1f{message_id}"
 
 
 def _read_service_ready_file(path: Path) -> dict[str, Any]:
@@ -857,6 +1004,21 @@ def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int) -> int
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _bounded_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _is_retryable_cli_error(message: str) -> bool:

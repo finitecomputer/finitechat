@@ -24,15 +24,16 @@ from tests.hermes.test_live_hermes_agent_media_e2e import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FINITECHAT_RMP_BIN = Path(os.environ.get("FINITECHAT_RMP_BIN", REPO_ROOT / "target/debug/finitechat-rmp"))
+FINITECHAT_RMP_BIN = Path(
+    os.environ.get("FINITECHAT_RMP_BIN", REPO_ROOT / "target/debug/finitechat-rmp")
+)
 BUNDLE_ID = os.environ.get("FINITECHAT_IOS_BUNDLE_ID", "computer.finite.finitechat")
 IOS_DEVICE_ID = "ios-hermes-media-sim"
 IOS_CAPTION = "ios media hello"
 AGENT_TEXT = f"agent text echo: {IOS_CAPTION}"
 AGENT_MEDIA_CAPTION = "agent media echo"
 PNG_1X1 = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6X7"
-    "z9kAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6X7z9kAAAAASUVORK5CYII="
 )
 
 
@@ -40,10 +41,7 @@ def run_cmd(args: list[str], *, timeout: int = 180) -> subprocess.CompletedProce
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise AssertionError(
-            "command failed:\n"
-            f"  args={args!r}\n"
-            f"  stdout={result.stdout}\n"
-            f"  stderr={result.stderr}"
+            f"command failed:\n  args={args!r}\n  stdout={result.stdout}\n  stderr={result.stderr}"
         )
     return result
 
@@ -71,7 +69,9 @@ def launch_ios_app(
     image_path: Path,
 ) -> None:
     run_cmd([str(FINITECHAT_RMP_BIN), "run", "ios", "--udid", udid], timeout=600)
-    subprocess.run(["xcrun", "simctl", "terminate", udid, BUNDLE_ID], capture_output=True, text=True)
+    subprocess.run(
+        ["xcrun", "simctl", "terminate", udid, BUNDLE_ID], capture_output=True, text=True
+    )
     run_cmd(
         [
             "xcrun",
@@ -160,9 +160,15 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
                 )
                 try:
                     wait_for_health(f"{server_url}/health")
-                    await self._run_ios_round_trip(tmp, support_root, server_url, agent_image, ios_image, udid)
+                    await self._run_ios_round_trip(
+                        tmp, support_root, server_url, agent_image, ios_image, udid
+                    )
                 finally:
-                    subprocess.run(["xcrun", "simctl", "terminate", udid, BUNDLE_ID], capture_output=True, text=True)
+                    subprocess.run(
+                        ["xcrun", "simctl", "terminate", udid, BUNDLE_ID],
+                        capture_output=True,
+                        text=True,
+                    )
                     server.terminate()
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         server.wait(timeout=5)
@@ -246,7 +252,9 @@ class LiveIosSimulatorHermesMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
             self.assertTrue(received["agent_text_send_success"])
-            self.assertTrue(received["agent_media_send_success"], received["agent_media_send_error"])
+            self.assertTrue(
+                received["agent_media_send_success"], received["agent_media_send_error"]
+            )
 
             deadline = time.monotonic() + 45
             last_state: dict[str, Any] | None = None

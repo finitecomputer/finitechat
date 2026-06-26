@@ -306,6 +306,52 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             {"room_id": "room-agent-1", "seq": 12, "message_id": "msg-12"},
         )
 
+    def test_duplicate_redelivery_is_acked_without_second_dispatch(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            return self.module._FiniteChatResult(True, {}, None, False)
+
+        adapter._finitechat_json = fake_json
+        raw_event = {
+            "room_id": "room-agent-1",
+            "seq": 12,
+            "message_id": "msg-12",
+            "text": "please build",
+        }
+
+        asyncio.run(adapter._handle_finitechat_event(raw_event))
+        asyncio.run(adapter._handle_finitechat_event(raw_event))
+
+        self.assertEqual(len(adapter.handled_messages), 1)
+        self.assertEqual([call[0] for call in calls], ["ack", "ack"])
+
+    def test_ack_failure_retries_without_dispatching_duplicate(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            if len(calls) == 1:
+                return self.module._FiniteChatResult(False, {}, "ack transport busy", True)
+            return self.module._FiniteChatResult(True, {"acked": True}, None, False)
+
+        adapter._finitechat_json = fake_json
+        raw_event = {
+            "room_id": "room-agent-1",
+            "seq": 12,
+            "message_id": "msg-12",
+            "text": "please build",
+        }
+
+        asyncio.run(adapter._handle_finitechat_event(raw_event))
+        asyncio.run(adapter._handle_finitechat_event(raw_event))
+
+        self.assertEqual(len(adapter.handled_messages), 1)
+        self.assertEqual([call[0] for call in calls], ["ack", "ack"])
+
     def test_room_filter_drops_other_rooms_but_unfiltered_serves_all(self):
         filtered = self.adapter(room_id="room-agent-1")
         filtered_calls = []
@@ -450,6 +496,33 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             self.module.ACTIVE_TURN_POLL_TIMEOUT_MILLIS,
         )
 
+    def test_poll_loop_continues_after_transient_poll_error(self):
+        adapter = self.adapter()
+        adapter._mark_connected()
+        calls = []
+        sleeps = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            if len(calls) == 1:
+                return self.module._FiniteChatResult(False, {}, "server busy", True)
+            adapter._mark_disconnected()
+            return self.module._FiniteChatResult(True, {"events": []}, None, False)
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        original_sleep = self.module.asyncio.sleep
+        try:
+            adapter._finitechat_json = fake_json
+            self.module.asyncio.sleep = fake_sleep
+            asyncio.run(adapter._poll_loop())
+        finally:
+            self.module.asyncio.sleep = original_sleep
+
+        self.assertEqual([call[0] for call in calls], ["poll", "poll"])
+        self.assertEqual(sleeps, [2.0])
+
     def test_finitechat_json_serializes_cli_access_per_adapter(self):
         adapter = self.adapter()
         original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
@@ -565,6 +638,202 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(result.data["recovered"], 0)
         self.assertEqual(calls[0][0:2], ("/bin/finitechat", "hermes"))
         self.assertEqual(calls[0][-2:], ("recover", "--json"))
+
+    def test_finitechat_service_inbound_parses_ndjson_records(self):
+        original_urlopen = self.module.urllib.request.urlopen
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return (
+                    b'{"type":"joined","account_id":"alice"}\n'
+                    b'{"type":"event","event":{"room_id":"room-agent-1",'
+                    b'"seq":12,"message_id":"msg-12","text":"hello"}}\n'
+                )
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        try:
+            self.module.urllib.request.urlopen = fake_urlopen
+            result = self.module._finitechat_service_inbound(
+                "http://127.0.0.1:9999",
+                {"room_id": "room agent", "limit": 10, "timeout_millis": 1000},
+                7,
+            )
+        finally:
+            self.module.urllib.request.urlopen = original_urlopen
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            captured["url"],
+            "http://127.0.0.1:9999/v1/hermes/inbound?"
+            "room_id=room+agent&limit=10&timeout_millis=1000",
+        )
+        self.assertEqual(captured["timeout"], 7)
+        self.assertEqual(result.data["records"][0]["type"], "joined")
+        self.assertEqual(result.data["records"][1]["event"]["message_id"], "msg-12")
+
+    def test_stream_loop_consumes_inbound_records_and_acks_events(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "room_id": "room-agent-1",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/false",
+                    "inbound_stream": True,
+                }
+            )
+        )
+        adapter._mark_connected()
+        module = cast(Any, self.module)
+        original_inbound = module._finitechat_service_inbound
+        stream_calls = []
+        ack_calls = []
+
+        def fake_inbound(service_url, payload, timeout):
+            stream_calls.append((service_url, payload, timeout))
+            adapter._mark_disconnected()
+            return self.module._FiniteChatResult(
+                True,
+                {
+                    "records": [
+                        {"type": "joined", "account_id": "alice"},
+                        {
+                            "type": "event",
+                            "event": {
+                                "room_id": "room-agent-1",
+                                "seq": 12,
+                                "message_id": "msg-12",
+                                "text": "hello from stream",
+                            },
+                        },
+                    ]
+                },
+                None,
+                False,
+            )
+
+        async def fake_json(action, payload, *, timeout):
+            ack_calls.append((action, payload, timeout))
+            return self.module._FiniteChatResult(True, {"acked": True}, None, False)
+
+        try:
+            module._finitechat_service_inbound = fake_inbound
+            adapter._finitechat_json = fake_json
+            asyncio.run(adapter._stream_loop())
+        finally:
+            module._finitechat_service_inbound = original_inbound
+
+        self.assertEqual(stream_calls[0][0], "http://127.0.0.1:9999")
+        self.assertEqual(stream_calls[0][1]["room_id"], "room-agent-1")
+        self.assertEqual(len(adapter.handled_messages), 1)
+        self.assertEqual(adapter.handled_messages[0].text, "hello from stream")
+        self.assertEqual(ack_calls[0][0], "ack")
+        self.assertEqual(ack_calls[0][1]["message_id"], "msg-12")
+
+    def test_stream_loop_falls_back_to_poll_after_stream_transport_error(self):
+        adapter = self.module.FiniteChatAdapter(
+            PlatformConfig(
+                extra={
+                    "home": "/tmp/finite-agent-home",
+                    "room_id": "room-agent-1",
+                    "service_url": "http://127.0.0.1:9999",
+                    "finitechat_bin": "/bin/false",
+                    "inbound_stream": True,
+                }
+            )
+        )
+        adapter._mark_connected()
+        module = cast(Any, self.module)
+        original_inbound = module._finitechat_service_inbound
+        original_sleep = self.module.asyncio.sleep
+        calls = []
+
+        def fake_inbound(service_url, payload, timeout):
+            calls.append(("stream", payload))
+            return self.module._FiniteChatResult(
+                False,
+                {},
+                "connection reset",
+                True,
+                transport_error=True,
+            )
+
+        async def fake_ensure_service():
+            calls.append(("ensure", {}))
+            return False
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload))
+            adapter._mark_disconnected()
+            return self.module._FiniteChatResult(True, {"events": []}, None, False)
+
+        async def fake_sleep(delay):
+            calls.append(("sleep", {"delay": delay}))
+
+        try:
+            module._finitechat_service_inbound = fake_inbound
+            self.module.asyncio.sleep = fake_sleep
+            adapter._ensure_service = fake_ensure_service
+            adapter._finitechat_json = fake_json
+            asyncio.run(adapter._stream_loop())
+        finally:
+            module._finitechat_service_inbound = original_inbound
+            self.module.asyncio.sleep = original_sleep
+
+        self.assertEqual([call[0] for call in calls], ["stream", "sleep", "ensure", "poll"])
+        self.assertEqual(adapter.service_url, "")
+
+    def test_ensure_service_can_discover_late_ready_file_after_startup_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = self.module.FiniteChatAdapter(
+                PlatformConfig(
+                    extra={
+                        "home": temp_dir,
+                        "finitechat_bin": "/bin/finitechat",
+                        "service_addr": "127.0.0.1:0",
+                    }
+                )
+            )
+            original_create_subprocess_exec = self.module.asyncio.create_subprocess_exec
+            module = cast(Any, self.module)
+            original_start_timeout = module.SERVICE_START_TIMEOUT_SECS
+            calls = []
+
+            class FakeProcess:
+                returncode = None
+
+            async def fake_create_subprocess_exec(*args, **kwargs):
+                calls.append(args)
+                return FakeProcess()
+
+            try:
+                self.module.asyncio.create_subprocess_exec = fake_create_subprocess_exec
+                module.SERVICE_START_TIMEOUT_SECS = 0.0
+                started = asyncio.run(adapter._ensure_service())
+                Path(temp_dir, self.module.SERVICE_READY_FILE).write_text(
+                    '{"url":"http://127.0.0.1:7777"}',
+                    encoding="utf-8",
+                )
+                rediscovered = asyncio.run(adapter._ensure_service())
+            finally:
+                self.module.asyncio.create_subprocess_exec = original_create_subprocess_exec
+                module.SERVICE_START_TIMEOUT_SECS = original_start_timeout
+
+        self.assertFalse(started)
+        self.assertTrue(rediscovered)
+        self.assertEqual(adapter.service_url, "http://127.0.0.1:7777")
+        self.assertEqual(len(calls), 1)
 
     def test_ensure_service_starts_finitechat_serve_and_reads_ready_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

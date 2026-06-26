@@ -28,10 +28,7 @@ def run_json(args: list[str], *, timeout: int = 120) -> dict[str, Any]:
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise AssertionError(
-            "command failed:\n"
-            f"  args={args!r}\n"
-            f"  stdout={result.stdout}\n"
-            f"  stderr={result.stderr}"
+            f"command failed:\n  args={args!r}\n  stdout={result.stdout}\n  stderr={result.stderr}"
         )
     return json.loads(result.stdout)
 
@@ -243,7 +240,9 @@ class LiveHermesAgentMediaE2ETest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(received["message_type"], "photo")
             self.assertEqual(received["media_types"], ["image/png"])
             self.assertTrue(received["agent_text_send_success"])
-            self.assertTrue(received["agent_media_send_success"], received["agent_media_send_error"])
+            self.assertTrue(
+                received["agent_media_send_success"], received["agent_media_send_error"]
+            )
 
             user_received_text: list[str] = []
             user_received_media_count = 0

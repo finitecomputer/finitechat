@@ -1,0 +1,220 @@
+"""Unit checks for the Hermes hardening evidence audit."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+AUDIT_SCRIPT = REPO_ROOT / "scripts" / "hermes-hardening-audit.py"
+IMAGE_ID = "sha256:local-image"
+IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
+
+SIDECAR_LAYERS = [
+    "finitechat-server",
+    "finitechat hermes CLI",
+    "encrypted client stores",
+    "finitechat hermes serve",
+    "sidecar /v1/hermes/inbound NDJSON",
+    "ack/drain",
+    "agent reply",
+    "user decrypt",
+]
+DOCKER_LAYERS = [
+    "docker image build",
+    "hermes-agent 0.17 runtime",
+    "finitechat binary in image",
+    "finite-platform plugin in image",
+    "E2EE echo round trip before restore",
+    "entrypoint restic encrypted agent state snapshot on shutdown",
+    "restic repository check",
+    "agent state volume wipe",
+    "fresh agent container with empty local state",
+    "entrypoint restic latest-by-tag restore into fresh volume",
+    "same agent npub after restore",
+    "runtime HTTP health endpoint after restore",
+    "E2EE echo round trip after restore",
+]
+TINFOIL_LAYERS = [
+    "Tinfoil container running",
+    "digest-pinned runtime image",
+    "S3 restic repository",
+    "attested health proxy ready",
+    "agent npub observed before restart",
+    "Finite Chat round trip before restart",
+    "entrypoint backup observed on clean stop",
+    "latest-by-tag restore observed after restart",
+    "same agent npub after restore",
+    "Finite Chat round trip after restore",
+]
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+
+def sidecar_report() -> dict:
+    return {"status": "passed", "proof_layers": SIDECAR_LAYERS}
+
+
+def docker_report(restic_backend: str = "s3") -> dict:
+    return {
+        "status": "passed",
+        "proof_layers": DOCKER_LAYERS,
+        "facts": {
+            "image_id": IMAGE_ID,
+            "restic_backend": restic_backend,
+            "hermes_agent_version_actual": "0.17.0",
+            "agent_npub": "npub1agent",
+            "agent_npub_after_restore": "npub1agent",
+            "agent_state_backup": {"source": "entrypoint_backup_on_exit"},
+        },
+    }
+
+
+def tinfoil_result() -> dict:
+    return {
+        "status": "passed",
+        "proof_layers": TINFOIL_LAYERS,
+        "facts": {
+            "restic_backend": "s3",
+            "restore_tag": "finite-agent-state",
+            "health_npub": "npub1agent",
+            "agent_npub_before_restart": "npub1agent",
+            "agent_npub_after_restore": "npub1agent",
+            "chat_before_restart": True,
+            "chat_after_restart": True,
+        },
+    }
+
+
+def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
+    args = [
+        str(AUDIT_SCRIPT),
+        "--sidecar-report",
+        str(tmp / "sidecar.json"),
+        "--docker-report",
+        str(tmp / "docker.json"),
+        "--github-setup-report",
+        str(tmp / "github-setup.json"),
+        "--github-publish-gate-report",
+        str(tmp / "github-publish-gate.json"),
+        "--preflight-report",
+        str(tmp / "preflight.json"),
+        "--publish-report",
+        str(tmp / "publish.json"),
+        "--handoff-report",
+        str(tmp / "handoff.json"),
+        "--canary-summary",
+        str(tmp / "canary-summary.json"),
+        "--tinfoil-result",
+        str(tmp / "tinfoil-result.json"),
+        "--report",
+        str(tmp / "audit.json"),
+    ]
+    if require_complete:
+        args.append("--require-complete")
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    return result.returncode, json.loads((tmp / "audit.json").read_text(encoding="utf-8"))
+
+
+class HardeningAuditTest(unittest.TestCase):
+    def test_audit_marks_local_only_smoke_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "docker.json", docker_report(restic_backend="local"))
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "local"})
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("github_actions_s3_setup_ready", audit["missing"])
+        self.assertIn("github_publish_gate_ready", audit["missing"])
+        self.assertIn("docker_runtime_s3_smoke", audit["missing"])
+        self.assertIn("proven_image_published", audit["missing"])
+        self.assertIn("tinfoil_canary_runtime", audit["missing"])
+
+    def test_audit_marks_complete_evidence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", {"status": "ready"})
+            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(audit["status"], "complete")
+        self.assertEqual(audit["missing"], [])
+
+    def test_audit_rejects_unvalidated_tinfoil_success_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", {"status": "ready"})
+            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "tinfoil-result.json", {"status": "passed"})
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("tinfoil_canary_runtime", audit["missing"])
+
+    def test_audit_reports_github_setup_errors_before_s3_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "docker.json", docker_report(restic_backend="local"))
+            write_json(
+                tmp / "github-setup.json",
+                {
+                    "status": "failed",
+                    "errors": ["missing required secret values: FINITE_DOCKER_RESTIC_PASSWORD"],
+                },
+            )
+            write_json(
+                tmp / "github-publish-gate.json",
+                {
+                    "status": "not_ready",
+                    "errors": ["remote workflow ref is missing; push the branch before dispatch"],
+                },
+            )
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("FINITE_DOCKER_RESTIC_PASSWORD", details["github_actions_s3_setup_ready"])
+        self.assertIn("remote workflow ref is missing", details["github_publish_gate_ready"])
+
+
+if __name__ == "__main__":
+    unittest.main()

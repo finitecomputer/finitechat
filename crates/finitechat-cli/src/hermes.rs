@@ -12,12 +12,14 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
+    extract::{Path as AxumPath, Query, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use finitechat_blob::{
@@ -221,6 +223,7 @@ fn cmd_install<W: Write>(
 #[derive(Debug, Clone, Serialize)]
 struct HermesServiceStarted {
     service: &'static str,
+    version: &'static str,
     url: String,
     addr: String,
     agent_home: String,
@@ -236,16 +239,28 @@ struct HermesServiceState {
     account_id: String,
     device_id: String,
     server_url: String,
+    bridge_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Serialize)]
 struct HermesServiceHealth {
     status: &'static str,
     service: &'static str,
+    version: &'static str,
     agent_home: String,
     account_id: String,
     device_id: String,
     server_url: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HermesInboundQuery {
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    timeout_millis: Option<u64>,
 }
 
 struct PreparedHermesService {
@@ -307,9 +322,11 @@ async fn prepare_hermes_service(
         account_id: home.config.account_id.clone(),
         device_id: home.config.device_id.clone(),
         server_url: home.config.server_url.clone(),
+        bridge_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     let started = HermesServiceStarted {
         service: "finitechat-hermes",
+        version: env!("CARGO_PKG_VERSION"),
         url,
         addr: bound_addr.to_string(),
         agent_home: state.agent_home.display().to_string(),
@@ -346,6 +363,8 @@ async fn serve_prepared_hermes_service(prepared: PreparedHermesService) -> Resul
 fn hermes_service_router(state: HermesServiceState) -> Router {
     Router::new()
         .route("/healthz", get(hermes_service_healthz))
+        .route("/readyz", get(hermes_service_readyz))
+        .route("/v1/hermes/inbound", get(hermes_service_inbound))
         .route("/v1/hermes/{action}", post(hermes_service_action))
         .with_state(state)
 }
@@ -356,11 +375,40 @@ async fn hermes_service_healthz(
     Json(HermesServiceHealth {
         status: "ok",
         service: "finitechat-hermes",
+        version: env!("CARGO_PKG_VERSION"),
         agent_home: state.agent_home.display().to_string(),
         account_id: state.account_id,
         device_id: state.device_id,
         server_url: state.server_url,
     })
+}
+
+async fn hermes_service_readyz(
+    State(state): State<HermesServiceState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let home_dir = state.agent_home.clone();
+    let _guard = state.bridge_lock.lock().await;
+    let result = tokio::task::spawn_blocking(move || {
+        let home = load_home(&home_dir)?;
+        let (_store, device, _delivery) = open_agent(&home)?;
+        let device_ref = device.device_ref();
+        Ok(json!({
+            "status": "ready",
+            "service": "finitechat-hermes",
+            "version": env!("CARGO_PKG_VERSION"),
+            "agent_home": home.dir.display().to_string(),
+            "account_id": device_ref.account_id.clone(),
+            "device_id": device_ref.device_id.clone(),
+            "server_url": home.config.server_url,
+            "store": "ok",
+            "store_file": home.dir.join(STORE_FILE).display().to_string(),
+        }))
+    })
+    .await
+    .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    result
+        .map(Json)
+        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
 }
 
 async fn hermes_service_action(
@@ -369,6 +417,7 @@ async fn hermes_service_action(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let home_dir = state.agent_home.clone();
+    let _guard = state.bridge_lock.lock().await;
     let result = tokio::task::spawn_blocking(move || {
         handle_hermes_bridge_action(&home_dir, &action, payload)
     })
@@ -376,6 +425,30 @@ async fn hermes_service_action(
     .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     result
         .map(Json)
+        .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
+}
+
+async fn hermes_service_inbound(
+    State(state): State<HermesServiceState>,
+    Query(query): Query<HermesInboundQuery>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let home_dir = state.agent_home.clone();
+    let _guard = state.bridge_lock.lock().await;
+    let result =
+        tokio::task::spawn_blocking(move || handle_hermes_inbound_stream(&home_dir, query))
+            .await
+            .map_err(|error| service_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    result
+        .map(|body| {
+            (
+                [
+                    (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                body,
+            )
+                .into_response()
+        })
         .map_err(|error| service_error(status_for_cli_error(&error), error.to_string()))
 }
 
@@ -419,6 +492,52 @@ fn handle_hermes_bridge_action(
         }
     }
     serde_json::from_slice(&output).map_err(CliError::Json)
+}
+
+fn handle_hermes_inbound_stream(
+    home_dir: &Path,
+    query: HermesInboundQuery,
+) -> Result<String, CliError> {
+    let mut request = serde_json::Map::new();
+    if let Some(room_id) = query.room_id {
+        request.insert("room_id".to_owned(), Value::String(room_id));
+    }
+    if let Some(limit) = query.limit {
+        request.insert("limit".to_owned(), json!(limit));
+    }
+    if let Some(timeout_millis) = query.timeout_millis {
+        request.insert("timeout_millis".to_owned(), json!(timeout_millis));
+    }
+
+    let mut output = Vec::new();
+    cmd_poll(home_dir, Value::Object(request), &mut output)?;
+    let payload: Value = serde_json::from_slice(&output).map_err(CliError::Json)?;
+    hermes_inbound_ndjson(&payload)
+}
+
+fn hermes_inbound_ndjson(payload: &Value) -> Result<String, CliError> {
+    let mut lines = String::new();
+    if let Some(joined) = payload.get("joined").and_then(Value::as_array) {
+        for account_id in joined {
+            let record = json!({
+                "type": "joined",
+                "account_id": account_id,
+            });
+            lines.push_str(&serde_json::to_string(&record).map_err(CliError::Serialize)?);
+            lines.push('\n');
+        }
+    }
+    if let Some(events) = payload.get("events").and_then(Value::as_array) {
+        for event in events {
+            let record = json!({
+                "type": "event",
+                "event": event,
+            });
+            lines.push_str(&serde_json::to_string(&record).map_err(CliError::Serialize)?);
+            lines.push('\n');
+        }
+    }
+    Ok(lines)
 }
 
 fn status_for_cli_error(error: &CliError) -> StatusCode {
@@ -2059,6 +2178,34 @@ mod tests {
         .expect("typed plain-text chat is still bridge-visible");
         assert_eq!(event.text, "plain hello");
         assert_eq!(event.message_type, HermesMessageTypeV1::Text);
+    }
+
+    #[test]
+    fn inbound_ndjson_encodes_joined_accounts_and_events() {
+        let payload = json!({
+            "joined": ["alice"],
+            "events": [
+                {
+                    "room_id": "room-main",
+                    "seq": 7,
+                    "message_id": "message-7",
+                    "text": "hello"
+                }
+            ]
+        });
+
+        let ndjson = hermes_inbound_ndjson(&payload).expect("encode inbound stream records");
+        let lines = ndjson
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "joined");
+        assert_eq!(lines[0]["account_id"], "alice");
+        assert_eq!(lines[1]["type"], "event");
+        assert_eq!(lines[1]["event"]["message_id"], "message-7");
+        assert_eq!(lines[1]["event"]["text"], "hello");
     }
 
     #[test]

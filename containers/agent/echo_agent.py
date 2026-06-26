@@ -21,6 +21,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger("echo-agent")
@@ -29,29 +30,89 @@ HOME = Path(os.environ["FINITECHAT_HOME"])
 SERVER_URL = os.environ["FINITE_SERVER_URL"]
 PLUGIN_DIR = Path(os.environ.get("FINITECHAT_PLUGIN_DIR", "/root/.hermes/plugins/finite"))
 FINITECHAT_CMD = shlex.split(os.environ.get("FINITECHAT_BIN", "finitechat"))
+HEALTH_HOST = os.environ.get("FINITE_AGENT_HTTP_HOST", "0.0.0.0")
+HEALTH_PORT = int(os.environ.get("FINITE_AGENT_HTTP_PORT", "8080"))
+STATUS: dict[str, Any] = {
+    "ready": False,
+    "npub": None,
+    "account_id": None,
+}
 
 
-def ensure_initialized() -> None:
-    if (HOME / "config.json").exists():
-        logger.info("agent home already initialized at %s", HOME)
-        return
+def finitechat_json(*args: str) -> dict[str, Any]:
     result = subprocess.run(
-        [
-            *FINITECHAT_CMD,
-            "hermes",
-            "--home",
-            str(HOME),
-            "init",
-            "--server",
-            SERVER_URL,
-        ],
+        [*FINITECHAT_CMD, *args],
         capture_output=True,
         text=True,
         check=True,
     )
-    identity = json.loads(result.stdout)
+    return json.loads(result.stdout)
+
+
+def ensure_initialized() -> dict[str, Any]:
+    if (HOME / "config.json").exists():
+        logger.info("agent home already initialized at %s", HOME)
+        return finitechat_json("identity", "--agent-home", str(HOME), "show")
+    identity = finitechat_json(
+        "hermes",
+        "--home",
+        str(HOME),
+        "init",
+        "--server",
+        SERVER_URL,
+    )
     logger.info("agent identity: %s", identity["npub"])
     print(f"AGENT_NPUB={identity['npub']}", flush=True)
+    return identity
+
+
+def set_identity_status(identity: dict[str, Any]) -> None:
+    STATUS["npub"] = identity.get("npub")
+    STATUS["account_id"] = identity.get("account_id")
+
+
+async def handle_health(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=2)
+        parts = request_line.decode("latin-1", errors="replace").split()
+        path = parts[1] if len(parts) >= 2 else "/"
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2)
+            if line in {b"\r\n", b"\n", b""}:
+                break
+        status_code = 200 if path == "/healthz" and STATUS["ready"] else 503
+        if path != "/healthz":
+            status_code = 404
+        reason = {200: "OK", 404: "Not Found", 503: "Service Unavailable"}[status_code]
+        body = json.dumps(
+            {
+                "ready": STATUS["ready"],
+                "npub": STATUS["npub"],
+                "account_id": STATUS["account_id"],
+            }
+        ).encode("utf-8")
+        writer.write(
+            (
+                f"HTTP/1.1 {status_code} {reason}\r\n"
+                "content-type: application/json\r\n"
+                f"content-length: {len(body)}\r\n"
+                "connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            + body
+        )
+        await writer.drain()
+    except Exception as exc:  # pragma: no cover - defensive health server guard
+        logger.warning("health request failed: %s", exc)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def start_health_server() -> asyncio.AbstractServer:
+    server = await asyncio.start_server(handle_health, HEALTH_HOST, HEALTH_PORT)
+    logger.info("health endpoint listening on %s:%s", HEALTH_HOST, HEALTH_PORT)
+    return server
 
 
 def load_adapter_class():
@@ -91,7 +152,9 @@ def build_adapter(module):
 
 
 async def main() -> None:
-    ensure_initialized()
+    identity = ensure_initialized()
+    set_identity_status(identity)
+    health_server = await start_health_server()
     module = load_adapter_class()
     adapter = build_adapter(module)
 
@@ -116,9 +179,14 @@ async def main() -> None:
     if not connected:
         logger.error("adapter failed to connect")
         sys.exit(1)
+    STATUS["ready"] = True
     print("ECHO_AGENT_READY", flush=True)
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        health_server.close()
+        await health_server.wait_closed()
 
 
 if __name__ == "__main__":
