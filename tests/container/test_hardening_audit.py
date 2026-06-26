@@ -11,6 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_SCRIPT = REPO_ROOT / "scripts" / "hermes-hardening-audit.py"
 IMAGE_ID = "sha256:local-image"
+IMAGE_REF = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
 RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/hermes"
 SNAPSHOT_ID = "88929f1f90c5fcadd1d19e33f26609e595af4c2afb1e72b724695435e051900f"
@@ -172,7 +173,9 @@ def docker_report(restic_backend: str = "s3") -> dict:
         "status": "passed",
         "proof_layers": DOCKER_LAYERS,
         "facts": {
+            "image": "finite-chat-hermes-runtime:smoke",
             "image_id": IMAGE_ID,
+            "restic_version": "restic 0.18.0 compiled with go1.24.4 on linux/arm64",
             "restic_backend": restic_backend,
             "hermes_agent_version_actual": "0.17.0",
             "agent_npub": "npub1agent",
@@ -240,7 +243,7 @@ def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
         },
         "image": {
             "source_image_id": IMAGE_ID,
-            "target_ref": "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0",
+            "target_ref": IMAGE_REF,
             "digest": image_digest,
         },
         "runtime": {
@@ -277,6 +280,26 @@ def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
             },
+        },
+    }
+
+
+def publish_report(restic_backend: str = "s3") -> dict:
+    return {
+        "status": "published",
+        "generated_at_unix": 1,
+        "source_report": "target/hermes-docker-smoke/report.json",
+        "source_image": "finite-chat-hermes-runtime:smoke",
+        "source_image_id": IMAGE_ID,
+        "target_image_ref": IMAGE_REF,
+        "pushed": True,
+        "repo_digests": [IMAGE_DIGEST],
+        "proof": {
+            "smoke_status": "passed",
+            "hermes_agent_version_actual": "0.17.0",
+            "restic_version": "restic 0.18.0 compiled with go1.24.4 on linux/arm64",
+            "agent_npub_after_restore": "npub1agent",
+            "restic_backend": restic_backend,
         },
     }
 
@@ -462,14 +485,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -492,14 +508,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", {"status": "passed"})
@@ -522,14 +531,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", {"status": "passed"})
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -541,7 +543,7 @@ class HardeningAuditTest(unittest.TestCase):
         details = {check["name"]: check["detail"] for check in audit["checks"]}
         self.assertIn("run_id", details["github_publish_gate_ready"])
 
-    def test_audit_rejects_placeholder_tinfoil_handoff(self) -> None:
+    def test_audit_rejects_placeholder_image_publish_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
             write_json(tmp / "adapter-regressions.json", adapter_regression_report())
@@ -562,6 +564,32 @@ class HardeningAuditTest(unittest.TestCase):
                     "repo_digests": [IMAGE_DIGEST],
                 },
             )
+            write_json(tmp / "handoff.json", handoff_report())
+            write_canary_artifacts(tmp)
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("proven_image_published", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("source_report", details["proven_image_published"])
+        self.assertIn("pushed", details["proven_image_published"])
+
+    def test_audit_rejects_placeholder_tinfoil_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "docker-ios.json", docker_ios_report())
+            write_json(tmp / "s3-emulator.json", s3_emulator_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", {"status": "ready"})
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -586,14 +614,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_json(tmp / "canary-summary.json", {"status": "ready"})
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -655,14 +676,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -689,14 +703,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -727,14 +734,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())
@@ -757,14 +757,7 @@ class HardeningAuditTest(unittest.TestCase):
             write_json(tmp / "github-setup.json", {"status": "ready"})
             write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
             write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
-            write_json(
-                tmp / "publish.json",
-                {
-                    "status": "published",
-                    "source_image_id": IMAGE_ID,
-                    "repo_digests": [IMAGE_DIGEST],
-                },
-            )
+            write_json(tmp / "publish.json", publish_report())
             write_json(tmp / "handoff.json", handoff_report())
             write_canary_artifacts(tmp)
             write_json(tmp / "tinfoil-result.json", tinfoil_result())

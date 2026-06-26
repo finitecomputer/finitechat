@@ -315,7 +315,11 @@ Current CI shape:
   After the S3-backed smoke passes, it logs into GHCR, tags the exact
   `facts.image_id` from the passing smoke report as
   `ghcr.io/<owner>/finite-chat-hermes-runtime:<commit-sha>`, pushes it, and
-  uploads `target/hermes-docker-smoke/image-publish.json`.
+  uploads `target/hermes-docker-smoke/image-publish.json`. The hardening audit
+  rejects a placeholder image-publish `{"status":"published"}` report: it
+  requires the source smoke report path, source image name/id, target ref,
+  pushed flag, sha256 repo digest, and runtime proof tying the published image
+  back to the S3-backed Hermes 0.17 Docker smoke.
 - The same manual publish workflow then runs
   `scripts/hermes-tinfoil-handoff.py` to produce
   `target/hermes-docker-smoke/tinfoil-handoff.json`. That report fails closed

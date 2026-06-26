@@ -147,6 +147,11 @@ REQUIRED_HANDOFF_CONTAINER_ENV = {
     "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
     "FINITECHAT_HERMES_INBOUND_STREAM": "1",
 }
+REQUIRED_PUBLISH_PROOF = {
+    "smoke_status": "passed",
+    "hermes_agent_version_actual": "0.17.0",
+    "restic_backend": "s3",
+}
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -445,6 +450,56 @@ def validate_tinfoil_handoff(
     return errors
 
 
+def validate_publish_report(
+    publish: dict[str, Any] | None,
+    *,
+    docker_facts: dict[str, Any],
+) -> list[str]:
+    if not publish:
+        return ["requires published image report with repo digest matching Docker smoke image id"]
+
+    errors: list[str] = []
+    if publish.get("status") != "published":
+        errors.append(f"publish status={publish.get('status')!r}; expected 'published'")
+    if publish.get("pushed") is not True:
+        errors.append(f"publish pushed={publish.get('pushed')!r}; expected True")
+
+    for key in ("source_report", "source_image", "source_image_id", "target_image_ref"):
+        if not non_empty_str(publish.get(key)):
+            errors.append(f"publish {key} is required")
+
+    docker_image = docker_facts.get("image")
+    if non_empty_str(docker_image) and publish.get("source_image") != docker_image:
+        errors.append("publish source_image does not match Docker smoke image")
+    docker_image_id = docker_facts.get("image_id")
+    if non_empty_str(docker_image_id) and publish.get("source_image_id") != docker_image_id:
+        errors.append("publish source_image_id does not match Docker smoke image_id")
+
+    repo_digests = publish.get("repo_digests")
+    if not isinstance(repo_digests, list) or not repo_digests:
+        errors.append("publish repo_digests must be a non-empty list")
+    else:
+        digest_values = [str(item) for item in repo_digests]
+        if not any("@sha256:" in value for value in digest_values):
+            errors.append("publish repo_digests must include a sha256 digest")
+
+    proof = publish.get("proof")
+    if not isinstance(proof, dict):
+        errors.append("publish proof is required")
+        return errors
+    for key, expected in REQUIRED_PUBLISH_PROOF.items():
+        if proof.get(key) != expected:
+            errors.append(f"publish proof.{key}={proof.get(key)!r}; expected {expected!r}")
+    if not non_empty_str(proof.get("restic_version")):
+        errors.append("publish proof.restic_version is required")
+    if not non_empty_str(proof.get("agent_npub_after_restore")):
+        errors.append("publish proof.agent_npub_after_restore is required")
+    docker_npub = docker_facts.get("agent_npub_after_restore")
+    if non_empty_str(docker_npub) and proof.get("agent_npub_after_restore") != docker_npub:
+        errors.append("publish proof.agent_npub_after_restore does not match Docker smoke")
+    return errors
+
+
 def step_names(report: dict[str, Any]) -> set[str]:
     steps = report.get("steps")
     if not isinstance(steps, list):
@@ -732,20 +787,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         else f"backend={preflight.get('backend') if preflight else None!r}",
     )
 
-    publish_passed = (
-        bool(publish)
-        and publish.get("status") == "published"
-        and publish.get("source_image_id") == docker_facts.get("image_id")
-        and bool(publish.get("repo_digests"))
-    )
+    publish_errors = validate_publish_report(publish, docker_facts=docker_facts)
+    publish_passed = not publish_errors
     add_check(
         checks,
         name="proven_image_published",
         status="passed" if publish_passed else "missing",
         evidence=str(publish_path) if publish else None,
-        detail=None
-        if publish_passed
-        else "requires published image report with repo digest matching Docker smoke image id",
+        detail=None if publish_passed else "; ".join(publish_errors),
     )
 
     handoff_errors = validate_tinfoil_handoff(handoff, docker_facts=docker_facts, publish=publish)
