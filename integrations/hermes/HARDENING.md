@@ -67,9 +67,10 @@ Facts established:
   provider configured" error through chat; with provider env loaded, the same
   path received a model reply.
 - The iOS UI responsiveness issue had a separate root: several fire-and-forget
-  actions, especially `setTyping`, synchronously called `runtime.dispatch` on
-  the main actor. These actions now use background dispatch so typing, taps, and
-  room read markers do not wait behind Rust/network work.
+  actions, especially `setTyping` and composer sends, synchronously called
+  `runtime.dispatch` on the main actor. These actions now use background
+  dispatch so typing, taps, sends, and room read markers do not wait behind
+  Rust/network work.
 
 Final Tinfoil root cause, found after the first live canary probes still
 failed: the supervised sidecar was launched as the `node` user with
@@ -91,6 +92,11 @@ then showed:
   admitted a throwaway client in 2.1s.
 - A CLI chat smoke joined the same live invite, ran `/sethome`, sent a message,
   and received the model reply `tinfoil chat ok`.
+- A visible iOS Simulator run with no launch automation pasted the live
+  `finite://join` URL, entered the current PIN, reached the composer, sent
+  `Reply with exactly: simulator chat ok`, and received `simulator chat ok`.
+  After relaunching the updated app, the same joined room persisted and a second
+  visible composer send received `updated app ok`.
 
 Before asking a human to try iOS again, run the live canary admission probe
 from finitecomputer:

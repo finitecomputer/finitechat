@@ -1944,6 +1944,46 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send to the visible thread only")
     }
 
+    func testBackgroundSendDoesNotWaitForRuntimeDispatch() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let sendStarted = expectation(description: "send runtime dispatch started")
+        let releaseSend = DispatchSemaphore(value: 0)
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        ) { action, current in
+            if case .sendMessage = action {
+                sendStarted.fulfill()
+                _ = releaseSend.wait(timeout: .now() + 5)
+            }
+            return current
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        let startedAt = Date()
+
+        XCTAssertTrue(model.sendInBackground(roomID: "room-main", text: "slow send"))
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
+
+        await fulfillment(of: [sendStarted], timeout: 1)
+        releaseSend.signal()
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains(.sendMessage(roomId: "room-main", text: "slow send"))
+        }
+    }
+
     func testOpeningRoomMarksItRead() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -2159,6 +2199,21 @@ final class AppModelPersistenceTests: XCTestCase {
             }
             return false
         })
+    }
+
+    func testPendingRoomPresentationHidesLowLevelWelcomeErrors() {
+        let room = AppRoomSummary(
+            roomId: "room-main",
+            displayName: "Main Room",
+            state: .waitingForApproval,
+            status: "client error: this device has no accepted Welcome for room 'room-main'",
+            userStatusText: "Waiting for approval",
+            lastMessagePreview: "",
+            unreadCount: 0,
+            canLoadOlder: false
+        )
+
+        XCTAssertNil(PendingRoomPresentation(room: room).detailText)
     }
 
     func testRetryMessageDispatchesOnlyForFailedLocalOutbound() async throws {

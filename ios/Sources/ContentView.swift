@@ -1745,7 +1745,7 @@ private struct RoomThreadView: View {
 
     private func sendComposerDraft() {
         if stagedAttachments.isEmpty {
-            if model.send(roomID: roomID, text: composerText, replyTo: replyDraftMessage) {
+            if model.sendInBackground(roomID: roomID, text: composerText, replyTo: replyDraftMessage) {
                 composerText = ""
                 model.setTyping(roomID: roomID, isTyping: false)
                 replyDraftMessage = nil
@@ -2401,6 +2401,24 @@ enum PhotoLibraryImageSaver {
     }
 }
 
+struct PendingRoomPresentation {
+    let room: AppRoomSummary
+
+    var detailText: String? {
+        let status = room.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !status.isEmpty else { return nil }
+        guard status != room.userStatusText else { return nil }
+        guard status != room.userStatusText.lowercased() else { return nil }
+        guard !Self.isLowLevelAdmissionStatus(status) else { return nil }
+        return status
+    }
+
+    private static func isLowLevelAdmissionStatus(_ status: String) -> Bool {
+        status.localizedCaseInsensitiveContains("accepted Welcome")
+            || status.localizedCaseInsensitiveContains("client error:")
+    }
+}
+
 private struct PendingRoomView: View {
     let room: AppRoomSummary
     @ObservedObject var model: AppModel
@@ -2455,11 +2473,7 @@ private struct PendingRoomView: View {
     }
 
     private var detailText: String? {
-        let status = room.status.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !status.isEmpty else { return nil }
-        guard status != room.userStatusText else { return nil }
-        guard status != room.userStatusText.lowercased() else { return nil }
-        return status
+        PendingRoomPresentation(room: room).detailText
     }
 }
 

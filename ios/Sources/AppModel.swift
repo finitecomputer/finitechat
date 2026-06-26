@@ -1186,6 +1186,30 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
+    func sendInBackground(
+        roomID: String,
+        text rawText: String,
+        replyTo message: ChatMessage? = nil
+    ) -> Bool {
+        guard roomAllowsComposition(roomID) else { return false }
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        let action: AppAction
+        if let message {
+            action = .sendReply(
+                roomId: roomID,
+                text: text,
+                replyToMessageId: message.messageId
+            )
+        } else {
+            action = .sendMessage(roomId: roomID, text: text)
+        }
+        return dispatchInBackground(action) { [weak self] in
+            self?.schedulePostSendCatchUp()
+        }
+    }
+
+    @discardableResult
     func send(replyTo message: ChatMessage? = nil) -> Bool {
         guard let roomID = selectedRoom?.roomId else { return false }
         return send(roomID: roomID, replyTo: message)
@@ -1514,7 +1538,8 @@ final class AppModel: ObservableObject {
         _ action: AppAction,
         priority: TaskPriority = .userInitiated,
         showsError: Bool = true,
-        restartsUpdateLoop: Bool = true
+        restartsUpdateLoop: Bool = true,
+        onSuccess: (@MainActor () -> Void)? = nil
     ) -> Bool {
         let diagnostic = diagnosticAction(action)
         appendDiagnostic(
@@ -1556,6 +1581,7 @@ final class AppModel: ObservableObject {
                 if restartsUpdateLoop {
                     self.restartUpdateLoopIfEnabled()
                 }
+                onSuccess?()
             } catch {
                 guard self.openKey == runtimeKey else { return }
                 self.appendDiagnostic(
