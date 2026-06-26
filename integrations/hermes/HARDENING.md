@@ -71,11 +71,29 @@ Facts established:
   the main actor. These actions now use background dispatch so typing, taps, and
   room read markers do not wait behind Rust/network work.
 
-Current root-cause classification: artifact/source drift plus insufficient
-release evidence. Current code can admit locally through real Hermes 0.17, but
-the live Tinfoil canary was on an older package tag and the release gate did
-not include an owner-side admission probe. Before asking a human to try iOS
-again, run the live canary admission probe from finitecomputer:
+Final Tinfoil root cause, found after the first live canary probes still
+failed: the supervised sidecar was launched as the `node` user with
+`--ready-file /run/finite-agent/finitechat-hermes-ready.json`. The runtime
+directory is root-owned, so `finitechat hermes serve` exited with
+`Permission denied (os error 13)` after binding. Hermes was then not connected
+to a live sidecar/admission loop. A token-gated `/finitechat-poll-once`
+diagnostic proved the underlying Finite Chat owner state was healthy by
+admitting the same pending join manually inside the container.
+
+The fix in `finitecomputer` moved the ready file into the node-owned agent home
+(`/home/node/.finite/agent/hermes-service-ready.json`) and added token-gated
+diagnostics plus Hermes/sidecar log capture. Tinfoil canary release `v0.1.14`
+then showed:
+
+- `finitechat hermes serve` and `hermes gateway run --replace` both running in
+  the Tinfoil container.
+- `scripts/tinfoil_agent_admission_probe.sh --json --timeout-ms 60000`
+  admitted a throwaway client in 2.1s.
+- A CLI chat smoke joined the same live invite, ran `/sethome`, sent a message,
+  and received the model reply `tinfoil chat ok`.
+
+Before asking a human to try iOS again, run the live canary admission probe
+from finitecomputer:
 
 ```bash
 scripts/tinfoil_agent_admission_probe.sh --json --timeout-ms 30000
