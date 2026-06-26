@@ -30,6 +30,12 @@ def passing_evidence() -> dict:
             "storage_backend": "s3",
             "restore_tag": "finite-agent-state",
         },
+        "source_artifacts": {
+            "handoff_report": {"path": "handoff.json", "present": True},
+            "canary_summary": {"path": "summary.json", "present": True},
+            "container_json": {"path": "container.json", "present": True},
+            "health_json": {"path": "health.json", "present": True},
+        },
         "image": {"digest": IMAGE_DIGEST},
         "storage": {"backend": "s3", "restore_tag": "finite-agent-state"},
         "health": {"ready": True, "npub": "npub1agent"},
@@ -77,6 +83,8 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(report["facts"]["restic_backend"], "s3")
         self.assertEqual(report["facts"]["agent_npub_before_restart"], "npub1agent")
         self.assertEqual(report["facts"]["agent_npub_after_restore"], "npub1agent")
+        self.assertTrue(report["facts"]["container_json_source_present"])
+        self.assertTrue(report["facts"]["health_json_source_present"])
         self.assertTrue(report["facts"]["chat_before_restart"])
         self.assertEqual(report["facts"]["chat_before_message_id"], "event-before")
         self.assertTrue(report["facts"]["chat_after_restart"])
@@ -126,6 +134,17 @@ class TinfoilCanaryResultTest(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertIn("digest-pinned runtime image", report["missing_proof_layers"])
         self.assertIn("expected.image_digest", " ".join(report["errors"]))
+
+    def test_fails_when_raw_health_artifact_is_missing(self) -> None:
+        evidence = passing_evidence()
+        evidence["source_artifacts"]["health_json"] = {"path": "health.json", "present": False}
+        with tempfile.TemporaryDirectory() as tmp_value:
+            result, report = run_result(Path(tmp_value), evidence)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("attested health proxy ready", report["missing_proof_layers"])
+        self.assertIn("source_artifacts.health_json", " ".join(report["errors"]))
 
 
 if __name__ == "__main__":

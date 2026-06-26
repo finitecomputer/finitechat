@@ -356,11 +356,12 @@ Tinfoil canary runbook draft:
    `target/hermes-docker-smoke/tinfoil-canary-evidence.json` with
    `scripts/hermes-tinfoil-canary-evidence.py`. Then run
    `scripts/hermes-tinfoil-canary-result.py --evidence-json target/hermes-docker-smoke/tinfoil-canary-evidence.json --report target/hermes-docker-smoke/tinfoil-canary-result.json`.
-   The evidence builder records the generated handoff/config expectations for
-   container name, image digest, storage backend, and restore tag. The validator
-   must pass before `scripts/hermes-hardening-audit.py --require-complete` can
-   pass, and it rejects mismatched expectations or chat claims without concrete
-   event IDs.
+   The evidence builder records the source artifact paths plus the generated
+   handoff/config expectations for container name, image digest, storage
+   backend, and restore tag. The validator must pass before
+   `scripts/hermes-hardening-audit.py --require-complete` can pass, and it
+   rejects missing source artifacts, mismatched expectations, or chat claims
+   without concrete event IDs.
 8. Treat `FINITE_AGENT_RESTIC_PASSWORD` as a temporary canary secret, not the
    production privacy posture. Tinfoil documents that container secrets are not
    public in the repo/dashboard, but are visible to Tinfoil infrastructure. The
@@ -398,9 +399,9 @@ Tinfoil canary runbook draft:
   the first place chat correctness is discovered.
 - Live Tinfoil canary evidence must be normalized by
   `scripts/hermes-tinfoil-canary-result.py`; a hand-written
-  `{"status":"passed"}` result is not enough. The normalized result must match
-  the generated handoff expectations and include concrete before/after chat
-  event IDs.
+  `{"status":"passed"}` result is not enough. The normalized result must
+  preserve raw source artifact references, match the generated handoff
+  expectations, and include concrete before/after chat event IDs.
 - The hardening audit must report `complete` before this track is considered
   done. Local-only smoke evidence is not enough to satisfy the Tinfoil objective.
 

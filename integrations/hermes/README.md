@@ -286,11 +286,13 @@ scripts/hermes-tinfoil-canary-result.py \
   --report target/hermes-docker-smoke/tinfoil-canary-result.json
 ```
 
-That validator fails unless the canary used the generated handoff expectations
-for container name, digest-pinned image, S3 restic state, and restore tag; a
-running Tinfoil container; `/healthz` readiness with the restored npub; concrete
-Finite Chat event IDs before and after restart; an observed clean-stop backup;
-an observed latest-by-tag restore; and the same agent npub after restore.
+That validator fails unless the evidence preserves the raw handoff, summary,
+container, and health source artifact references; the canary used the generated
+handoff expectations for container name, digest-pinned image, S3 restic state,
+and restore tag; a running Tinfoil container; `/healthz` readiness with the
+restored npub; concrete Finite Chat event IDs before and after restart; an
+observed clean-stop backup; an observed latest-by-tag restore; and the same
+agent npub after restore.
 
 To see exactly which hardening gates are proven by the reports on disk:
 

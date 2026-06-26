@@ -32,6 +32,11 @@ def nested_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def artifact_present(source_artifacts: dict[str, Any], name: str) -> bool:
+    artifact = nested_dict(source_artifacts.get(name))
+    return artifact.get("present") is True and bool(non_empty_string(artifact.get("path")))
+
+
 def chat_round_trip(value: Any) -> tuple[bool, str | None]:
     if not isinstance(value, dict):
         return False, None
@@ -71,6 +76,7 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     image = nested_dict(evidence.get("image"))
     storage = nested_dict(evidence.get("storage"))
     expected = nested_dict(evidence.get("expected"))
+    source_artifacts = nested_dict(evidence.get("source_artifacts"))
     health = nested_dict(evidence.get("health"))
     chat = nested_dict(evidence.get("chat"))
     restart_restore = nested_dict(evidence.get("restart_restore"))
@@ -109,6 +115,10 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         and restore_tag
         and expected_restore_tag == restore_tag
     )
+    handoff_source_present = artifact_present(source_artifacts, "handoff_report")
+    summary_source_present = artifact_present(source_artifacts, "canary_summary")
+    container_source_present = artifact_present(source_artifacts, "container_json")
+    health_source_present = artifact_present(source_artifacts, "health_json")
 
     add_layer(
         proof_layers,
@@ -118,21 +128,29 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             and container_url
             and container_status == "running"
             and expected_container_matches
+            and container_source_present
         ),
         layer="Tinfoil container running",
         error=(
             "container.name, container.url, container.status='running', and "
-            "expected.container_name matching container.name are required"
+            "expected.container_name matching container.name are required from "
+            "source_artifacts.container_json"
         ),
     )
     add_layer(
         proof_layers,
         errors,
-        condition=bool(image_digest and "@sha256:" in image_digest and expected_image_matches),
+        condition=bool(
+            image_digest
+            and "@sha256:" in image_digest
+            and expected_image_matches
+            and handoff_source_present
+            and summary_source_present
+        ),
         layer="digest-pinned runtime image",
         error=(
             "image.digest must be digest-pinned with @sha256: and match "
-            "expected.image_digest from the generated handoff"
+            "expected.image_digest from source handoff/summary artifacts"
         ),
     )
     add_layer(
@@ -142,19 +160,21 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             restic_backend == "s3"
             and restore_tag == "finite-agent-state"
             and expected_storage_matches
+            and handoff_source_present
         ),
         layer="S3 restic repository",
         error=(
             "storage.backend must be 's3', storage.restore_tag must be "
-            "'finite-agent-state', and both must match expected storage values"
+            "'finite-agent-state', and both must match expected storage values "
+            "from source_artifacts.handoff_report"
         ),
     )
     add_layer(
         proof_layers,
         errors,
-        condition=bool(health_ready and health_npub),
+        condition=bool(health_ready and health_npub and health_source_present),
         layer="attested health proxy ready",
-        error="health.ready=true and health.npub are required",
+        error="health.ready=true and health.npub are required from source_artifacts.health_json",
     )
     add_layer(
         proof_layers,
@@ -221,6 +241,10 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
             "expected_image_digest": expected_image_digest,
             "expected_storage_backend": expected_storage_backend,
             "expected_restore_tag": expected_restore_tag,
+            "handoff_source_present": handoff_source_present,
+            "canary_summary_source_present": summary_source_present,
+            "container_json_source_present": container_source_present,
+            "health_json_source_present": health_source_present,
             "health_ready": health_ready,
             "health_npub": health_npub,
             "agent_npub_before_restart": before_npub,
