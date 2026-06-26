@@ -25,7 +25,7 @@ class GithubSecretsSetupTest(unittest.TestCase):
             env_file.write_text(
                 "\n".join(
                     [
-                        "FINITE_DOCKER_RESTIC_PASSWORD='restore key'",
+                        "FINITE_DOCKER_RESTIC_PASSWORD='canary backup secret'",
                         'export AWS_ACCESS_KEY_ID="access"',
                         "AWS_SECRET_ACCESS_KEY=secret",
                         "FINITE_LATITUDE_STORAGE_BUCKET=bucket",
@@ -36,7 +36,7 @@ class GithubSecretsSetupTest(unittest.TestCase):
 
             values = setup.parse_env_file(env_file)
 
-        self.assertEqual(values["FINITE_DOCKER_RESTIC_PASSWORD"], "restore key")
+        self.assertEqual(values["FINITE_DOCKER_RESTIC_PASSWORD"], "canary backup secret")
         self.assertEqual(values["AWS_ACCESS_KEY_ID"], "access")
         self.assertEqual(values["AWS_SECRET_ACCESS_KEY"], "secret")
         self.assertEqual(values["FINITE_LATITUDE_STORAGE_BUCKET"], "bucket")

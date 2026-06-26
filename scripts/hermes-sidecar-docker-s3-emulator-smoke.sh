@@ -17,7 +17,7 @@ MINIO_CONTAINER="${FINITE_S3_EMULATOR_CONTAINER:-finite-hermes-minio-$(date +%s)
 MINIO_ACCESS_KEY="${FINITE_S3_EMULATOR_ACCESS_KEY:-finite-minio-access}"
 MINIO_SECRET_KEY="${FINITE_S3_EMULATOR_SECRET_KEY:-finite-minio-secret}"
 MINIO_BUCKET="${FINITE_S3_EMULATOR_BUCKET:-finite-hermes-runtime-smoke}"
-MINIO_PREFIX="${FINITE_S3_EMULATOR_PREFIX:-hermes-docker-smoke}"
+MINIO_PREFIX="${FINITE_S3_EMULATOR_PREFIX:-agents/finite-agent-tinfoil-user-canary/state}"
 MINIO_PORT="${FINITE_S3_EMULATOR_PORT:-$(python3 - <<'PY'
 import socket
 

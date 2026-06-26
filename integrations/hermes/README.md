@@ -133,8 +133,8 @@ and AWS-style credentials:
 
 ```bash
 FINITE_DOCKER_RESTIC_BACKEND=s3 \
-FINITE_DOCKER_RESTIC_REPOSITORY=s3:https://objects.nyc.storage.sh/YOUR_BUCKET/hermes-docker-smoke \
-FINITE_DOCKER_RESTIC_PASSWORD='user-owned-restore-key' \
+FINITE_DOCKER_RESTIC_REPOSITORY=s3:https://objects.nyc.storage.sh/YOUR_BUCKET/agents/finite-agent-tinfoil-user-canary/state \
+FINITE_DOCKER_RESTIC_PASSWORD='temporary-canary-backup-secret' \
 AWS_ACCESS_KEY_ID='...' \
 AWS_SECRET_ACCESS_KEY='...' \
 scripts/hermes-sidecar-docker-smoke.sh
@@ -146,7 +146,10 @@ marks the report as `s3_endpoint_kind=local_emulator`. The hardening audit
 accepts that as local S3-compatible rehearsal evidence but rejects it as the
 real Latitude/GitHub S3 gate.
 `FINITE_DOCKER_RESTIC_PASSWORD` must be explicitly set for the S3 backend and
-must be the user-owned restore key, not the disposable local smoke default.
+must not be the disposable local smoke default. For this canary it is a
+temporary backup encryption secret. The product path should derive or unwrap a
+per-agent backup key from user-controlled key material so object storage and
+operators cannot decrypt agent state without user-mediated key release.
 For local runs, copy `.env.example` to `.env`; the smoke wrapper sources it
 before preflight and promotes `FINITE_DOCKER_RESTIC_AWS_*` values to the
 `AWS_*` names restic expects. If those values are still unset, it reads the
@@ -177,7 +180,7 @@ For hands-free dispatches, set these repository variables or secrets:
 - `FINITE_LATITUDE_OBJECT_ENDPOINT`, optional when using the default
   `https://objects.nyc.storage.sh`
 - `FINITE_DOCKER_RESTIC_PREFIX`, optional when using the default
-  `hermes-docker-smoke`
+  `agents/finite-agent-tinfoil-user-canary/state`
 
 Configure these repository secrets before using the publish gate:
 
@@ -266,7 +269,9 @@ The handoff's restore section uses the runtime env names consumed by
 `/opt/agent-entrypoint.sh`: `FINITE_AGENT_RESTORE_ON_START=1`,
 `FINITE_AGENT_RESTORE_LATEST=1`, `FINITE_AGENT_BACKUP_ON_EXIT=1`,
 `FINITE_AGENT_RESTIC_REPOSITORY`, `FINITE_AGENT_RESTIC_BACKUP_TAG`, and
-`FINITE_AGENT_RESTIC_PASSWORD`.
+`FINITE_AGENT_RESTIC_PASSWORD`. The generated Tinfoil config must point at the
+same per-agent restic repository proven by the S3-backed Docker smoke; it must
+not point at emulator buckets or local artifact paths.
 
 After a ready S3/published handoff, generate the Tinfoil canary config and
 runbook:

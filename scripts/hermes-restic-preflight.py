@@ -27,6 +27,7 @@ AWS_SHARED_ENV_NAMES = (
     "AWS_SESSION_TOKEN",
     "AWS_REGION",
 )
+DEFAULT_RESTIC_PREFIX = "agents/finite-agent-tinfoil-user-canary/state"
 
 
 def aws_config_section(profile: str) -> str:
@@ -136,7 +137,7 @@ def normalized_env(env: dict[str, str]) -> dict[str, str]:
             "FINITE_LATITUDE_OBJECT_ENDPOINT", "https://objects.nyc.storage.sh"
         ).rstrip("/")
         bucket = normalized["FINITE_LATITUDE_STORAGE_BUCKET"].strip().strip("/")
-        prefix = normalized.get("FINITE_DOCKER_RESTIC_PREFIX", "hermes-docker-smoke")
+        prefix = normalized.get("FINITE_DOCKER_RESTIC_PREFIX", DEFAULT_RESTIC_PREFIX)
         prefix = prefix.strip().strip("/")
         normalized["FINITE_DOCKER_RESTIC_REPOSITORY"] = f"s3:{endpoint}/{bucket}/{prefix}"
     return normalized
@@ -209,8 +210,8 @@ def validate(env: dict[str, str]) -> tuple[int, dict[str, object]]:
             errors.append("FINITE_DOCKER_RESTIC_PASSWORD is required for backend=s3")
         elif password == DEFAULT_LOCAL_PASSWORD:
             errors.append(
-                "FINITE_DOCKER_RESTIC_PASSWORD must be user-owned for backend=s3, "
-                "not the local smoke default"
+                "FINITE_DOCKER_RESTIC_PASSWORD must be an explicit canary backup "
+                "encryption secret for backend=s3, not the local smoke default"
             )
         for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
             if not env.get(name):

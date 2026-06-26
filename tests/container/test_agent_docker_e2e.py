@@ -361,7 +361,7 @@ class AgentDockerE2ETest(unittest.TestCase):
                 )
             if RESTIC_PASSWORD == DEFAULT_LOCAL_RESTIC_PASSWORD:
                 self.fail(
-                    "FINITE_DOCKER_RESTIC_BACKEND=s3 requires a user-owned "
+                    "FINITE_DOCKER_RESTIC_BACKEND=s3 requires an explicit "
                     "FINITE_DOCKER_RESTIC_PASSWORD, not the local smoke default"
                 )
             return {

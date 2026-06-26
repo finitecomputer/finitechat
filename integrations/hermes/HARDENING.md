@@ -225,8 +225,8 @@ receipt, and verifies the app decrypts the runtime echo reply. This closes the
 gap between Docker CLI acceptance and the product client humans will use.
 The smoke defaults to a local bind-mounted restic repository for CI, and can
 point the same restic contract at S3-compatible object storage with
-`FINITE_DOCKER_RESTIC_BACKEND=s3` plus
-`FINITE_DOCKER_RESTIC_REPOSITORY=s3:https://endpoint/bucket/prefix`,
+`FINITE_DOCKER_RESTIC_BACKEND=s3` plus a per-agent repository such as
+`FINITE_DOCKER_RESTIC_REPOSITORY=s3:https://endpoint/bucket/agents/<agent-id>/state`,
 `FINITE_DOCKER_RESTIC_PASSWORD`, and AWS-style credentials. The remaining
 Phase 5 storage gap is running that S3 path against the actual Latitude bucket
 and carrying the same env contract into the Tinfoil canary/runbook.
@@ -236,7 +236,7 @@ against it. This proves the runtime/restic S3 path without real object-storage
 credentials, but the audit marks it separately as `docker_runtime_s3_emulator_smoke`
 and still requires a non-emulated S3 report for the actual Latitude/GitHub gate.
 The restic preflight fails before the image build when S3 env is incomplete,
-requires an explicit user-owned password for remote repos, and writes a JSON
+requires an explicit non-default backup encryption secret for remote repos, and writes a JSON
 report that is uploaded alongside the Docker smoke report. The hardening audit
 does not accept a status-only S3/preflight report: the Docker report must show
 the entrypoint-created encrypted restic backup, matching repository metadata,
@@ -249,6 +249,9 @@ by restic, falls back to the standard AWS shared credentials/config profile
 when the AWS env is still unset, and can derive
 `FINITE_DOCKER_RESTIC_REPOSITORY` from `FINITE_LATITUDE_STORAGE_BUCKET`,
 `FINITE_LATITUDE_OBJECT_ENDPOINT`, and `FINITE_DOCKER_RESTIC_PREFIX`.
+For the current canary, the default prefix is
+`agents/finite-agent-tinfoil-user-canary/state`; `target/hermes-docker-smoke`
+is only a local/CI artifact path, not a storage prefix to deploy.
 `.env.example` documents those fields without shipping secrets.
 `scripts/hermes-publish-proven-image.py` then turns a passing smoke report into
 a publish artifact by validating that the local Docker image id still matches
@@ -371,7 +374,7 @@ Tinfoil canary runbook draft:
 1. Run the local Docker smoke and keep `target/hermes-docker-smoke/report.json`
    as the baseline for image id, Hermes version, restic version, and latency.
 2. Run the Docker smoke again with `FINITE_DOCKER_RESTIC_BACKEND=s3` against an
-   isolated Latitude/restic prefix and a user-owned
+   isolated per-agent Latitude/restic prefix and an explicit canary
    `FINITE_DOCKER_RESTIC_PASSWORD`.
 3. Publish only the image digest that passed the Docker S3 smoke, using
    `scripts/hermes-publish-proven-image.py --require-restic-backend s3` or the
@@ -408,10 +411,12 @@ Tinfoil canary runbook draft:
    rejects missing source artifacts, mismatched expectations, or chat claims
    without concrete event IDs.
 8. Treat `FINITE_AGENT_RESTIC_PASSWORD` as a temporary canary secret, not the
-   production privacy posture. Tinfoil documents that container secrets are not
-   public in the repo/dashboard, but are visible to Tinfoil infrastructure. The
-   production operator-can't-peek path still needs user-mediated or
-   attestation-gated key release.
+   production privacy posture. Today the entrypoint passes this value directly
+   to restic as `RESTIC_PASSWORD`; no user-key derivation happens in the
+   container. The product path should derive or unwrap a per-agent backup key
+   from user-controlled key material, with domain separation from finitechat
+   identity keys, so object storage and operators cannot decrypt agent state
+   without user-mediated or attestation-gated key release.
 9. If Tinfoil fails after the Docker S3 smoke is green, classify the failure as
    image pull, runtime state, object storage, network, secrets/unlock,
    attestation, or Tinfoil control plane before changing application code.

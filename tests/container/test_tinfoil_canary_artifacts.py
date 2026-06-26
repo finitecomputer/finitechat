@@ -11,7 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_SCRIPT = REPO_ROOT / "scripts" / "hermes-tinfoil-canary-artifacts.py"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
-RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/hermes"
+RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"
 
 
 def write_json(path: Path, value: dict) -> None:

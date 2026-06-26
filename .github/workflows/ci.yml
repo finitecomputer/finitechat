@@ -35,10 +35,10 @@ on:
         type: string
         default: https://objects.nyc.storage.sh
       restic_prefix:
-        description: "Restic repository prefix under the Latitude bucket"
+        description: "Per-agent restic repository prefix under the Latitude bucket"
         required: false
         type: string
-        default: hermes-docker-smoke
+        default: agents/finite-agent-tinfoil-user-canary/state
       tinfoil_config_repo:
         description: "Public GitHub owner/repo containing tinfoil-config.yml"
         required: false
@@ -167,7 +167,7 @@ jobs:
           FINITE_DOCKER_RESTIC_REPOSITORY: ${{ github.event_name == 'workflow_dispatch' && inputs.restic_repository || '' }}
           FINITE_LATITUDE_STORAGE_BUCKET: ${{ inputs.latitude_storage_bucket || vars.FINITE_LATITUDE_STORAGE_BUCKET || secrets.FINITE_LATITUDE_STORAGE_BUCKET }}
           FINITE_LATITUDE_OBJECT_ENDPOINT: ${{ inputs.latitude_object_endpoint || vars.FINITE_LATITUDE_OBJECT_ENDPOINT || secrets.FINITE_LATITUDE_OBJECT_ENDPOINT || 'https://objects.nyc.storage.sh' }}
-          FINITE_DOCKER_RESTIC_PREFIX: ${{ inputs.restic_prefix || vars.FINITE_DOCKER_RESTIC_PREFIX || 'hermes-docker-smoke' }}
+          FINITE_DOCKER_RESTIC_PREFIX: ${{ inputs.restic_prefix || vars.FINITE_DOCKER_RESTIC_PREFIX || 'agents/finite-agent-tinfoil-user-canary/state' }}
           FINITE_DOCKER_RESTIC_PASSWORD: ${{ secrets.FINITE_DOCKER_RESTIC_PASSWORD }}
           AWS_ACCESS_KEY_ID: ${{ secrets.FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY }}

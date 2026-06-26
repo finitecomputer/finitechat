@@ -16,7 +16,7 @@ from typing import Any
 DEFAULT_REPO = "finitecomputer/finitechat"
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_LATITUDE_ENDPOINT = "https://objects.nyc.storage.sh"
-DEFAULT_RESTIC_PREFIX = "hermes-docker-smoke"
+DEFAULT_RESTIC_PREFIX = "agents/finite-agent-tinfoil-user-canary/state"
 REQUIRED_SECRET_SOURCES = {
     "FINITE_DOCKER_RESTIC_PASSWORD": ["FINITE_DOCKER_RESTIC_PASSWORD"],
     "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": [

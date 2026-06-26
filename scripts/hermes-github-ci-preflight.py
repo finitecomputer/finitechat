@@ -25,7 +25,7 @@ REQUIRED_VARIABLES = {
 }
 OPTIONAL_VARIABLES_WITH_WORKFLOW_DEFAULTS = {
     "FINITE_LATITUDE_OBJECT_ENDPOINT": "https://objects.nyc.storage.sh",
-    "FINITE_DOCKER_RESTIC_PREFIX": "hermes-docker-smoke",
+    "FINITE_DOCKER_RESTIC_PREFIX": "agents/finite-agent-tinfoil-user-canary/state",
 }
 
 
