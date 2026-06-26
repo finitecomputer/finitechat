@@ -117,6 +117,73 @@ class GithubSecretsSetupTest(unittest.TestCase):
         )
         self.assertEqual(report["existing_required_variables"], ["FINITE_LATITUDE_STORAGE_BUCKET"])
 
+    def test_parse_aws_shared_config_reads_profile_without_leaking_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            credentials_file = tmp / "credentials"
+            config_file = tmp / "config"
+            credentials_file.write_text(
+                "\n".join(
+                    [
+                        "[finite]",
+                        "aws_access_key_id = access-from-profile",
+                        "aws_secret_access_key = secret-from-profile",
+                        "aws_session_token = session-from-profile",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config_file.write_text(
+                "\n".join(
+                    [
+                        "[profile finite]",
+                        "region = us-east-1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            values = setup.parse_aws_shared_config(
+                credentials_file=credentials_file,
+                config_file=config_file,
+                profile="finite",
+            )
+            values["FINITE_DOCKER_RESTIC_PASSWORD"] = "restore-key"
+            values["FINITE_LATITUDE_STORAGE_BUCKET"] = "bucket"
+            status, report = setup.build_report(
+                repo="finitecomputer/finitechat",
+                env_file=Path(".env"),
+                values=values,
+                existing_secret_names=set(),
+                existing_variable_names=set(),
+                apply=False,
+            )
+
+        serialized = json.dumps(report)
+        self.assertEqual(values["AWS_ACCESS_KEY_ID"], "access-from-profile")
+        self.assertEqual(values["AWS_SECRET_ACCESS_KEY"], "secret-from-profile")
+        self.assertEqual(values["AWS_SESSION_TOKEN"], "session-from-profile")
+        self.assertEqual(values["AWS_REGION"], "us-east-1")
+        self.assertEqual(status, 0)
+        self.assertEqual(report["status"], "ready")
+        self.assertIn("FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN", serialized)
+        self.assertNotIn("access-from-profile", serialized)
+        self.assertNotIn("secret-from-profile", serialized)
+        self.assertNotIn("session-from-profile", serialized)
+
+    def test_env_and_process_values_override_aws_shared_config(self) -> None:
+        values = setup.merged_env(
+            Path("/tmp/does-not-exist"),
+            {"AWS_ACCESS_KEY_ID": "process-access"},
+            aws_shared_values={
+                "AWS_ACCESS_KEY_ID": "profile-access",
+                "AWS_SECRET_ACCESS_KEY": "profile-secret",
+            },
+        )
+
+        self.assertEqual(values["AWS_ACCESS_KEY_ID"], "process-access")
+        self.assertEqual(values["AWS_SECRET_ACCESS_KEY"], "profile-secret")
+
 
 if __name__ == "__main__":
     unittest.main()

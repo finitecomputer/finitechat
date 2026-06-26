@@ -16,6 +16,10 @@ REQUIRED_SECRETS = {
     "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID",
     "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY",
 }
+OPTIONAL_SECRETS = {
+    "FINITE_DOCKER_RESTIC_AWS_REGION",
+    "FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN",
+}
 REQUIRED_VARIABLES = {
     "FINITE_LATITUDE_STORAGE_BUCKET",
 }
@@ -87,6 +91,8 @@ def validate(
         "required_secrets": sorted(REQUIRED_SECRETS),
         "present_required_secrets": sorted(REQUIRED_SECRETS & secret_names),
         "missing_required_secrets": missing_secrets,
+        "optional_secrets": sorted(OPTIONAL_SECRETS),
+        "present_optional_secrets": sorted(OPTIONAL_SECRETS & secret_names),
         "required_variables": sorted(REQUIRED_VARIABLES),
         "present_required_variables": sorted(REQUIRED_VARIABLES & variable_names),
         "missing_required_variables": missing_variables,

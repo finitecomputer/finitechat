@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
 import subprocess
@@ -28,6 +29,10 @@ REQUIRED_SECRET_SOURCES = {
     ],
 }
 OPTIONAL_SECRET_SOURCES = {
+    "FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN": [
+        "FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN",
+        "AWS_SESSION_TOKEN",
+    ],
     "FINITE_DOCKER_RESTIC_AWS_REGION": [
         "FINITE_DOCKER_RESTIC_AWS_REGION",
         "AWS_REGION",
@@ -73,8 +78,56 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return result
 
 
-def merged_env(env_file: Path, process_env: dict[str, str]) -> dict[str, str]:
-    values = parse_env_file(env_file)
+def aws_config_section(profile: str) -> str:
+    if profile == "default":
+        return "default"
+    return f"profile {profile}"
+
+
+def parse_aws_shared_config(
+    *,
+    credentials_file: Path,
+    config_file: Path,
+    profile: str,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    profile = profile or "default"
+
+    credentials = configparser.ConfigParser()
+    credentials.read(credentials_file)
+    if credentials.has_section(profile):
+        section = credentials[profile]
+        access_key = section.get("aws_access_key_id")
+        secret_key = section.get("aws_secret_access_key")
+        session_token = section.get("aws_session_token")
+        if access_key:
+            values["AWS_ACCESS_KEY_ID"] = access_key
+        if secret_key:
+            values["AWS_SECRET_ACCESS_KEY"] = secret_key
+        if session_token:
+            values["AWS_SESSION_TOKEN"] = session_token
+        region = section.get("region")
+        if region:
+            values["AWS_REGION"] = region
+
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    section_name = aws_config_section(profile)
+    if config.has_section(section_name):
+        region = config[section_name].get("region")
+        if region:
+            values["AWS_REGION"] = region
+    return values
+
+
+def merged_env(
+    env_file: Path,
+    process_env: dict[str, str],
+    *,
+    aws_shared_values: dict[str, str] | None = None,
+) -> dict[str, str]:
+    values = dict(aws_shared_values or {})
+    values.update(parse_env_file(env_file))
     values.update(process_env)
     return values
 
@@ -287,6 +340,26 @@ def main() -> int:
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE)
     parser.add_argument("--report", default="target/hermes-github-secrets-setup.json")
     parser.add_argument(
+        "--aws-profile",
+        default=os.environ.get("AWS_PROFILE", "default"),
+        help="AWS shared credentials/config profile to read before .env and process env.",
+    )
+    parser.add_argument(
+        "--aws-credentials-file",
+        default=str(Path.home() / ".aws" / "credentials"),
+        help="AWS shared credentials file used as a low-precedence input source.",
+    )
+    parser.add_argument(
+        "--aws-config-file",
+        default=str(Path.home() / ".aws" / "config"),
+        help="AWS shared config file used as a low-precedence input source.",
+    )
+    parser.add_argument(
+        "--no-aws-shared-config",
+        action="store_true",
+        help="Do not read AWS shared credentials/config files.",
+    )
+    parser.add_argument(
         "--offline",
         action="store_true",
         help="Do not inspect existing GitHub names before planning.",
@@ -304,14 +377,32 @@ def main() -> int:
     if not args.offline:
         existing_secret_names = gh_names(args.repo, "secret")
         existing_variable_names = gh_names(args.repo, "variable")
+    aws_shared_values: dict[str, str] = {}
+    if not args.no_aws_shared_config:
+        aws_shared_values = parse_aws_shared_config(
+            credentials_file=Path(args.aws_credentials_file),
+            config_file=Path(args.aws_config_file),
+            profile=args.aws_profile,
+        )
     status, report = build_report(
         repo=args.repo,
         env_file=env_file,
-        values=merged_env(env_file, dict(os.environ)),
+        values=merged_env(
+            env_file,
+            dict(os.environ),
+            aws_shared_values=aws_shared_values,
+        ),
         existing_secret_names=existing_secret_names,
         existing_variable_names=existing_variable_names,
         apply=args.apply,
     )
+    report["aws_shared_config"] = {
+        "enabled": not args.no_aws_shared_config,
+        "profile": args.aws_profile,
+        "credentials_file_present": Path(args.aws_credentials_file).exists(),
+        "config_file_present": Path(args.aws_config_file).exists(),
+        "value_names_loaded": sorted(aws_shared_values),
+    }
     report_path = Path(args.report)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(report, indent=2) + "\n"

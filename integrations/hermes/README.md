@@ -181,10 +181,12 @@ Configure these repository secrets before using the publish gate:
 - `FINITE_DOCKER_RESTIC_PASSWORD`
 - `FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID`
 - `FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY`
+- `FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN` if using temporary credentials
 - `FINITE_DOCKER_RESTIC_AWS_REGION` if the provider requires one
 
-If the values are present in `.env` or the current process environment, install
-the GitHub secrets/variables without printing secret values:
+If the values are present in `.env`, the current process environment, or the
+standard AWS shared credentials/config files, install the GitHub
+secrets/variables without printing secret values:
 
 ```bash
 scripts/hermes-github-secrets-setup.py \
@@ -193,6 +195,8 @@ scripts/hermes-github-secrets-setup.py \
   --apply
 ```
 
+Pass `--aws-profile PROFILE` when the object-storage key lives outside the
+default AWS profile.
 Omit `--apply` for a redacted dry run. Existing GitHub secret or variable names
 are preserved, so the script only requires local values for names that are not
 already configured remotely.

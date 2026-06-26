@@ -287,11 +287,13 @@ Current CI shape:
   inputs/repository variables. It passes `FINITE_DOCKER_RESTIC_PASSWORD`,
   `FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID`,
   `FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY`, and optional
+  `FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN` and
   `FINITE_DOCKER_RESTIC_AWS_REGION` repository secrets into the Docker smoke.
-  `scripts/hermes-github-secrets-setup.py` can install those names from `.env`
-  or process env without printing secret values. `scripts/hermes-github-ci-preflight.py`
-  checks the GitHub secret and variable names before the slow workflow is
-  started without reading secret values. `scripts/hermes-branch-publication-readiness.py`
+  `scripts/hermes-github-secrets-setup.py` can install those names from `.env`,
+  process env, or the standard AWS shared credentials/config files without
+  printing secret values. `scripts/hermes-github-ci-preflight.py` checks the
+  GitHub secret and variable names before the slow workflow is started without
+  reading secret values. `scripts/hermes-branch-publication-readiness.py`
   checks the local worktree before that slow path by classifying publishable
   source changes, blocking obvious generated or sensitive paths, reporting clean
   already-pushed worktrees distinctly from blocked ones, and printing the exact
