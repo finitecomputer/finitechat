@@ -115,6 +115,17 @@ jobs:
       - name: BasedPyright
         run: basedpyright
 
+      - name: Hermes adapter regression report
+        run: scripts/hermes-adapter-regression-report.py --report target/hermes-adapter-regressions/report.json
+
+      - name: Upload Hermes adapter regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-adapter-regression-report
+          path: target/hermes-adapter-regressions/report.json
+          if-no-files-found: ignore
+
       - name: Hermes platform adapter tests
         run: python3 -m unittest discover -s tests -p '*test*.py'
 
@@ -208,6 +219,13 @@ jobs:
           name: hermes-sidecar-smoke-report
           path: target/hermes-sidecar-smoke
 
+      - name: Download Hermes adapter regression report
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-adapter-regression-report
+          path: target/hermes-adapter-regressions
+
       - name: Build hardening evidence audit
         if: always()
         run: scripts/hermes-hardening-audit.py --report target/hermes-hardening-audit.json
@@ -227,6 +245,7 @@ jobs:
           name: hermes-docker-smoke-report
           path: |
             target/hermes-hardening-audit.json
+            target/hermes-adapter-regressions/report.json
             target/hermes-docker-smoke/report.json
             target/hermes-docker-smoke/restic-preflight.json
             target/hermes-docker-smoke/image-publish.json

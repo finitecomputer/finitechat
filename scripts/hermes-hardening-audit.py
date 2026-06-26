@@ -35,6 +35,22 @@ REQUIRED_SIDECAR_PROOF_LAYERS = {
     "agent reply",
     "user decrypt",
 }
+REQUIRED_ADAPTER_REGRESSION_LAYERS = {
+    "plain message mapping",
+    "redelivery dedupe",
+    "ack retry without duplicate dispatch",
+    "transient poll recovery",
+    "sidecar startup",
+    "service fallback",
+    "service serialization",
+    "media attachments",
+    "outbound edit route",
+    "typing activity",
+    "room filtering",
+    "group sender identity",
+    "receipt/control stream filtering",
+    "inbound stream fallback",
+}
 REQUIRED_MEDIA_E2E_STEPS = {
     "server_ready",
     "agent_init",
@@ -113,6 +129,7 @@ def step_names(report: dict[str, Any]) -> set[str]:
 
 
 def audit(args: argparse.Namespace) -> dict[str, Any]:
+    adapter_regression_path = Path(args.adapter_regression_report)
     sidecar_path = Path(args.sidecar_report)
     media_e2e_path = Path(args.media_e2e_report)
     ios_media_e2e_path = Path(args.ios_media_e2e_report)
@@ -125,6 +142,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     canary_summary_path = Path(args.canary_summary)
     tinfoil_result_path = Path(args.tinfoil_result)
 
+    adapter_regression = load_optional_json(adapter_regression_path)
     sidecar = load_optional_json(sidecar_path)
     media_e2e = load_optional_json(media_e2e_path)
     ios_media_e2e = load_optional_json(ios_media_e2e_path)
@@ -138,6 +156,24 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     tinfoil_result = load_optional_json(tinfoil_result_path)
 
     checks: list[dict[str, Any]] = []
+    adapter_missing = missing_layers(adapter_regression or {}, REQUIRED_ADAPTER_REGRESSION_LAYERS)
+    adapter_passed = (
+        bool(adapter_regression)
+        and adapter_regression.get("status") == "passed"
+        and not adapter_missing
+        and int(adapter_regression.get("test_count") or 0)
+        >= len(REQUIRED_ADAPTER_REGRESSION_LAYERS)
+    )
+    add_check(
+        checks,
+        name="adapter_focused_regressions",
+        status="passed" if adapter_passed else "missing",
+        evidence=str(adapter_regression_path) if adapter_regression else None,
+        detail=None
+        if adapter_passed
+        else f"missing regression layers: {', '.join(adapter_missing)}",
+    )
+
     add_check(
         checks,
         name="local_sidecar_smoke",
@@ -366,6 +402,10 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--adapter-regression-report",
+        default="target/hermes-adapter-regressions/report.json",
+    )
     parser.add_argument(
         "--sidecar-report",
         default="target/hermes-sidecar-smoke/report.json",

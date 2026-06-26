@@ -67,6 +67,22 @@ IOS_MEDIA_STEPS = [
     "agent_receive_ios_media",
     "ios_receive_agent_replies",
 ]
+ADAPTER_REGRESSION_LAYERS = [
+    "plain message mapping",
+    "redelivery dedupe",
+    "ack retry without duplicate dispatch",
+    "transient poll recovery",
+    "sidecar startup",
+    "service fallback",
+    "service serialization",
+    "media attachments",
+    "outbound edit route",
+    "typing activity",
+    "room filtering",
+    "group sender identity",
+    "receipt/control stream filtering",
+    "inbound stream fallback",
+]
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -76,6 +92,14 @@ def write_json(path: Path, value: dict) -> None:
 
 def sidecar_report() -> dict:
     return {"status": "passed", "proof_layers": SIDECAR_LAYERS}
+
+
+def adapter_regression_report() -> dict:
+    return {
+        "status": "passed",
+        "proof_layers": ADAPTER_REGRESSION_LAYERS,
+        "test_count": len(ADAPTER_REGRESSION_LAYERS),
+    }
 
 
 def media_e2e_report() -> dict:
@@ -143,6 +167,8 @@ def tinfoil_result() -> dict:
 def run_audit(tmp: Path, *, require_complete: bool = False) -> tuple[int, dict]:
     args = [
         str(AUDIT_SCRIPT),
+        "--adapter-regression-report",
+        str(tmp / "adapter-regressions.json"),
         "--sidecar-report",
         str(tmp / "sidecar.json"),
         "--media-e2e-report",
@@ -185,6 +211,7 @@ class HardeningAuditTest(unittest.TestCase):
 
         self.assertEqual(status, 2)
         self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("adapter_focused_regressions", audit["missing"])
         self.assertIn("local_hermes_agent_media_e2e", audit["missing"])
         self.assertIn("ios_simulator_media_e2e", audit["missing"])
         self.assertIn("github_actions_s3_setup_ready", audit["missing"])
@@ -196,6 +223,7 @@ class HardeningAuditTest(unittest.TestCase):
     def test_audit_marks_complete_evidence_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
@@ -223,6 +251,7 @@ class HardeningAuditTest(unittest.TestCase):
     def test_audit_rejects_unvalidated_tinfoil_success_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
@@ -250,6 +279,7 @@ class HardeningAuditTest(unittest.TestCase):
     def test_audit_reports_github_setup_errors_before_s3_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
@@ -278,6 +308,7 @@ class HardeningAuditTest(unittest.TestCase):
     def test_audit_rejects_ios_success_flag_without_native_store_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
             write_json(tmp / "sidecar.json", sidecar_report())
             write_json(tmp / "media-e2e.json", media_e2e_report())
             write_json(
@@ -307,6 +338,38 @@ class HardeningAuditTest(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(audit["status"], "incomplete")
         self.assertIn("ios_simulator_media_e2e", audit["missing"])
+
+    def test_audit_rejects_adapter_regression_report_missing_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            report = adapter_regression_report()
+            report["proof_layers"] = [
+                layer for layer in ADAPTER_REGRESSION_LAYERS if layer != "typing activity"
+            ]
+            write_json(tmp / "adapter-regressions.json", report)
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", {"status": "passed"})
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", {"status": "ready"})
+            write_json(tmp / "canary-summary.json", {"status": "ready"})
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("adapter_focused_regressions", audit["missing"])
 
 
 if __name__ == "__main__":
