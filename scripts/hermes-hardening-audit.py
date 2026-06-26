@@ -133,6 +133,20 @@ REQUIRED_GITHUB_PUBLISH_ARTIFACTS = {
     "target/hermes-docker-smoke/tinfoil-handoff.json",
     "target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json",
 }
+REQUIRED_HANDOFF_RUNTIME = {
+    "hermes_agent_version": "0.17.0",
+    "finitechat_hermes_inbound_stream": "1",
+    "finite_agent_restore_on_start": "1",
+    "finite_agent_restore_latest": "1",
+    "finite_agent_backup_on_exit": "1",
+}
+REQUIRED_HANDOFF_CONTAINER_ENV = {
+    "FINITE_AGENT_RESTORE_ON_START": "1",
+    "FINITE_AGENT_RESTORE_LATEST": "1",
+    "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+    "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
+    "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+}
 
 
 def load_optional_json(path: Path) -> dict[str, Any] | None:
@@ -319,6 +333,115 @@ def validate_github_publish_gate(github_publish_gate: dict[str, Any] | None) -> 
     )
     if missing_copied:
         errors.append(f"publish-gate artifact_ingest copied missing: {', '.join(missing_copied)}")
+    return errors
+
+
+def validate_tinfoil_handoff(
+    handoff: dict[str, Any] | None,
+    *,
+    docker_facts: dict[str, Any],
+    publish: dict[str, Any] | None,
+) -> list[str]:
+    if not handoff:
+        return ["requires ready handoff from S3 smoke and published digest"]
+
+    errors: list[str] = []
+    if handoff.get("status") != "ready":
+        report_errors = list_detail(handoff.get("errors"))
+        errors.append(report_errors or f"handoff status={handoff.get('status')!r}")
+    handoff_errors = handoff.get("errors")
+    if isinstance(handoff_errors, list) and handoff_errors:
+        errors.append(f"handoff errors: {', '.join(str(item) for item in handoff_errors)}")
+
+    source_reports = handoff.get("source_reports")
+    if not isinstance(source_reports, dict):
+        errors.append("handoff source_reports is required")
+    else:
+        for key in ("smoke", "preflight", "publish"):
+            if not non_empty_str(source_reports.get(key)):
+                errors.append(f"handoff source_reports.{key} is required")
+
+    image = handoff.get("image")
+    if not isinstance(image, dict):
+        errors.append("handoff image is required")
+    else:
+        image_digest = image.get("digest")
+        if not non_empty_str(image_digest) or "@sha256:" not in str(image_digest):
+            errors.append("handoff image.digest must pin sha256")
+        if not non_empty_str(image.get("target_ref")):
+            errors.append("handoff image.target_ref is required")
+        if not non_empty_str(image.get("source_image_id")):
+            errors.append("handoff image.source_image_id is required")
+        docker_image_id = docker_facts.get("image_id")
+        if non_empty_str(docker_image_id) and image.get("source_image_id") != docker_image_id:
+            errors.append("handoff image.source_image_id does not match Docker smoke image_id")
+        repo_digests = publish.get("repo_digests") if isinstance(publish, dict) else None
+        if isinstance(repo_digests, list) and repo_digests and image_digest not in repo_digests:
+            errors.append("handoff image.digest is not in publish repo_digests")
+
+    runtime = handoff.get("runtime")
+    if not isinstance(runtime, dict):
+        errors.append("handoff runtime is required")
+    else:
+        for key, expected in REQUIRED_HANDOFF_RUNTIME.items():
+            if runtime.get(key) != expected:
+                errors.append(f"handoff runtime.{key}={runtime.get(key)!r}; expected {expected!r}")
+
+    restore = handoff.get("restore")
+    if not isinstance(restore, dict):
+        errors.append("handoff restore is required")
+        return errors
+    if restore.get("backend") != "s3":
+        errors.append(f"handoff restore.backend={restore.get('backend')!r}; expected 's3'")
+    if restore.get("restore_selector") != "latest":
+        errors.append(
+            f"handoff restore.restore_selector={restore.get('restore_selector')!r}; expected 'latest'"
+        )
+    if restore.get("restore_tag") != "finite-agent-state":
+        errors.append(
+            f"handoff restore.restore_tag={restore.get('restore_tag')!r}; expected 'finite-agent-state'"
+        )
+    if not non_empty_str(restore.get("seed_snapshot_id")):
+        errors.append("handoff restore.seed_snapshot_id is required")
+
+    repository = restore.get("repository")
+    if not isinstance(repository, dict):
+        errors.append("handoff restore.repository is required")
+    else:
+        if repository.get("kind") != "s3":
+            errors.append(
+                f"handoff restore.repository.kind={repository.get('kind')!r}; expected 's3'"
+            )
+        repository_url = repository.get("repository")
+        if not non_empty_str(repository_url) or not str(repository_url).startswith("s3:"):
+            errors.append("handoff restore.repository.repository must be an s3: URL")
+
+    secret_env = restore.get("required_secret_env")
+    if not isinstance(secret_env, list):
+        errors.append("handoff restore.required_secret_env must be a list")
+    else:
+        missing_secret_env = sorted(REQUIRED_CANARY_SECRET_ENV - {str(item) for item in secret_env})
+        if missing_secret_env:
+            errors.append(
+                f"handoff restore.required_secret_env missing: {', '.join(missing_secret_env)}"
+            )
+
+    container_env = restore.get("container_env")
+    if not isinstance(container_env, dict):
+        errors.append("handoff restore.container_env is required")
+    else:
+        for key, expected in REQUIRED_HANDOFF_CONTAINER_ENV.items():
+            if container_env.get(key) != expected:
+                errors.append(
+                    f"handoff restore.container_env.{key}={container_env.get(key)!r}; "
+                    f"expected {expected!r}"
+                )
+        repository_url = container_env.get("FINITE_AGENT_RESTIC_REPOSITORY")
+        if not non_empty_str(repository_url) or not str(repository_url).startswith("s3:"):
+            errors.append(
+                "handoff restore.container_env.FINITE_AGENT_RESTIC_REPOSITORY must be an s3: URL"
+            )
+
     return errors
 
 
@@ -625,15 +748,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         else "requires published image report with repo digest matching Docker smoke image id",
     )
 
-    handoff_ready = bool(handoff) and handoff.get("status") == "ready"
+    handoff_errors = validate_tinfoil_handoff(handoff, docker_facts=docker_facts, publish=publish)
+    handoff_ready = not handoff_errors
     add_check(
         checks,
         name="tinfoil_handoff_ready",
         status="passed" if handoff_ready else "missing",
         evidence=str(handoff_path) if handoff else None,
-        detail=None
-        if handoff_ready
-        else "requires ready handoff from S3 smoke and published digest",
+        detail=None if handoff_ready else "; ".join(handoff_errors),
     )
 
     canary_errors = validate_canary_summary(canary_summary, canary_summary_path, handoff)

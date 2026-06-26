@@ -321,7 +321,11 @@ Current CI shape:
   `target/hermes-docker-smoke/tinfoil-handoff.json`. That report fails closed
   unless the Docker smoke was S3-backed, the publish report is `published`, the
   source image id matches the proven smoke image id, and a registry digest is
-  present.
+  present. The hardening audit rejects a placeholder handoff
+  `{"status":"ready"}`: it requires source report paths, the digest-pinned
+  image, Hermes/restic runtime flags, S3 repository proof, latest restore
+  selector, `finite-agent-state` restore tag, required secret names, and runtime
+  container env.
 - A ready handoff can be turned into a digest-pinned `tinfoil-config.yml`,
   Markdown runbook, and summary JSON with
   `scripts/hermes-tinfoil-canary-artifacts.py`. The generator refuses local,

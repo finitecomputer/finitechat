@@ -12,6 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_SCRIPT = REPO_ROOT / "scripts" / "hermes-hardening-audit.py"
 IMAGE_ID = "sha256:local-image"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
+RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/hermes"
+SNAPSHOT_ID = "88929f1f90c5fcadd1d19e33f26609e595af4c2afb1e72b724695435e051900f"
 CONFIG_REPO = "finitecomputer/tinfoil-agent-runtime-canary"
 RELEASE_TAG = "v0.1.0"
 CONTAINER_NAME = "finite-agent-tinfoil-user-canary"
@@ -230,10 +232,51 @@ def tinfoil_result() -> dict:
 def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
     return {
         "status": "ready",
+        "errors": [],
+        "source_reports": {
+            "smoke": "target/hermes-docker-smoke/report.json",
+            "preflight": "target/hermes-docker-smoke/restic-preflight.json",
+            "publish": "target/hermes-docker-smoke/image-publish.json",
+        },
         "image": {
             "source_image_id": IMAGE_ID,
             "target_ref": "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0",
             "digest": image_digest,
+        },
+        "runtime": {
+            "hermes_agent_version": "0.17.0",
+            "restic_version": "restic 0.18.0 compiled with go1.24.4 on linux/arm64",
+            "finitechat_hermes_inbound_stream": "1",
+            "finite_agent_restore_on_start": "1",
+            "finite_agent_restore_latest": "1",
+            "finite_agent_backup_on_exit": "1",
+        },
+        "restore": {
+            "backend": "s3",
+            "repository": {
+                "kind": "s3",
+                "repository": RESTIC_REPOSITORY,
+                "size_bytes": None,
+            },
+            "seed_snapshot_id": SNAPSHOT_ID,
+            "seed_snapshot_short_id": "88929f1f",
+            "seed_snapshot_time": "2026-06-26T02:26:14Z",
+            "restore_selector": "latest",
+            "restore_tag": "finite-agent-state",
+            "required_secret_env": [
+                "FINITE_AGENT_RESTIC_PASSWORD",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+            ],
+            "optional_secret_env": ["AWS_REGION", "AWS_DEFAULT_REGION", "AWS_SESSION_TOKEN"],
+            "container_env": {
+                "FINITE_AGENT_RESTORE_ON_START": "1",
+                "FINITE_AGENT_RESTORE_LATEST": "1",
+                "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
+                "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
+                "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+            },
         },
     }
 
@@ -497,6 +540,38 @@ class HardeningAuditTest(unittest.TestCase):
         self.assertIn("github_publish_gate_ready", audit["missing"])
         details = {check["name"]: check["detail"] for check in audit["checks"]}
         self.assertIn("run_id", details["github_publish_gate_ready"])
+
+    def test_audit_rejects_placeholder_tinfoil_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            write_json(tmp / "adapter-regressions.json", adapter_regression_report())
+            write_json(tmp / "sidecar.json", sidecar_report())
+            write_json(tmp / "media-e2e.json", media_e2e_report())
+            write_json(tmp / "ios-media-e2e.json", ios_media_e2e_report())
+            write_json(tmp / "docker.json", docker_report())
+            write_json(tmp / "docker-ios.json", docker_ios_report())
+            write_json(tmp / "s3-emulator.json", s3_emulator_report())
+            write_json(tmp / "github-setup.json", {"status": "ready"})
+            write_json(tmp / "github-publish-gate.json", github_publish_gate_report())
+            write_json(tmp / "preflight.json", {"status": "ok", "backend": "s3"})
+            write_json(
+                tmp / "publish.json",
+                {
+                    "status": "published",
+                    "source_image_id": IMAGE_ID,
+                    "repo_digests": [IMAGE_DIGEST],
+                },
+            )
+            write_json(tmp / "handoff.json", {"status": "ready"})
+            write_canary_artifacts(tmp)
+            write_json(tmp / "tinfoil-result.json", tinfoil_result())
+            status, audit = run_audit(tmp, require_complete=True)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(audit["status"], "incomplete")
+        self.assertIn("tinfoil_handoff_ready", audit["missing"])
+        details = {check["name"]: check["detail"] for check in audit["checks"]}
+        self.assertIn("source_reports", details["tinfoil_handoff_ready"])
 
     def test_audit_rejects_placeholder_canary_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
