@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use walkdir::WalkDir;
 
@@ -44,6 +45,25 @@ pub fn build_swift_for_run(
     profile: BuildProfile,
     verbose: bool,
 ) -> Result<(), CliError> {
+    build_swift_for_run_with_output(root, rust_target, profile, verbose, false)
+}
+
+pub fn build_swift_for_test(
+    root: &Path,
+    rust_target: &str,
+    profile: BuildProfile,
+    verbose: bool,
+) -> Result<(), CliError> {
+    build_swift_for_run_with_output(root, rust_target, profile, verbose, true)
+}
+
+fn build_swift_for_run_with_output(
+    root: &Path,
+    rust_target: &str,
+    profile: BuildProfile,
+    verbose: bool,
+    stdout_to_stderr: bool,
+) -> Result<(), CliError> {
     let cfg = load_rmp_toml(root)?;
     let _ = cfg
         .ios
@@ -51,14 +71,22 @@ pub fn build_swift_for_run(
         .ok_or_else(|| CliError::user("rmp.toml missing [ios] section"))?;
     let core_pkg = cfg.core.crate_.clone();
     let core_lib = core_pkg.replace('-', "_");
-    generate_ios_sources(root, &cfg, profile, true, verbose)?;
+    generate_ios_sources_with_output(root, &cfg, profile, true, verbose, stdout_to_stderr)?;
     let mut targets = vec![rust_target];
     for default_target in default_ios_targets() {
         if !targets.contains(&default_target) {
             targets.push(default_target);
         }
     }
-    build_ios_xcframework(root, &core_lib, &core_pkg, &targets, profile, verbose)
+    build_ios_xcframework(
+        root,
+        &core_lib,
+        &core_pkg,
+        &targets,
+        profile,
+        verbose,
+        stdout_to_stderr,
+    )
 }
 
 pub fn build_kotlin_for_run(
@@ -117,6 +145,7 @@ pub fn bindings(
                 &default_ios_targets(),
                 profile,
                 verbose,
+                false,
             )?;
         }
         crate::cli::BindingsTarget::Kotlin => {
@@ -152,6 +181,7 @@ pub fn bindings(
                 &default_ios_targets(),
                 profile,
                 verbose,
+                false,
             )?;
             build_android_so(root, &core_pkg, &default_android_abis(), profile, verbose)?;
         }
@@ -194,6 +224,7 @@ fn cargo_build_host(
     core_pkg: &str,
     profile: BuildProfile,
     verbose: bool,
+    stdout_to_stderr: bool,
 ) -> Result<(), CliError> {
     if which("cargo").is_none() {
         return Err(CliError::operational("missing `cargo` on PATH"));
@@ -207,15 +238,40 @@ fn cargo_build_host(
     if let Some(flag) = profile.cargo_release_arg() {
         cmd.arg(flag);
     }
-    let status = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| CliError::operational(format!("failed to run cargo: {e}")))?;
+    let status = run_logged_status(cmd, stdout_to_stderr, "failed to run cargo")?;
     if !status.success() {
         return Err(CliError::operational("cargo build failed"));
     }
     Ok(())
+}
+
+fn run_logged_status(
+    mut cmd: Command,
+    stdout_to_stderr: bool,
+    spawn_error_prefix: &str,
+) -> Result<ExitStatus, CliError> {
+    if stdout_to_stderr {
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| CliError::operational(format!("{spawn_error_prefix}: {error}")))?;
+        let mut stderr = std::io::stderr().lock();
+        stderr.write_all(&output.stdout).map_err(|error| {
+            CliError::operational(format!(
+                "failed to write captured stdout to stderr: {error}"
+            ))
+        })?;
+        stderr.write_all(&output.stderr).map_err(|error| {
+            CliError::operational(format!("failed to write captured stderr: {error}"))
+        })?;
+        return Ok(output.status);
+    }
+
+    cmd.stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| CliError::operational(format!("{spawn_error_prefix}: {error}")))
 }
 
 fn generate_ios_sources(
@@ -225,6 +281,17 @@ fn generate_ios_sources(
     use_cache: bool,
     verbose: bool,
 ) -> Result<(), CliError> {
+    generate_ios_sources_with_output(root, cfg, profile, use_cache, verbose, false)
+}
+
+fn generate_ios_sources_with_output(
+    root: &Path,
+    cfg: &RmpToml,
+    profile: BuildProfile,
+    use_cache: bool,
+    verbose: bool,
+    stdout_to_stderr: bool,
+) -> Result<(), CliError> {
     let core_pkg = cfg.core.crate_.as_str();
     let core_lib = cfg.core.crate_.replace('-', "_");
     let out_dir = root.join("ios/Bindings");
@@ -233,12 +300,12 @@ fn generate_ios_sources(
     if use_cache && bindgen_cache_hit(root, swift_bindings_present(root)?, "swift", verbose)? {
         return Ok(());
     }
-    cargo_build_host(root, core_pkg, profile, verbose)?;
+    cargo_build_host(root, core_pkg, profile, verbose, stdout_to_stderr)?;
     let lib = host_cdylib_path(root, &core_lib, profile)?;
 
     human_log(verbose, "uniffi-bindgen generate (swift)");
-    let status = Command::new("cargo")
-        .current_dir(root)
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root)
         .arg("run")
         .arg("-q")
         .arg("-p")
@@ -252,11 +319,8 @@ fn generate_ios_sources(
         .arg("--out-dir")
         .arg(&out_dir)
         .arg("--config")
-        .arg(uniffi_toml_path(root)?)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| CliError::operational(format!("failed to run uniffi-bindgen: {e}")))?;
+        .arg(uniffi_toml_path(root)?);
+    let status = run_logged_status(cmd, stdout_to_stderr, "failed to run uniffi-bindgen")?;
     if !status.success() {
         return Err(CliError::operational("uniffi swift generation failed"));
     }
@@ -281,7 +345,7 @@ fn generate_android_sources(
     if use_cache && bindgen_cache_hit(root, kotlin_bindings_present(root)?, "kotlin", verbose)? {
         return Ok(());
     }
-    cargo_build_host(root, core_pkg, profile, verbose)?;
+    cargo_build_host(root, core_pkg, profile, verbose, false)?;
     let lib = host_cdylib_path(root, &core_lib, profile)?;
 
     human_log(verbose, "uniffi-bindgen generate (kotlin)");
@@ -359,7 +423,7 @@ fn check_ios_sources(root: &Path, cfg: &RmpToml, verbose: bool) -> Result<(), Cl
 
     let core_pkg = cfg.core.crate_.as_str();
     let core_lib = cfg.core.crate_.replace('-', "_");
-    cargo_build_host(root, core_pkg, BuildProfile::Release, verbose)?;
+    cargo_build_host(root, core_pkg, BuildProfile::Release, verbose, false)?;
     let lib = host_cdylib_path(root, &core_lib, BuildProfile::Release)?;
     let tmp = TempDir::new().map_err(|e| CliError::operational(format!("tempdir: {e}")))?;
     let out_dir = tmp.path().join("Bindings");
@@ -401,7 +465,7 @@ fn check_android_sources(root: &Path, cfg: &RmpToml, verbose: bool) -> Result<()
 
     let core_pkg = cfg.core.crate_.as_str();
     let core_lib = cfg.core.crate_.replace('-', "_");
-    cargo_build_host(root, core_pkg, BuildProfile::Release, verbose)?;
+    cargo_build_host(root, core_pkg, BuildProfile::Release, verbose, false)?;
     let lib = host_cdylib_path(root, &core_lib, BuildProfile::Release)?;
     let tmp = TempDir::new().map_err(|e| CliError::operational(format!("tempdir: {e}")))?;
     let out_dir = tmp.path().join("java");
@@ -499,6 +563,7 @@ fn build_ios_xcframework(
     targets: &[&str],
     profile: BuildProfile,
     verbose: bool,
+    stdout_to_stderr: bool,
 ) -> Result<(), CliError> {
     if targets.is_empty() {
         return Err(CliError::user("no iOS Rust target selected"));
@@ -506,7 +571,15 @@ fn build_ios_xcframework(
     let dev_dir = discover_xcode_dev_dir()?;
 
     // Build Rust static libs for the selected iOS targets.
-    build_ios_staticlibs(root, &dev_dir, core_pkg, targets, profile, verbose)?;
+    build_ios_staticlibs(
+        root,
+        &dev_dir,
+        core_pkg,
+        targets,
+        profile,
+        verbose,
+        stdout_to_stderr,
+    )?;
 
     // Ensure headers exist from UniFFI swift generation.
     let bindings_dir = root.join("ios/Bindings");
@@ -561,13 +634,11 @@ fn build_ios_xcframework(
             .arg(&headers_dir);
     }
     cmd.arg("-output").arg(&out_xcf);
-    let status = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| {
-            CliError::operational(format!("failed to run xcodebuild -create-xcframework: {e}"))
-        })?;
+    let status = run_logged_status(
+        cmd,
+        stdout_to_stderr,
+        "failed to run xcodebuild -create-xcframework",
+    )?;
     if !status.success() {
         return Err(CliError::operational(
             "xcodebuild -create-xcframework failed",
@@ -584,6 +655,7 @@ fn build_ios_staticlibs(
     targets: &[&str],
     profile: BuildProfile,
     verbose: bool,
+    stdout_to_stderr: bool,
 ) -> Result<(), CliError> {
     if which("cargo").is_none() {
         return Err(CliError::operational("missing `cargo` on PATH"));
@@ -698,11 +770,11 @@ fn build_ios_staticlibs(
             _ => {}
         }
 
-        let status = cmd
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| CliError::operational(format!("failed to run cargo for {target}: {e}")))?;
+        let status = run_logged_status(
+            cmd,
+            stdout_to_stderr,
+            &format!("failed to run cargo for {target}"),
+        )?;
         if !status.success() {
             return Err(CliError::operational(format!(
                 "cargo build failed for target {target}"

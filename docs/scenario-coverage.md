@@ -247,6 +247,22 @@ gateway state changes, daemon restarts, and crash-after-ledger-write points.
 It asserts cursor monotonicity, bounded command ledger state, non-notifying
 snapshots, and eventual recovery to no pending commands.
 
+## Hermes Adapter Proof
+
+The Hermes CLI/plugin contract is exercised in
+`crates/finitechat-cli/tests/hermes_flow.rs`. The current adapter boundary now
+has a named protocol regression:
+
+- `hermes_poll_recovers_messages_already_applied_by_runtime_sync`: after Hermes
+  has processed and acked an inbound user message, later messages are synced by a
+  separate Rust app runtime before the Hermes bridge polls. `finitechat hermes
+  poll` must still recover those messages from durable `client_app_events`, keep
+  ordered-log sequence order, redeliver until ack, and stop replaying after ack.
+
+This is the adapter-level version of the v1 transport invariant: streams,
+pushes, and sidecar callbacks are hints; durable ordered sync plus a local
+consumer cursor is the only consistency boundary.
+
 Checkpoint test signal:
 
 - The fake-MLS pending-Commit rule mapped cleanly to OpenMLS: `add_members`

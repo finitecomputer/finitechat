@@ -17,7 +17,7 @@ use finitechat_proto::{
 };
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,11 +100,117 @@ fn hermes_send_text(home_arg: &str, room_id: &str, text: &str) -> Value {
     ])
 }
 
+fn hermes_poll(home_arg: &str, request: Value) -> Value {
+    hermes(&[
+        "hermes",
+        "--home",
+        home_arg,
+        "poll",
+        "--request-json",
+        &request.to_string(),
+    ])
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+struct TestHermesUser {
+    store: SqliteClientStore,
+    device: FiniteChatDevice,
+    delivery: HttpRuntimeDelivery<ReqwestHttpRuntimeTransport>,
+}
+
+impl TestHermesUser {
+    fn new(
+        db_path: &Path,
+        server_url: &str,
+        account_secret: [u8; NOSTR_SECRET_KEY_BYTES],
+        device_id: &str,
+    ) -> Self {
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: NostrSecretKey::from_bytes(account_secret).unwrap(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: now_ms() / 1000,
+            credential_not_before_unix_seconds: now_ms() / 1000 - 3600,
+            credential_not_after_unix_seconds: now_ms() / 1000 + 86400,
+        };
+        let mut store = SqliteClientStore::open(
+            db_path,
+            SqliteClientStoreOptions::from_nostr_secret(
+                &config.account_secret_key,
+                &config.device_id,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let device = FiniteChatDevice::new(config).unwrap();
+        store.save_device_state(&device).unwrap();
+        let delivery =
+            HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.to_owned()));
+        Self {
+            store,
+            device,
+            delivery,
+        }
+    }
+
+    fn submit_invite_join(&mut self, code: &InviteCodeV1, display_name: &str) {
+        let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
+        submit_invite_join_request(
+            &mut self.store,
+            &mut self.device,
+            &mut self.delivery,
+            code,
+            &pin,
+            Some(display_name.to_owned()),
+            now_ms(),
+        )
+        .unwrap();
+    }
+
+    fn finalize_invite(&mut self, code: &InviteCodeV1, options: &RuntimeSyncOptions) {
+        run_runtime_sync_tick(
+            &mut self.store,
+            &mut self.device,
+            &mut self.delivery,
+            options,
+        )
+        .unwrap();
+        finalize_invited_room(&mut self.store, &mut self.device, code).unwrap();
+    }
+
+    fn send_hermes_message(
+        &mut self,
+        room_id: &str,
+        text: &str,
+        idempotency_key: &str,
+        sender_name: &str,
+    ) {
+        let payload = HermesMessagePayloadV1 {
+            payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: None,
+            text: text.to_owned(),
+            kind: HermesSendKindV1::Message,
+            status: HermesMessageStatusV1::Complete,
+            edit_of: None,
+            attachments: Vec::new(),
+            reply_to_message_id: None,
+            sender_name: Some(sender_name.to_owned()),
+            metadata: Default::default(),
+        };
+        let request = self
+            .device
+            .create_application_request(room_id, &payload.encode().unwrap(), idempotency_key)
+            .unwrap();
+        self.store.save_device_state(&self.device).unwrap();
+        self.delivery
+            .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+            .unwrap();
+    }
 }
 
 struct SmokeReport {
@@ -424,11 +530,11 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
     })
     .unwrap();
 
-    app.dispatch(AppAction::ScanTarget {
+    app.dispatch_and_wait(AppAction::ScanTarget {
         value: invite["url"].as_str().unwrap().to_owned(),
     })
     .unwrap();
-    app.dispatch(AppAction::SubmitInvitePin {
+    app.dispatch_and_wait(AppAction::SubmitInvitePin {
         pending_room_id: room_id.clone(),
         pin: invite["pin"].as_str().unwrap().to_owned(),
     })
@@ -442,17 +548,17 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
         r#"{"timeout_millis":0}"#,
     ]);
     assert_eq!(admitted["joined"].as_array().unwrap().len(), 1);
-    app.dispatch(AppAction::StartRuntime).unwrap();
+    app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
     hermes_send_text(&home_arg, &room_id, "first agent message");
-    let first_sync = app.dispatch(AppAction::StartRuntime).unwrap();
+    let first_sync = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
     assert!(
         first_sync
             .messages
             .iter()
             .any(|message| message.text == "first agent message")
     );
-    app.dispatch(AppAction::MarkRoomRead {
+    app.dispatch_and_wait(AppAction::MarkRoomRead {
         room_id: room_id.clone(),
     })
     .unwrap();
@@ -467,13 +573,147 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
         now_unix_seconds: None,
     })
     .unwrap();
-    let final_state = reopened.dispatch(AppAction::StartRuntime).unwrap();
+    let final_state = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
     assert!(
         final_state
             .messages
             .iter()
             .any(|message| message.text == "second agent message"),
         "app should decrypt the second Hermes CLI message after sending a read receipt"
+    );
+}
+
+#[test]
+fn hermes_poll_recovers_messages_already_applied_by_runtime_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_url = spawn_live_http_server(&dir.path().join("server.sqlite3"));
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+        "--device-id",
+        "agent",
+    ]);
+    let invite = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "invite",
+        "--room-name",
+        "Hermes Durable Recovery",
+        "--max-joins",
+        "1",
+        "--json",
+    ]);
+    let code = InviteCodeV1::parse(invite["url"].as_str().unwrap()).unwrap();
+    let room_id = code.room_id.clone();
+    let mut user = TestHermesUser::new(
+        &dir.path().join("user.sqlite3"),
+        &server_url,
+        USER_SECRET,
+        "user_phone",
+    );
+    user.submit_invite_join(&code, "Paul");
+
+    let admitted = hermes_poll(&home_arg, json!({ "timeout_millis": 0 }));
+    assert_eq!(admitted["joined"].as_array().unwrap().len(), 1);
+
+    let options = RuntimeSyncOptions {
+        key_package_target_available: 0,
+        max_sync_pages_per_room: 4,
+    };
+    user.finalize_invite(&code, &options);
+
+    user.send_hermes_message(&room_id, "cursor seed", "recovery-cursor-seed", "Paul");
+    let seed = hermes_poll(&home_arg, json!({ "timeout_millis": 5000 }));
+    let seed_events = seed["events"].as_array().unwrap();
+    assert_eq!(seed_events.len(), 1);
+    assert_eq!(seed_events[0]["text"], "cursor seed");
+    assert_eq!(hermes_ack(&home_arg, &seed_events[0])["acked"], true);
+
+    user.send_hermes_message(
+        &room_id,
+        "durable followup one",
+        "recovery-followup-one",
+        "Paul",
+    );
+    user.send_hermes_message(
+        &room_id,
+        "durable followup two",
+        "recovery-followup-two",
+        "Paul",
+    );
+
+    let agent_secret_hex = std::fs::read_to_string(home.join("agent.nsec")).unwrap();
+    let agent_app_runtime = FiniteChatRuntime::open(OpenOptions {
+        data_dir: home_arg.clone(),
+        server_url: server_url.clone(),
+        device_id: "agent".to_owned(),
+        account_secret_hex: Some(agent_secret_hex.trim().to_owned()),
+        now_unix_seconds: None,
+    })
+    .unwrap();
+    let agent_state = agent_app_runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .unwrap();
+    assert!(
+        agent_state
+            .messages
+            .iter()
+            .any(|message| message.text == "durable followup one")
+    );
+    assert!(
+        agent_state
+            .messages
+            .iter()
+            .any(|message| message.text == "durable followup two")
+    );
+    drop(agent_app_runtime);
+
+    let recovered = hermes_poll(&home_arg, json!({ "timeout_millis": 0, "limit": 10 }));
+    let recovered_events = recovered["events"].as_array().unwrap();
+    assert_eq!(
+        recovered_events
+            .iter()
+            .map(|event| event["text"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["durable followup one", "durable followup two"]
+    );
+    let first_seq = recovered_events[0]["seq"].as_u64().unwrap();
+    let second_seq = recovered_events[1]["seq"].as_u64().unwrap();
+    assert!(
+        first_seq < second_seq,
+        "Hermes must preserve ordered-log sequence when recovering from durable store"
+    );
+
+    let redelivered = hermes_poll(&home_arg, json!({ "timeout_millis": 0, "limit": 10 }));
+    let redelivered_events = redelivered["events"].as_array().unwrap();
+    assert_eq!(
+        redelivered_events
+            .iter()
+            .map(|event| event["message_id"].clone())
+            .collect::<Vec<_>>(),
+        recovered_events
+            .iter()
+            .map(|event| event["message_id"].clone())
+            .collect::<Vec<_>>(),
+        "unacked recovered events should redeliver from the local Hermes inbox"
+    );
+
+    for event in recovered_events {
+        assert_eq!(hermes_ack(&home_arg, event)["acked"], true);
+    }
+    let drained = hermes_poll(&home_arg, json!({ "timeout_millis": 0, "limit": 10 }));
+    assert_eq!(
+        drained["events"].as_array().unwrap().len(),
+        0,
+        "acked durable recovery events must not replay from client_app_events"
     );
 }
 
@@ -788,6 +1028,71 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         r#"{"timeout_millis":0}"#,
     ]);
     assert_eq!(after_ack["events"].as_array().unwrap().len(), 0);
+
+    // Regression: a separate runtime sync can land an inbound user message
+    // in the agent's durable local store before the Hermes sidecar polls it.
+    // The sidecar must recover it from client_app_events instead of depending
+    // on a single live bridge edge.
+    let stored_reply = HermesMessagePayloadV1 {
+        payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+        conversation_id: None,
+        text: "already synced followup".to_owned(),
+        kind: HermesSendKindV1::Message,
+        status: HermesMessageStatusV1::Complete,
+        edit_of: None,
+        attachments: Vec::new(),
+        reply_to_message_id: Some(first_inbound["message_id"].as_str().unwrap().to_owned()),
+        sender_name: Some("Paul".to_owned()),
+        metadata: Default::default(),
+    };
+    let request = user
+        .create_application_request(
+            &code.room_id,
+            &stored_reply.encode().unwrap(),
+            "user-reply-already-synced",
+        )
+        .unwrap();
+    user_store.save_device_state(&user).unwrap();
+    user_delivery
+        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
+        .unwrap();
+    let agent_secret_hex = std::fs::read_to_string(home.join("agent.nsec")).unwrap();
+    let agent_app_runtime = FiniteChatRuntime::open(OpenOptions {
+        data_dir: home_arg.clone(),
+        server_url: server_url.clone(),
+        device_id: "agent".to_owned(),
+        account_secret_hex: Some(agent_secret_hex.trim().to_owned()),
+        now_unix_seconds: None,
+    })
+    .unwrap();
+    let agent_app_state = agent_app_runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .unwrap();
+    assert!(
+        agent_app_state
+            .messages
+            .iter()
+            .any(|message| message.text == "already synced followup")
+    );
+    drop(agent_app_runtime);
+
+    let recovered = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "poll",
+        "--request-json",
+        r#"{"timeout_millis":0}"#,
+    ]);
+    let recovered_events = recovered["events"].as_array().unwrap();
+    assert_eq!(recovered_events.len(), 1);
+    assert_eq!(recovered_events[0]["text"], "already synced followup");
+    assert_eq!(
+        recovered_events[0]["source"]["user_id"].as_str().unwrap(),
+        user.device_ref().account_id
+    );
+    let ack = hermes_ack(&home_arg, &recovered_events[0]);
+    assert_eq!(ack["acked"], true);
 
     // The iOS app sends ordinary UTF-8 chat text, not a Hermes JSON
     // envelope. The bridge still surfaces it as an authenticated inbound
@@ -1293,9 +1598,9 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
         now_unix_seconds: Some(now_ms() / 1000),
     })
     .unwrap();
-    user.dispatch(AppAction::ScanTarget { value: invite_url })
+    user.dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
         .unwrap();
-    user.dispatch(AppAction::SubmitInvitePin {
+    user.dispatch_and_wait(AppAction::SubmitInvitePin {
         pending_room_id: room_id.clone(),
         pin,
     })
@@ -1310,7 +1615,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
         r#"{"timeout_millis":0}"#,
     ]);
     assert_eq!(poll["joined"].as_array().unwrap().len(), 1);
-    let joined = user.dispatch(AppAction::StartRuntime).unwrap();
+    let joined = user.dispatch_and_wait(AppAction::StartRuntime).unwrap();
     assert_eq!(
         joined
             .rooms
@@ -1322,7 +1627,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
     );
 
     let sent = user
-        .dispatch(AppAction::SendAttachment {
+        .dispatch_and_wait(AppAction::SendAttachment {
             room_id: room_id.clone(),
             filename: "diagram.png".to_owned(),
             mime_type: "image/png".to_owned(),
@@ -1396,7 +1701,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
         })
         .to_string(),
     ]);
-    let received = user.dispatch(AppAction::StartRuntime).unwrap();
+    let received = user.dispatch_and_wait(AppAction::StartRuntime).unwrap();
     let agent_media = received
         .messages
         .iter()

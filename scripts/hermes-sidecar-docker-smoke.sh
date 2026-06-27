@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Docker runtime smoke for the Finite Chat Hermes sidecar.
 #
-# Builds containers/agent/Dockerfile, starts the echo agent in Docker, drives a
-# second finitechat CLI user in Docker, snapshots/restores agent state through
-# restic, and writes a JSON report comparable to scripts/hermes-sidecar-smoke.sh.
+# Builds containers/agent/Dockerfile, starts the real Hermes gateway in Docker,
+# admits finitechat CLI users through invite/PIN before and after restore,
+# snapshots/restores agent state through restic, and writes a JSON report.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -77,7 +77,7 @@ path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps({
     "status": "failed",
     "exit_code": int(sys.argv[2]),
-    "name": "docker_agent_pairs_and_echoes",
+    "name": "docker_real_gateway_admission_and_restore",
     "generated_at_unix": int(time.time()),
     "command": "scripts/hermes-sidecar-docker-smoke.sh",
     "hermes_agent_version_expected": sys.argv[3],

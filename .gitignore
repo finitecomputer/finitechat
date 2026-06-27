@@ -13,6 +13,7 @@ __pycache__/
 /.env.*
 !/.env.example
 !/docs/examples/*.env
+/.finitechat/
 **/*.sqlite
 **/*.sqlite3
 **/*.sqlite3-shm

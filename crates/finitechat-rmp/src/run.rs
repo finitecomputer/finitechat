@@ -1497,7 +1497,7 @@ fn default_iced_package_name(project_name: &str) -> String {
     format!("{out}_desktop_iced")
 }
 
-fn ios_sim_target_for_host() -> Result<(&'static str, &'static str), CliError> {
+pub(crate) fn ios_sim_target_for_host() -> Result<(&'static str, &'static str), CliError> {
     match std::env::consts::ARCH {
         "aarch64" => Ok(("aarch64-apple-ios-sim", "arm64")),
         arch => Err(CliError::operational(format!(
@@ -1836,7 +1836,7 @@ fn resolve_ios_app_path(
 }
 
 /// Read the `name:` field from `ios/project.yml` to derive the Xcode project/target/app name.
-fn read_xcode_project_name(root: &Path) -> Option<String> {
+pub(crate) fn read_xcode_project_name(root: &Path) -> Option<String> {
     let yml_path = root.join("ios/project.yml");
     let content = std::fs::read_to_string(&yml_path).ok()?;
     for line in content.lines() {

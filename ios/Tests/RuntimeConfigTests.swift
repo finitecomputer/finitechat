@@ -605,19 +605,23 @@ final class RuntimeConfigTests: XCTestCase {
     }
 }
 
-final class ChatTimelineTypingTests: XCTestCase {
-    func testTypingRowHasStableNonDurableIdentity() {
-        let row = ChatTimelineRow.typing([
-            AppTypingMember(
-                roomId: "room-main",
-                accountId: "alice-account",
-                deviceId: "alice-ios",
-                displayName: "Alice",
-                npub: nil
-            ),
-        ])
+final class ChatTimelineActivityTests: XCTestCase {
+    func testActivityRowHasStableNonDurableIdentity() {
+        let row = ChatTimelineRow.activity(
+            ChatTimelineActivity(
+                kind: .working,
+                members: [
+                    appTypingMember(
+                        roomID: "room-main",
+                        deviceID: "hermes-agent",
+                        displayName: "Hermes",
+                        activityKind: "working"
+                    ),
+                ]
+            )
+        )
 
-        XCTAssertEqual(row.id, "typing-indicator")
+        XCTAssertEqual(row.id, "activity-working")
         XCTAssertNil(row.oldestMessageID)
     }
 
@@ -630,13 +634,82 @@ final class ChatTimelineTypingTests: XCTestCase {
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(
             ChatTimeline.rowID(containingMessageID: "message-1", rows: rows),
-            "group-message-1"
+            "group-message-1-message-2-2"
         )
         XCTAssertEqual(
             ChatTimeline.rowID(containingMessageID: "message-2", rows: rows),
-            "group-message-1"
+            "group-message-1-message-2-2"
         )
         XCTAssertNil(ChatTimeline.rowID(containingMessageID: "missing-message", rows: rows))
+    }
+
+    func testRoomProjectionIncludesActivityOnlyRoom() {
+        let projections = ChatTimeline.roomProjections(
+            messages: [],
+            typingMembers: [
+                appTypingMember(
+                    roomID: "room-empty",
+                    deviceID: "hermes-agent",
+                    displayName: "Hermes",
+                    activityKind: "working"
+                ),
+            ]
+        )
+
+        let rows = projections["room-empty"]?.rows
+        XCTAssertEqual(rows?.count, 1)
+        guard case .activity(let activity) = rows?.first else {
+            XCTFail("expected activity marker")
+            return
+        }
+        XCTAssertEqual(activity.kind, .working)
+        XCTAssertEqual(activity.label, "Hermes is working")
+        XCTAssertTrue(projections["room-empty"]?.messages.isEmpty ?? false)
+    }
+
+    func testStrongestActivityKindWinsForSameRoom() {
+        let rows = ChatTimeline.rows(
+            messages: [],
+            typingMembers: [
+                appTypingMember(
+                    roomID: "room-main",
+                    deviceID: "alice-ios",
+                    displayName: "Alice",
+                    activityKind: "typing"
+                ),
+                appTypingMember(
+                    roomID: "room-main",
+                    deviceID: "hermes-agent",
+                    displayName: "Hermes",
+                    activityKind: "working"
+                ),
+            ]
+        )
+
+        XCTAssertEqual(rows.count, 1)
+        guard case .activity(let activity) = rows.first else {
+            XCTFail("expected activity marker")
+            return
+        }
+        XCTAssertEqual(activity.kind, .working)
+        XCTAssertEqual(activity.label, "Hermes is working")
+    }
+
+    private func appTypingMember(
+        roomID: String,
+        accountID: String = "alice-account",
+        deviceID: String,
+        displayName: String,
+        activityKind: String
+    ) -> AppTypingMember {
+        AppTypingMember(
+            roomId: roomID,
+            accountId: accountID,
+            deviceId: deviceID,
+            displayName: displayName,
+            npub: nil,
+            activityKind: activityKind
+        )
     }
 
     private func chatMessage(id: String, seq: UInt64, text: String) -> ChatMessage {
@@ -1961,6 +2034,58 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send to the visible thread only")
     }
 
+    func testRuntimeDispatchesAreFifoAcrossStartupAndUserActions() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let startRuntimeEntered = expectation(description: "start runtime dispatch entered")
+        let releaseStartRuntime = DispatchSemaphore(value: 0)
+        let runtime = FakeFiniteChatRuntime(
+            initialState: savedChatState(),
+            startRuntimeState: savedChatState()
+        )
+        runtime.setDispatchStartHook { action in
+            if action == .startRuntime {
+                startRuntimeEntered.fulfill()
+                _ = releaseStartRuntime.wait(timeout: .now() + 5)
+            }
+        }
+        defer {
+            runtime.setDispatchStartHook(nil)
+            releaseStartRuntime.signal()
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        await fulfillment(of: [startRuntimeEntered], timeout: 1)
+
+        model.outboundText = "queued behind startup"
+        XCTAssertTrue(model.send())
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(
+            runtime.dispatchedActions,
+            [],
+            "user actions must not overtake the startup command"
+        )
+
+        runtime.setDispatchStartHook(nil)
+        releaseStartRuntime.signal()
+        try await waitUntil {
+            runtime.dispatchedActions == [
+                .startRuntime,
+                .sendMessage(roomId: "room-main", text: "queued behind startup"),
+            ]
+        }
+    }
+
     func testBackgroundSendDoesNotWaitForRuntimeDispatch() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",
@@ -1988,10 +2113,17 @@ final class AppModelPersistenceTests: XCTestCase {
         }
 
         model.start()
+        try await waitUntil {
+            model.developerDiagnosticsExport.contains("event=start.succeeded")
+        }
         let startedAt = Date()
 
         XCTAssertTrue(model.send(roomID: "room-main", text: "slow send"))
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.2)
+        let optimistic = try XCTUnwrap(model.selectedRoomMessages.last)
+        XCTAssertEqual(optimistic.text, "slow send")
+        XCTAssertEqual(optimistic.outboundDelivery?.localSend, .sending)
+        XCTAssertEqual(optimistic.outboundDelivery?.serverDelivery, .undelivered)
 
         await fulfillment(of: [sendStarted], timeout: 1)
         releaseSend.signal()
@@ -2120,7 +2252,14 @@ final class AppModelPersistenceTests: XCTestCase {
         let scannedState = savedChatState(
             status: "invite scanned",
             roomState: .waitingForApproval,
-            roomStatus: "enter PIN to request admission"
+            roomStatus: "enter PIN to request admission",
+            flow: AppFlowState(
+                noticeText: "Opened Main Room. Enter the current PIN to request access.",
+                noticeBusy: false,
+                scanInFlight: false,
+                invitePinSubmissionRoomId: nil,
+                scanResult: .room
+            )
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: readyState,
@@ -2178,7 +2317,14 @@ final class AppModelPersistenceTests: XCTestCase {
         let admissionPendingState = savedChatState(
             status: "pin submitted",
             roomState: .waitingForApproval,
-            roomStatus: "waiting for room admission"
+            roomStatus: "waiting for room admission",
+            flow: AppFlowState(
+                noticeText: "PIN submitted for Main Room. Waiting for the agent to approve this device.",
+                noticeBusy: false,
+                scanInFlight: false,
+                invitePinSubmissionRoomId: nil,
+                scanResult: .none
+            )
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: pendingState,
@@ -2203,10 +2349,9 @@ final class AppModelPersistenceTests: XCTestCase {
         model.pinDraft = "123456"
 
         XCTAssertTrue(model.submitPin(for: room))
-        XCTAssertEqual(model.invitePinSubmissionRoomID, "room-main")
 
         try await waitUntil {
-            model.invitePinSubmissionRoomID == nil
+            model.userNoticeText == "PIN submitted for Main Room. Waiting for the agent to approve this device."
         }
 
         XCTAssertEqual(model.pinDraft, "123456")
@@ -3054,6 +3199,13 @@ final class AppModelPersistenceTests: XCTestCase {
             if case .scanTarget = action {
                 state.status = "profile unavailable"
                 state.toast = "Profile unavailable"
+                state.flow = AppFlowState(
+                    noticeText: "Profile unavailable",
+                    noticeBusy: false,
+                    scanInFlight: false,
+                    invitePinSubmissionRoomId: nil,
+                    scanResult: .unavailable
+                )
             }
             return state
         }
@@ -3106,6 +3258,13 @@ final class AppModelPersistenceTests: XCTestCase {
                 state.profiles = [profile]
                 state.status = "profile details unavailable"
                 state.toast = "Profile details unavailable; you can still start a chat"
+                state.flow = AppFlowState(
+                    noticeText: "Profile opened.",
+                    noticeBusy: false,
+                    scanInFlight: false,
+                    invitePinSubmissionRoomId: nil,
+                    scanResult: .profile
+                )
             }
             return state
         }
@@ -3356,7 +3515,14 @@ final class AppModelPersistenceTests: XCTestCase {
         status: String = "ready",
         toast: String? = nil,
         roomState: AppRoomState = .connected,
-        roomStatus: String = "connected"
+        roomStatus: String = "connected",
+        flow: AppFlowState = AppFlowState(
+            noticeText: nil,
+            noticeBusy: false,
+            scanInFlight: false,
+            invitePinSubmissionRoomId: nil,
+            scanResult: .none
+        )
     ) -> AppState {
         let identity = Identity(
             accountId: "alice-account",
@@ -3413,7 +3579,8 @@ final class AppModelPersistenceTests: XCTestCase {
             roomDetails: nil,
             profiles: [],
             devices: [],
-            typingMembers: []
+            typingMembers: [],
+            flow: flow
         )
     }
 
@@ -3478,7 +3645,14 @@ final class AppModelPersistenceTests: XCTestCase {
     private func emptyChatState(
         deviceID: String = "qt433",
         status: String = "ready",
-        toast: String? = nil
+        toast: String? = nil,
+        flow: AppFlowState = AppFlowState(
+            noticeText: nil,
+            noticeBusy: false,
+            scanInFlight: false,
+            invitePinSubmissionRoomId: nil,
+            scanResult: .none
+        )
     ) -> AppState {
         AppState(
             rev: 1,
@@ -3498,7 +3672,8 @@ final class AppModelPersistenceTests: XCTestCase {
             roomDetails: nil,
             profiles: [],
             devices: [],
-            typingMembers: []
+            typingMembers: [],
+            flow: flow
         )
     }
 
@@ -4011,6 +4186,9 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
     private var startRuntimeStates: [AppState]
     private let dispatchOverride: ((AppAction, AppState) -> AppState)?
     private var dispatchedActionsStorage: [AppAction] = []
+    private var reconciler: AppReconciler?
+    private var stateReadHook: (() -> Void)?
+    private var dispatchStartHook: ((AppAction) -> Void)?
 
     var dispatchedActions: [AppAction] {
         withLock {
@@ -4039,14 +4217,39 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
     }
 
     func state() throws -> AppState {
-        withLock {
+        let hook = withLock {
+            stateReadHook
+        }
+        hook?()
+        return withLock {
             currentState
         }
     }
 
-    func dispatch(action: AppAction) throws -> AppState {
+    func setStateReadHook(_ hook: (() -> Void)?) {
         withLock {
+            stateReadHook = hook
+        }
+    }
+
+    func setDispatchStartHook(_ hook: ((AppAction) -> Void)?) {
+        withLock {
+            dispatchStartHook = hook
+        }
+    }
+
+    func dispatch(action: AppAction) throws {
+        _ = try dispatchAndWait(action: action)
+    }
+
+    func dispatchAndWait(action: AppAction) throws -> AppState {
+        let hook = withLock {
+            dispatchStartHook
+        }
+        hook?(action)
+        let updatedState = withLock {
             dispatchedActionsStorage.append(action)
+            let previousRev = currentState.rev
             if action == .startRuntime {
                 if startRuntimeStates.count > 1 {
                     currentState = startRuntimeStates.removeFirst()
@@ -4056,14 +4259,45 @@ private final class FakeFiniteChatRuntime: FiniteChatRuntimeProtocol, @unchecked
             } else if let dispatchOverride {
                 currentState = dispatchOverride(action, currentState)
             }
+            if currentState.rev <= previousRev {
+                currentState.rev = previousRev + 1
+            }
             return currentState
         }
+        publish(updatedState)
+        return updatedState
     }
 
     func waitForUpdate(timeoutMillis: UInt64) throws -> AppState {
-        withLock {
-            currentState
+        let updatedState = withLock {
+            let previousRev = currentState.rev
+            if startRuntimeStates.count > 1 {
+                currentState = startRuntimeStates.removeFirst()
+            } else if let startRuntimeState = startRuntimeStates.first {
+                currentState = startRuntimeState
+            }
+            if currentState.rev <= previousRev {
+                currentState.rev = previousRev + 1
+            }
+            return currentState
         }
+        publish(updatedState)
+        return updatedState
+    }
+
+    func listenForUpdates(reconciler: AppReconciler) {
+        let current = withLock {
+            self.reconciler = reconciler
+            return currentState
+        }
+        reconciler.reconcile(update: .fullState(current))
+    }
+
+    private func publish(_ state: AppState) {
+        let listener = withLock {
+            reconciler
+        }
+        listener?.reconcile(update: .fullState(state))
     }
 
     private func withLock<T>(_ operation: () throws -> T) rethrows -> T {

@@ -537,11 +537,13 @@ fn run_profile_dm_harness(
         peer_device,
         "profile DM peer preparation",
     )?;
-    let peer_state = peer.dispatch(AppAction::StartRuntime).map_err(|error| {
-        CliError::operational(format!(
-            "profile DM peer preparation: peer failed to publish key packages: {error}"
-        ))
-    })?;
+    let peer_state = peer
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(|error| {
+            CliError::operational(format!(
+                "profile DM peer preparation: peer failed to publish key packages: {error}"
+            ))
+        })?;
     let peer_account_id = peer_state.identity.account_id;
     let peer_npub = npub_from_account_id(peer_account_id.clone()).map_err(|error| {
         CliError::operational(format!(
@@ -1420,7 +1422,7 @@ fn establish_peer_membership(
 ) -> Result<(), CliError> {
     let owner = open_product_runtime(owner_store_path, server_url, owner_device, label)?;
     let owner_state = owner
-        .dispatch(AppAction::CreateInvite {
+        .dispatch_and_wait(AppAction::CreateInvite {
             room_id: room_id.to_owned(),
         })
         .map_err(|error| {
@@ -1431,13 +1433,13 @@ fn establish_peer_membership(
     })?;
 
     let peer = open_product_runtime(peer_store_path, server_url, peer_device, label)?;
-    peer.dispatch(AppAction::ScanTarget {
+    peer.dispatch_and_wait(AppAction::ScanTarget {
         value: invite.invite_url,
     })
     .map_err(|error| {
         CliError::operational(format!("{label}: peer failed to scan invite: {error}"))
     })?;
-    peer.dispatch(AppAction::SubmitInvitePin {
+    peer.dispatch_and_wait(AppAction::SubmitInvitePin {
         pending_room_id: room_id.to_owned(),
         pin: invite.pin,
     })
@@ -1446,12 +1448,16 @@ fn establish_peer_membership(
             "{label}: peer failed to submit invite PIN: {error}"
         ))
     })?;
-    owner.dispatch(AppAction::StartRuntime).map_err(|error| {
-        CliError::operational(format!("{label}: owner failed to admit peer: {error}"))
-    })?;
-    let peer_state = peer.dispatch(AppAction::StartRuntime).map_err(|error| {
-        CliError::operational(format!("{label}: peer failed to finalize room: {error}"))
-    })?;
+    owner
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(|error| {
+            CliError::operational(format!("{label}: owner failed to admit peer: {error}"))
+        })?;
+    let peer_state = peer
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(|error| {
+            CliError::operational(format!("{label}: peer failed to finalize room: {error}"))
+        })?;
     let Some(room) = peer_state.rooms.iter().find(|room| room.room_id == room_id) else {
         return Err(CliError::operational(format!(
             "{label}: peer state missing joined room `{room_id}`"
@@ -1607,11 +1613,13 @@ fn assert_peer_delivery_snapshot(
     label: &str,
 ) -> Result<PeerReceiptSnapshot, CliError> {
     let runtime = open_product_runtime(peer_store_path, server_url, peer_device, label)?;
-    runtime.dispatch(AppAction::StartRuntime).map_err(|error| {
-        CliError::operational(format!("{label}: peer failed to sync after drain: {error}"))
-    })?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(|error| {
+            CliError::operational(format!("{label}: peer failed to sync after drain: {error}"))
+        })?;
     let state = runtime
-        .dispatch(AppAction::OpenRoom {
+        .dispatch_and_wait(AppAction::OpenRoom {
             room_id: room_id.to_owned(),
         })
         .map_err(|error| {

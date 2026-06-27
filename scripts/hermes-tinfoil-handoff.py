@@ -54,6 +54,21 @@ def main() -> int:
     require(preflight.get("status") == "ok", "Restic preflight must be ok", errors)
     require(publish.get("status") == "published", "Image publish report must be published", errors)
     require(facts.get("restic_backend") == "s3", "Docker smoke must use restic_backend=s3", errors)
+    require(
+        facts.get("real_gateway_runtime") is True,
+        "Docker smoke must prove real_gateway_runtime=true",
+        errors,
+    )
+    require(
+        facts.get("gateway_admission_before_restore") is True,
+        "Docker smoke must prove gateway admission before restore",
+        errors,
+    )
+    require(
+        facts.get("gateway_admission_after_restore") is True,
+        "Docker smoke must prove gateway admission after restore",
+        errors,
+    )
     require(preflight.get("backend") == "s3", "Restic preflight must use backend=s3", errors)
     require(repository.get("kind") == "s3", "Restic repository proof must be kind=s3", errors)
     require(bool(snapshot.get("id")), "Restic snapshot id is required", errors)

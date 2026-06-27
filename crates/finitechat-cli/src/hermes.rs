@@ -27,23 +27,23 @@ use finitechat_blob::{
     prepare_blossom_download_http_request, sha256_hex,
 };
 use finitechat_client::{
-    AppliedLogEntry, CreateRoomInviteParams, FiniteChatDevice, FiniteChatDeviceConfig,
-    HttpRuntimeDelivery, ReqwestHttpRuntimeTransport, RuntimeDelivery, RuntimeSyncOptions,
-    SqliteClientStore, SqliteClientStoreOptions, accept_pending_invite_joins, create_room_invite,
-    finalize_invited_room, generate_account_secret, run_room_server_sync_tick,
-    run_runtime_sync_tick, submit_invite_join_request,
+    FiniteChatDevice, FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport,
+    SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent, generate_account_secret,
+};
+use finitechat_core::{
+    AppAction, AppBridgeActivityInput, AppRoomState, AppSentMessage, FiniteChatCoreError,
+    FiniteChatRuntime, OpenOptions,
 };
 use finitechat_hermes::{
     HermesAckRequestV1, HermesActivityRequestV1, HermesEditRequestV1, HermesMessagePayloadV1,
     HermesMessageStatusV1, HermesPollEventV1, HermesSendRequestV1, MAX_HERMES_POLL_TIMEOUT_MILLIS,
 };
-use finitechat_http::{HttpInviteJoinState, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
+use finitechat_http::{SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
-    AppendEphemeralActivityRequest, AttachmentBlobReferenceV1, CreateRoomRequest,
-    DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DurableAppEventKind,
-    EphemeralActivityActionV1, EventAccepted, INVITE_PIN_WINDOW_SECONDS, InviteCodeV1,
-    RoomProtocol, invite_current_pin, npub_encode,
+    AttachmentBlobReferenceV1, DecryptedApplicationEventV1, DurableAppEventKind,
+    EphemeralActivityActionV1, INVITE_PIN_WINDOW_SECONDS, InviteCodeV1, invite_current_pin,
+    npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -71,9 +71,8 @@ const DEFAULT_DEVICE_ID: &str = "agent";
 const DEFAULT_MAX_JOINS: u32 = 8;
 const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CREDENTIAL_VALIDITY_SECONDS: u64 = 90 * 24 * 60 * 60;
-const KEY_PACKAGE_TARGET_AVAILABLE: u32 = 4;
 const POLL_SLEEP_MS: u64 = 300;
-const ACTIVITY_DEFAULT_EXPIRY_MS: u64 = 30 * 1000;
+const HERMES_STORED_EVENT_RECOVERY_LIMIT: u32 = 5_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentConfig {
@@ -544,7 +543,7 @@ fn status_for_cli_error(error: &CliError) -> StatusCode {
         | CliError::Http(_)
         | CliError::Server { .. }
         | CliError::Output(_)
-        | CliError::Core(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        | CliError::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -593,7 +592,7 @@ fn cli_error_kind(error: &CliError) -> &'static str {
         CliError::Output(_) => "output",
         CliError::Hermes(_) => "hermes",
         CliError::Identity(_) => "identity",
-        CliError::Core(_) => "core",
+        CliError::Runtime(_) => "runtime",
     }
 }
 
@@ -611,7 +610,7 @@ fn cli_error_retryable(error: &CliError) -> bool {
         | CliError::Output(_)
         | CliError::Hermes(_)
         | CliError::Identity(_)
-        | CliError::Core(_) => false,
+        | CliError::Runtime(_) => false,
     }
 }
 
@@ -700,8 +699,15 @@ fn non_empty_home_channel_value(name: &str, value: String) -> Result<String, Cli
 
 fn ensure_agent_room_available(home_dir: &Path, room_id: &str) -> Result<(), CliError> {
     let home = load_home(home_dir)?;
-    let (_store, device, _delivery) = open_agent(&home)?;
-    if device.group_epoch(room_id).is_ok() || device.room_server_url(room_id).is_some() {
+    let runtime = open_agent_runtime(&home)?;
+    let state = runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    if state
+        .rooms
+        .iter()
+        .any(|room| room.room_id == room_id && room.state == AppRoomState::Connected)
+    {
         return Ok(());
     }
     Err(CliError::Hermes(format!(
@@ -756,17 +762,20 @@ fn cmd_init<W: Write>(
     } else {
         generate_account_secret().map_err(|error| CliError::Hermes(error.to_string()))?
     };
-    let device = FiniteChatDevice::new(device_config(&secret, &device_id, now_secs()))
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let mut store = open_store(home_dir, &secret, &device_id)?;
-    store
-        .save_device_state(&device)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let runtime = FiniteChatRuntime::open(OpenOptions {
+        data_dir: home_dir.to_string_lossy().into_owned(),
+        server_url: server_url.clone(),
+        device_id: device_id.clone(),
+        account_secret_hex: Some(hex_lower(secret.as_bytes())),
+        now_unix_seconds: Some(now_secs()),
+    })
+    .map_err(map_core_hermes_error)?;
+    let state = runtime.state().map_err(map_core_hermes_error)?;
 
     let config = AgentConfig {
         server_url,
         device_id,
-        account_id: device.device_ref().account_id.clone(),
+        account_id: state.identity.account_id,
     };
     crate::identity::persist_agent_identity(home_dir, &secret)?;
     write_private(
@@ -808,54 +817,36 @@ fn cmd_invite<W: Write>(
     crate::reject_extra_args(&args)?;
 
     let home = load_home(home_dir)?;
-    let (mut store, mut device, mut delivery) = open_agent(&home)?;
-    let now_ms = now_ms();
-
-    // Resolve or create the room this invite admits people to.
+    let runtime = open_agent_runtime(&home)?;
     let room_id = match room_id {
-        Some(room_id) => room_id,
-        None => {
-            let room_id = device
-                .generate_object_id("room")
-                .map_err(|error| CliError::Hermes(error.to_string()))?;
-            let mls_group_id = format!("mls-{room_id}");
-            device
-                .create_group_state(&room_id, &mls_group_id)
-                .map_err(|error| CliError::Hermes(error.to_string()))?;
-            store
-                .save_device_state(&device)
-                .map_err(|error| CliError::Hermes(error.to_string()))?;
-            delivery
-                .bootstrap_account_room(&CreateRoomRequest {
-                    room_id: room_id.clone(),
-                    mls_group_id,
-                    creator: device.device_ref().clone(),
-                    protocol: RoomProtocol::default(),
-                })
-                .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+        Some(room_id) => {
+            runtime
+                .dispatch_and_wait(AppAction::StartRuntime)
+                .map_err(map_core_hermes_error)?;
             room_id
         }
+        None => {
+            let state = runtime
+                .dispatch_and_wait(AppAction::CreateRoom {
+                    display_name: room_name.clone().unwrap_or_default(),
+                })
+                .map_err(map_core_hermes_error)?;
+            state
+                .selected_room_id
+                .ok_or_else(|| CliError::Hermes("created room was not selected".to_owned()))?
+        }
     };
-
-    let code = create_room_invite(
-        &device,
-        &mut delivery,
-        CreateRoomInviteParams {
-            room_id: &room_id,
-            server_url: &home.config.server_url,
-            display_name: room_name,
-            max_joins,
-            ttl_ms,
-            now_ms,
-        },
-    )
-    .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-    let url = code
-        .encode()
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let state = runtime
+        .create_invite_with_options_and_wait(room_id.clone(), room_name, max_joins, ttl_ms)
+        .map_err(map_core_hermes_error)?;
+    let invite = state
+        .active_invite
+        .ok_or_else(|| CliError::Hermes(format!("could not create invite for room {room_id}")))?;
+    let url = invite.invite_url;
     append_invite(home_dir, &url)?;
 
-    let pin = invite_current_pin(&code.invite_token, now_ms / 1000);
+    let code = InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?;
+    let pin = invite.pin;
     let npub = npub_encode(&code.inviter_account_id)
         .map_err(|error| CliError::Hermes(format!("npub encoding failed: {error}")))?;
     let qr = render_qr(&url)?;
@@ -948,83 +939,50 @@ fn cmd_join<W: Write>(
 
     let code = InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?;
     let home = load_home(home_dir)?;
-    let (mut store, mut device, _home_delivery) = open_agent(&home)?;
-    // The invite names the room's server; every leg of the join talks to it.
-    let mut delivery =
-        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(code.server_url.clone()));
-    let handle = submit_invite_join_request(
-        &mut store,
-        &mut device,
-        &mut delivery,
-        &code,
-        &pin,
-        display_name,
-        now_ms(),
-    )
-    .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::ScanTarget { value: url.clone() })
+        .map_err(map_core_hermes_error)?;
+    runtime
+        .submit_invite_pin_with_display_name_and_wait(code.room_id.clone(), pin, display_name)
+        .map_err(map_core_hermes_error)?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let verdict = loop {
-        let status = delivery
-            .invite_join_status(&code.invite_id, &handle.request_id)
-            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-        match status.state {
-            HttpInviteJoinState::Accepted => break "accepted",
-            HttpInviteJoinState::Rejected => break "rejected",
-            HttpInviteJoinState::Pending => {
-                if Instant::now() >= deadline {
-                    break "pending";
+    loop {
+        let state = runtime
+            .dispatch_and_wait(AppAction::StartRuntime)
+            .map_err(map_core_hermes_error)?;
+        if let Some(room) = state.rooms.iter().find(|room| room.room_id == code.room_id) {
+            match room.state {
+                AppRoomState::Connected => break,
+                AppRoomState::UnavailableOnDevice => {
+                    crate::write_pretty_json(
+                        output,
+                        &json!({ "state": "rejected", "room_id": code.room_id }),
+                    )?;
+                    return Err(CliError::Hermes(
+                        "join was rejected (wrong or expired PIN?)".to_owned(),
+                    ));
                 }
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis() as u64;
-                let wait = SyncWaitRequest {
-                    rooms: Vec::new(),
-                    invites: vec![SyncWaitInvite {
-                        invite_id: code.invite_id.clone(),
-                        // Wake only when a further request gets resolved
-                        // (ours is among the pending ones).
-                        seen_requests: u32::MAX,
-                        seen_resolved: status.resolved_requests,
-                    }],
-                    wait_ms: remaining,
-                };
-                if delivery.sync_wait(&wait).is_err() {
-                    std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
-                }
+                AppRoomState::WaitingForApproval | AppRoomState::Joining => {}
             }
         }
-    };
-    if verdict != "accepted" {
-        crate::write_pretty_json(
-            output,
-            &json!({ "state": verdict, "room_id": code.room_id }),
-        )?;
-        return if verdict == "rejected" {
-            Err(CliError::Hermes(
-                "join was rejected (wrong or expired PIN?)".to_owned(),
-            ))
-        } else {
-            Err(CliError::Hermes(
+        if Instant::now() >= deadline {
+            crate::write_pretty_json(
+                output,
+                &json!({ "state": "pending", "room_id": code.room_id }),
+            )?;
+            return Err(CliError::Hermes(
                 "join timed out awaiting the agent".to_owned(),
-            ))
-        };
-    }
-
-    // Claim and activate the Welcome from the room's server.
-    let options = sync_options();
-    while Instant::now() < deadline {
-        run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
-            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-        if device.room_server_url(&code.room_id).is_some()
-            || device.group_epoch(&code.room_id).is_ok()
-        {
-            break;
+            ));
         }
-        std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
+        if runtime.wait_for_update(remaining.min(5_000)).is_err() {
+            std::thread::sleep(Duration::from_millis(POLL_SLEEP_MS));
+        }
     }
-    finalize_invited_room(&mut store, &mut device, &code)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
     crate::write_pretty_json(
         output,
         &json!({
@@ -1050,6 +1008,8 @@ struct PollRequest {
 struct HermesInboxState {
     #[serde(default)]
     events: Vec<HermesInboxEvent>,
+    #[serde(default)]
+    cursors: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,92 +1032,32 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
             .min(MAX_HERMES_POLL_TIMEOUT_MILLIS),
     );
     let home = load_home(home_dir)?;
-    let (mut store, mut device, mut delivery) = open_agent(&home)?;
+    let runtime = open_agent_runtime(&home)?;
+    let invite_urls = load_invite_urls(home_dir)?;
     let invites = load_invites(home_dir)?;
-    let options = sync_options();
     let started = Instant::now();
-    let own_account = device.device_ref().account_id.clone();
+    let own_account = home.config.account_id.clone();
     let mut inbox = load_hermes_inbox(home_dir)?;
+    initialize_hermes_inbox_cursors(home_dir, &home, &mut inbox)?;
     let mut events = pending_hermes_inbox_events(&inbox, request.room_id.as_deref(), limit);
     let mut joined: Vec<String> = Vec::new();
-    let mut invite_counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let invite_counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
 
     while events.is_empty() {
-        let mut report = run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
-            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+        let bridge = runtime
+            .agent_bridge_poll_once(invite_urls.clone())
+            .map_err(map_core_hermes_error)?;
+        joined.extend(bridge.joined_account_ids);
+        joined.sort();
+        joined.dedup();
 
-        // Rooms pinned to other servers (joined via invite) sync against
-        // their own server (ADR 0005 grouping).
-        let mut room_servers: Vec<String> = device
-            .room_sync_cursors()
-            .into_iter()
-            .filter_map(|cursor| cursor.server_url)
-            .collect();
-        room_servers.sort_unstable();
-        room_servers.dedup();
-        for server_url in room_servers {
-            let mut room_delivery =
-                HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
-            let room_report = run_room_server_sync_tick(
-                &mut store,
-                &mut device,
-                &mut room_delivery,
-                &options,
-                &server_url,
-            )
-            .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-            report.applied_entries.extend(room_report.applied_entries);
-        }
-
-        // Process pending invite joins after the sync tick so any
-        // previously submitted add commit has merged (pending-commit rule).
-        let mut accepted_any = false;
-        for code in &invites {
-            match accept_pending_invite_joins(
-                &mut store,
-                &mut device,
-                &mut delivery,
-                code,
-                now_ms(),
-            ) {
-                Ok(invite_report) => {
-                    accepted_any |= !invite_report.accepted.is_empty();
-                    invite_counts.insert(
-                        code.invite_id.clone(),
-                        (
-                            invite_report.total_requests,
-                            invite_report.resolved_requests,
-                        ),
-                    );
-                    joined.extend(
-                        invite_report
-                            .accepted
-                            .iter()
-                            .map(|joiner| joiner.account_id.clone()),
-                    );
-                }
-                // Expired/closed sessions are routine; the next `hermes
-                // invite` replaces them.
-                Err(_) => continue,
-            }
-        }
-        if accepted_any {
-            // Merge our own add commit promptly so sends are not blocked on
-            // the next poll cycle.
-            run_runtime_sync_tick(&mut store, &mut device, &mut delivery, &options)
-                .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-        }
-
-        for applied in &report.applied_entries {
+        for applied in &bridge.events {
             if let Some(room_filter) = &request.room_id
                 && room_filter != &applied.room_id
             {
                 continue;
             }
-            let AppliedLogEntry::Application { plaintext, sender } = &applied.entry else {
-                continue;
-            };
-            if sender.account_id == own_account {
+            if applied.sender_account_id == own_account {
                 continue;
             }
             let context = HermesPollEventContext {
@@ -1165,19 +1065,29 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
                 room_id: &applied.room_id,
                 seq: applied.seq,
                 message_id: &applied.message_id,
-                sender_account_id: &sender.account_id,
-                sender_device_id: &sender.device_id,
+                sender_account_id: &applied.sender_account_id,
+                sender_device_id: &applied.sender_device_id,
             };
-            if let Some(event) = hermes_poll_event_from_application_plaintext(context, plaintext)? {
+            if let Some(event) =
+                hermes_poll_event_from_application_plaintext(context, &applied.plaintext)?
+            {
                 enqueue_hermes_inbox_event(home_dir, &mut inbox, event)?;
             }
         }
+        recover_stored_hermes_events(
+            home_dir,
+            &home,
+            &own_account,
+            request.room_id.as_deref(),
+            &mut inbox,
+        )?;
         events = pending_hermes_inbox_events(&inbox, request.room_id.as_deref(), limit);
 
         if !events.is_empty() || !joined.is_empty() || started.elapsed() >= timeout {
             break;
         }
         let remaining = timeout.saturating_sub(started.elapsed()).as_millis() as u64;
+        let (_store, device, mut delivery) = open_agent(&home)?;
         wait_for_hermes_sync_hint(
             &home,
             &mut delivery,
@@ -1233,8 +1143,15 @@ fn enqueue_hermes_inbox_event(
 ) -> Result<(), CliError> {
     let key = hermes_inbox_key(&event.room_id, event.seq, &event.message_id);
     if inbox.events.iter().any(|existing| existing.key == key) {
+        if advance_hermes_inbox_cursor(inbox, &event.room_id, event.seq) {
+            save_hermes_inbox(home_dir, inbox)?;
+        }
         return Ok(());
     }
+    if event.seq <= hermes_inbox_cursor(inbox, &event.room_id) {
+        return Ok(());
+    }
+    advance_hermes_inbox_cursor(inbox, &event.room_id, event.seq);
     inbox.events.push(HermesInboxEvent {
         key,
         room_id: event.room_id.clone(),
@@ -1244,6 +1161,100 @@ fn enqueue_hermes_inbox_event(
         event,
     });
     save_hermes_inbox(home_dir, inbox)
+}
+
+fn initialize_hermes_inbox_cursors(
+    home_dir: &Path,
+    home: &AgentHome,
+    inbox: &mut HermesInboxState,
+) -> Result<(), CliError> {
+    if !inbox.cursors.is_empty() {
+        return Ok(());
+    }
+    let mut changed = false;
+    let pending = inbox
+        .events
+        .iter()
+        .map(|event| (event.room_id.clone(), event.seq))
+        .collect::<Vec<_>>();
+    for (room_id, seq) in pending {
+        changed |= advance_hermes_inbox_cursor(inbox, &room_id, seq);
+    }
+    if !inbox.events.is_empty() {
+        if changed {
+            save_hermes_inbox(home_dir, inbox)?;
+        }
+        return Ok(());
+    }
+
+    for event in load_recent_agent_app_events(home)? {
+        changed |= advance_hermes_inbox_cursor(inbox, &event.room_id, event.seq);
+    }
+    if changed {
+        save_hermes_inbox(home_dir, inbox)?;
+    }
+    Ok(())
+}
+
+fn recover_stored_hermes_events(
+    home_dir: &Path,
+    home: &AgentHome,
+    own_account: &str,
+    room_filter: Option<&str>,
+    inbox: &mut HermesInboxState,
+) -> Result<(), CliError> {
+    let mut cursor_changed = false;
+    for stored in load_recent_agent_app_events(home)? {
+        if let Some(room_id) = room_filter
+            && room_id != stored.room_id
+        {
+            continue;
+        }
+        if stored.sender.account_id == own_account {
+            continue;
+        }
+        if stored.seq <= hermes_inbox_cursor(inbox, &stored.room_id) {
+            continue;
+        }
+        let context = HermesPollEventContext {
+            home_dir,
+            room_id: &stored.room_id,
+            seq: stored.seq,
+            message_id: &stored.message_id,
+            sender_account_id: &stored.sender.account_id,
+            sender_device_id: &stored.sender.device_id,
+        };
+        match hermes_poll_event_from_application_plaintext(context, &stored.plaintext)? {
+            Some(event) => enqueue_hermes_inbox_event(home_dir, inbox, event)?,
+            None => {
+                cursor_changed |= advance_hermes_inbox_cursor(inbox, &stored.room_id, stored.seq);
+            }
+        }
+    }
+    if cursor_changed {
+        save_hermes_inbox(home_dir, inbox)?;
+    }
+    Ok(())
+}
+
+fn load_recent_agent_app_events(home: &AgentHome) -> Result<Vec<StoredAppEvent>, CliError> {
+    let (store, device, _) = open_agent(home)?;
+    store
+        .load_app_events(&device.device_ref(), HERMES_STORED_EVENT_RECOVERY_LIMIT)
+        .map_err(|error| CliError::Hermes(error.to_string()))
+}
+
+fn hermes_inbox_cursor(inbox: &HermesInboxState, room_id: &str) -> u64 {
+    inbox.cursors.get(room_id).copied().unwrap_or(0)
+}
+
+fn advance_hermes_inbox_cursor(inbox: &mut HermesInboxState, room_id: &str, seq: u64) -> bool {
+    let cursor = inbox.cursors.entry(room_id.to_owned()).or_default();
+    if seq <= *cursor {
+        return false;
+    }
+    *cursor = seq;
+    true
 }
 
 fn pending_hermes_inbox_events(
@@ -1552,9 +1563,9 @@ fn cmd_send<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     let payload = HermesMessagePayloadV1::from_send(&request)
         .encode()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let accepted = append_payload_to_room(home_dir, &request.room_id, payload)?;
-    update_running_after_send(home_dir, &request, &accepted)?;
-    write_event_accepted(output, &accepted)
+    let sent = append_payload_to_room(home_dir, &request.room_id, payload, request.text.clone())?;
+    update_running_after_send(home_dir, &request, &sent.message_id)?;
+    write_sent_message(output, &sent)
 }
 
 fn cmd_edit<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
@@ -1562,9 +1573,9 @@ fn cmd_edit<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     let payload = HermesMessagePayloadV1::from_edit(&request)
         .encode()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let accepted = append_payload_to_room(home_dir, &request.room_id, payload)?;
+    let sent = append_payload_to_room(home_dir, &request.room_id, payload, request.text.clone())?;
     update_running_after_edit(home_dir, &request)?;
-    write_event_accepted(output, &accepted)
+    write_sent_message(output, &sent)
 }
 
 fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Result<(), CliError> {
@@ -1583,7 +1594,7 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
         let payload = HermesMessagePayloadV1::from_edit(&recovery)
             .encode()
             .map_err(|error| CliError::Hermes(error.to_string()))?;
-        append_payload_to_room(home_dir, &recovery.room_id, payload)?;
+        append_payload_to_room(home_dir, &recovery.room_id, payload, recovery.text.clone())?;
         recovered += 1;
     }
     if recovered > 0 {
@@ -1596,45 +1607,22 @@ fn append_payload_to_room(
     home_dir: &Path,
     room_id: &str,
     payload: Vec<u8>,
-) -> Result<EventAccepted, CliError> {
+    preview: String,
+) -> Result<AppSentMessage, CliError> {
     let home = load_home(home_dir)?;
-    let (mut store, mut device, mut delivery) = open_agent(&home)?;
-    sync_agent_room(&mut store, &mut device, &mut delivery, room_id)?;
-    if device
-        .has_pending_commit(room_id)
-        .map_err(|error| CliError::Hermes(error.to_string()))?
-    {
-        // Merge our own pending add commit from the log before sending.
-        sync_agent_room(&mut store, &mut device, &mut delivery, room_id)?;
-    }
-    let idempotency_key = device
-        .generate_object_id("hermes-send")
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let request = device
-        .create_application_request(room_id, &payload, idempotency_key)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    store
-        .save_device_state(&device)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let accepted = delivery
-        .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
-        .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
-    if let Err(error) = sync_agent_room(&mut store, &mut device, &mut delivery, room_id) {
-        eprintln!(
-            "warning: post-accept sync failed after appending {}: {error}",
-            accepted.message_id
-        );
-    }
-    Ok(accepted)
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    runtime
+        .send_encoded_chat_message_and_wait(room_id.to_owned(), payload, preview)
+        .map_err(map_core_hermes_error)
 }
 
-fn write_event_accepted<W: Write>(
-    output: &mut W,
-    accepted: &EventAccepted,
-) -> Result<(), CliError> {
+fn write_sent_message<W: Write>(output: &mut W, sent: &AppSentMessage) -> Result<(), CliError> {
     crate::write_pretty_json(
         output,
-        &json!({ "message_id": &accepted.message_id, "seq": accepted.seq }),
+        &json!({ "message_id": &sent.message_id, "seq": sent.seq }),
     )
 }
 
@@ -1671,7 +1659,7 @@ fn save_hermes_running(home_dir: &Path, running: &HermesRunningState) -> Result<
 fn update_running_after_send(
     home_dir: &Path,
     request: &HermesSendRequestV1,
-    accepted: &EventAccepted,
+    message_id: &str,
 ) -> Result<(), CliError> {
     if request.status != HermesMessageStatusV1::Running {
         return Ok(());
@@ -1681,7 +1669,7 @@ fn update_running_after_send(
         HermesRunningMessage {
             room_id: request.room_id.clone(),
             conversation_id: request.conversation_id.clone(),
-            message_id: accepted.message_id.clone(),
+            message_id: message_id.to_owned(),
         },
     )
 }
@@ -1731,75 +1719,30 @@ fn remove_hermes_running_message(
     Ok(())
 }
 
-fn sync_agent_room(
-    store: &mut SqliteClientStore,
-    device: &mut FiniteChatDevice,
-    home_delivery: &mut AgentDelivery,
-    room_id: &str,
-) -> Result<(), CliError> {
-    let options = sync_options();
-    if let Some(room_server_url) = device.room_server_url(room_id).map(str::to_owned) {
-        let mut room_delivery =
-            HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(room_server_url.clone()));
-        run_room_server_sync_tick(
-            store,
-            device,
-            &mut room_delivery,
-            &options,
-            &room_server_url,
-        )
-    } else {
-        run_runtime_sync_tick(store, device, home_delivery, &options)
-    }
-    .map(|_| ())
-    .map_err(|error| CliError::Hermes(format!("{error:?}")))
-}
-
 fn cmd_activity<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
     let request: HermesActivityRequestV1 =
         serde_json::from_value(request).map_err(CliError::Json)?;
     let home = load_home(home_dir)?;
-    let (_store, device, mut delivery) = open_agent(&home)?;
     let payload = if matches!(request.action, EphemeralActivityActionV1::Set) {
         serde_json::to_vec(&request.payload).map_err(CliError::Serialize)?
     } else {
         Vec::new()
     };
-    let activity = DecryptedEphemeralActivityV1 {
-        activity_kind: request.activity_kind,
-        activity_id: request.activity_id,
-        action: request.action,
-        payload,
-    };
-    activity
-        .validate_limits()
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let plaintext = serde_json::to_vec(&activity).map_err(CliError::Serialize)?;
-    let payload = device
-        .encrypt_activity_payload(&request.room_id, &plaintext)
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let now = now_ms();
-    let expires_in = if request.expires_in_millis == 0 {
-        ACTIVITY_DEFAULT_EXPIRY_MS
-    } else {
-        request.expires_in_millis
-    };
-    let accepted = delivery
-        .append_activity(&AppendEphemeralActivityRequest {
-            room_id: request.room_id.clone(),
-            mls_group_id: device
-                .room_mls_group_id(&request.room_id)
-                .map_err(|error| CliError::Hermes(error.to_string()))?,
-            epoch: device
-                .group_epoch(&request.room_id)
-                .map_err(|error| CliError::Hermes(error.to_string()))?,
-            sender: device.device_ref().clone(),
-            conversation_id: request.conversation_id.clone(),
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    let accepted = runtime
+        .append_ephemeral_activity_and_wait(AppBridgeActivityInput {
+            room_id: request.room_id,
+            conversation_id: request.conversation_id,
+            activity_kind: request.activity_kind,
+            activity_id: request.activity_id,
+            action: request.action,
             payload,
-            received_at_ms: now,
-            expires_at_ms: now.saturating_add(expires_in),
+            expires_in_millis: request.expires_in_millis,
         })
-        .map_err(|error| CliError::Hermes(format!("{error:?}")))?;
+        .map_err(map_core_hermes_error)?;
     crate::write_pretty_json(output, &json!({ "accepted": true, "result": accepted }))
 }
 
@@ -1944,6 +1887,21 @@ fn load_home(dir: &Path) -> Result<AgentHome, CliError> {
 
 type AgentDelivery = HttpRuntimeDelivery<ReqwestHttpRuntimeTransport>;
 
+fn open_agent_runtime(home: &AgentHome) -> Result<Arc<FiniteChatRuntime>, CliError> {
+    FiniteChatRuntime::open(OpenOptions {
+        data_dir: home.dir.to_string_lossy().into_owned(),
+        server_url: home.config.server_url.clone(),
+        device_id: home.config.device_id.clone(),
+        account_secret_hex: Some(hex_lower(home.secret.as_bytes())),
+        now_unix_seconds: Some(now_secs()),
+    })
+    .map_err(map_core_hermes_error)
+}
+
+fn map_core_hermes_error(error: FiniteChatCoreError) -> CliError {
+    CliError::Hermes(error.to_string())
+}
+
 fn open_agent(
     home: &AgentHome,
 ) -> Result<(SqliteClientStore, FiniteChatDevice, AgentDelivery), CliError> {
@@ -1984,21 +1942,18 @@ fn device_config(
     }
 }
 
-fn sync_options() -> RuntimeSyncOptions {
-    RuntimeSyncOptions {
-        key_package_target_available: KEY_PACKAGE_TARGET_AVAILABLE,
-        max_sync_pages_per_room: 8,
-    }
-}
-
 fn load_invites(dir: &Path) -> Result<Vec<InviteCodeV1>, CliError> {
-    let raw = fs::read_to_string(dir.join(INVITES_FILE)).unwrap_or_else(|_| "[]".to_owned());
-    let urls: Vec<String> = serde_json::from_str(&raw).map_err(CliError::Json)?;
+    let urls = load_invite_urls(dir)?;
     let mut codes = Vec::with_capacity(urls.len());
     for url in urls {
         codes.push(InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?);
     }
     Ok(codes)
+}
+
+fn load_invite_urls(dir: &Path) -> Result<Vec<String>, CliError> {
+    let raw = fs::read_to_string(dir.join(INVITES_FILE)).unwrap_or_else(|_| "[]".to_owned());
+    serde_json::from_str(&raw).map_err(CliError::Json)
 }
 
 fn append_invite(dir: &Path, url: &str) -> Result<(), CliError> {
@@ -2020,6 +1975,16 @@ fn write_private(path: PathBuf, contents: &str) -> Result<(), CliError> {
             .map_err(|error| CliError::Hermes(error.to_string()))?;
     }
     Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn read_request(request_json: Option<String>) -> Result<Value, CliError> {
@@ -2237,6 +2202,66 @@ mod tests {
         .expect("typed plain-text chat is still bridge-visible");
         assert_eq!(event.text, "plain hello");
         assert_eq!(event.message_type, HermesMessageTypeV1::Text);
+    }
+
+    #[test]
+    fn inbox_cursor_redelivers_until_ack_then_blocks_stale_recovery() {
+        let home = tempfile::tempdir().unwrap();
+        let mut inbox = HermesInboxState::default();
+        let first = HermesPollEventV1::finite_chat_text(
+            "room-a",
+            10,
+            "msg-10",
+            "account-a",
+            "phone",
+            "one",
+        )
+        .unwrap();
+
+        enqueue_hermes_inbox_event(home.path(), &mut inbox, first.clone()).unwrap();
+        enqueue_hermes_inbox_event(home.path(), &mut inbox, first.clone()).unwrap();
+        assert_eq!(hermes_inbox_cursor(&inbox, "room-a"), 10);
+        assert_eq!(pending_hermes_inbox_events(&inbox, None, 10).len(), 1);
+
+        let mut output = Vec::new();
+        cmd_ack(
+            home.path(),
+            serde_json::to_value(HermesAckRequestV1 {
+                room_id: "room-a".to_owned(),
+                seq: 10,
+                message_id: "msg-10".to_owned(),
+            })
+            .unwrap(),
+            &mut output,
+        )
+        .unwrap();
+        let acked: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(acked["acked"], true);
+
+        let mut inbox = load_hermes_inbox(home.path()).unwrap();
+        assert_eq!(hermes_inbox_cursor(&inbox, "room-a"), 10);
+        assert!(pending_hermes_inbox_events(&inbox, None, 10).is_empty());
+
+        enqueue_hermes_inbox_event(home.path(), &mut inbox, first).unwrap();
+        assert!(
+            pending_hermes_inbox_events(&inbox, None, 10).is_empty(),
+            "an acked seq must not be re-enqueued from durable recovery"
+        );
+
+        let second = HermesPollEventV1::finite_chat_text(
+            "room-a",
+            11,
+            "msg-11",
+            "account-a",
+            "phone",
+            "two",
+        )
+        .unwrap();
+        enqueue_hermes_inbox_event(home.path(), &mut inbox, second).unwrap();
+        let pending = pending_hermes_inbox_events(&inbox, None, 10);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, "msg-11");
+        assert_eq!(hermes_inbox_cursor(&inbox, "room-a"), 11);
     }
 
     #[test]

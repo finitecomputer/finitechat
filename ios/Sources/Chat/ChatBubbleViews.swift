@@ -40,8 +40,8 @@ struct ChatTimelineRowView: View {
             )
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
-        case .typing(let members):
-            ChatTypingIndicatorRow(members: members)
+        case .activity(let activity):
+            ChatActivityMarkerRow(activity: activity)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 4)
         }
@@ -1694,27 +1694,35 @@ private struct MessageStatusLine: View {
     }
 }
 
-private struct ChatTypingIndicatorRow: View {
-    let members: [AppTypingMember]
+private struct ChatActivityMarkerRow: View {
+    let activity: ChatTimelineActivity
 
     private let avatarSize: CGFloat = 28
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
             ChatAvatar(
-                title: primaryName,
-                subtitle: primaryMember?.npub ?? primaryMember?.accountId ?? "typing",
+                title: activity.primaryDisplayName,
+                subtitle: activity.primarySubtitle,
                 size: avatarSize
             )
             .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 4) {
-                TypingDotsBubble()
+            HStack(spacing: 8) {
+                ActivityMarkerGlyph(kind: activity.kind)
+                    .accessibilityHidden(true)
 
-                Text(label)
-                    .font(.caption2.weight(.semibold))
+                Text(activity.label)
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(Color.secondary.opacity(0.14), lineWidth: 1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -1722,44 +1730,44 @@ private struct ChatTypingIndicatorRow: View {
         }
         .frame(maxWidth: .infinity)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(label)
-    }
-
-    private var primaryMember: AppTypingMember? {
-        members.first
-    }
-
-    private var primaryName: String {
-        let trimmed = primaryMember?.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let trimmed, !trimmed.isEmpty {
-            return trimmed
-        }
-        return primaryMember?.deviceId ?? "Someone"
-    }
-
-    private var label: String {
-        if members.count <= 1 {
-            return "\(primaryName) is typing"
-        }
-        return "\(primaryName) and \(members.count - 1) others are typing"
+        .accessibilityLabel(activity.label)
+        .accessibilityIdentifier("ChatActivityMarker-\(activity.kind.id)")
     }
 }
 
-private struct TypingDotsBubble: View {
+private struct ActivityMarkerGlyph: View {
+    let kind: ChatActivityKind
+
+    var body: some View {
+        switch kind {
+        case .typing:
+            TypingDotsGlyph()
+        case .thinking, .working, .other:
+            ProgressView()
+                .controlSize(.mini)
+                .tint(.secondary)
+                .frame(width: 16, height: 16)
+        }
+    }
+}
+
+private struct TypingDotsGlyph: View {
     var body: some View {
         TimelineView(.animation) { context in
-            HStack(spacing: 4) {
-                ForEach(0..<3, id: \.self) { index in
-                    Circle()
-                        .fill(Color.secondary)
-                        .frame(width: 5, height: 5)
-                        .opacity(dotOpacity(index: index, date: context.date))
-                }
+            HStack(spacing: 3) {
+                dot(index: 0, date: context.date)
+                dot(index: 1, date: context.date)
+                dot(index: 2, date: context.date)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
+            .frame(width: 18, height: 16)
         }
+    }
+
+    private func dot(index: Int, date: Date) -> some View {
+        Circle()
+            .fill(Color.secondary)
+            .frame(width: 4, height: 4)
+            .opacity(dotOpacity(index: index, date: date))
     }
 
     private func dotOpacity(index: Int, date: Date) -> Double {

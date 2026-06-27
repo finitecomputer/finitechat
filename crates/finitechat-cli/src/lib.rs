@@ -1,7 +1,6 @@
 use std::io::Write;
 
 mod app;
-mod core;
 mod hermes;
 mod identity;
 
@@ -62,8 +61,8 @@ pub enum CliError {
     Hermes(String),
     #[error("identity: {0}")]
     Identity(String),
-    #[error("core: {0}")]
-    Core(String),
+    #[error("runtime: {0}")]
+    Runtime(String),
 }
 
 impl CliError {
@@ -77,7 +76,7 @@ impl CliError {
             | Self::Output(_)
             | Self::Hermes(_)
             | Self::Identity(_)
-            | Self::Core(_) => 1,
+            | Self::Runtime(_) => 1,
         }
     }
 }
@@ -103,7 +102,6 @@ where
         Some("app") => app::run(args.into_iter().skip(1).collect(), output),
         Some("identity") => identity::run(args.into_iter().skip(1).collect(), output),
         Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
-        Some("core") => core::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
             let request = prepare_http_request(args.into_iter().skip(1))?;
             execute_http_request(&request, output)
@@ -897,10 +895,9 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat <http-smoke|http|identity|hermes|core|app>\n\n{}\n\n{}\n\n{}\n\n{}",
+        "usage: finitechat <http-smoke|http|identity|hermes|app>\n\n{}\n\n{}\n\n{}",
         identity::usage(),
         app::usage(),
-        core::usage(),
         http_usage()
     )
 }
@@ -1653,6 +1650,194 @@ mod tests {
     fn unknown_option_is_usage_error() {
         let error = prepare_http_request(["health", "--wat"]).expect_err("usage error");
         assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn core_product_command_is_removed() {
+        let mut output = Vec::new();
+        let error = run(["core"], &mut output).expect_err("core command is gone");
+        assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn app_identity_and_state_use_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("app").display().to_string();
+
+        let identity = run_cli_json([
+            "app",
+            "--data-dir",
+            &data_dir,
+            "--server",
+            "http://127.0.0.1:1",
+            "--device-id",
+            "cli-device",
+            "--now",
+            "1000",
+            "identity",
+        ]);
+        assert_eq!(identity["device_id"], "cli-device");
+        assert!(identity["account_id"].as_str().unwrap().len() > 16);
+
+        let state = run_cli_json([
+            "app",
+            "--data-dir",
+            &data_dir,
+            "--server",
+            "http://127.0.0.1:1",
+            "--device-id",
+            "cli-device",
+            "--now",
+            "1000",
+            "state",
+        ]);
+        assert_eq!(state["identity"]["account_id"], identity["account_id"]);
+        assert_eq!(state["rooms"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn app_cli_invite_pin_and_message_flow_uses_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_cli_server(&dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice").display().to_string();
+        let bob_dir = dir.path().join("bob").display().to_string();
+
+        let created = run_cli_json([
+            "app",
+            "--data-dir",
+            &alice_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "alice-cli",
+            "--now",
+            "1000",
+            "create-room",
+            "--display-name",
+            "CLI App Flow",
+        ]);
+        let room_id = created["selected_room_id"].as_str().unwrap().to_owned();
+        assert_eq!(created["status"], "room created");
+
+        let invite = run_cli_json([
+            "app",
+            "--data-dir",
+            &alice_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "alice-cli",
+            "--now",
+            "1000",
+            "create-invite",
+            "--room-id",
+            &room_id,
+        ]);
+        let invite_url = invite["invite_url"].as_str().unwrap().to_owned();
+        let pin = invite["pin"].as_str().unwrap().to_owned();
+
+        let scanned = run_cli_json([
+            "app",
+            "--data-dir",
+            &bob_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "bob-cli",
+            "--now",
+            "1000",
+            "scan",
+            "--value",
+            &invite_url,
+        ]);
+        assert_eq!(scanned["selected_room_id"], room_id);
+        assert_eq!(scanned["status"], "invite scanned");
+
+        let requested = run_cli_json([
+            "app",
+            "--data-dir",
+            &bob_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "bob-cli",
+            "--now",
+            "1000",
+            "submit-pin",
+            "--room-id",
+            &room_id,
+            "--pin",
+            &pin,
+        ]);
+        assert_eq!(requested["status"], "join requested");
+
+        run_cli_json([
+            "app",
+            "--data-dir",
+            &alice_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "alice-cli",
+            "--now",
+            "1000",
+            "start",
+        ]);
+        let joined = run_cli_json([
+            "app",
+            "--data-dir",
+            &bob_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "bob-cli",
+            "--now",
+            "1000",
+            "start",
+        ]);
+        let bob_room = joined["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|room| room["room_id"] == room_id)
+            .expect("bob room projects");
+        assert_eq!(bob_room["state"], "Connected");
+
+        run_cli_json([
+            "app",
+            "--data-dir",
+            &bob_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "bob-cli",
+            "--now",
+            "1000",
+            "send",
+            "--room-id",
+            &room_id,
+            "--text",
+            "hello from app cli",
+        ]);
+        let synced = run_cli_json([
+            "app",
+            "--data-dir",
+            &alice_dir,
+            "--server",
+            &server_url,
+            "--device-id",
+            "alice-cli",
+            "--now",
+            "1000",
+            "start",
+        ]);
+        assert!(
+            synced["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["text"] == "hello from app cli")
+        );
     }
 
     fn run_cli_json<const N: usize>(args: [&str; N]) -> Value {

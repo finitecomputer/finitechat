@@ -28,6 +28,9 @@ def proven_smoke_report() -> dict[str, object]:
             "hermes_agent_version_actual": "0.17.0",
             "restic_version": "restic 0.18.0 compiled with go1.24.4 on linux/arm64",
             "restic_backend": "s3",
+            "real_gateway_runtime": True,
+            "gateway_admission_before_restore": True,
+            "gateway_admission_after_restore": True,
             "agent_state_backup": {
                 "backend": "restic",
                 "repository": {

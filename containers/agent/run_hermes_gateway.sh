@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+agent_home="${FINITECHAT_HOME:-/data/agent}"
+hermes_home="${HERMES_HOME:-${agent_home}/hermes-home}"
+server_url="${FINITE_SERVER_URL:-${FINITECHAT_SERVER_URL:-}}"
+device_id="${FINITECHAT_HERMES_AGENT_DEVICE_ID:-agent}"
+finitechat_bin="${FINITECHAT_BIN:-/usr/local/bin/finitechat}"
+plugin_name="${FINITECHAT_HERMES_PLUGIN_NAME:-finite}"
+model="${FINITECHAT_HERMES_MODEL:-anthropic/claude-sonnet-4.6}"
+provider="${FINITECHAT_HERMES_PROVIDER:-openrouter}"
+base_url="${FINITECHAT_HERMES_BASE_URL:-https://openrouter.ai/api/v1}"
+api_mode="${FINITECHAT_HERMES_API_MODE:-chat_completions}"
+service_addr="${FINITECHAT_HERMES_SERVICE_ADDR:-127.0.0.1:0}"
+poll_timeout_secs="${FINITECHAT_HERMES_POLL_TIMEOUT_SECS:-1}"
+poll_limit="${FINITECHAT_HERMES_POLL_LIMIT:-10}"
+workspace="${FINITECHAT_WORKSPACE:-/workspace}"
+
+export FINITECHAT_HOME="$agent_home"
+export HERMES_HOME="$hermes_home"
+export FINITECHAT_BIN="$finitechat_bin"
+export FINITECHAT_HERMES_INBOUND_STREAM="${FINITECHAT_HERMES_INBOUND_STREAM:-1}"
+export FINITECHAT_HERMES_SERVICE_ADDR="$service_addr"
+export FINITECHAT_ALLOW_ALL_USERS="${FINITECHAT_ALLOW_ALL_USERS:-true}"
+export FINITE_ALLOW_ALL_USERS="${FINITE_ALLOW_ALL_USERS:-true}"
+export GATEWAY_ALLOW_ALL_USERS="${GATEWAY_ALLOW_ALL_USERS:-true}"
+export FINITE_AGENT_ID="${FINITE_AGENT_ID:-agent_${device_id}}"
+export FINITE_AGENT_NAME="${FINITE_AGENT_NAME:-Finite Agent}"
+
+mkdir -p "$agent_home" "$hermes_home/plugins" "$workspace"
+
+if [[ ! -f "${agent_home}/config.json" ]]; then
+    if [[ -z "$server_url" ]]; then
+        echo "FINITE_AGENT_START_ERROR missing FINITE_SERVER_URL for first initialization" >&2
+        exit 64
+    fi
+    "$finitechat_bin" hermes --home "$agent_home" init \
+        --server "$server_url" \
+        --device-id "$device_id" \
+        >/dev/null
+fi
+
+"$finitechat_bin" hermes --home "$agent_home" install \
+    --plugins-dir "${hermes_home}/plugins" \
+    --plugin-name "$plugin_name" \
+    --finitechat-bin "$finitechat_bin" \
+    --force \
+    --json \
+    >/dev/null
+
+if ! "$finitechat_bin" hermes --home "$agent_home" pin >/tmp/finitechat-invite.json 2>/dev/null; then
+    "$finitechat_bin" hermes --home "$agent_home" invite \
+        --room-name "${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}" \
+        --json \
+        >/tmp/finitechat-invite.json
+fi
+
+cat >"${hermes_home}/config.yaml" <<EOF
+model:
+  default: ${model}
+  provider: ${provider}
+  base_url: ${base_url}
+  api_mode: ${api_mode}
+plugins:
+  enabled:
+    - finite-platform
+gateway:
+  platforms:
+    finite:
+      enabled: true
+      extra:
+        home: ${agent_home}
+        finitechat_bin: ${finitechat_bin}
+        inbound_stream: true
+        service_addr: ${service_addr}
+        poll_timeout_secs: ${poll_timeout_secs}
+        poll_limit: ${poll_limit}
+terminal:
+  backend: local
+  cwd: ${workspace}
+  persistent_shell: true
+approvals:
+  mode: off
+display:
+  streaming: false
+security:
+  redact_secrets: true
+_config_version: 10
+EOF
+
+python /opt/health_server.py &
+health_pid="$!"
+trap 'kill "$health_pid" 2>/dev/null || true' EXIT
+
+echo "FINITE_AGENT_RUNTIME real_hermes_gateway=true hermes_home=${hermes_home} agent_home=${agent_home}"
+exec hermes gateway run --replace

@@ -51,7 +51,8 @@ FINITECHAT_SERVER_URL=http://127.0.0.1:8787 cargo run -p finitechat-rmp -- run i
 ```
 
 To test the iOS app surface with a real local Hermes gateway, use the bundled
-runner instead of the plain server command:
+runner instead of the plain server command. This is a low-level local runner,
+not the physical-phone canary gate:
 
 ```sh
 scripts/hermes-real-gateway-demo.sh
@@ -68,6 +69,11 @@ The Hermes runner needs a prepared Hermes checkout with a `.venv`; set
 finitecomputer checkout location. It also needs the model provider key used by
 the Hermes profile. The runner loads `.env` when present, or set
 `FINITECHAT_HERMES_ENV_FILE=/path/to/provider.env`.
+
+For the hardened "fresh Hermes instance to Paul's phone" quality loop, use
+`docs/hermes-phone-canary-loop.md`. That runbook defines the local phone,
+remote Docker, and Tinfoil promotion gates and the evidence required before a
+human invite is handed out.
 
 The normal app flow is:
 
@@ -95,7 +101,14 @@ iOS checks:
 ```sh
 cargo run -p finitechat-rmp -- doctor
 cargo run -p finitechat-rmp -- bindings swift
+cargo run -p finitechat-rmp -- test ios-simulator
 ```
+
+`finitechat-rmp test ios-simulator` owns the simulator test lifecycle: it
+creates or reuses a dedicated RMP simulator, shuts it down, erases it, runs the
+full `FiniteChat` test scheme with isolated derived data and `.xcresult` output
+under `.state`, then terminates and shuts the simulator down. Use `--json` when
+automation needs the resolved UDID and result bundle path.
 
 Hermes/Python checks:
 

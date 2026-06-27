@@ -30,17 +30,17 @@ cargo clippy -p finitechat-mls -p finitechat-core --all-targets -- -D warnings
 ```
 
 Then run the iOS simulator unit suite for scheme `FiniteChat`. The current
-XcodeBuildMCP profile uses:
+canonical command is:
 
-```text
-project: ios/FiniteChat.xcodeproj
-scheme: FiniteChat
-simulator: iPhone 17 Pro
-derived data: .state/xcode-derived-data
+```sh
+cargo run -q -p finitechat-rmp -- test ios-simulator
 ```
 
 Expected result: all simulator unit tests pass, with only intentionally skipped
-live-relay tests skipped.
+live-relay tests skipped. The RMP command erases the dedicated simulator before
+launch, writes derived data and the `.xcresult` bundle under `.state`, and shuts
+the simulator down after the run so back-to-back unit-suite runs do not inherit
+stale app state or a busy SpringBoard.
 
 ## Server Sync Gate
 

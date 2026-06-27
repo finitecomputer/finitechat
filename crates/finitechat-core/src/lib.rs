@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -33,14 +35,14 @@ use finitechat_proto::{
     AppendEphemeralActivityRequest, ApplicationDeliveryPolicy, AttachmentBlobMetadataV1,
     AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1,
     ClaimKeyPackageResult, CreateRoomRequest, DecryptedApplicationEventV1,
-    DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind, EphemeralActivityActionV1,
-    EphemeralActivityIngressContext, EphemeralActivityProjection, EphemeralActivityProjectionEntry,
-    FINITECHAT_ACTIVITY_KIND_THINKING, FINITECHAT_ACTIVITY_KIND_TYPING,
-    FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, INVITE_URL_PREFIX, InviteCodeV1,
-    ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1, invite_current_pin,
-    nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
-    validate_string_bytes,
+    DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind, EphemeralActivityAccepted,
+    EphemeralActivityActionV1, EphemeralActivityIngressContext, EphemeralActivityProjection,
+    EphemeralActivityProjectionEntry, EventAccepted, FINITECHAT_ACTIVITY_KIND_THINKING,
+    FINITECHAT_ACTIVITY_KIND_TYPING, FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1,
+    INVITE_URL_PREFIX, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
+    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1,
+    invite_current_pin, nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode,
+    validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -65,6 +67,7 @@ const DEFAULT_CREDENTIAL_VALIDITY_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 const DEFAULT_INVITE_TTL_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_INVITE_MAX_JOINS: u32 = 32;
 const DEFAULT_APP_UPDATE_WAIT_MILLIS: u64 = 30_000;
+const DEFAULT_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30_000;
 const MIN_APP_UPDATE_WAIT_MILLIS: u64 = 1_000;
 const MAX_APP_UPDATE_WAIT_MILLIS: u64 = 60_000;
 const MAX_ATTACHMENTS_PER_MESSAGE: u32 = 32;
@@ -441,6 +444,64 @@ pub struct AppTypingMember {
     pub device_id: String,
     pub display_name: String,
     pub npub: Option<String>,
+    pub activity_kind: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum AppScanTargetOutcome {
+    #[default]
+    None,
+    Profile,
+    Room,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppFlowState {
+    pub notice_text: Option<String>,
+    pub notice_busy: bool,
+    pub scan_in_flight: bool,
+    pub invite_pin_submission_room_id: Option<String>,
+    pub scan_result: AppScanTargetOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSentMessage {
+    pub message_id: String,
+    pub seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAcceptedActivity {
+    pub route_key: String,
+    pub cached_events_for_route: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppBridgeActivityInput {
+    pub room_id: String,
+    pub conversation_id: Option<String>,
+    pub activity_kind: String,
+    pub activity_id: Option<String>,
+    pub action: EphemeralActivityActionV1,
+    pub payload: Vec<u8>,
+    pub expires_in_millis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppBridgeAppliedEvent {
+    pub room_id: String,
+    pub seq: u64,
+    pub message_id: String,
+    pub sender_account_id: String,
+    pub sender_device_id: String,
+    pub plaintext: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppBridgeSync {
+    pub joined_account_ids: Vec<String>,
+    pub events: Vec<AppBridgeAppliedEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -459,6 +520,7 @@ pub struct AppState {
     pub profiles: Vec<AppProfileSummary>,
     pub devices: Vec<AppDeviceSummary>,
     pub typing_members: Vec<AppTypingMember>,
+    pub flow: AppFlowState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
@@ -569,6 +631,16 @@ pub enum AppAction {
     RemovePushToken,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Enum)]
+pub enum AppUpdate {
+    FullState(AppState),
+}
+
+#[uniffi::export(callback_interface)]
+pub trait AppReconciler: Send + Sync + 'static {
+    fn reconcile(&self, update: AppUpdate);
+}
+
 struct CoreState {
     data_dir: PathBuf,
     server_url: String,
@@ -579,13 +651,82 @@ struct CoreState {
 }
 
 #[derive(uniffi::Object)]
-pub struct FiniteChatCore {
-    state: Mutex<CoreState>,
+pub struct FiniteChatRuntime {
+    command_tx: mpsc::Sender<AppRuntimeCommand>,
+    shared_state: Arc<Mutex<AppState>>,
+    reconciler: Arc<Mutex<Option<Box<dyn AppReconciler>>>>,
+    listening: AtomicBool,
 }
 
-#[derive(uniffi::Object)]
-pub struct FiniteChatRuntime {
-    state: Mutex<AppRuntimeState>,
+enum AppRuntimeCommand {
+    Dispatch {
+        action: AppAction,
+        response: Option<mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>>,
+    },
+    WaitPlan {
+        timeout_millis: u64,
+        response: mpsc::SyncSender<Result<AppRuntimeWaitPlan, FiniteChatCoreError>>,
+    },
+    ApplySyncHint {
+        event: SyncHintEvent,
+        response: mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>,
+    },
+    CreateInviteWithOptions {
+        room_id: String,
+        display_name: Option<String>,
+        max_joins: u32,
+        ttl_ms: u64,
+        response: mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>,
+    },
+    SubmitInvitePinWithDisplayName {
+        pending_room_id: String,
+        pin: String,
+        display_name: Option<String>,
+        response: mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>,
+    },
+    AgentBridgePoll {
+        invite_urls: Vec<String>,
+        response: mpsc::SyncSender<Result<AppBridgeSync, FiniteChatCoreError>>,
+    },
+    SendEncodedChatMessage {
+        room_id: String,
+        app_event_plaintext: Vec<u8>,
+        preview: String,
+        response: mpsc::SyncSender<Result<AppSentMessage, FiniteChatCoreError>>,
+    },
+    AppendEphemeralActivity {
+        input: AppBridgeActivityInput,
+        response: mpsc::SyncSender<Result<AppAcceptedActivity, FiniteChatCoreError>>,
+    },
+    DebugOutbox {
+        response: mpsc::SyncSender<Result<Vec<AppOutboxDebugRow>, FiniteChatCoreError>>,
+    },
+    #[cfg(test)]
+    TestLoadOutbox {
+        response: mpsc::SyncSender<Result<Vec<StoredOutboundMessage>, FiniteChatCoreError>>,
+    },
+    #[cfg(test)]
+    TestSaveOutbox {
+        rows: Vec<StoredOutboundMessage>,
+        response: mpsc::SyncSender<Result<(), FiniteChatCoreError>>,
+    },
+    #[cfg(test)]
+    TestRevokedDevices {
+        response: mpsc::SyncSender<Result<BTreeSet<String>, FiniteChatCoreError>>,
+    },
+    #[cfg(test)]
+    TestSeedRoomState {
+        room: StoredAppRoom,
+        selected_room_id: Option<String>,
+        response: mpsc::SyncSender<Result<(), FiniteChatCoreError>>,
+    },
+    #[cfg(test)]
+    TestAppendActivity {
+        room_id: String,
+        activity_kind: String,
+        action: EphemeralActivityActionV1,
+        response: mpsc::SyncSender<Result<(), FiniteChatCoreError>>,
+    },
 }
 
 struct AppRuntimeState {
@@ -814,161 +955,67 @@ pub fn finite_sites_native_viewer_session_proof(
 }
 
 #[uniffi::export]
-impl FiniteChatCore {
-    #[uniffi::constructor]
-    pub fn open(options: OpenOptions) -> Result<Arc<Self>, FiniteChatCoreError> {
-        let state = CoreState::open(options)?;
-        Ok(Arc::new(Self {
-            state: Mutex::new(state),
-        }))
-    }
-
-    pub fn identity(&self) -> Result<Identity, FiniteChatCoreError> {
-        let state = self.lock()?;
-        Ok(state.identity())
-    }
-
-    pub fn bootstrap_room(
-        &self,
-        room_id: String,
-        display_name: Option<String>,
-    ) -> Result<BootstrapRoomResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.bootstrap_room(&room_id, display_name)
-    }
-
-    pub fn create_invite(
-        &self,
-        room_id: String,
-        display_name: Option<String>,
-    ) -> Result<InviteResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.create_invite(&room_id, display_name)
-    }
-
-    pub fn current_invite_pin(&self, invite_url: String) -> Result<String, FiniteChatCoreError> {
-        let state = self.lock()?;
-        let code = parse_invite(&invite_url)?;
-        Ok(invite_current_pin(
-            &code.invite_token,
-            state.now_unix_seconds()?,
-        ))
-    }
-
-    pub fn join_invite(
-        &self,
-        invite_url: String,
-        pin: String,
-        display_name: Option<String>,
-    ) -> Result<JoinRequestResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.join_invite(&invite_url, &pin, display_name)
-    }
-
-    pub fn accept_invite_joins(
-        &self,
-        invite_url: String,
-    ) -> Result<AcceptInvitesResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.accept_invite_joins(&invite_url)
-    }
-
-    pub fn finalize_invite(&self, invite_url: String) -> Result<(), FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.finalize_invite(&invite_url)
-    }
-
-    pub fn send_text(
-        &self,
-        room_id: String,
-        text: String,
-    ) -> Result<SyncResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.send_text(&room_id, &text)
-    }
-
-    pub fn send_attachment(
-        &self,
-        room_id: String,
-        filename: String,
-        mime_type: String,
-        kind: ChatMediaKind,
-        bytes: Vec<u8>,
-        caption: String,
-    ) -> Result<SyncResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.send_attachment(SendAttachmentInput {
-            room_id,
-            attachments: vec![OutboundAttachment {
-                filename,
-                mime_type,
-                kind,
-                bytes,
-            }],
-            caption,
-            reply_to_message_id: None,
-        })
-    }
-
-    pub fn send_poll(
-        &self,
-        room_id: String,
-        question: String,
-        options: Vec<String>,
-    ) -> Result<SyncResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.send_poll(&room_id, &question, options)
-    }
-
-    pub fn sync(&self) -> Result<SyncResult, FiniteChatCoreError> {
-        let mut state = self.lock()?;
-        state.sync()
-    }
-}
-
-impl FiniteChatCore {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, CoreState>, FiniteChatCoreError> {
-        self.state
-            .lock()
-            .map_err(|_| FiniteChatCoreError::LockPoisoned)
-    }
-}
-
-#[uniffi::export]
 impl FiniteChatRuntime {
     #[uniffi::constructor]
     pub fn open(options: OpenOptions) -> Result<Arc<Self>, FiniteChatCoreError> {
         let core = CoreState::open(options)?;
+        let runtime_state = AppRuntimeState::new(core)?;
+        let initial_state = runtime_state.app.clone();
+        let shared_state = Arc::new(Mutex::new(initial_state.clone()));
+        let reconciler = Arc::new(Mutex::new(None::<Box<dyn AppReconciler>>));
+        let (command_tx, command_rx) = mpsc::channel();
+        spawn_app_runtime_worker(
+            runtime_state,
+            command_rx,
+            Arc::clone(&shared_state),
+            Arc::clone(&reconciler),
+        );
         Ok(Arc::new(Self {
-            state: Mutex::new(AppRuntimeState::new(core)?),
+            command_tx,
+            shared_state,
+            reconciler,
+            listening: AtomicBool::new(false),
         }))
     }
 
     pub fn state(&self) -> Result<AppState, FiniteChatCoreError> {
         let state = self
-            .state
+            .shared_state
             .lock()
             .map_err(|_| FiniteChatCoreError::LockPoisoned)?;
-        Ok(state.app.clone())
+        Ok(state.clone())
     }
 
-    pub fn dispatch(&self, action: AppAction) -> Result<AppState, FiniteChatCoreError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| FiniteChatCoreError::LockPoisoned)?;
-        state.dispatch(action)?;
-        Ok(state.app.clone())
+    pub fn dispatch(&self, action: AppAction) -> Result<(), FiniteChatCoreError> {
+        self.command_tx
+            .send(AppRuntimeCommand::Dispatch {
+                action,
+                response: None,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })
+    }
+
+    pub fn dispatch_and_wait(&self, action: AppAction) -> Result<AppState, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::Dispatch {
+                action,
+                response: Some(response_tx),
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before completing command".to_owned(),
+            })?
     }
 
     pub fn wait_for_update(&self, timeout_millis: u64) -> Result<AppState, FiniteChatCoreError> {
-        let plan = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| FiniteChatCoreError::LockPoisoned)?;
-            state.wait_plan(timeout_millis)
-        };
+        let plan = self.wait_plan(timeout_millis)?;
 
         let event = {
             let mut delivery = delivery_for(&plan.server_url);
@@ -976,24 +1023,502 @@ impl FiniteChatRuntime {
             stream.next_hint().map_err(runtime_error)?
         };
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| FiniteChatCoreError::LockPoisoned)?;
-        state.apply_sync_hint(event);
-        state.runtime_tick()?;
-        state.bump_rev();
-        Ok(state.app.clone())
+        self.apply_sync_hint_and_wait(event)
+    }
+
+    pub fn listen_for_updates(&self, reconciler: Box<dyn AppReconciler>) {
+        if self
+            .listening
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(mut slot) = self.reconciler.lock() {
+            *slot = Some(reconciler);
+            if let Ok(state) = self.shared_state.lock()
+                && let Some(listener) = slot.as_ref()
+            {
+                listener.reconcile(AppUpdate::FullState(state.clone()));
+            }
+        }
     }
 }
 
 impl FiniteChatRuntime {
+    fn wait_plan(&self, timeout_millis: u64) -> Result<AppRuntimeWaitPlan, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::WaitPlan {
+                timeout_millis,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before preparing update wait".to_owned(),
+            })?
+    }
+
+    fn apply_sync_hint_and_wait(
+        &self,
+        event: SyncHintEvent,
+    ) -> Result<AppState, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::ApplySyncHint {
+                event,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before applying update".to_owned(),
+            })?
+    }
+
+    pub fn create_invite_with_options_and_wait(
+        &self,
+        room_id: String,
+        display_name: Option<String>,
+        max_joins: u32,
+        ttl_ms: u64,
+    ) -> Result<AppState, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::CreateInviteWithOptions {
+                room_id,
+                display_name,
+                max_joins,
+                ttl_ms,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before creating invite".to_owned(),
+            })?
+    }
+
+    pub fn submit_invite_pin_with_display_name_and_wait(
+        &self,
+        pending_room_id: String,
+        pin: String,
+        display_name: Option<String>,
+    ) -> Result<AppState, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::SubmitInvitePinWithDisplayName {
+                pending_room_id,
+                pin,
+                display_name,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before submitting invite PIN".to_owned(),
+            })?
+    }
+
+    pub fn agent_bridge_poll_once(
+        &self,
+        invite_urls: Vec<String>,
+    ) -> Result<AppBridgeSync, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::AgentBridgePoll {
+                invite_urls,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before bridge poll".to_owned(),
+            })?
+    }
+
+    pub fn send_encoded_chat_message_and_wait(
+        &self,
+        room_id: String,
+        app_event_plaintext: Vec<u8>,
+        preview: String,
+    ) -> Result<AppSentMessage, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::SendEncodedChatMessage {
+                room_id,
+                app_event_plaintext,
+                preview,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before sending encoded chat message".to_owned(),
+            })?
+    }
+
+    pub fn append_ephemeral_activity_and_wait(
+        &self,
+        input: AppBridgeActivityInput,
+    ) -> Result<AppAcceptedActivity, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::AppendEphemeralActivity {
+                input,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before appending ephemeral activity".to_owned(),
+            })?
+    }
+
     pub fn app_outbox_debug_rows(&self) -> Result<Vec<AppOutboxDebugRow>, FiniteChatCoreError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| FiniteChatCoreError::LockPoisoned)?;
-        state.app_outbox_debug_rows()
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::DebugOutbox {
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before debug snapshot".to_owned(),
+            })?
+    }
+
+    #[cfg(test)]
+    fn test_outbox(&self) -> Result<Vec<StoredOutboundMessage>, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::TestLoadOutbox {
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before test outbox snapshot".to_owned(),
+            })?
+    }
+
+    #[cfg(test)]
+    fn test_save_outbox(
+        &self,
+        rows: Vec<StoredOutboundMessage>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::TestSaveOutbox {
+                rows,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before test outbox write".to_owned(),
+            })?
+    }
+
+    #[cfg(test)]
+    fn test_revoked_devices(&self) -> Result<BTreeSet<String>, FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::TestRevokedDevices {
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before test revoked-device snapshot".to_owned(),
+            })?
+    }
+
+    #[cfg(test)]
+    fn test_seed_room_state(
+        &self,
+        room: StoredAppRoom,
+        selected_room_id: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::TestSeedRoomState {
+                room,
+                selected_room_id,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before test room seed".to_owned(),
+            })?
+    }
+
+    #[cfg(test)]
+    fn test_append_activity(
+        &self,
+        room_id: String,
+        activity_kind: String,
+        action: EphemeralActivityActionV1,
+    ) -> Result<(), FiniteChatCoreError> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::TestAppendActivity {
+                room_id,
+                activity_kind,
+                action,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before test activity append".to_owned(),
+            })?
+    }
+}
+
+fn spawn_app_runtime_worker(
+    mut state: AppRuntimeState,
+    command_rx: mpsc::Receiver<AppRuntimeCommand>,
+    shared_state: Arc<Mutex<AppState>>,
+    reconciler: Arc<Mutex<Option<Box<dyn AppReconciler>>>>,
+) {
+    thread::spawn(move || {
+        publish_app_update(&state.app, &shared_state, &reconciler);
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                AppRuntimeCommand::Dispatch { action, response } => {
+                    if state.prepare_dispatch(&action) {
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                    }
+                    let completed_action = action.clone();
+                    let result = match state.dispatch(action) {
+                        Ok(()) => {
+                            let snapshot = state.app.clone();
+                            publish_app_update(&snapshot, &shared_state, &reconciler);
+                            Ok(snapshot)
+                        }
+                        Err(error) => {
+                            if state.finish_failed_dispatch(&completed_action, &error) {
+                                state.bump_rev();
+                                let snapshot = state.app.clone();
+                                publish_app_update(&snapshot, &shared_state, &reconciler);
+                            }
+                            Err(error)
+                        }
+                    };
+                    if let Some(response) = response {
+                        let _ = response.send(result);
+                    }
+                }
+                AppRuntimeCommand::WaitPlan {
+                    timeout_millis,
+                    response,
+                } => {
+                    let _ = response.send(Ok(state.wait_plan(timeout_millis)));
+                }
+                AppRuntimeCommand::ApplySyncHint { event, response } => {
+                    let result = (|| {
+                        state.apply_sync_hint(event);
+                        state.runtime_tick()?;
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                        Ok(snapshot)
+                    })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::CreateInviteWithOptions {
+                    room_id,
+                    display_name,
+                    max_joins,
+                    ttl_ms,
+                    response,
+                } => {
+                    let result = (|| {
+                        state.create_invite_with_options(
+                            room_id,
+                            display_name,
+                            max_joins,
+                            ttl_ms,
+                        )?;
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                        Ok(snapshot)
+                    })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::SubmitInvitePinWithDisplayName {
+                    pending_room_id,
+                    pin,
+                    display_name,
+                    response,
+                } => {
+                    state.app.flow.invite_pin_submission_room_id = Some(pending_room_id.clone());
+                    state.app.flow.notice_text = Some("Submitting PIN...".to_owned());
+                    state.app.flow.notice_busy = true;
+                    publish_app_update(&state.app.clone(), &shared_state, &reconciler);
+                    let result = match state.submit_invite_pin_with_display_name(
+                        pending_room_id.clone(),
+                        pin,
+                        display_name,
+                    ) {
+                        Ok(()) => {
+                            state.bump_rev();
+                            let snapshot = state.app.clone();
+                            publish_app_update(&snapshot, &shared_state, &reconciler);
+                            Ok(snapshot)
+                        }
+                        Err(error) => {
+                            if state.finish_failed_dispatch(
+                                &AppAction::SubmitInvitePin {
+                                    pending_room_id,
+                                    pin: String::new(),
+                                },
+                                &error,
+                            ) {
+                                state.bump_rev();
+                                publish_app_update(&state.app.clone(), &shared_state, &reconciler);
+                            }
+                            Err(error)
+                        }
+                    };
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::AgentBridgePoll {
+                    invite_urls,
+                    response,
+                } => {
+                    let result = (|| {
+                        let bridge = state.agent_bridge_poll_once(invite_urls)?;
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                        Ok(bridge)
+                    })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::SendEncodedChatMessage {
+                    room_id,
+                    app_event_plaintext,
+                    preview,
+                    response,
+                } => {
+                    let result = (|| {
+                        let sent = state.send_encoded_chat_message(
+                            room_id,
+                            app_event_plaintext,
+                            preview,
+                        )?;
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                        Ok(sent)
+                    })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::AppendEphemeralActivity { input, response } => {
+                    let result = (|| {
+                        let accepted = state.append_ephemeral_activity(input)?;
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                        Ok(accepted)
+                    })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::DebugOutbox { response } => {
+                    let _ = response.send(state.app_outbox_debug_rows());
+                }
+                #[cfg(test)]
+                AppRuntimeCommand::TestLoadOutbox { response } => {
+                    let _ = response.send(state.test_outbox());
+                }
+                #[cfg(test)]
+                AppRuntimeCommand::TestSaveOutbox { rows, response } => {
+                    let _ = response.send(state.test_save_outbox(rows));
+                }
+                #[cfg(test)]
+                AppRuntimeCommand::TestRevokedDevices { response } => {
+                    let _ = response.send(Ok(state.revoked_devices.clone()));
+                }
+                #[cfg(test)]
+                AppRuntimeCommand::TestSeedRoomState {
+                    room,
+                    selected_room_id,
+                    response,
+                } => {
+                    let _ = response.send(state.test_seed_room_state(room, selected_room_id));
+                }
+                #[cfg(test)]
+                AppRuntimeCommand::TestAppendActivity {
+                    room_id,
+                    activity_kind,
+                    action,
+                    response,
+                } => {
+                    let _ =
+                        response.send(state.test_append_activity(&room_id, &activity_kind, action));
+                }
+            }
+        }
+    });
+}
+
+fn publish_app_update(
+    snapshot: &AppState,
+    shared_state: &Arc<Mutex<AppState>>,
+    reconciler: &Arc<Mutex<Option<Box<dyn AppReconciler>>>>,
+) {
+    if let Ok(mut shared) = shared_state.lock() {
+        *shared = snapshot.clone();
+    }
+    if let Ok(slot) = reconciler.lock()
+        && let Some(listener) = slot.as_ref()
+    {
+        listener.reconcile(AppUpdate::FullState(snapshot.clone()));
     }
 }
 
@@ -1107,6 +1632,7 @@ impl AppRuntimeState {
                 profiles: Vec::new(),
                 devices: Vec::new(),
                 typing_members: Vec::new(),
+                flow: AppFlowState::default(),
             },
             chat_projection,
             pending_invites,
@@ -1131,6 +1657,71 @@ impl AppRuntimeState {
         Ok(state)
     }
 
+    fn prepare_dispatch(&mut self, action: &AppAction) -> bool {
+        match action {
+            AppAction::ScanTarget { .. } => {
+                self.app.flow.scan_in_flight = true;
+                self.app.flow.notice_busy = true;
+                self.app.flow.notice_text = None;
+                self.app.flow.scan_result = AppScanTargetOutcome::None;
+                true
+            }
+            AppAction::SubmitInvitePin {
+                pending_room_id, ..
+            } => {
+                self.app.flow.invite_pin_submission_room_id = Some(pending_room_id.clone());
+                self.app.flow.notice_text = Some("Submitting PIN...".to_owned());
+                self.app.flow.notice_busy = true;
+                self.app.flow.scan_in_flight = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn finish_failed_dispatch(&mut self, action: &AppAction, error: &FiniteChatCoreError) -> bool {
+        match action {
+            AppAction::ScanTarget { .. } => {
+                self.app.flow.scan_in_flight = false;
+                self.app.flow.notice_busy = false;
+                self.app.flow.scan_result = AppScanTargetOutcome::Unavailable;
+                self.app.flow.notice_text = Some(scan_target_failure_message(error));
+                self.app.status = "scan unavailable".to_owned();
+                true
+            }
+            AppAction::SubmitInvitePin {
+                pending_room_id, ..
+            } => {
+                if self.app.flow.invite_pin_submission_room_id.as_deref()
+                    == Some(pending_room_id.as_str())
+                {
+                    self.app.flow.invite_pin_submission_room_id = None;
+                }
+                self.app.flow.notice_busy = false;
+                self.app.flow.notice_text = Some(invite_pin_failure_message(error));
+                self.app.status = "join request failed".to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn finish_scan_target(&mut self, outcome: AppScanTargetOutcome, notice_text: Option<String>) {
+        self.app.flow.scan_in_flight = false;
+        self.app.flow.notice_busy = false;
+        self.app.flow.invite_pin_submission_room_id = None;
+        self.app.flow.scan_result = outcome;
+        self.app.flow.notice_text = notice_text;
+    }
+
+    fn finish_invite_pin(&mut self, room_id: &str, notice_text: Option<String>) {
+        if self.app.flow.invite_pin_submission_room_id.as_deref() == Some(room_id) {
+            self.app.flow.invite_pin_submission_room_id = None;
+        }
+        self.app.flow.notice_busy = false;
+        self.app.flow.notice_text = notice_text;
+    }
+
     fn dispatch(&mut self, action: AppAction) -> Result<(), FiniteChatCoreError> {
         self.app.toast = None;
         self.core.refresh_device_clock()?;
@@ -1151,7 +1742,12 @@ impl AppRuntimeState {
                 room_id,
                 account_ids,
             } => self.add_room_members(room_id, account_ids)?,
-            AppAction::CreateInvite { room_id } => self.create_invite(room_id)?,
+            AppAction::CreateInvite { room_id } => self.create_invite_with_options(
+                room_id,
+                None,
+                DEFAULT_INVITE_MAX_JOINS,
+                DEFAULT_INVITE_TTL_MS,
+            )?,
             AppAction::ScanTarget { value } => self.scan_target(value)?,
             AppAction::SubmitInvitePin {
                 pending_room_id,
@@ -1338,28 +1934,88 @@ impl AppRuntimeState {
     }
 
     fn runtime_tick(&mut self) -> Result<(), FiniteChatCoreError> {
-        for invite_url in self.owned_invites.values().cloned().collect::<Vec<_>>() {
-            let accepted = match self.core.accept_invite_joins(&invite_url) {
-                Ok(accepted) => accepted,
-                Err(FiniteChatCoreError::Delivery { .. }) => {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if !accepted.accepted.is_empty() {
-                self.app.toast = Some(format!("{} device(s) joined", accepted.accepted.len()));
-            }
+        let joined = self.accept_owned_invite_joins(Vec::new())?;
+        if !joined.is_empty() {
+            self.app.toast = Some(format!("{} device(s) joined", joined.len()));
         }
         self.try_finalize_pending_rooms()?;
         self.refresh_ephemeral_activity_for_connected_rooms()?;
         let synced = self.core.sync_with_projection()?;
         self.apply_projection_events(synced.events);
         self.append_messages(synced.result.messages);
+        self.reload_chat_projection_from_store()?;
         self.materialize_known_connected_rooms()?;
         self.drain_undelivered_outbox(MAX_OUTBOX_DRAIN_PER_TICK)?;
         self.try_finalize_pending_rooms()?;
         self.app.status = "ready".to_owned();
         Ok(())
+    }
+
+    fn agent_bridge_poll_once(
+        &mut self,
+        invite_urls: Vec<String>,
+    ) -> Result<AppBridgeSync, FiniteChatCoreError> {
+        for invite_url in &invite_urls {
+            if let Ok(code) = parse_invite(invite_url) {
+                self.owned_invites
+                    .entry(code.room_id)
+                    .or_insert_with(|| invite_url.clone());
+            }
+        }
+        let joined_account_ids = self.accept_owned_invite_joins(invite_urls)?;
+        if !joined_account_ids.is_empty() {
+            self.app.toast = Some(format!("{} device(s) joined", joined_account_ids.len()));
+        }
+        self.try_finalize_pending_rooms()?;
+        self.refresh_ephemeral_activity_for_connected_rooms()?;
+        let synced = self.core.sync_with_projection()?;
+        let events = synced
+            .events
+            .iter()
+            .map(app_bridge_event_from_stored_event)
+            .collect::<Vec<_>>();
+        self.apply_projection_events(synced.events);
+        self.append_messages(synced.result.messages);
+        self.materialize_known_connected_rooms()?;
+        self.drain_undelivered_outbox(MAX_OUTBOX_DRAIN_PER_TICK)?;
+        self.try_finalize_pending_rooms()?;
+        self.sync_selected_room_messages();
+        self.app.status = "ready".to_owned();
+        Ok(AppBridgeSync {
+            joined_account_ids,
+            events,
+        })
+    }
+
+    fn accept_owned_invite_joins<I>(
+        &mut self,
+        extra_invite_urls: I,
+    ) -> Result<Vec<String>, FiniteChatCoreError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut invite_urls = self.owned_invites.values().cloned().collect::<Vec<_>>();
+        invite_urls.extend(extra_invite_urls);
+        invite_urls.sort();
+        invite_urls.dedup();
+
+        let mut joined_account_ids = Vec::new();
+        for invite_url in invite_urls {
+            let accepted = match self.core.accept_invite_joins(&invite_url) {
+                Ok(accepted) => accepted,
+                Err(FiniteChatCoreError::Delivery { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            joined_account_ids.extend(
+                accepted
+                    .accepted
+                    .iter()
+                    .map(|label| joined_account_id_from_accept_label(label)),
+            );
+        }
+        joined_account_ids.sort();
+        joined_account_ids.dedup();
+        Ok(joined_account_ids)
     }
 
     fn materialize_known_connected_rooms(&mut self) -> Result<(), FiniteChatCoreError> {
@@ -1863,20 +2519,28 @@ impl AppRuntimeState {
         self.app.toast = Some(toast.to_owned());
     }
 
-    fn create_invite(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
+    fn create_invite_with_options(
+        &mut self,
+        room_id: String,
+        display_name: Option<String>,
+        max_joins: u32,
+        ttl_ms: u64,
+    ) -> Result<(), FiniteChatCoreError> {
         if !self.room_is_connected(&room_id) {
             self.app.active_invite = None;
             self.set_online_action_unavailable("invite unavailable", "Invite could not be created");
             return Ok(());
         }
         let display_name = self
-            .room(&room_id)
-            .map(|room| room.display_name.clone())
+            .normalized_invite_display_name(display_name.as_deref(), &room_id)
+            .or_else(|| self.room(&room_id).map(|room| room.display_name.clone()))
             .unwrap_or_else(|| room_id.clone());
-        let invite = match self
-            .core
-            .create_invite(&room_id, Some(display_name.clone()))
-        {
+        let invite = match self.core.create_invite_with_options(
+            &room_id,
+            Some(display_name.clone()),
+            max_joins,
+            ttl_ms,
+        ) {
             Ok(invite) => invite,
             Err(error) => {
                 if !online_action_failure(&error) {
@@ -1902,6 +2566,18 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn normalized_invite_display_name(
+        &self,
+        display_name: Option<&str>,
+        room_id: &str,
+    ) -> Option<String> {
+        display_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.room(room_id).map(|room| room.display_name.clone()))
+    }
+
     fn scan_target(&mut self, value: String) -> Result<(), FiniteChatCoreError> {
         let trimmed = value.trim();
         if let Some(account_id) = explicit_profile_account_id(trimmed) {
@@ -1925,6 +2601,48 @@ impl AppRuntimeState {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| room_id.clone());
         self.app.active_profile_id = None;
+        if let Some(existing) = self.room(&room_id).cloned() {
+            match existing.state {
+                AppRoomState::Connected if self.core.has_room(&room_id) => {
+                    self.app.selected_room_id = Some(room_id);
+                    self.persist_app_state()?;
+                    self.app.status = "invite scanned".to_owned();
+                    self.finish_scan_target(
+                        AppScanTargetOutcome::Room,
+                        Some(invite_scan_notice_for_room(&existing)),
+                    );
+                    return Ok(());
+                }
+                AppRoomState::UnavailableOnDevice => {
+                    self.app.selected_room_id = Some(room_id);
+                    self.persist_app_state()?;
+                    self.app.status = "invite unavailable".to_owned();
+                    self.finish_scan_target(
+                        AppScanTargetOutcome::Room,
+                        Some(invite_scan_notice_for_room(&existing)),
+                    );
+                    return Ok(());
+                }
+                AppRoomState::WaitingForApproval | AppRoomState::Joining => {
+                    self.pending_invites.insert(
+                        room_id.clone(),
+                        PendingInvite {
+                            invite_url: trimmed.to_owned(),
+                        },
+                    );
+                    self.app.selected_room_id = Some(room_id.clone());
+                    self.persist_room_projection(&room_id)?;
+                    self.persist_app_state()?;
+                    self.app.status = "invite scanned".to_owned();
+                    self.finish_scan_target(
+                        AppScanTargetOutcome::Room,
+                        Some(invite_scan_notice_for_room(&existing)),
+                    );
+                    return Ok(());
+                }
+                AppRoomState::Connected => {}
+            }
+        }
         self.pending_invites.insert(
             room_id.clone(),
             PendingInvite {
@@ -1938,9 +2656,15 @@ impl AppRuntimeState {
             "enter PIN to request admission",
         );
         self.persist_room_projection(&room_id)?;
-        self.app.selected_room_id = Some(room_id);
+        self.app.selected_room_id = Some(room_id.clone());
         self.persist_app_state()?;
         self.app.status = "invite scanned".to_owned();
+        if let Some(room) = self.room(&room_id).cloned() {
+            self.finish_scan_target(
+                AppScanTargetOutcome::Room,
+                Some(invite_scan_notice_for_room(&room)),
+            );
+        }
         Ok(())
     }
 
@@ -1957,6 +2681,10 @@ impl AppRuntimeState {
                     "profile details unavailable",
                     "Profile details unavailable; you can still start a chat",
                 );
+                self.finish_scan_target(
+                    AppScanTargetOutcome::Profile,
+                    Some("Profile opened.".to_owned()),
+                );
                 return Ok(());
             }
         };
@@ -1969,6 +2697,10 @@ impl AppRuntimeState {
             self.app.status = "profile not found".to_owned();
             self.app.toast = Some("No cached profile was available for that npub".to_owned());
         }
+        self.finish_scan_target(
+            AppScanTargetOutcome::Profile,
+            Some("Profile opened.".to_owned()),
+        );
         Ok(())
     }
 
@@ -1977,6 +2709,19 @@ impl AppRuntimeState {
         pending_room_id: String,
         pin: String,
     ) -> Result<(), FiniteChatCoreError> {
+        self.submit_invite_pin_with_display_name(
+            pending_room_id,
+            pin,
+            Some(self.app.identity.device_id.clone()),
+        )
+    }
+
+    fn submit_invite_pin_with_display_name(
+        &mut self,
+        pending_room_id: String,
+        pin: String,
+        display_name: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
         if self
             .room(&pending_room_id)
             .is_some_and(|room| room.state == AppRoomState::UnavailableOnDevice)
@@ -1984,6 +2729,13 @@ impl AppRuntimeState {
             self.set_online_action_unavailable(
                 "invite unavailable",
                 "Join request could not be sent",
+            );
+            self.finish_invite_pin(
+                &pending_room_id,
+                Some(invite_unavailable_notice_for_room(
+                    self.room(&pending_room_id),
+                    &pending_room_id,
+                )),
             );
             return Ok(());
         }
@@ -1994,11 +2746,10 @@ impl AppRuntimeState {
                 reason: format!("no pending invite for room '{pending_room_id}'"),
             })?
             .clone();
-        match self.core.join_invite(
-            &pending.invite_url,
-            pin.trim(),
-            Some(self.app.identity.device_id.clone()),
-        ) {
+        match self
+            .core
+            .join_invite(&pending.invite_url, pin.trim(), display_name)
+        {
             Ok(_) => {}
             Err(error) => {
                 if !online_action_failure(&error) {
@@ -2008,6 +2759,7 @@ impl AppRuntimeState {
                     "invite unavailable",
                     "Join request could not be sent",
                 );
+                self.finish_invite_pin(&pending_room_id, Some(invite_pin_failure_message(&error)));
                 return Ok(());
             }
         }
@@ -2022,9 +2774,12 @@ impl AppRuntimeState {
             "waiting for room admission",
         );
         self.persist_room_projection(&pending_room_id)?;
-        self.app.selected_room_id = Some(pending_room_id);
+        self.app.selected_room_id = Some(pending_room_id.clone());
         self.persist_app_state()?;
         self.app.status = "join requested".to_owned();
+        if let Some(room) = self.room(&pending_room_id).cloned() {
+            self.finish_invite_pin(&pending_room_id, Some(invite_pin_notice_for_room(&room)));
+        }
         Ok(())
     }
 
@@ -2071,6 +2826,25 @@ impl AppRuntimeState {
         )
     }
 
+    fn send_encoded_chat_message(
+        &mut self,
+        room_id: String,
+        app_event_plaintext: Vec<u8>,
+        preview: String,
+    ) -> Result<AppSentMessage, FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to send"),
+            });
+        }
+        self.send_chat_message_with_local_outbox_result(
+            room_id,
+            app_event_plaintext,
+            preview,
+            "sent",
+        )
+    }
+
     fn send_chat_message_with_local_outbox(
         &mut self,
         room_id: String,
@@ -2078,6 +2852,22 @@ impl AppRuntimeState {
         preview: String,
         sent_status: &str,
     ) -> Result<(), FiniteChatCoreError> {
+        self.send_chat_message_with_local_outbox_result(
+            room_id,
+            app_event_plaintext,
+            preview,
+            sent_status,
+        )
+        .map(|_| ())
+    }
+
+    fn send_chat_message_with_local_outbox_result(
+        &mut self,
+        room_id: String,
+        app_event_plaintext: Vec<u8>,
+        preview: String,
+        sent_status: &str,
+    ) -> Result<AppSentMessage, FiniteChatCoreError> {
         let owner = self.core.device.device_ref().clone();
         let prepared = self
             .core
@@ -2088,17 +2878,28 @@ impl AppRuntimeState {
             .append_messages(vec![prepared.chat_message.clone()], &owner);
         self.sync_chat_projection();
 
-        match self.core.submit_outbox_message(&prepared.stored_message) {
-            Ok(result) => {
+        let sent = match self
+            .core
+            .submit_outbox_message_with_acceptance(&prepared.stored_message)
+        {
+            Ok((accepted, result)) => {
                 self.remove_outbox_message(&room_id, &local_message_id)?;
                 self.append_messages(result.messages);
                 if let Some(room) = self.room_mut(&room_id) {
                     room.last_message_preview = preview;
                 }
                 self.app.status = sent_status.to_owned();
+                AppSentMessage {
+                    message_id: accepted.message_id,
+                    seq: Some(accepted.seq),
+                }
             }
             Err(FiniteChatCoreError::Delivery { .. }) => {
                 self.app.status = sent_status.to_owned();
+                AppSentMessage {
+                    message_id: local_message_id,
+                    seq: None,
+                }
             }
             Err(FiniteChatCoreError::ServerRejected { reason }) => {
                 let failed = failed_outbox_message(prepared.stored_message, reason);
@@ -2109,12 +2910,33 @@ impl AppRuntimeState {
                 }
                 self.app.status = "delivery failed".to_owned();
                 self.app.toast = Some("Message delivery failed. Retry when ready.".to_owned());
+                AppSentMessage {
+                    message_id: local_message_id,
+                    seq: None,
+                }
             }
             Err(error) => {
                 return Err(error);
             }
+        };
+        Ok(sent)
+    }
+
+    fn append_ephemeral_activity(
+        &mut self,
+        input: AppBridgeActivityInput,
+    ) -> Result<AppAcceptedActivity, FiniteChatCoreError> {
+        if !self.room_is_connected(&input.room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{}' is not ready to send activity", input.room_id),
+            });
         }
-        Ok(())
+        let accepted = self.core.append_ephemeral_activity(input)?;
+        self.app.status = "activity sent".to_owned();
+        Ok(AppAcceptedActivity {
+            route_key: accepted.route_key,
+            cached_events_for_route: accepted.cached_events_for_route,
+        })
     }
 
     fn send_attachment(
@@ -2625,6 +3447,9 @@ impl AppRuntimeState {
         self.upsert_room(room_id, &display_name, AppRoomState::Connected, "connected");
         self.persist_room_projection(room_id)?;
         self.app.status = "joined".to_owned();
+        if let Some(room) = self.room(room_id).cloned() {
+            self.finish_invite_pin(room_id, Some(invite_pin_notice_for_room(&room)));
+        }
         Ok(())
     }
 
@@ -2892,6 +3717,55 @@ impl AppRuntimeState {
         self.sync_selected_room_messages();
     }
 
+    fn reload_chat_projection_from_store(&mut self) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        let stored_messages = self
+            .core
+            .store
+            .load_app_messages(&owner, MAX_APP_MESSAGES_U32)
+            .map_err(store_error)?;
+        let delivered_local_messages = stored_messages
+            .iter()
+            .filter(|message| message.sender == owner)
+            .map(|message| (message.room_id.clone(), message.message_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let stored_events = self
+            .core
+            .store
+            .load_app_events(&owner, MAX_APP_MESSAGES_U32)
+            .map_err(store_error)?;
+        let mut chat_projection =
+            ChatProjectionState::from_stored(stored_messages, stored_events, &owner);
+        let stored_outbox = self
+            .core
+            .store
+            .load_app_outbox(&owner)
+            .map_err(store_error)?;
+        let mut visible_outbox = Vec::new();
+        for message in stored_outbox {
+            if delivered_local_messages
+                .contains(&(message.room_id.clone(), message.message_id.clone()))
+            {
+                self.core
+                    .store
+                    .delete_app_outbox_message(&owner, &message.room_id, &message.message_id)
+                    .map_err(store_error)?;
+            } else {
+                visible_outbox.push(message);
+            }
+        }
+        chat_projection.append_messages(
+            visible_outbox
+                .into_iter()
+                .filter_map(|message| chat_message_from_outbox(message, &owner))
+                .collect(),
+            &owner,
+        );
+        self.chat_projection = chat_projection;
+        self.sync_chat_projection();
+        Ok(())
+    }
+
     fn sync_selected_room_messages(&mut self) {
         let Some(room_id) = self.app.selected_room_id.clone() else {
             self.app.messages.clear();
@@ -3080,13 +3954,26 @@ impl AppRuntimeState {
                 .then_with(|| left.display_name.cmp(&right.display_name))
                 .then_with(|| left.account_id.cmp(&right.account_id))
                 .then_with(|| left.device_id.cmp(&right.device_id))
+                .then_with(|| {
+                    live_indicator_activity_priority(&left.activity_kind)
+                        .cmp(&live_indicator_activity_priority(&right.activity_kind))
+                })
         });
-        members.dedup_by(|left, right| {
-            left.room_id == right.room_id
-                && left.account_id == right.account_id
-                && left.device_id == right.device_id
-        });
-        self.app.typing_members = members;
+        let mut deduped = Vec::with_capacity(members.len());
+        for member in members {
+            let duplicate_sender = deduped
+                .last()
+                .map(|existing: &AppTypingMember| {
+                    existing.room_id == member.room_id
+                        && existing.account_id == member.account_id
+                        && existing.device_id == member.device_id
+                })
+                .unwrap_or(false);
+            if !duplicate_sender {
+                deduped.push(member);
+            }
+        }
+        self.app.typing_members = deduped;
     }
 
     fn loaded_message_count(&self, room_id: &str) -> usize {
@@ -3150,6 +4037,105 @@ impl AppRuntimeState {
             .into_iter()
             .map(app_outbox_debug_row)
             .collect()
+    }
+
+    #[cfg(test)]
+    fn test_outbox(&self) -> Result<Vec<StoredOutboundMessage>, FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        self.core.store.load_app_outbox(&owner).map_err(store_error)
+    }
+
+    #[cfg(test)]
+    fn test_save_outbox(
+        &mut self,
+        rows: Vec<StoredOutboundMessage>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        self.core
+            .store
+            .save_app_outbox(&owner, &rows)
+            .map_err(store_error)
+    }
+
+    #[cfg(test)]
+    fn test_seed_room_state(
+        &mut self,
+        room: StoredAppRoom,
+        selected_room_id: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        self.core
+            .store
+            .save_app_rooms(&owner, std::slice::from_ref(&room))
+            .map_err(store_error)?;
+        self.core
+            .store
+            .save_app_state(
+                &owner,
+                &StoredAppState {
+                    selected_room_id,
+                    revoked_devices: BTreeSet::new(),
+                },
+            )
+            .map_err(store_error)
+    }
+
+    #[cfg(test)]
+    fn test_append_activity(
+        &mut self,
+        room_id: &str,
+        activity_kind: &str,
+        action: EphemeralActivityActionV1,
+    ) -> Result<(), FiniteChatCoreError> {
+        let now_ms = self.core.now_millis()?;
+        let is_set = matches!(action, EphemeralActivityActionV1::Set);
+        let activity = DecryptedEphemeralActivityV1 {
+            activity_kind: activity_kind.to_owned(),
+            activity_id: None,
+            action,
+            payload: if is_set {
+                br#"{}"#.to_vec()
+            } else {
+                Vec::new()
+            },
+        };
+        activity.validate_limits().map_err(client_error)?;
+        let plaintext =
+            serde_json::to_vec(&activity).map_err(|error| FiniteChatCoreError::Client {
+                reason: format!("failed to serialize test activity: {error}"),
+            })?;
+        let request = AppendEphemeralActivityRequest {
+            room_id: room_id.to_owned(),
+            mls_group_id: self
+                .core
+                .device
+                .room_mls_group_id(room_id)
+                .map_err(client_error)?,
+            epoch: self
+                .core
+                .device
+                .group_epoch(room_id)
+                .map_err(client_error)?,
+            sender: self.core.device.device_ref().clone(),
+            conversation_id: None,
+            payload: self
+                .core
+                .device
+                .encrypt_activity_payload(room_id, &plaintext)
+                .map_err(client_error)?,
+            received_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(
+                GenericActivityKindV1::from_activity_kind(activity_kind)
+                    .map(|kind| kind.recommended_expiry_millis())
+                    .unwrap_or(60_000),
+            ),
+        };
+        let room_server_url = self.core.room_server_url(room_id);
+        let mut delivery = delivery_for(&room_server_url);
+        delivery
+            .append_activity(&request)
+            .map(|_| ())
+            .map_err(delivery_error)
     }
 
     fn persist_outbox_message(
@@ -3632,10 +4618,12 @@ impl CoreState {
         })
     }
 
-    fn create_invite(
+    fn create_invite_with_options(
         &mut self,
         room_id: &str,
         display_name: Option<String>,
+        max_joins: u32,
+        ttl_ms: u64,
     ) -> Result<InviteResult, FiniteChatCoreError> {
         let mut delivery = self.home_delivery();
         let code = create_room_invite(
@@ -3645,8 +4633,8 @@ impl CoreState {
                 room_id,
                 server_url: &self.server_url,
                 display_name,
-                max_joins: DEFAULT_INVITE_MAX_JOINS,
-                ttl_ms: DEFAULT_INVITE_TTL_MS,
+                max_joins,
+                ttl_ms,
                 now_ms: self.now_millis()?,
             },
         )
@@ -3743,30 +4731,6 @@ impl CoreState {
         self.store
             .save_app_rooms(self.device.device_ref(), std::slice::from_ref(&app_room))
             .map_err(store_error)
-    }
-
-    fn send_text(&mut self, room_id: &str, text: &str) -> Result<SyncResult, FiniteChatCoreError> {
-        self.send_text_with_reply(room_id, text, None)
-    }
-
-    fn send_text_with_reply(
-        &mut self,
-        room_id: &str,
-        text: &str,
-        reply_to_message_id: Option<&str>,
-    ) -> Result<SyncResult, FiniteChatCoreError> {
-        let chat_payload = encode_text_message_payload(text, reply_to_message_id)?;
-        self.send_chat_payload(room_id, chat_payload)
-    }
-
-    fn send_poll(
-        &mut self,
-        room_id: &str,
-        question: &str,
-        options: Vec<String>,
-    ) -> Result<SyncResult, FiniteChatCoreError> {
-        let chat_payload = encode_poll_message_payload(question, options)?;
-        self.send_chat_payload(room_id, chat_payload)
     }
 
     fn send_attachment(
@@ -3895,6 +4859,14 @@ impl CoreState {
         &mut self,
         message: &StoredOutboundMessage,
     ) -> Result<SyncResult, FiniteChatCoreError> {
+        self.submit_outbox_message_with_acceptance(message)
+            .map(|(_, result)| result)
+    }
+
+    fn submit_outbox_message_with_acceptance(
+        &mut self,
+        message: &StoredOutboundMessage,
+    ) -> Result<(EventAccepted, SyncResult), FiniteChatCoreError> {
         let room_server_url = self.room_server_url(&message.room_id);
         let mut delivery = delivery_for(&room_server_url);
         let accepted = match delivery.append_event(
@@ -3932,7 +4904,7 @@ impl CoreState {
             Err(error) => return Err(error),
         };
         result.messages.insert(0, message);
-        Ok(result)
+        Ok((accepted, result))
     }
 
     fn upload_attachment_blob(
@@ -4143,6 +5115,56 @@ impl CoreState {
         let mut delivery = delivery_for(&room_server_url);
         delivery.append_activity(&request).map_err(delivery_error)?;
         Ok(())
+    }
+
+    fn append_ephemeral_activity(
+        &mut self,
+        input: AppBridgeActivityInput,
+    ) -> Result<EphemeralActivityAccepted, FiniteChatCoreError> {
+        let AppBridgeActivityInput {
+            room_id,
+            conversation_id,
+            activity_kind,
+            activity_id,
+            action,
+            payload,
+            expires_in_millis,
+        } = input;
+        let activity = DecryptedEphemeralActivityV1 {
+            activity_kind: activity_kind.clone(),
+            activity_id,
+            action,
+            payload,
+        };
+        activity.validate_limits().map_err(client_error)?;
+        let plaintext = serde_json::to_vec(&activity).map_err(client_error)?;
+        let now_ms = self.now_millis()?;
+        let expires_in_millis = if expires_in_millis == 0 {
+            GenericActivityKindV1::from_activity_kind(&activity_kind)
+                .map(|kind| kind.recommended_expiry_millis())
+                .unwrap_or(DEFAULT_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS)
+        } else {
+            expires_in_millis
+        };
+        let request = AppendEphemeralActivityRequest {
+            room_id: room_id.clone(),
+            mls_group_id: self
+                .device
+                .room_mls_group_id(&room_id)
+                .map_err(client_error)?,
+            epoch: self.device.group_epoch(&room_id).map_err(client_error)?,
+            sender: self.device.device_ref().clone(),
+            conversation_id,
+            payload: self
+                .device
+                .encrypt_activity_payload(&room_id, &plaintext)
+                .map_err(client_error)?,
+            received_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(expires_in_millis),
+        };
+        let room_server_url = self.room_server_url(&room_id);
+        let mut delivery = delivery_for(&room_server_url);
+        delivery.append_activity(&request).map_err(delivery_error)
     }
 
     fn get_ephemeral_activities(
@@ -4465,6 +5487,24 @@ impl CoreSyncProjection {
                 AppliedLogEntry::Commit { .. } => {}
             }
         }
+    }
+}
+
+fn joined_account_id_from_accept_label(label: &str) -> String {
+    label
+        .split_once('/')
+        .map(|(account_id, _)| account_id.to_owned())
+        .unwrap_or_else(|| label.to_owned())
+}
+
+fn app_bridge_event_from_stored_event(event: &StoredAppEvent) -> AppBridgeAppliedEvent {
+    AppBridgeAppliedEvent {
+        room_id: event.room_id.clone(),
+        seq: event.seq,
+        message_id: event.message_id.clone(),
+        sender_account_id: event.sender.account_id.clone(),
+        sender_device_id: event.sender.device_id.clone(),
+        plaintext: event.plaintext.clone(),
     }
 }
 
@@ -5100,6 +6140,7 @@ fn typing_member_from_activity(
         device_id: entry.sender.device_id.clone(),
         display_name: sender_display_name(&entry.sender, profile_name, false),
         npub,
+        activity_kind: entry.activity_kind.clone(),
     }
 }
 
@@ -5107,6 +6148,15 @@ fn is_chat_live_indicator_activity(activity_kind: &str) -> bool {
     activity_kind == FINITECHAT_ACTIVITY_KIND_TYPING
         || activity_kind == FINITECHAT_ACTIVITY_KIND_THINKING
         || activity_kind == FINITECHAT_ACTIVITY_KIND_WORKING
+}
+
+fn live_indicator_activity_priority(activity_kind: &str) -> u8 {
+    match activity_kind {
+        FINITECHAT_ACTIVITY_KIND_WORKING => 0,
+        FINITECHAT_ACTIVITY_KIND_THINKING => 1,
+        FINITECHAT_ACTIVITY_KIND_TYPING => 2,
+        _ => 3,
+    }
 }
 
 fn chat_message_from_stored(message: StoredAppMessage, owner: &DeviceRef) -> Option<ChatMessage> {
@@ -5774,6 +6824,88 @@ fn app_room_user_status_text_from_parts(state: &AppRoomState, status: &str) -> S
     }
 }
 
+fn invite_room_display_name(room: &AppRoomSummary) -> &str {
+    let trimmed = room.display_name.trim();
+    if trimmed.is_empty() {
+        "this room"
+    } else {
+        trimmed
+    }
+}
+
+fn invite_scan_notice_for_room(room: &AppRoomSummary) -> String {
+    let name = invite_room_display_name(room);
+    match room.state {
+        AppRoomState::Connected => {
+            format!("Opened {name}. This invite points to a room already on this device.")
+        }
+        AppRoomState::WaitingForApproval => {
+            if room
+                .status
+                .to_ascii_lowercase()
+                .contains("waiting for room admission")
+            {
+                format!("Opened {name}. Your join request is waiting for agent approval.")
+            } else {
+                format!("Opened {name}. Enter the current PIN to request access.")
+            }
+        }
+        AppRoomState::Joining => format!("Opened {name}. Finishing room setup."),
+        AppRoomState::UnavailableOnDevice => {
+            format!("{name} is unavailable on this device.")
+        }
+    }
+}
+
+fn invite_pin_notice_for_room(room: &AppRoomSummary) -> String {
+    let name = invite_room_display_name(room);
+    match room.state {
+        AppRoomState::Connected => format!("Joined {name}."),
+        AppRoomState::Joining => format!("Joining {name}..."),
+        AppRoomState::WaitingForApproval => {
+            let status = room.status.to_ascii_lowercase();
+            if status.contains("waiting for room admission") {
+                format!("PIN submitted for {name}. Waiting for the agent to approve this device.")
+            } else if status.contains("pin") {
+                format!("Enter the current PIN for {name}.")
+            } else if room.status.trim().is_empty() {
+                room.user_status_text.clone()
+            } else {
+                room.status.clone()
+            }
+        }
+        AppRoomState::UnavailableOnDevice => {
+            format!("{name} is unavailable on this device.")
+        }
+    }
+}
+
+fn invite_unavailable_notice_for_room(room: Option<&AppRoomSummary>, room_id: &str) -> String {
+    room.map(invite_pin_notice_for_room)
+        .unwrap_or_else(|| format!("{room_id} is unavailable on this device."))
+}
+
+fn scan_target_failure_message(error: &FiniteChatCoreError) -> String {
+    let raw = error.to_string();
+    if raw.to_ascii_lowercase().contains("invite") {
+        "The invite could not be opened. Check that the invite is still valid.".to_owned()
+    } else {
+        "That code is not a valid invite or profile code.".to_owned()
+    }
+}
+
+fn invite_pin_failure_message(error: &FiniteChatCoreError) -> String {
+    let raw = error.to_string();
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("pin") {
+        "That PIN did not complete the join. Check the current PIN and try again.".to_owned()
+    } else if lower.contains("invite") {
+        "The invite could not be joined. Check that the invite is still valid.".to_owned()
+    } else {
+        "The join request failed. Check the current PIN and try again.".to_owned()
+    }
+}
+
 fn selected_room_id_from_stored(
     rooms: &[AppRoomSummary],
     stored: &StoredAppState,
@@ -6337,10 +7469,52 @@ mod tests {
     }
 
     #[test]
-    fn core_sessions_message_each_other_over_live_http() {
+    fn app_runtime_listener_receives_initial_and_dispatched_snapshots() {
+        struct TestReconciler {
+            tx: Mutex<std::sync::mpsc::Sender<AppUpdate>>,
+        }
+
+        impl AppReconciler for TestReconciler {
+            fn reconcile(&self, update: AppUpdate) {
+                let _ = self.tx.lock().unwrap().send(update);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("app").to_string_lossy().into_owned(),
+            server_url: "http://127.0.0.1:1".to_owned(),
+            device_id: "listener-device".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        runtime.listen_for_updates(Box::new(TestReconciler { tx: Mutex::new(tx) }));
+
+        let AppUpdate::FullState(initial) =
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(initial.rev, 0);
+
+        runtime.dispatch(AppAction::StopRuntime).unwrap();
+
+        let updated = loop {
+            let AppUpdate::FullState(state) =
+                rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            if state.rev > initial.rev {
+                break state;
+            }
+        };
+        assert!(updated.rev > initial.rev);
+        assert_eq!(updated.status, "stopped");
+    }
+
+    #[test]
+    fn app_runtime_sessions_message_each_other_over_live_http() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatCore::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-cli".to_owned(),
@@ -6348,7 +7522,7 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let bob = FiniteChatCore::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
@@ -6357,40 +7531,197 @@ mod tests {
         })
         .unwrap();
 
-        alice
-            .bootstrap_room("room-core-flow".to_owned(), Some("Core Flow".to_owned()))
+        let alice_state = alice
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "App Runtime Flow".to_owned(),
+            })
             .unwrap();
-        alice.sync().unwrap();
+        let room_id = alice_state
+            .selected_room_id
+            .expect("created room is selected");
         let invite = alice
-            .create_invite("room-core-flow".to_owned(), Some("Core Flow".to_owned()))
-            .unwrap();
-        bob.join_invite(
-            invite.invite_url.clone(),
-            invite.pin.clone(),
-            Some("Bob iOS".to_owned()),
-        )
+            .dispatch_and_wait(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .expect("invite is projected through app state");
+        bob.dispatch_and_wait(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
         .unwrap();
-        let accepted = alice
-            .accept_invite_joins(invite.invite_url.clone())
-            .unwrap();
-        assert_eq!(accepted.accepted.len(), 1);
-        assert_eq!(accepted.rejected.len(), 0);
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
 
-        alice.sync().unwrap();
-        bob.sync().unwrap();
-        bob.finalize_invite(invite.invite_url).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        let bob_joined = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&bob_joined, &room_id).state,
+            AppRoomState::Connected
+        );
 
-        let from_cli = alice
-            .send_text("room-core-flow".to_owned(), "hello from cli".to_owned())
+        alice
+            .dispatch_and_wait(AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "hello from cli".to_owned(),
+            })
             .unwrap();
-        assert_eq!(from_cli.messages.len(), 1);
-        let bob_sync = bob.sync().unwrap();
-        assert_eq!(texts(&bob_sync), vec!["hello from cli"]);
+        let bob_sync = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert!(
+            bob_sync
+                .messages
+                .iter()
+                .any(|message| message.text == "hello from cli")
+        );
 
-        bob.send_text("room-core-flow".to_owned(), "hello from ios".to_owned())
+        bob.dispatch_and_wait(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "hello from ios".to_owned(),
+        })
+        .unwrap();
+        let alice_sync = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert!(
+            alice_sync
+                .messages
+                .iter()
+                .any(|message| message.text == "hello from ios")
+        );
+    }
+
+    #[test]
+    fn app_runtime_invite_uses_pin_bound_key_package_when_stale_inventory_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_secret_hex = hex::encode([1_u8; 32]);
+        let bob_secret_hex = hex::encode([2_u8; 32]);
+
+        let stale_bob = CoreState::open(OpenOptions {
+            data_dir: dir.path().join("stale-bob").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: Some(bob_secret_hex.clone()),
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let stale_upload = stale_bob
+            .device
+            .upload_key_package_request("000-stale-invite-decoy")
             .unwrap();
-        let alice_sync = alice.sync().unwrap();
-        assert_eq!(texts(&alice_sync), vec!["hello from ios"]);
+        let mut stale_delivery = delivery_for(&server_url);
+        stale_delivery.upload_key_package(stale_upload).unwrap();
+        drop(stale_bob);
+
+        let alice = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-cli".to_owned(),
+            account_secret_hex: Some(alice_secret_hex),
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let bob = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: Some(bob_secret_hex),
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "Stale Invite Inventory".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state
+            .selected_room_id
+            .expect("created room is selected");
+        let invite = alice
+            .dispatch_and_wait(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .expect("invite is projected through app state");
+
+        bob.dispatch_and_wait(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+            pending_room_id: room_id.clone(),
+            pin: invite.pin,
+        })
+        .unwrap();
+
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        let bob_joined = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&bob_joined, &room_id).state,
+            AppRoomState::Connected,
+            "invite admission must ignore stale server inventory and use the PIN-bound KeyPackage"
+        );
+    }
+
+    #[test]
+    fn app_runtime_reopens_app_created_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice_dir = dir.path().join("alice");
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let created = app
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "App Created".to_owned(),
+            })
+            .unwrap();
+        let room_id = created.selected_room_id.expect("created room is selected");
+        app.dispatch_and_wait(AppAction::SendMessage {
+            room_id: room_id.clone(),
+            text: "app message before relaunch".to_owned(),
+        })
+        .unwrap();
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: alice_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let local_snapshot = reopened.state().unwrap();
+        assert_eq!(
+            local_snapshot.selected_room_id.as_deref(),
+            Some(room_id.as_str())
+        );
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).display_name,
+            "App Created"
+        );
+        assert_eq!(
+            app_room(&local_snapshot, &room_id).last_message_preview,
+            "app message before relaunch"
+        );
+        assert!(
+            local_snapshot
+                .messages
+                .iter()
+                .any(|message| message.room_id == room_id
+                    && message.text == "app message before relaunch"),
+            "app cold launch must project a durable app-created transcript"
+        );
     }
 
     #[test]
@@ -6849,7 +8180,7 @@ mod tests {
         .unwrap();
 
         let error = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "No Server".to_owned(),
             })
             .expect_err("server failure rejects room creation");
@@ -6875,7 +8206,7 @@ mod tests {
         .unwrap();
 
         let error = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "x".repeat(MAX_INVITE_DISPLAY_NAME_BYTES as usize + 1),
             })
             .expect_err("oversized room labels fail before network or storage side effects");
@@ -6897,15 +8228,15 @@ mod tests {
         .unwrap();
 
         let registered = app
-            .dispatch(AppAction::SetPushToken {
+            .dispatch_and_wait(AppAction::SetPushToken {
                 token: "  apns-token-alice  ".to_owned(),
             })
             .unwrap();
         assert_eq!(registered.status, "ready");
-        app.dispatch(AppAction::RemovePushToken).unwrap();
+        app.dispatch_and_wait(AppAction::RemovePushToken).unwrap();
 
         let error = app
-            .dispatch(AppAction::SetPushToken {
+            .dispatch_and_wait(AppAction::SetPushToken {
                 token: " ".to_owned(),
             })
             .expect_err("server rejects empty push tokens");
@@ -6932,7 +8263,7 @@ mod tests {
         .unwrap();
 
         let created = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Windowed Chat".to_owned(),
             })
             .unwrap();
@@ -6941,7 +8272,7 @@ mod tests {
         let mut state = created;
         for index in 0..total_messages {
             state = app
-                .dispatch(AppAction::SendMessage {
+                .dispatch_and_wait(AppAction::SendMessage {
                     room_id: room_id.clone(),
                     text: format!("message-{index:03}"),
                 })
@@ -6954,7 +8285,7 @@ mod tests {
         assert!(app_room(&state, &room_id).can_load_older);
 
         let stale = app
-            .dispatch(AppAction::LoadOlderMessages {
+            .dispatch_and_wait(AppAction::LoadOlderMessages {
                 room_id: room_id.clone(),
                 before_message_id: "not-the-current-oldest".to_owned(),
                 limit: 25,
@@ -6966,7 +8297,7 @@ mod tests {
 
         let before_message_id = stale.messages.first().unwrap().message_id.clone();
         let loaded = app
-            .dispatch(AppAction::LoadOlderMessages {
+            .dispatch_and_wait(AppAction::LoadOlderMessages {
                 room_id: room_id.clone(),
                 before_message_id,
                 limit: 25,
@@ -7008,12 +8339,12 @@ mod tests {
         .unwrap();
 
         let created = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Persisted Chat".to_owned(),
             })
             .unwrap();
         let room_id = created.rooms.first().unwrap().room_id.clone();
-        app.dispatch(AppAction::SendMessage {
+        app.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "survives force close".to_owned(),
         })
@@ -7035,7 +8366,9 @@ mod tests {
         assert_eq!(cached.messages.len(), 1);
         assert_eq!(cached.messages[0].text, "survives force close");
 
-        let offline = relaunched.dispatch(AppAction::StartRuntime).unwrap();
+        let offline = relaunched
+            .dispatch_and_wait(AppAction::StartRuntime)
+            .unwrap();
         assert_eq!(offline.status, "offline");
         assert_eq!(
             offline.toast.as_deref(),
@@ -7078,7 +8411,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: npub.clone(),
             })
             .unwrap();
@@ -7112,7 +8445,7 @@ mod tests {
         assert!(!cached.profiles[0].stale);
 
         let scanned_offline = reopened
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: npub.clone(),
             })
             .unwrap();
@@ -7155,7 +8488,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("nostr:{nprofile}"),
             })
             .unwrap();
@@ -7189,7 +8522,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("nostr:{npub}"),
             })
             .unwrap();
@@ -7252,7 +8585,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("https://finite.computer/profile?npub={npub}&source=qr"),
             })
             .unwrap();
@@ -7297,7 +8630,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("https://finite.computer/profile?nprofile={nprofile}&source=qr"),
             })
             .unwrap();
@@ -7328,7 +8661,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("Profile code: {npub}\nShared from Finite Chat"),
             })
             .unwrap();
@@ -7371,7 +8704,7 @@ mod tests {
         .unwrap();
 
         let scanned = app
-            .dispatch(AppAction::ScanTarget { value: invite_url })
+            .dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
             .unwrap();
 
         let pending = app_room(&scanned, &room_id);
@@ -7397,7 +8730,7 @@ mod tests {
         .unwrap();
 
         let error = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: format!("{INVITE_URL_PREFIX}v=1&a={inviter_npub}"),
             })
             .expect_err("malformed invite should stay an invite error");
@@ -7428,7 +8761,7 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: npub.clone(),
             })
             .unwrap();
@@ -7490,14 +8823,14 @@ mod tests {
         .unwrap();
 
         let scanned = app
-            .dispatch(AppAction::ScanTarget { value: invite_url })
+            .dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
             .unwrap();
         let pending = app_room(&scanned, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
         assert_eq!(pending.status, "enter PIN to request admission");
 
         let submitted = app
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin,
             })
@@ -7531,6 +8864,90 @@ mod tests {
     }
 
     #[test]
+    fn app_invite_pin_flow_publishes_busy_and_final_state() {
+        struct TestReconciler {
+            tx: Mutex<std::sync::mpsc::Sender<AppUpdate>>,
+        }
+
+        impl AppReconciler for TestReconciler {
+            fn reconcile(&self, update: AppUpdate) {
+                let _ = self.tx.lock().unwrap().send(update);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let room_id = "room-flow-pin".to_owned();
+        let invite_code = InviteCodeV1 {
+            server_url: unavailable_http_server_url(),
+            room_id: room_id.clone(),
+            invite_id: "invite-flow-pin".to_owned(),
+            invite_token: vec![4; 16],
+            inviter_account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            display_name: Some("Flow PIN".to_owned()),
+        };
+        let invite_url = invite_code.encode().unwrap();
+        let pin = invite_current_pin(&invite_code.invite_token, NOW);
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "bob-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let scanned = app
+            .dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
+            .unwrap();
+        assert_eq!(scanned.flow.scan_result, AppScanTargetOutcome::Room);
+        assert_eq!(
+            scanned.flow.notice_text.as_deref(),
+            Some("Opened Flow PIN. Enter the current PIN to request access.")
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.listen_for_updates(Box::new(TestReconciler { tx: Mutex::new(tx) }));
+        let AppUpdate::FullState(initial) =
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let submitted = app
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
+                pending_room_id: room_id.clone(),
+                pin,
+            })
+            .unwrap();
+        assert_eq!(submitted.status, "invite unavailable");
+        assert_eq!(submitted.flow.invite_pin_submission_room_id, None);
+        assert!(!submitted.flow.notice_busy);
+
+        let mut saw_busy = false;
+        let mut saw_final = false;
+        for _ in 0..4 {
+            let AppUpdate::FullState(state) =
+                rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            if state.flow.invite_pin_submission_room_id.as_deref() == Some(room_id.as_str()) {
+                assert_eq!(state.rev, initial.rev);
+                assert!(state.flow.notice_busy);
+                assert_eq!(state.flow.notice_text.as_deref(), Some("Submitting PIN..."));
+                saw_busy = true;
+            }
+            if state.rev > initial.rev && state.status == "invite unavailable" {
+                assert_eq!(state.flow.invite_pin_submission_room_id, None);
+                assert!(!state.flow.notice_busy);
+                assert_eq!(
+                    state.flow.notice_text.as_deref(),
+                    Some("The invite could not be joined. Check that the invite is still valid.")
+                );
+                saw_final = true;
+                break;
+            }
+        }
+        assert!(saw_busy, "missing Rust-owned PIN busy update");
+        assert!(saw_final, "missing final PIN state update");
+    }
+
+    #[test]
     fn app_runtime_auto_admits_invite_and_joiner_sends_without_protocol_actions() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
@@ -7553,7 +8970,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Agent Room".to_owned(),
             })
             .unwrap();
@@ -7563,14 +8980,14 @@ mod tests {
         assert_eq!(room.state, AppRoomState::Connected);
 
         let alice_state = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap();
         let invite = alice_state.active_invite.expect("active invite");
 
         let bob_state = bob
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: invite.invite_url.clone(),
             })
             .unwrap();
@@ -7579,7 +8996,7 @@ mod tests {
         assert_eq!(pending.status, "enter PIN to request admission");
 
         let bob_state = bob
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin: invite.pin,
             })
@@ -7588,15 +9005,15 @@ mod tests {
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
         assert_eq!(pending.status, "waiting for room admission");
 
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&bob_state, &room_id).state,
             AppRoomState::Connected
         );
 
         let sent = bob
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "hello from app actor".to_owned(),
             })
@@ -7607,7 +9024,7 @@ mod tests {
                 .any(|message| message.text == "hello from app actor")
         );
 
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             alice_state
                 .messages
@@ -7660,11 +9077,11 @@ mod tests {
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
-        bob.dispatch(AppAction::StartRuntime)
+        bob.dispatch_and_wait(AppAction::StartRuntime)
             .expect("bob publishes key packages");
 
         let alice_state = alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
@@ -7676,7 +9093,7 @@ mod tests {
         let room_id = room.room_id.clone();
 
         let reopened_state = alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
@@ -7702,7 +9119,7 @@ mod tests {
         })
         .unwrap();
         let disk_reopened_state = reopened_alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
@@ -7717,21 +9134,21 @@ mod tests {
             AppRoomState::Connected
         );
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let bob_room = app_room(&bob_state, &room_id);
         assert_eq!(bob_room.state, AppRoomState::Connected);
-        bob.dispatch(AppAction::OpenRoom {
+        bob.dispatch_and_wait(AppAction::OpenRoom {
             room_id: room_id.clone(),
         })
         .unwrap();
 
         reopened_alice
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "hello direct".to_owned(),
             })
             .unwrap();
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             bob_state
                 .messages
@@ -7756,7 +9173,7 @@ mod tests {
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned();
 
         let state = alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: account_id.clone(),
                 display_name: "Chat with Missing".to_owned(),
             })
@@ -7817,14 +9234,14 @@ mod tests {
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
         let carol_account_id = carol.state().unwrap().identity.account_id;
-        bob.dispatch(AppAction::StartRuntime)
+        bob.dispatch_and_wait(AppAction::StartRuntime)
             .expect("bob publishes key packages");
         carol
-            .dispatch(AppAction::StartRuntime)
+            .dispatch_and_wait(AppAction::StartRuntime)
             .expect("carol publishes key packages");
 
         let alice_state = alice
-            .dispatch(AppAction::StartGroupChat {
+            .dispatch_and_wait(AppAction::StartGroupChat {
                 account_ids: vec![bob_account_id.clone(), carol_account_id.clone()],
                 display_name: "Weekend plans".to_owned(),
             })
@@ -7843,7 +9260,7 @@ mod tests {
         assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
 
         let direct_state = alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
@@ -7860,41 +9277,41 @@ mod tests {
             AppRoomState::Connected
         );
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&bob_state, &room_id).state,
             AppRoomState::Connected
         );
-        bob.dispatch(AppAction::OpenRoom {
+        bob.dispatch_and_wait(AppAction::OpenRoom {
             room_id: room_id.clone(),
         })
         .unwrap();
 
-        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        let carol_state = carol.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&carol_state, &room_id).state,
             AppRoomState::Connected
         );
         carol
-            .dispatch(AppAction::OpenRoom {
+            .dispatch_and_wait(AppAction::OpenRoom {
                 room_id: room_id.clone(),
             })
             .unwrap();
 
         alice
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "hello group".to_owned(),
             })
             .unwrap();
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             bob_state
                 .messages
                 .iter()
                 .any(|message| message.text == "hello group")
         );
-        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        let carol_state = carol.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             carol_state
                 .messages
@@ -7925,13 +9342,13 @@ mod tests {
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
-        bob.dispatch(AppAction::StartRuntime)
+        bob.dispatch_and_wait(AppAction::StartRuntime)
             .expect("bob publishes key packages");
         let missing_account_id =
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned();
 
         let state = alice
-            .dispatch(AppAction::StartGroupChat {
+            .dispatch_and_wait(AppAction::StartGroupChat {
                 account_ids: vec![bob_account_id, missing_account_id.clone()],
                 display_name: "Broken group".to_owned(),
             })
@@ -7976,14 +9393,14 @@ mod tests {
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
         let carol_account_id = carol.state().unwrap().identity.account_id;
-        bob.dispatch(AppAction::StartRuntime)
+        bob.dispatch_and_wait(AppAction::StartRuntime)
             .expect("bob publishes key packages");
         carol
-            .dispatch(AppAction::StartRuntime)
+            .dispatch_and_wait(AppAction::StartRuntime)
             .expect("carol publishes key packages");
 
         let alice_state = alice
-            .dispatch(AppAction::StartProfileChat {
+            .dispatch_and_wait(AppAction::StartProfileChat {
                 account_id: bob_account_id.clone(),
                 display_name: "Chat with Bob".to_owned(),
             })
@@ -7994,14 +9411,14 @@ mod tests {
             .expect("direct room")
             .room_id
             .clone();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::OpenRoom {
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::OpenRoom {
             room_id: room_id.clone(),
         })
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::AddRoomMembers {
+            .dispatch_and_wait(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
                 account_ids: vec![carol_account_id.clone()],
             })
@@ -8019,36 +9436,36 @@ mod tests {
         assert_member_in_room_details(details, &bob_account_id, "bob-ios", false);
         assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
 
-        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        let carol_state = carol.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&carol_state, &room_id).state,
             AppRoomState::Connected
         );
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&bob_state, &room_id).state,
             AppRoomState::Connected
         );
         carol
-            .dispatch(AppAction::OpenRoom {
+            .dispatch_and_wait(AppAction::OpenRoom {
                 room_id: room_id.clone(),
             })
             .unwrap();
 
         alice
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "hello after add".to_owned(),
             })
             .unwrap();
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             bob_state
                 .messages
                 .iter()
                 .any(|message| message.text == "hello after add")
         );
-        let carol_state = carol.dispatch(AppAction::StartRuntime).unwrap();
+        let carol_state = carol.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             carol_state
                 .messages
@@ -8071,7 +9488,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Existing room".to_owned(),
             })
             .unwrap();
@@ -8080,7 +9497,7 @@ mod tests {
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned();
 
         let state = alice
-            .dispatch(AppAction::AddRoomMembers {
+            .dispatch_and_wait(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
                 account_ids: vec![missing_account_id.clone()],
             })
@@ -8119,39 +9536,43 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Typing Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
-        bob.dispatch(AppAction::SetTyping {
+        bob.dispatch_and_wait(AppAction::SetTyping {
             room_id: room_id.clone(),
             is_typing: true,
         })
         .unwrap();
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(alice_state.typing_members.len(), 1);
         assert_eq!(alice_state.typing_members[0].room_id, room_id);
         assert_eq!(alice_state.typing_members[0].device_id, "bob-ios");
+        assert_eq!(
+            alice_state.typing_members[0].activity_kind,
+            FINITECHAT_ACTIVITY_KIND_TYPING
+        );
 
         drop(alice);
         let reopened = FiniteChatRuntime::open(OpenOptions {
@@ -8168,7 +9589,7 @@ mod tests {
         );
         drop(reopened);
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "done typing".to_owned(),
         })
@@ -8181,7 +9602,9 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let alice_state = alice_online.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice_online
+            .dispatch_and_wait(AppAction::StartRuntime)
+            .unwrap();
         assert!(
             alice_state.typing_members.is_empty(),
             "durable chat messages clear stale typing from the same sender"
@@ -8216,31 +9639,31 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Hermes Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
         hermes
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: invite.invite_url,
             })
             .unwrap();
         hermes
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin: invite.pin,
             })
             .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        hermes.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        hermes.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         append_test_activity(
             &hermes,
@@ -8248,10 +9671,14 @@ mod tests {
             FINITECHAT_ACTIVITY_KIND_WORKING,
             EphemeralActivityActionV1::Set,
         );
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(alice_state.typing_members.len(), 1);
         assert_eq!(alice_state.typing_members[0].room_id, room_id);
         assert_eq!(alice_state.typing_members[0].device_id, "hermes-agent");
+        assert_eq!(
+            alice_state.typing_members[0].activity_kind,
+            FINITECHAT_ACTIVITY_KIND_WORKING
+        );
 
         append_test_activity(
             &hermes,
@@ -8259,7 +9686,7 @@ mod tests {
             FINITECHAT_ACTIVITY_KIND_WORKING,
             EphemeralActivityActionV1::Clear,
         );
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             alice_state.typing_members.is_empty(),
             "Hermes working clears should remove the live indicator"
@@ -8281,13 +9708,13 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Local First".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         alice
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "saved before force close".to_owned(),
             })
@@ -8324,7 +9751,7 @@ mod tests {
         assert_eq!(reopened_message.timestamp_unix_seconds, NOW);
         assert!(!reopened_message.display_timestamp.is_empty());
 
-        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let started = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(started.status, "offline");
         assert_eq!(
             started.toast.as_deref(),
@@ -8338,79 +9765,6 @@ mod tests {
         assert_eq!(started_message.timestamp_unix_seconds, NOW);
         assert!(!started_message.display_timestamp.is_empty());
         assert_eq!(app_room(&started, &room_id).state, AppRoomState::Connected);
-    }
-
-    #[test]
-    fn app_runtime_reopens_core_created_chat_without_saved_selection() {
-        let dir = tempfile::tempdir().unwrap();
-        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice_dir = dir.path().join("alice");
-        let room_id = "room_core_cold_launch";
-        let core = FiniteChatCore::open(OpenOptions {
-            data_dir: alice_dir.to_string_lossy().into_owned(),
-            server_url,
-            device_id: "alice-ios".to_owned(),
-            account_secret_hex: None,
-            now_unix_seconds: Some(NOW),
-        })
-        .unwrap();
-
-        core.bootstrap_room(room_id.to_owned(), Some("Core Created".to_owned()))
-            .unwrap();
-        core.send_text(
-            room_id.to_owned(),
-            "core message before app launch".to_owned(),
-        )
-        .unwrap();
-        drop(core);
-
-        let reopened = FiniteChatRuntime::open(OpenOptions {
-            data_dir: alice_dir.to_string_lossy().into_owned(),
-            server_url: unavailable_http_server_url(),
-            device_id: "alice-ios".to_owned(),
-            account_secret_hex: None,
-            now_unix_seconds: Some(NOW),
-        })
-        .unwrap();
-        let local_snapshot = reopened.state().unwrap();
-        assert_eq!(local_snapshot.selected_room_id.as_deref(), Some(room_id));
-        assert_eq!(
-            app_room(&local_snapshot, room_id).display_name,
-            "Core Created"
-        );
-        assert_eq!(
-            app_room(&local_snapshot, room_id).last_message_preview,
-            "core message before app launch"
-        );
-        assert!(
-            local_snapshot
-                .messages
-                .iter()
-                .any(|message| message.room_id == room_id
-                    && message.text == "core message before app launch"),
-            "app cold launch must project a durable core-created transcript without a saved selection row"
-        );
-        drop(reopened);
-
-        let repaired = FiniteChatRuntime::open(OpenOptions {
-            data_dir: alice_dir.to_string_lossy().into_owned(),
-            server_url: unavailable_http_server_url(),
-            device_id: "alice-ios".to_owned(),
-            account_secret_hex: None,
-            now_unix_seconds: Some(NOW),
-        })
-        .unwrap()
-        .state()
-        .unwrap();
-        assert_eq!(repaired.selected_room_id.as_deref(), Some(room_id));
-        assert!(
-            repaired
-                .messages
-                .iter()
-                .any(|message| message.room_id == room_id
-                    && message.text == "core message before app launch"),
-            "selection repair must be persisted for later force-close relaunches"
-        );
     }
 
     #[test]
@@ -8428,7 +9782,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Local Outbox".to_owned(),
             })
             .unwrap();
@@ -8444,7 +9798,7 @@ mod tests {
         })
         .unwrap();
         let failed = offline
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "do not lose this".to_owned(),
             })
@@ -8515,7 +9869,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Retry Outbox".to_owned(),
             })
             .unwrap();
@@ -8531,7 +9885,7 @@ mod tests {
         })
         .unwrap();
         let failed = offline
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "retry after force close".to_owned(),
             })
@@ -8565,7 +9919,7 @@ mod tests {
             .expect("undelivered row should be visible before drain");
         assert_outbound_undelivered(before_message);
 
-        let drained = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let drained = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let accepted_messages = drained
             .messages
             .iter()
@@ -8579,15 +9933,9 @@ mod tests {
             runtime_outbox(&reopened).is_empty(),
             "successful drain removes the exact undelivered outbox row"
         );
-        {
-            let mut state = reopened.state.lock().unwrap();
-            let owner = state.core.device.device_ref().clone();
-            state
-                .core
-                .store
-                .save_app_outbox(&owner, std::slice::from_ref(&stale_outbox_row))
-                .unwrap();
-        }
+        reopened
+            .test_save_outbox(vec![stale_outbox_row.clone()])
+            .unwrap();
         assert_eq!(
             runtime_outbox(&reopened).len(),
             1,
@@ -8633,7 +9981,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Rejected Send".to_owned(),
             })
             .unwrap();
@@ -8649,7 +9997,7 @@ mod tests {
         })
         .unwrap();
         let rejected = rejected_runtime
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "retry only after server rejection".to_owned(),
             })
@@ -8693,7 +10041,7 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let before_retry = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let before_retry = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let still_failed = before_retry
             .messages
             .iter()
@@ -8714,7 +10062,7 @@ mod tests {
         );
 
         let retried = reopened
-            .dispatch(AppAction::RetryMessage {
+            .dispatch_and_wait(AppAction::RetryMessage {
                 room_id: room_id.clone(),
                 message_id: local_message_id.clone(),
             })
@@ -8752,7 +10100,7 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Offline Attachment Fail Fast".to_owned(),
             })
             .unwrap();
@@ -8770,7 +10118,7 @@ mod tests {
         })
         .unwrap();
         let failed = offline
-            .dispatch(AppAction::SendAttachment {
+            .dispatch_and_wait(AppAction::SendAttachment {
                 room_id: room_id.clone(),
                 filename: "offline-photo.jpg".to_owned(),
                 mime_type: "image/jpeg".to_owned(),
@@ -8843,14 +10191,14 @@ mod tests {
         .unwrap();
 
         let alpha = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Alpha".to_owned(),
             })
             .unwrap()
             .selected_room_id
             .unwrap();
         let zulu = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Zulu".to_owned(),
             })
             .unwrap()
@@ -8858,13 +10206,13 @@ mod tests {
             .unwrap();
         assert_ne!(alpha, zulu);
         alice
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: zulu.clone(),
                 text: "selected room survives force close".to_owned(),
             })
             .unwrap();
         alice
-            .dispatch(AppAction::OpenRoom {
+            .dispatch_and_wait(AppAction::OpenRoom {
                 room_id: zulu.clone(),
             })
             .unwrap();
@@ -8910,12 +10258,12 @@ mod tests {
         .unwrap();
 
         let state = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Recovered".to_owned(),
             })
             .unwrap();
         let room_id = state.rooms.first().unwrap().room_id.clone();
-        app.dispatch(AppAction::SendMessage {
+        app.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "still here after stale config".to_owned(),
         })
@@ -8945,7 +10293,7 @@ mod tests {
             "stale launch config must recover the durable local transcript before sync"
         );
 
-        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let started = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(started.status, "offline");
         assert!(
             started
@@ -8980,36 +10328,36 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Force Close".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "remote message before force close".to_owned(),
         })
         .unwrap();
-        let synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let synced = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             synced
                 .messages
@@ -9043,7 +10391,7 @@ mod tests {
             "force-close reopen must render synced peer messages from local SQLite before sync"
         );
 
-        let started = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let started = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(started.status, "offline");
         assert!(
             started
@@ -9069,13 +10417,13 @@ mod tests {
         .unwrap();
 
         let created = app
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Replies".to_owned(),
             })
             .unwrap();
         let room_id = created.rooms.first().unwrap().room_id.clone();
         let parent_state = app
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "parent".to_owned(),
             })
@@ -9089,7 +10437,7 @@ mod tests {
             .clone();
 
         let missing = app
-            .dispatch(AppAction::SendReply {
+            .dispatch_and_wait(AppAction::SendReply {
                 room_id: room_id.clone(),
                 text: "nope".to_owned(),
                 reply_to_message_id: "missing-message".to_owned(),
@@ -9101,7 +10449,7 @@ mod tests {
         );
 
         let replied = app
-            .dispatch(AppAction::SendReply {
+            .dispatch_and_wait(AppAction::SendReply {
                 room_id: room_id.clone(),
                 text: "child".to_owned(),
                 reply_to_message_id: parent_id.clone(),
@@ -9130,7 +10478,7 @@ mod tests {
         );
 
         let media_replied = app
-            .dispatch(AppAction::SendAttachment {
+            .dispatch_and_wait(AppAction::SendAttachment {
                 room_id: room_id.clone(),
                 filename: "reply-photo.jpg".to_owned(),
                 mime_type: "image/jpeg".to_owned(),
@@ -9207,7 +10555,7 @@ mod tests {
         })
         .unwrap();
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Media Room".to_owned(),
             })
             .unwrap();
@@ -9215,7 +10563,7 @@ mod tests {
         let plaintext = b"fake jpeg plaintext bytes".to_vec();
 
         let sent = alice
-            .dispatch(AppAction::SendAttachment {
+            .dispatch_and_wait(AppAction::SendAttachment {
                 room_id: room_id.clone(),
                 filename: "photo.jpg".to_owned(),
                 mime_type: "image/jpeg".to_owned(),
@@ -9309,14 +10657,14 @@ mod tests {
         })
         .unwrap();
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Batch Media".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
 
         let sent = alice
-            .dispatch(AppAction::SendAttachments {
+            .dispatch_and_wait(AppAction::SendAttachments {
                 room_id: room_id.clone(),
                 attachments: vec![
                     OutboundAttachment {
@@ -9402,7 +10750,7 @@ mod tests {
         })
         .unwrap();
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Voice Notes".to_owned(),
             })
             .unwrap();
@@ -9410,7 +10758,7 @@ mod tests {
 
         let voice_bytes = b"fake m4a voice note".to_vec();
         let sent = alice
-            .dispatch(AppAction::SendAttachment {
+            .dispatch_and_wait(AppAction::SendAttachment {
                 room_id: room_id.clone(),
                 filename: "voice_1725000123.m4a".to_owned(),
                 mime_type: "audio/mp4".to_owned(),
@@ -9491,33 +10839,33 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Media Download".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let alice_state = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap();
         let invite = alice_state.active_invite.unwrap();
 
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         let plaintext = b"download me after sync".to_vec();
         alice
-            .dispatch(AppAction::SendAttachment {
+            .dispatch_and_wait(AppAction::SendAttachment {
                 room_id: room_id.clone(),
                 filename: "remote photo.jpg".to_owned(),
                 mime_type: "image/jpeg".to_owned(),
@@ -9528,7 +10876,7 @@ mod tests {
             })
             .unwrap();
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let message = bob_state
             .messages
             .iter()
@@ -9551,7 +10899,7 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let reopened_before_download = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let reopened_before_download = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let cache_miss_message = reopened_before_download
             .messages
             .iter()
@@ -9565,7 +10913,7 @@ mod tests {
         assert_eq!(cache_miss_message.outbound_delivery, None);
 
         let downloading_state = bob
-            .dispatch(AppAction::BeginDownloadAttachment {
+            .dispatch_and_wait(AppAction::BeginDownloadAttachment {
                 room_id: room_id.clone(),
                 message_id: message_id.clone(),
                 attachment_id: attachment_id.clone(),
@@ -9583,7 +10931,7 @@ mod tests {
         assert_eq!(downloading_message.media[0].local_path, None);
 
         let bob_state = bob
-            .dispatch(AppAction::DownloadAttachment {
+            .dispatch_and_wait(AppAction::DownloadAttachment {
                 room_id: room_id.clone(),
                 message_id,
                 attachment_id,
@@ -9647,33 +10995,33 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Gallery Window".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
 
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         let plaintext = b"old image outside visible transcript".to_vec();
-        bob.dispatch(AppAction::SendAttachment {
+        bob.dispatch_and_wait(AppAction::SendAttachment {
             room_id: room_id.clone(),
             filename: "old-photo.jpg".to_owned(),
             mime_type: "image/jpeg".to_owned(),
@@ -9684,14 +11032,14 @@ mod tests {
         })
         .unwrap();
         for index in 0..55 {
-            bob.dispatch(AppAction::SendMessage {
+            bob.dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: format!("filler {index}"),
             })
             .unwrap();
         }
 
-        let synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let synced = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(synced.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
         assert!(
             synced
@@ -9725,7 +11073,7 @@ mod tests {
         assert_eq!(details.media_item_count, 1);
 
         let downloaded = alice
-            .dispatch(AppAction::DownloadAttachment {
+            .dispatch_and_wait(AppAction::DownloadAttachment {
                 room_id: room_id.clone(),
                 message_id: item.message_id.clone(),
                 attachment_id: item.attachment_id.clone(),
@@ -9800,13 +11148,13 @@ mod tests {
         })
         .unwrap();
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Recovered Join".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
@@ -9836,7 +11184,7 @@ mod tests {
         })
         .unwrap();
         let scanned = bob
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: invite.invite_url.clone(),
             })
             .unwrap();
@@ -9868,7 +11216,7 @@ mod tests {
             "enter PIN to request admission"
         );
         let requested = bob
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin: invite.pin,
             })
@@ -9902,13 +11250,13 @@ mod tests {
         );
         assert_eq!(app_room(&waiting, &room_id).display_name, "Recovered Join");
 
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             alice_state.toast.as_deref(),
             Some("1 device(s) joined"),
             "creator invite watch must survive relaunch and admit the joiner"
         );
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&bob_state, &room_id).state,
             AppRoomState::Connected
@@ -9937,24 +11285,24 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Hint Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
 
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
@@ -9974,7 +11322,7 @@ mod tests {
             "joiner should wake from invite SSE hint and finalize without a visible retry"
         );
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "hello over app sse".to_owned(),
         })
@@ -10012,37 +11360,37 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Remote Persistence".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
 
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "remote sync survives force close".to_owned(),
         })
         .unwrap();
-        let alice_synced = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_synced = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             alice_synced
                 .messages
@@ -10079,7 +11427,7 @@ mod tests {
             "force-close reopen must restore remote synced messages from local SQLite before sync"
         );
 
-        let offline = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let offline = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(offline.status, "offline");
         assert!(
             offline
@@ -10114,32 +11462,32 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Poll Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         let bob_state = bob
-            .dispatch(AppAction::SendPoll {
+            .dispatch_and_wait(AppAction::SendPoll {
                 room_id: room_id.clone(),
                 question: "Lunch?".to_owned(),
                 options: vec!["Tacos".to_owned(), "Sushi".to_owned()],
@@ -10157,7 +11505,7 @@ mod tests {
             "Lunch?"
         );
 
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_poll(
             &alice_state,
             &poll_message_id,
@@ -10168,7 +11516,7 @@ mod tests {
             false,
         );
         let alice_state = alice
-            .dispatch(AppAction::VotePoll {
+            .dispatch_and_wait(AppAction::VotePoll {
                 room_id: room_id.clone(),
                 message_id: poll_message_id.clone(),
                 option_id: "option-2".to_owned(),
@@ -10184,7 +11532,7 @@ mod tests {
             true,
         );
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_poll(
             &bob_state,
             &poll_message_id,
@@ -10243,32 +11591,32 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Reaction Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         let bob_state = bob
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "tap a reaction on this".to_owned(),
             })
@@ -10281,9 +11629,9 @@ mod tests {
             .message_id
             .clone();
 
-        alice.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let alice_state = alice
-            .dispatch(AppAction::ReactToMessage {
+            .dispatch_and_wait(AppAction::ReactToMessage {
                 room_id: room_id.clone(),
                 message_id: target_message_id.clone(),
                 emoji: "👍".to_owned(),
@@ -10292,7 +11640,7 @@ mod tests {
         assert_reaction(&alice_state, &target_message_id, "👍", 1, true);
 
         let alice_state = alice
-            .dispatch(AppAction::ReactToMessage {
+            .dispatch_and_wait(AppAction::ReactToMessage {
                 room_id: room_id.clone(),
                 message_id: target_message_id.clone(),
                 emoji: "👍".to_owned(),
@@ -10300,7 +11648,7 @@ mod tests {
             .unwrap();
         assert_reaction(&alice_state, &target_message_id, "👍", 1, true);
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_reaction(&bob_state, &target_message_id, "👍", 1, false);
         drop(alice);
 
@@ -10344,32 +11692,32 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Receipt Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         let bob_state = bob
-            .dispatch(AppAction::SendMessage {
+            .dispatch_and_wait(AppAction::SendMessage {
                 room_id: room_id.clone(),
                 text: "read me".to_owned(),
             })
@@ -10382,19 +11730,19 @@ mod tests {
             .message_id
             .clone();
 
-        alice.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         alice
-            .dispatch(AppAction::MarkRoomRead {
+            .dispatch_and_wait(AppAction::MarkRoomRead {
                 room_id: room_id.clone(),
             })
             .unwrap();
         alice
-            .dispatch(AppAction::MarkRoomRead {
+            .dispatch_and_wait(AppAction::MarkRoomRead {
                 room_id: room_id.clone(),
             })
             .unwrap();
 
-        let bob_state = bob.dispatch(AppAction::StartRuntime).unwrap();
+        let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_read_receipt(&bob_state, &target_message_id, 1, 1, "Read by 1");
         drop(bob);
 
@@ -10421,7 +11769,7 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let room_id = "room-hermes-receipt-followup".to_owned();
         let app_dir = dir.path().join("app");
-        let agent = FiniteChatCore::open(OpenOptions {
+        let mut agent = CoreState::open(OpenOptions {
             data_dir: dir.path().join("agent").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "agent".to_owned(),
@@ -10439,49 +11787,54 @@ mod tests {
         .unwrap();
 
         agent
-            .bootstrap_room(room_id.clone(), Some("Hermes Receipt Followup".to_owned()))
+            .bootstrap_room(&room_id, Some("Hermes Receipt Followup".to_owned()))
             .unwrap();
         let invite = agent
-            .create_invite(room_id.clone(), Some("Hermes Receipt Followup".to_owned()))
+            .create_invite_with_options(
+                &room_id,
+                Some("Hermes Receipt Followup".to_owned()),
+                DEFAULT_INVITE_MAX_JOINS,
+                DEFAULT_INVITE_TTL_MS,
+            )
             .unwrap();
-        app.dispatch(AppAction::ScanTarget {
+        app.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        app.dispatch(AppAction::SubmitInvitePin {
+        app.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        agent
-            .accept_invite_joins(invite.invite_url.clone())
-            .unwrap();
-        app.dispatch(AppAction::StartRuntime).unwrap();
+        agent.accept_invite_joins(&invite.invite_url).unwrap();
+        app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
         agent
-            .state
-            .lock()
-            .unwrap()
             .send_application_plaintext(&room_id, hermes_chat_event("first agent message"))
             .unwrap();
-        let first_sync = app.dispatch(AppAction::StartRuntime).unwrap();
+        let first_sync = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             first_sync
                 .messages
                 .iter()
                 .any(|message| message.text == "first agent message")
         );
-        app.dispatch(AppAction::MarkRoomRead {
+        app.dispatch_and_wait(AppAction::MarkRoomRead {
             room_id: room_id.clone(),
         })
         .unwrap();
         agent.sync().unwrap();
         agent
-            .state
-            .lock()
-            .unwrap()
             .send_application_plaintext(&room_id, hermes_chat_event("second agent message"))
             .unwrap();
+        let live_second_sync = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert!(
+            live_second_sync
+                .messages
+                .iter()
+                .any(|message| message.text == "second agent message"),
+            "live app runtime should project the second Hermes message without a relaunch"
+        );
         drop(app);
 
         let reopened = FiniteChatRuntime::open(OpenOptions {
@@ -10492,7 +11845,7 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let final_state = reopened.dispatch(AppAction::StartRuntime).unwrap();
+        let final_state = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
             final_state
                 .messages
@@ -10526,51 +11879,51 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Unread Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
-        bob.dispatch(AppAction::ScanTarget {
+        bob.dispatch_and_wait(AppAction::ScanTarget {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
             pending_room_id: room_id.clone(),
             pin: invite.pin,
         })
         .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        bob.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "first unread".to_owned(),
         })
         .unwrap();
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(app_room(&alice_state, &room_id).unread_count, 1);
 
         let alice_state = alice
-            .dispatch(AppAction::MarkRoomRead {
+            .dispatch_and_wait(AppAction::MarkRoomRead {
                 room_id: room_id.clone(),
             })
             .unwrap();
         assert_eq!(app_room(&alice_state, &room_id).unread_count, 0);
 
-        bob.dispatch(AppAction::SendMessage {
+        bob.dispatch_and_wait(AppAction::SendMessage {
             room_id: room_id.clone(),
             text: "second unread".to_owned(),
         })
         .unwrap();
-        let alice_state = alice.dispatch(AppAction::StartRuntime).unwrap();
+        let alice_state = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(app_room(&alice_state, &room_id).unread_count, 1);
         assert_eq!(
             app_room(&alice_state, &room_id).last_message_preview,
@@ -10590,7 +11943,7 @@ mod tests {
         assert_eq!(app_room(&offline_state, &room_id).unread_count, 1);
 
         let cleared = reopened
-            .dispatch(AppAction::MarkRoomRead {
+            .dispatch_and_wait(AppAction::MarkRoomRead {
                 room_id: room_id.clone(),
             })
             .unwrap();
@@ -10639,33 +11992,33 @@ mod tests {
         .unwrap();
 
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Device Room".to_owned(),
             })
             .unwrap();
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         let invite = alice
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap()
             .active_invite
             .unwrap();
         tablet
-            .dispatch(AppAction::ScanTarget {
+            .dispatch_and_wait(AppAction::ScanTarget {
                 value: invite.invite_url.clone(),
             })
             .unwrap();
         tablet
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin: invite.pin,
             })
             .unwrap();
-        alice.dispatch(AppAction::StartRuntime).unwrap();
-        tablet.dispatch(AppAction::StartRuntime).unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        tablet.dispatch_and_wait(AppAction::StartRuntime).unwrap();
 
-        let devices = alice.dispatch(AppAction::RefreshDevices).unwrap();
+        let devices = alice.dispatch_and_wait(AppAction::RefreshDevices).unwrap();
         assert_device(&devices, "alice-phone", true, true, false);
         assert_device(&devices, "alice-tablet", true, false, false);
         let details = devices
@@ -10678,7 +12031,7 @@ mod tests {
         assert_device_in_room_details(details, "alice-tablet", true, false, false);
 
         let devices = alice
-            .dispatch(AppAction::RevokeDevice {
+            .dispatch_and_wait(AppAction::RevokeDevice {
                 account_id: alice_identity.account_id,
                 device_id: "alice-tablet".to_owned(),
             })
@@ -10704,7 +12057,9 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        let devices = reopened.dispatch(AppAction::RefreshDevices).unwrap();
+        let devices = reopened
+            .dispatch_and_wait(AppAction::RefreshDevices)
+            .unwrap();
         assert_device(&devices, "alice-tablet", true, false, true);
         assert_device_in_room_details(
             devices
@@ -10730,7 +12085,7 @@ mod tests {
         })
         .unwrap();
 
-        let refreshed = app.dispatch(AppAction::RefreshDevices).unwrap();
+        let refreshed = app.dispatch_and_wait(AppAction::RefreshDevices).unwrap();
         assert_eq!(refreshed.status, "devices unavailable");
         assert_eq!(
             refreshed.toast.as_deref(),
@@ -10742,7 +12097,7 @@ mod tests {
 
         let account_id = refreshed.identity.account_id.clone();
         let revoked = app
-            .dispatch(AppAction::RevokeDevice {
+            .dispatch_and_wait(AppAction::RevokeDevice {
                 account_id,
                 device_id: "alice-tablet".to_owned(),
             })
@@ -10755,7 +12110,7 @@ mod tests {
         assert!(revoked.devices.is_empty());
         assert!(revoked.messages.is_empty());
         assert!(runtime_outbox(&app).is_empty());
-        assert!(app.state.lock().unwrap().revoked_devices.is_empty());
+        assert!(app.test_revoked_devices().unwrap().is_empty());
     }
 
     #[test]
@@ -10772,7 +12127,7 @@ mod tests {
         })
         .unwrap();
         let alice_state = alice
-            .dispatch(AppAction::CreateRoom {
+            .dispatch_and_wait(AppAction::CreateRoom {
                 display_name: "Stale Room".to_owned(),
             })
             .unwrap();
@@ -10790,7 +12145,7 @@ mod tests {
         .unwrap();
 
         let stale_state = stale
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap();
@@ -10832,37 +12187,20 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
-        {
-            let mut state = seeded.state.lock().unwrap();
-            let owner = state.core.device.device_ref().clone();
-            state
-                .core
-                .store
-                .save_app_rooms(
-                    &owner,
-                    &[StoredAppRoom {
-                        room_id: room_id.clone(),
-                        display_name: "Missing MLS Room".to_owned(),
-                        state: StoredAppRoomState::UnavailableOnDevice,
-                        status: LOCAL_ROOM_UNAVAILABLE_STATUS.to_owned(),
-                        local_read_seq: 0,
-                        pending_invite_url: Some("finitechat://unavailable-pending".to_owned()),
-                        owned_invite_url: None,
-                    }],
-                )
-                .unwrap();
-            state
-                .core
-                .store
-                .save_app_state(
-                    &owner,
-                    &StoredAppState {
-                        selected_room_id: Some(room_id.clone()),
-                        revoked_devices: BTreeSet::new(),
-                    },
-                )
-                .unwrap();
-        }
+        seeded
+            .test_seed_room_state(
+                StoredAppRoom {
+                    room_id: room_id.clone(),
+                    display_name: "Missing MLS Room".to_owned(),
+                    state: StoredAppRoomState::UnavailableOnDevice,
+                    status: LOCAL_ROOM_UNAVAILABLE_STATUS.to_owned(),
+                    local_read_seq: 0,
+                    pending_invite_url: Some("finitechat://unavailable-pending".to_owned()),
+                    owned_invite_url: None,
+                },
+                Some(room_id.clone()),
+            )
+            .unwrap();
         drop(seeded);
 
         let app = FiniteChatRuntime::open(OpenOptions {
@@ -10880,7 +12218,7 @@ mod tests {
         assert_eq!(initial.selected_room_id.as_deref(), Some(room_id.as_str()));
 
         let after = app
-            .dispatch(AppAction::CreateInvite {
+            .dispatch_and_wait(AppAction::CreateInvite {
                 room_id: room_id.clone(),
             })
             .unwrap();
@@ -10893,7 +12231,7 @@ mod tests {
         assert!(runtime_outbox(&app).is_empty());
 
         let after_pin = app
-            .dispatch(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInvitePin {
                 pending_room_id: room_id.clone(),
                 pin: "123456".to_owned(),
             })
@@ -10909,7 +12247,7 @@ mod tests {
         );
         assert!(runtime_outbox(&app).is_empty());
 
-        let after_start = app.dispatch(AppAction::StartRuntime).unwrap();
+        let after_start = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let room = app_room(&after_start, &room_id);
         assert_eq!(room.state, AppRoomState::UnavailableOnDevice);
         assert_eq!(room.status, LOCAL_ROOM_UNAVAILABLE_STATUS);
@@ -10971,14 +12309,6 @@ mod tests {
             stale_but_available_room.user_status_text,
             LOCAL_ROOM_CONNECTED_TEXT
         );
-    }
-
-    fn texts(result: &SyncResult) -> Vec<&str> {
-        result
-            .messages
-            .iter()
-            .map(|message| message.text.as_str())
-            .collect()
     }
 
     fn hermes_chat_event(text: &str) -> Vec<u8> {
@@ -11057,9 +12387,7 @@ mod tests {
     }
 
     fn runtime_outbox(runtime: &FiniteChatRuntime) -> Vec<StoredOutboundMessage> {
-        let state = runtime.state.lock().unwrap();
-        let owner = state.core.device.device_ref().clone();
-        state.core.store.load_app_outbox(&owner).unwrap()
+        runtime.test_outbox().unwrap()
     }
 
     fn application_effect(
@@ -11253,42 +12581,9 @@ mod tests {
         activity_kind: &str,
         action: EphemeralActivityActionV1,
     ) {
-        let state = runtime.state.lock().unwrap();
-        let now_ms = state.core.now_millis().unwrap();
-        let is_set = matches!(action, EphemeralActivityActionV1::Set);
-        let activity = DecryptedEphemeralActivityV1 {
-            activity_kind: activity_kind.to_owned(),
-            activity_id: None,
-            action,
-            payload: if is_set {
-                br#"{}"#.to_vec()
-            } else {
-                Vec::new()
-            },
-        };
-        activity.validate_limits().unwrap();
-        let plaintext = serde_json::to_vec(&activity).unwrap();
-        let request = AppendEphemeralActivityRequest {
-            room_id: room_id.to_owned(),
-            mls_group_id: state.core.device.room_mls_group_id(room_id).unwrap(),
-            epoch: state.core.device.group_epoch(room_id).unwrap(),
-            sender: state.core.device.device_ref().clone(),
-            conversation_id: None,
-            payload: state
-                .core
-                .device
-                .encrypt_activity_payload(room_id, &plaintext)
-                .unwrap(),
-            received_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(
-                GenericActivityKindV1::from_activity_kind(activity_kind)
-                    .map(|kind| kind.recommended_expiry_millis())
-                    .unwrap_or(60_000),
-            ),
-        };
-        let room_server_url = state.core.room_server_url(room_id);
-        let mut delivery = delivery_for(&room_server_url);
-        delivery.append_activity(&request).unwrap();
+        runtime
+            .test_append_activity(room_id.to_owned(), activity_kind.to_owned(), action)
+            .unwrap();
     }
 
     fn decode_nip98_event(header: &str) -> NostrHttpAuthEvent {

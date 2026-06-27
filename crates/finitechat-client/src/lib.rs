@@ -3589,6 +3589,15 @@ impl SqliteClientStore {
         Ok(ack.commit_seq)
     }
 
+    pub fn clear_pending_welcome_and_save(
+        &mut self,
+        device: &mut FiniteChatDevice,
+        welcome_id: &str,
+    ) -> Result<(), ClientStoreError> {
+        device.clear_pending_welcome(welcome_id)?;
+        self.save_device_state(device)
+    }
+
     pub fn clear_pending_welcome_ack_and_save(
         &mut self,
         device: &mut FiniteChatDevice,
@@ -4731,9 +4740,7 @@ pub fn run_runtime_sync_tick<D: RuntimeDelivery>(
         store.store_pending_welcome_and_save(device, &welcome)?;
     }
 
-    for welcome_id in device.pending_welcome_ids() {
-        store.activate_pending_welcome_and_save(device, &welcome_id)?;
-    }
+    activate_pending_welcomes(store, device)?;
 
     for ack in device.pending_welcome_acks() {
         delivery
@@ -4786,9 +4793,7 @@ pub fn run_room_server_sync_tick<D: RuntimeDelivery>(
         store.store_pending_welcome_and_save(device, &welcome)?;
     }
 
-    for welcome_id in device.pending_welcome_ids() {
-        store.activate_pending_welcome_and_save(device, &welcome_id)?;
-    }
+    activate_pending_welcomes(store, device)?;
 
     for ack in device.pending_welcome_acks() {
         delivery
@@ -4814,6 +4819,34 @@ pub fn run_room_server_sync_tick<D: RuntimeDelivery>(
     }
 
     Ok(report)
+}
+
+fn activate_pending_welcomes(
+    store: &mut SqliteClientStore,
+    device: &mut FiniteChatDevice,
+) -> Result<(), ClientStoreError> {
+    for welcome_id in device.pending_welcome_ids() {
+        match store.activate_pending_welcome_and_save(device, &welcome_id) {
+            Ok(_) => {}
+            Err(error) if pending_welcome_activation_failure_is_permanent(&error) => {
+                store.clear_pending_welcome_and_save(device, &welcome_id)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn pending_welcome_activation_failure_is_permanent(error: &ClientStoreError) -> bool {
+    matches!(
+        error,
+        ClientStoreError::Client(
+            ClientError::ParseWelcome
+                | ClientError::StageWelcome
+                | ClientError::ActivateWelcome
+                | ClientError::GroupAlreadyExists(_)
+        )
+    )
 }
 
 /// Parameters for creating a room invite (ADR 0006). `server_url` is the
@@ -4948,21 +4981,16 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
         return Ok(report);
     }
 
-    // The joiner's KeyPackage rides inline in the join request; publish and
-    // claim it on this server so the existing commit validation (claimed
-    // KeyPackages only) applies unchanged.
+    // The joiner's KeyPackage rides inline in the join request. The proof is
+    // bound to that exact package, so admission must not accept an older
+    // available package for the same device.
     let mut claimed_key_packages = Vec::with_capacity(verified.len());
     let mut welcome_ids = Vec::with_capacity(verified.len());
     for (join, upload) in &verified {
         delivery
             .upload_key_package(upload.clone())
             .map_err(RuntimeWorkerError::Delivery)?;
-        let claimed = delivery
-            .claim_key_package_for_device(&join.joiner)
-            .map_err(RuntimeWorkerError::Delivery)?
-            .ok_or_else(|| {
-                ClientError::InviteKeyPackageUnavailable(join.joiner.device_id.clone())
-            })?;
+        let claimed = claim_invite_key_package_for_device(delivery, &join.joiner, upload)?;
         claimed_key_packages.push(claimed);
         welcome_ids.push(format!(
             "invite-welcome-{}-{}",
@@ -4997,6 +5025,29 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
         report.resolved_requests += 1;
     }
     Ok(report)
+}
+
+fn claim_invite_key_package_for_device<D: RuntimeDelivery>(
+    delivery: &mut D,
+    joiner: &DeviceRef,
+    expected: &UploadKeyPackageRequest,
+) -> Result<ClaimKeyPackageResult, RuntimeWorkerError<D::Error>> {
+    for _ in 0..=MAX_KEY_PACKAGES_PER_DEVICE {
+        let Some(claimed) = delivery
+            .claim_key_package_for_device(joiner)
+            .map_err(RuntimeWorkerError::Delivery)?
+        else {
+            break;
+        };
+        if claimed.key_package_id == expected.key_package_id
+            && claimed.key_package_ref == expected.key_package_ref
+            && claimed.key_package_hash == expected.key_package_hash
+            && claimed.key_package_payload == expected.key_package_payload
+        {
+            return Ok(claimed);
+        }
+    }
+    Err(ClientError::InviteKeyPackageUnavailable(joiner.device_id.clone()).into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

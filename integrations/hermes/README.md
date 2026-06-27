@@ -60,6 +60,9 @@ instead of POSTing `poll`; transport failures fall back to the existing poll
 path.
 See [HARDENING.md](./HARDENING.md) for the adapter reliability plan and
 acceptance matrix.
+See [../../docs/hermes-phone-canary-loop.md](../../docs/hermes-phone-canary-loop.md)
+for the physical-phone quality loop that promotes local Hermes, remote Docker,
+and Tinfoil only after lower-layer evidence is green.
 
 For a local human smoke with JSON evidence:
 
@@ -67,8 +70,8 @@ For a local human smoke with JSON evidence:
 scripts/hermes-adapter-regression-report.py
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
+scripts/hermes-real-gateway-admission-smoke.py
 scripts/ios-hermes-agent-media-e2e.sh
-scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
 The adapter regression command writes
@@ -84,20 +87,20 @@ The media E2E writes `target/hermes-agent-media-e2e/report.json` and runs the
 real `hermes-agent` package against the Finite plugin with the sidecar inbound
 stream enabled. It proves an image sent by a Finite Chat user reaches Hermes as
 media and that the user decrypts both text and image replies from the agent.
+It installs an echo callback, so it is adapter transport coverage, not a real
+Hermes model or gateway acceptance gate.
+The real gateway admission smoke writes
+`target/hermes-real-gateway-admission-smoke/report.json` and proves Hermes 0.17
+`gateway run --replace` loads the installed `finite-platform` plugin and admits
+a normal invite/PIN join without a test callback.
 The iOS Simulator E2E writes
 `target/ios-hermes-agent-media-e2e/report.json`, drives the native app through
 the product harness, and proves that the app's encrypted local store contains
-the Hermes text and image replies. It requires a booted simulator or
-`IOS_SIMULATOR_UDID`.
+the adapter text and image replies. It is still echo-handler transport coverage
+and requires a booted simulator or `IOS_SIMULATOR_UDID`.
 The physical-device variant is `scripts/ios-device-hermes-agent-media-e2e.sh`;
 it writes `target/ios-device-hermes-agent-media-e2e/report.json` after pulling
 the app's store from an installed, unlocked phone.
-The Docker runtime iOS E2E writes
-`target/ios-hermes-docker-runtime-e2e/report.json`, builds the real runtime
-image, starts the echo agent in Docker, rewrites the invite server URL for the
-iOS Simulator, sends an encrypted image message from the native app, proves the
-runtime received it as media, and verifies the app decrypts the runtime reply.
-It requires Docker plus a booted simulator or `IOS_SIMULATOR_UDID`.
 
 Validate the restic backup environment before the longer Docker smoke:
 
@@ -116,16 +119,15 @@ scripts/hermes-sidecar-docker-s3-emulator-smoke.sh
 ```
 
 That builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts
-the agent in Docker, drives a second `finitechat` CLI user in Docker, and writes
+the real Hermes gateway in Docker, drives `finitechat` CLI users through
+invite/PIN admission before and after restore, and writes
 `target/hermes-docker-smoke/report.json`. It also stops the first agent
 container cleanly so the runtime entrypoint snapshots agent state to an
 encrypted restic repository, checks the repository, wipes the local agent
 volume, starts a fresh container whose entrypoint restores the latest tagged
-snapshot before the agent process starts, verifies the same npub, verifies the
-runtime `/healthz` endpoint, and chats again in the same room.
-The separate `scripts/ios-hermes-docker-runtime-e2e.sh` smoke covers the native
-iOS client against that real runtime image. The hardening audit treats CLI-only
-Docker evidence as incomplete for the full Docker acceptance bar.
+snapshot before the gateway starts, verifies the same npub, verifies the
+runtime `/healthz` endpoint, and admits a second user through the restored
+gateway. Echo replies are not accepted as Docker runtime proof.
 By default the restic repo is a local bind mount under
 `target/hermes-docker-smoke/restic-repo`. To run the same smoke against
 S3-compatible storage such as Latitude, provide an isolated repository prefix

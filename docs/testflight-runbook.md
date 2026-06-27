@@ -78,8 +78,15 @@ Before the first uploaded build:
 cargo test --workspace
 cargo run -q -p finitechat-rmp -- bindings swift --clean
 (cd ios && xcodegen generate)
+cargo run -q -p finitechat-rmp -- test ios-simulator
 xcodebuild -project ios/FiniteChat.xcodeproj -scheme FiniteChat -configuration Release -sdk iphonesimulator build
 ```
+
+Use `finitechat-rmp test ios-simulator` for simulator test preflight instead
+of an ad hoc `xcodebuild test` command. It erases the dedicated RMP simulator,
+uses `.state/xcode-derived-data`, replaces its explicit `.xcresult` bundle, and
+shuts the simulator down after the run so repeated preflights do not inherit a
+busy SpringBoard or polluted app container.
 
 Also verify:
 

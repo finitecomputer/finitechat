@@ -93,6 +93,9 @@ def main() -> int:
             "restic_version": facts.get("restic_version"),
             "agent_npub_after_restore": facts.get("agent_npub_after_restore"),
             "restic_backend": facts.get("restic_backend"),
+            "real_gateway_runtime": facts.get("real_gateway_runtime"),
+            "gateway_admission_before_restore": facts.get("gateway_admission_before_restore"),
+            "gateway_admission_after_restore": facts.get("gateway_admission_after_restore"),
         },
     }
 

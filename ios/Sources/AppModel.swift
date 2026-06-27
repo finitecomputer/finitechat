@@ -399,8 +399,15 @@ private struct DiagnosticActionSummary {
 }
 
 @MainActor
-final class AppModel: ObservableObject {
+final class AppModel: ObservableObject, AppReconciler {
     private static let developerDiagnosticsLimit = 200
+    private static let optimisticSequenceBase = UInt64.max - 1_000_000
+    private static let optimisticTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
 
     @Published var serverURL: String
     @Published var deviceID: String
@@ -412,14 +419,12 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    private(set) var chatProjections: [String: ChatRoomProjection] = [:]
+    @Published private(set) var chatProjections: [String: ChatRoomProjection] = [:]
     @Published var errorText: String?
     @Published var roomDraft: String = ""
     @Published var scanDraft: String = ""
     @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
-    @Published private(set) var localNoticeText: String?
-    @Published private(set) var invitePinSubmissionRoomID: String?
     @Published private(set) var runtimeStorePath: String?
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
     @Published private(set) var nostrIdentity: AppNostrIdentity?
@@ -430,6 +435,8 @@ final class AppModel: ObservableObject {
     private var openKey = ""
     private var foregroundStartKey: String?
     private let usesTransientStore: Bool
+    private var pendingOptimisticMessages: [String: ChatMessage] = [:]
+    private var optimisticMessageCounter: UInt64 = 0
     private let persistsRuntimeIdentityUpdates: Bool
     private let applicationSupportURL: URL?
     private let configStorageURL: URL?
@@ -438,9 +445,10 @@ final class AppModel: ObservableObject {
     private let startsUpdateLoop: Bool
     private let nostrIdentityStore: AppNostrIdentityStoring
     private var updateTask: Task<Void, Never>?
-    private var runtimeCommandTail: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var postSendCatchUpTask: Task<Void, Never>?
+    private var runtimeDispatchTail: Task<Void, Never>?
+    private var lastAppliedRuntimeRev: UInt64 = 0
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
     private var lastTypingIntentByRoom: [String: Bool] = [:]
@@ -451,9 +459,9 @@ final class AppModel: ObservableObject {
 
     deinit {
         updateTask?.cancel()
-        runtimeCommandTail?.cancel()
         launchAutomationTask?.cancel()
         postSendCatchUpTask?.cancel()
+        runtimeDispatchTail?.cancel()
     }
 
     init(
@@ -513,6 +521,30 @@ final class AppModel: ObservableObject {
         )
     }
 
+    nonisolated func reconcile(update: AppUpdate) {
+        Task { @MainActor [weak self] in
+            self?.applyRuntimeUpdate(update)
+        }
+    }
+
+    private func applyRuntimeUpdate(_ update: AppUpdate) {
+        switch update {
+        case .fullState(let nextState):
+            applyRuntimeSnapshot(nextState)
+        }
+    }
+
+    private func applyRuntimeSnapshot(_ nextState: AppState) {
+        if nextState.rev < lastAppliedRuntimeRev {
+            return
+        }
+        if nextState.rev == lastAppliedRuntimeRev, state == nextState {
+            return
+        }
+        lastAppliedRuntimeRev = nextState.rev
+        state = nextState
+    }
+
     var rooms: [AppRoomSummary] {
         state?.rooms ?? []
     }
@@ -544,14 +576,23 @@ final class AppModel: ObservableObject {
 
     var userNoticeText: String? {
         let toast = state?.toast?.nonEmptyTrimmed
+        let flowNotice = state?.flow.noticeText?.nonEmptyTrimmed
         if toast == "Showing saved chats. Connection will retry." {
-            return localNoticeText
+            return flowNotice
         }
-        return toast ?? localNoticeText
+        return toast ?? flowNotice
     }
 
     var actionNoticeText: String? {
         userNoticeText ?? developerErrorText
+    }
+
+    var invitePinSubmissionRoomID: String? {
+        state?.flow.invitePinSubmissionRoomId
+    }
+
+    var scanInFlight: Bool {
+        state?.flow.scanInFlight ?? false
     }
 
     var developerErrorText: String? {
@@ -642,10 +683,15 @@ final class AppModel: ObservableObject {
 
     func signOutAndDeleteEverything() {
         appendDiagnostic(category: "persistence", event: "signout.delete_all.requested")
-        removePushTokenIfPossible()
+        let runtimeForPushCleanup = runtime
+        runtimeDispatchTail?.cancel()
+        runtimeDispatchTail = nil
+        if let runtimeForPushCleanup {
+            removePushTokenDuringSignOut(runtime: runtimeForPushCleanup)
+        }
         pendingPushToken = nil
         nostrIdentityStore.clear()
-        closeRuntime(cancelQueuedCommands: false)
+        closeRuntime()
         try? RuntimeDataStore.deleteDataDir(
             deviceID: deviceID,
             applicationSupportURL: applicationSupportURL,
@@ -719,15 +765,14 @@ final class AppModel: ObservableObject {
         do {
             let runtime = try currentRuntime()
             let runtimeKey = openKey
-            state = try runtime.state()
+            applyRuntimeSnapshot(try runtime.state())
             enqueueRuntimeDispatch(
                 .startRuntime,
                 runtime: runtime,
                 runtimeKey: runtimeKey,
                 priority: .utility,
-                onSuccess: { [weak self] nextState in
+                onSuccess: { [weak self] _ in
                     guard let self else { return }
-                    self.state = nextState
                     self.appendDiagnostic(category: "runtime", event: "start.succeeded")
                     self.errorText = nil
                     self.restartUpdateLoopIfEnabled()
@@ -763,19 +808,18 @@ final class AppModel: ObservableObject {
         do {
             let runtime = try currentRuntime()
             let runtimeKey = openKey
-            state = try runtime.state()
+            applyRuntimeSnapshot(try runtime.state())
             foregroundStartKey = runtimeKey
             enqueueRuntimeDispatch(
                 .startRuntime,
                 runtime: runtime,
                 runtimeKey: runtimeKey,
                 priority: .utility,
-                onSuccess: { [weak self] nextState in
+                onSuccess: { [weak self] _ in
                     guard let self else { return }
                     if self.foregroundStartKey == runtimeKey {
                         self.foregroundStartKey = nil
                     }
-                    self.state = nextState
                     self.appendDiagnostic(category: "runtime", event: "foreground_start.succeeded")
                     self.errorText = nil
                     self.restartUpdateLoopIfEnabled()
@@ -843,18 +887,34 @@ final class AppModel: ObservableObject {
             do {
                 let runtime = try currentRuntime()
                 let runtimeKey = openKey
-                let nextState = try await Task.detached(priority: .utility) {
-                    try runtime.dispatch(action: .startRuntime)
-                }.value
-                guard openKey == runtimeKey else {
-                    completion(.noData)
-                    return
-                }
-                state = nextState
-                errorText = nil
-                appendDiagnostic(category: "push", event: "wake.sync.succeeded")
-                restartUpdateLoopIfEnabled()
-                completion(.newData)
+                enqueueRuntimeDispatch(
+                    .startRuntime,
+                    runtime: runtime,
+                    runtimeKey: runtimeKey,
+                    priority: .utility,
+                    onSuccess: { [weak self] _ in
+                        guard let self else {
+                            completion(.noData)
+                            return
+                        }
+                        self.errorText = nil
+                        self.appendDiagnostic(category: "push", event: "wake.sync.succeeded")
+                        self.restartUpdateLoopIfEnabled()
+                        completion(.newData)
+                    },
+                    onFailure: { [weak self] error in
+                        guard let self else {
+                            completion(.failed)
+                            return
+                        }
+                        self.appendDiagnostic(
+                            category: "push",
+                            event: "wake.sync.failed",
+                            details: self.diagnosticErrorDetails(error)
+                        )
+                        completion(.failed)
+                    }
+                )
             } catch {
                 appendDiagnostic(
                     category: "push",
@@ -1003,10 +1063,7 @@ final class AppModel: ObservableObject {
             onComplete(.empty)
             return false
         }
-        localNoticeText = nil
 
-        let previousRoomIDs = Set(rooms.map(\.roomId))
-        let previousSelectedRoomID = state?.selectedRoomId
         let action = AppAction.scanTarget(value: value)
         let diagnostic = diagnosticAction(action)
         appendDiagnostic(
@@ -1038,7 +1095,7 @@ final class AppModel: ObservableObject {
             priority: .userInitiated,
             onSuccess: { [weak self] nextState in
                 guard let self else { return }
-                self.state = nextState
+                self.applyRuntimeSnapshot(nextState)
                 self.errorText = nil
                 self.appendDiagnostic(
                     category: diagnostic.category,
@@ -1046,10 +1103,7 @@ final class AppModel: ObservableObject {
                     details: diagnostic.details
                 )
                 self.restartUpdateLoopIfEnabled()
-                onComplete(self.scanTargetResultFromUpdatedState(
-                    previousRoomIDs: previousRoomIDs,
-                    previousSelectedRoomID: previousSelectedRoomID
-                ))
+                onComplete(self.scanTargetResultFromUpdatedState())
             },
             onFailure: { [weak self] error in
                 guard let self else { return }
@@ -1065,27 +1119,20 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    private func scanTargetResultFromUpdatedState(
-        previousRoomIDs: Set<String>,
-        previousSelectedRoomID: String?
-    ) -> AppScanTargetResult {
-        if let profile = activeProfile {
+    private func scanTargetResultFromUpdatedState() -> AppScanTargetResult {
+        guard let scanResult = state?.flow.scanResult else { return .unavailable }
+        switch scanResult {
+        case .profile:
+            guard let profile = activeProfile else { return .unavailable }
             scanDraft = ""
-            localNoticeText = "Profile opened."
             return .profile(profile)
-        }
-
-        if let room = selectedRoom,
-           state?.status == "invite scanned"
-            || room.roomId != previousSelectedRoomID
-            || !previousRoomIDs.contains(room.roomId)
-        {
+        case .room:
+            guard let room = selectedRoom else { return .unavailable }
             scanDraft = ""
-            localNoticeText = inviteScanNotice(for: room)
             return .room(room)
+        case .unavailable, .none:
+            return .unavailable
         }
-
-        return .unavailable
     }
 
     @discardableResult
@@ -1112,15 +1159,11 @@ final class AppModel: ObservableObject {
                 event: "\(diagnostic.name).failed",
                 details: diagnosticErrorDetails(error)
             )
-            let message = invitePinFailureMessage(error)
-            localNoticeText = message
-            errorText = message
+            errorText = String(describing: error)
             return false
         }
 
         let pendingRoomID = room.roomId
-        invitePinSubmissionRoomID = pendingRoomID
-        localNoticeText = "Submitting PIN..."
 
         enqueueRuntimeDispatch(
             action,
@@ -1129,12 +1172,7 @@ final class AppModel: ObservableObject {
             priority: .userInitiated,
             onSuccess: { [weak self] nextState in
                 guard let self else { return }
-                defer {
-                    if self.invitePinSubmissionRoomID == pendingRoomID {
-                        self.invitePinSubmissionRoomID = nil
-                    }
-                }
-                self.state = nextState
+                self.applyRuntimeSnapshot(nextState)
                 self.errorText = nil
                 self.appendDiagnostic(
                     category: diagnostic.category,
@@ -1142,25 +1180,15 @@ final class AppModel: ObservableObject {
                     details: diagnostic.details
                 )
                 if let room = nextState.rooms.first(where: { $0.roomId == pendingRoomID }) {
-                    self.localNoticeText = self.invitePinNotice(for: room)
                     if room.state == .connected {
                         self.pinDraft = ""
                     }
-                } else {
-                    self.localNoticeText = "Invite request submitted."
                 }
                 self.restartUpdateLoopIfEnabled()
             },
             onFailure: { [weak self] error in
                 guard let self else { return }
-                defer {
-                    if self.invitePinSubmissionRoomID == pendingRoomID {
-                        self.invitePinSubmissionRoomID = nil
-                    }
-                }
-                let message = self.invitePinFailureMessage(error)
-                self.localNoticeText = message
-                self.errorText = message
+                self.errorText = String(describing: error)
                 self.appendDiagnostic(
                     category: diagnostic.category,
                     event: "\(diagnostic.name).failed",
@@ -1169,54 +1197,6 @@ final class AppModel: ObservableObject {
             }
         )
         return true
-    }
-
-    private func inviteScanNotice(for room: AppRoomSummary) -> String {
-        let name = room.displayName.nonEmptyTrimmed ?? "this room"
-        switch room.state {
-        case .connected:
-            return "Opened \(name). This invite points to a room already on this device."
-        case .waitingForApproval:
-            if room.status.localizedCaseInsensitiveContains("waiting for room admission") {
-                return "Opened \(name). Your join request is waiting for agent approval."
-            }
-            return "Opened \(name). Enter the current PIN to request access."
-        case .joining:
-            return "Opened \(name). Finishing room setup."
-        case .unavailableOnDevice:
-            return "\(name) is unavailable on this device."
-        }
-    }
-
-    private func invitePinNotice(for room: AppRoomSummary) -> String {
-        let name = room.displayName.nonEmptyTrimmed ?? "this room"
-        switch room.state {
-        case .connected:
-            return "Joined \(name)."
-        case .joining:
-            return "Joining \(name)..."
-        case .waitingForApproval:
-            if room.status.localizedCaseInsensitiveContains("waiting for room admission") {
-                return "PIN submitted for \(name). Waiting for the agent to approve this device."
-            }
-            if room.status.localizedCaseInsensitiveContains("pin") {
-                return "Enter the current PIN for \(name)."
-            }
-            return room.status.nonEmptyTrimmed ?? room.userStatusText
-        case .unavailableOnDevice:
-            return "\(name) is unavailable on this device."
-        }
-    }
-
-    private func invitePinFailureMessage(_ error: Error) -> String {
-        let raw = String(describing: error)
-        if raw.localizedCaseInsensitiveContains("pin") {
-            return "That PIN did not complete the join. Check the current PIN and try again."
-        }
-        if raw.localizedCaseInsensitiveContains("invite") {
-            return "The invite could not be joined. Check that the invite is still valid."
-        }
-        return "The join request failed. Check the current PIN and try again."
     }
 
     @discardableResult
@@ -1247,7 +1227,7 @@ final class AppModel: ObservableObject {
             onSuccess: { [weak self] nextState in
                 guard let self else { return }
                 self.messageRetriesInFlight.remove(key)
-                self.state = nextState
+                self.applyRuntimeSnapshot(nextState)
                 self.errorText = nil
                 self.restartUpdateLoopIfEnabled()
             },
@@ -1286,6 +1266,11 @@ final class AppModel: ObservableObject {
         guard roomAllowsComposition(roomID) else { return false }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
+        let optimisticMessageID = installOptimisticMessage(
+            roomID: roomID,
+            text: text,
+            replyToMessageID: message?.messageId
+        )
         let action: AppAction
         if let message {
             action = .sendReply(
@@ -1296,9 +1281,22 @@ final class AppModel: ObservableObject {
         } else {
             action = .sendMessage(roomId: roomID, text: text)
         }
-        return dispatchInBackground(action) { [weak self] in
+        let dispatched = dispatchInBackground(action) { [weak self] in
+            if let optimisticMessageID {
+                self?.removeOptimisticMessage(id: optimisticMessageID)
+            }
             self?.schedulePostSendCatchUp()
+        } onFailure: { [weak self] error in
+            guard let optimisticMessageID else { return }
+            self?.markOptimisticMessageFailed(
+                id: optimisticMessageID,
+                reason: String(describing: error)
+            )
         }
+        if !dispatched, let optimisticMessageID {
+            removeOptimisticMessage(id: optimisticMessageID)
+        }
+        return dispatched
     }
 
     @discardableResult
@@ -1341,7 +1339,7 @@ final class AppModel: ObservableObject {
                     priority: .userInitiated,
                     onSuccess: { [weak self] nextState in
                         guard let self else { return }
-                        self.state = nextState
+                        self.applyRuntimeSnapshot(nextState)
                         self.errorText = nil
                         onSuccess?()
                         self.restartUpdateLoopIfEnabled()
@@ -1388,7 +1386,7 @@ final class AppModel: ObservableObject {
                     priority: .userInitiated,
                     onSuccess: { [weak self] nextState in
                         guard let self else { return }
-                        self.state = nextState
+                        self.applyRuntimeSnapshot(nextState)
                         if captionOverride == nil {
                             self.outboundText = ""
                         }
@@ -1464,7 +1462,7 @@ final class AppModel: ObservableObject {
             priority: .utility,
             onSuccess: { [weak self] beginState in
                 guard let self else { return }
-                self.state = beginState
+                self.applyRuntimeSnapshot(beginState)
                 self.errorText = nil
                 self.restartUpdateLoopIfEnabled()
 
@@ -1480,7 +1478,7 @@ final class AppModel: ObservableObject {
                     onSuccess: { [weak self] nextState in
                         guard let self else { return }
                         self.attachmentDownloadsInFlight.remove(key)
-                        self.state = nextState
+                        self.applyRuntimeSnapshot(nextState)
                         self.errorText = nil
                         self.restartUpdateLoopIfEnabled()
                     },
@@ -1594,6 +1592,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func removePushTokenDuringSignOut(runtime: any FiniteChatRuntimeProtocol) {
+        appendDiagnostic(category: "push", event: "token.remove.requested")
+        Task.detached(priority: .utility) { [runtime] in
+            _ = try? runtime.dispatchAndWait(action: .removePushToken)
+        }
+    }
+
     private func startUpdateLoop() {
         updateTask?.cancel()
         guard let runtime else { return }
@@ -1604,11 +1609,11 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     guard !Task.isCancelled else { return }
                     let nextState = try await Task.detached(priority: .background) {
-                        try runtime.dispatch(action: .startRuntime)
+                        try runtime.waitForUpdate(timeoutMillis: 30_000)
                     }.value
                     guard !Task.isCancelled else { return }
                     guard let self, self.openKey == runtimeKey else { return }
-                    self.state = nextState
+                    self.applyRuntimeSnapshot(nextState)
                     self.appendDiagnostic(category: "runtime", event: "update.polled")
                     self.errorText = nil
                 } catch {
@@ -1619,11 +1624,20 @@ final class AppModel: ObservableObject {
                         event: "update.failed",
                         details: self.diagnosticErrorDetails(error)
                     )
-                    self.errorText = String(describing: error)
+                    let description = String(describing: error)
+                    if !Self.isTransientUpdateHintError(description) {
+                        self.errorText = description
+                    }
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
             }
         }
+    }
+
+    private static func isTransientUpdateHintError(_ description: String) -> Bool {
+        description.contains("SSE hint stream")
+            || description.contains("sync hint stream")
+            || description.contains("Sync hint stream")
     }
 
     @discardableResult
@@ -1635,22 +1649,23 @@ final class AppModel: ObservableObject {
         onSuccess: @escaping @MainActor (AppState) -> Void,
         onFailure: @escaping @MainActor (Error) -> Void
     ) -> Bool {
-        let previousCommand = runtimeCommandTail
-        let command = Task { @MainActor [weak self, previousCommand, runtime, runtimeKey, action] in
-            await previousCommand?.value
+        let previousDispatch = runtimeDispatchTail
+        let dispatchTask = Task { @MainActor [weak self, runtime, runtimeKey, previousDispatch] in
+            await previousDispatch?.value
             guard !Task.isCancelled, let self else { return }
             do {
                 let nextState = try await Task.detached(priority: priority) {
-                    try runtime.dispatch(action: action)
+                    try runtime.dispatchAndWait(action: action)
                 }.value
                 guard !Task.isCancelled, self.openKey == runtimeKey else { return }
+                self.applyRuntimeSnapshot(nextState)
                 onSuccess(nextState)
             } catch {
                 guard !Task.isCancelled, self.openKey == runtimeKey else { return }
                 onFailure(error)
             }
         }
-        runtimeCommandTail = command
+        runtimeDispatchTail = dispatchTask
         return true
     }
 
@@ -1693,7 +1708,7 @@ final class AppModel: ObservableObject {
             priority: priority,
             onSuccess: { [weak self] nextState in
                 guard let self else { return }
-                self.state = nextState
+                self.applyRuntimeSnapshot(nextState)
                 self.errorText = nil
                 self.appendDiagnostic(
                     category: diagnostic.category,
@@ -1738,10 +1753,10 @@ final class AppModel: ObservableObject {
                 do {
                     let runtime = try currentRuntime()
                     let nextState = try await Task.detached(priority: .utility) {
-                        try runtime.dispatch(action: .startRuntime)
+                        try runtime.dispatchAndWait(action: .startRuntime)
                     }.value
                     guard !Task.isCancelled, openKey == runtimeKey else { return }
-                    state = nextState
+                    applyRuntimeSnapshot(nextState)
                     errorText = nil
                     appendDiagnostic(category: "runtime", event: "post_send_catchup.succeeded")
                     restartUpdateLoopIfEnabled()
@@ -1792,6 +1807,7 @@ final class AppModel: ObservableObject {
             )
         )
         let openedState = try opened.state()
+        applyRuntimeSnapshot(openedState)
         syncNostrIdentityFromRuntime(openedState.identity)
         let resolvedDeviceID = openedState.identity.deviceId
         if resolvedDeviceID != deviceID {
@@ -1810,6 +1826,7 @@ final class AppModel: ObservableObject {
         runtime = opened
         let resolvedAccountSecretHex = nostrIdentity?.accountSecretHex ?? accountSecretHex
         openKey = "\(serverURL)|\(deviceID)|\(resolvedAccountSecretHex ?? "stored")"
+        opened.listenForUpdates(reconciler: self)
         appendDiagnostic(category: "runtime", event: "open.succeeded")
         return opened
     }
@@ -1827,17 +1844,15 @@ final class AppModel: ObservableObject {
         canRecoverRuntimeIdentity = false
     }
 
-    private func closeRuntime(cancelQueuedCommands: Bool = true) {
+    private func closeRuntime() {
         updateTask?.cancel()
-        if cancelQueuedCommands {
-            runtimeCommandTail?.cancel()
-            runtimeCommandTail = nil
-        }
         launchAutomationTask?.cancel()
         postSendCatchUpTask?.cancel()
         updateTask = nil
         launchAutomationTask = nil
         postSendCatchUpTask = nil
+        runtimeDispatchTail?.cancel()
+        runtimeDispatchTail = nil
         foregroundStartKey = nil
         attachmentDownloadsInFlight.removeAll()
         messageRetriesInFlight.removeAll()
@@ -1846,7 +1861,11 @@ final class AppModel: ObservableObject {
         runtime = nil
         openKey = ""
         state = nil
+        lastAppliedRuntimeRev = 0
         runtimeStorePath = nil
+        pendingOptimisticMessages = [:]
+        optimisticMessageCounter = 0
+        chatProjections = [:]
     }
 
     private func rebuildChatProjections() {
@@ -1854,7 +1873,83 @@ final class AppModel: ObservableObject {
             chatProjections = [:]
             return
         }
-        chatProjections = ChatTimeline.roomProjections(messages: state.messages)
+        pruneConfirmedOptimisticMessages(confirmedMessages: state.messages)
+        let messages = state.messages + pendingOptimisticMessages.values
+        chatProjections = ChatTimeline.roomProjections(
+            messages: messages,
+            typingMembers: state.typingMembers
+        )
+    }
+
+    private func installOptimisticMessage(
+        roomID: String,
+        text: String,
+        replyToMessageID: String?
+    ) -> String? {
+        guard let state else { return nil }
+        optimisticMessageCounter &+= 1
+        let messageID = "optimistic-\(String(format: "%020llu", optimisticMessageCounter))-\(UUID().uuidString)"
+        let timestamp = Date()
+        let timestampSeconds = UInt64(max(0, timestamp.timeIntervalSince1970))
+        let sequenceOffset = optimisticMessageCounter % 1_000_000
+        let message = ChatMessage(
+            roomId: roomID,
+            seq: Self.optimisticSequenceBase + sequenceOffset,
+            messageId: messageID,
+            conversationId: nil,
+            senderAccountId: state.identity.accountId,
+            senderDeviceId: state.identity.deviceId,
+            senderDisplayName: state.identity.deviceId,
+            senderNpub: myNpub,
+            text: text,
+            displayContent: text,
+            richTextJson: "",
+            payload: Data(text.utf8),
+            replyToMessageId: replyToMessageID,
+            isMine: true,
+            outboundDelivery: OutboundDelivery(
+                localSend: .sending,
+                serverDelivery: .undelivered
+            ),
+            reactions: [],
+            media: [],
+            readReceipt: nil,
+            poll: nil,
+            timestampUnixSeconds: timestampSeconds,
+            displayTimestamp: Self.optimisticTimestampFormatter.string(from: timestamp)
+        )
+        pendingOptimisticMessages[messageID] = message
+        rebuildChatProjections()
+        return messageID
+    }
+
+    private func removeOptimisticMessage(id: String) {
+        guard pendingOptimisticMessages.removeValue(forKey: id) != nil else { return }
+        rebuildChatProjections()
+    }
+
+    private func markOptimisticMessageFailed(id: String, reason: String) {
+        guard var message = pendingOptimisticMessages[id] else { return }
+        message.outboundDelivery = OutboundDelivery(
+            localSend: .sent,
+            serverDelivery: .failed(reason: reason)
+        )
+        pendingOptimisticMessages[id] = message
+        rebuildChatProjections()
+    }
+
+    private func pruneConfirmedOptimisticMessages(confirmedMessages: [ChatMessage]) {
+        guard !pendingOptimisticMessages.isEmpty else { return }
+        pendingOptimisticMessages = pendingOptimisticMessages.filter { _, pending in
+            !confirmedMessages.contains { confirmed in
+                confirmed.isMine
+                    && confirmed.roomId == pending.roomId
+                    && confirmed.text == pending.text
+                    && confirmed.replyToMessageId == pending.replyToMessageId
+                    && confirmed.messageId != pending.messageId
+                    && confirmed.timestampUnixSeconds + 30 >= pending.timestampUnixSeconds
+            }
+        }
     }
 
     private func appendStateDiagnostic(_ state: AppState, event: String) {

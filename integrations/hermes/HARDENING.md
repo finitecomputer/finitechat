@@ -10,6 +10,11 @@ calls are flaky.
 This track is independent of Tinfoil. Tinfoil should only add deployment and
 persistence constraints, not hide basic adapter defects.
 
+For the repeated human canary flow "fresh Hermes instance -> Paul's physical
+phone -> real multi-turn chat", use
+[../../docs/hermes-phone-canary-loop.md](../../docs/hermes-phone-canary-loop.md).
+That runbook is the promotion policy for local Mac, remote Docker, and Tinfoil.
+
 ## Acceptance Criteria
 
 - Hermes 0.17 gateway can chat with Finite Chat iOS through the `finite`
@@ -109,6 +114,67 @@ That probe fetches the running canary invite, creates a throwaway local
 `finitechat` client, submits the current PIN, and fails unless the agent admits
 the join. It would have caught this failure without involving the iOS app.
 
+## RCA: 2026-06-26 Phase 5 Real Hermes/iOS Product Flow
+
+Goal: prove the whole product surface locally before another Tinfoil attempt:
+visible iOS Simulator UI, hosted Finite Chat server, a real Hermes 0.17 gateway
+running on the Mac, the real `finite-platform` plugin, a real invite/PIN join,
+and multiple model-backed AI response turns. CLI state reads are allowed for
+diagnostics only; they are not the UI oracle because they can open the same
+store and perform sync work.
+
+Root causes found:
+
+- Invite admission could claim a stale KeyPackage for the same device instead
+  of the exact KeyPackage uploaded with the current PIN-bound join request.
+  The client now uploads the inline joiner KeyPackage and the owner claims by
+  exact id/ref/hash/payload match before creating the Welcome.
+- A permanently bad pending Welcome could poison later invite attempts. The
+  client now clears permanent pending Welcome activation failures
+  (`ParseWelcome`, `StageWelcome`, `ActivateWelcome`, `GroupAlreadyExists`) so
+  a later valid Welcome can be processed.
+- Swift command completion treated "any later runtime revision" as success
+  after enqueueing a runtime action. Typing, read receipts, or sends could win
+  that race before the requested `.startRuntime` sync had actually completed.
+  Native callers now use exported `dispatchAndWait(action:)` on background
+  tasks when they need completed action state.
+- The runtime could persist a newly synced decrypted message to SQLite without
+  reflecting that durable row in live `AppState.messages`. `runtime_tick` now
+  reloads the durable chat projection after sync and reapplies visible outbox
+  rows, so failed or undelivered local messages remain visible.
+- Swift timeline groups used an id derived only from the first message in a
+  group. Consecutive incoming messages from Hermes could update data without a
+  row identity change that forced the native transcript to render. Group row ids
+  now include first id, last id, and count.
+- Long device IDs can break the Hermes inbound stream recipient limit
+  (`recipient length ... exceeds max 128`). The local canary used a short
+  device id (`p5h`) for the agent. Production should validate or derive bounded
+  device IDs before runtime launch.
+- The local proof used `GATEWAY_ALLOW_ALL_USERS=true` /
+  `FINITECHAT_ALLOW_ALL_USERS=true` so the invited iOS user could drive Hermes.
+  This is canary-only. Production needs finitechat room membership or an
+  explicit per-user allowlist as the Hermes authorization source.
+
+Final local proof:
+
+- Runtime directory:
+  `target/phase5-real-hermes-hosted/run-20260626-130008`
+- Hosted server: `https://chat.finite.computer`
+- Room: `room-07a72ff0b88b9819`
+- Invite: `invite-fbc27d8906ce7ef7`
+- Agent device: `p5h`
+- iOS flow: Home -> Chats -> room -> composer send, with no launch automation
+  flags and no CLI join.
+- Hermes gateway log shows real model turns through
+  `anthropic/claude-sonnet-4.6` via OpenRouter for:
+  `phase five actual turn one ok`,
+  `phase five actual turn two ok`,
+  `phase five dispatch wait turn ok`, and
+  `phase five durable projection ok`.
+- The simulator UI rendered the incoming model bubbles for the final two
+  post-fix turns, proving Rust state, encrypted local projection, Swift
+  timeline grouping, and visible product UI agree.
+
 ## Phases
 
 Each phase should run both vertically through the stack and horizontally across
@@ -178,6 +244,17 @@ thread-scoped working activity set/clear routing. They also cover group-room
 sender identity mapping and fail-closed handling for typed non-message stream
 records such as receipts.
 
+Protocol-hardening regression added after the missed second-turn incident:
+`hermes_poll_recovers_messages_already_applied_by_runtime_sync` proves the
+adapter does not treat the live bridge callback as authoritative. After Hermes
+has acknowledged one user message and recorded its own cursor, the test sends
+two later user messages, lets a separate Rust app runtime sync and persist them
+first, then requires `finitechat hermes poll` to recover both ordered messages
+from durable `client_app_events`, redeliver them until ack, and never replay
+them after ack. This directly exercises the v1 protocol rule that streams and
+pushes are only hints; ordered durable sync and local cursors are the
+consistency boundary.
+
 ### Phase 2: Make The Rust Sidecar The Normal Runtime Path
 
 - Quality: treat `finitechat hermes serve` as the primary path and CLI-per-call
@@ -234,15 +311,20 @@ fallback.
 Current local smoke:
 
 ```bash
+cargo run -q -p finitechat-rmp -- test ios-simulator --json
 scripts/hermes-adapter-regression-report.py
 scripts/hermes-sidecar-smoke.sh
 scripts/hermes-agent-media-e2e.sh
 scripts/hermes-real-gateway-admission-smoke.py
 scripts/ios-hermes-agent-media-e2e.sh
-scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
-They write `target/hermes-adapter-regressions/report.json`,
+The RMP simulator test command erases the dedicated simulator, runs the full
+native `FiniteChat` test scheme with `.state/xcode-derived-data`, replaces its
+explicit `.state/xcode-results/FiniteChatTests.xcresult`, and shuts the
+simulator down after the run. This is the default unit-suite gate before any
+visible app or Hermes E2E proof.
+The smoke commands write `target/hermes-adapter-regressions/report.json`,
 `target/hermes-sidecar-smoke/report.json`, and
 `target/hermes-agent-media-e2e/report.json`.
 `scripts/hermes-real-gateway-admission-smoke.py` writes
@@ -253,18 +335,15 @@ handler.
 The iOS Simulator script writes
 `target/ios-hermes-agent-media-e2e/report.json`; it requires a booted
 simulator or `IOS_SIMULATOR_UDID`.
-The Docker runtime iOS script writes
-`target/ios-hermes-docker-runtime-e2e/report.json`; it requires Docker plus a
-booted simulator or `IOS_SIMULATOR_UDID`.
 Together they prove finitechat-server, `finitechat hermes` CLI, encrypted
 client stores, `finitechat hermes serve`, `/v1/hermes/inbound` NDJSON,
 ack/drain, adapter redelivery/ack/fallback/filter/group/receipt regressions,
 and native iOS app runtime plumbing. They do not, by themselves, prove the
 production `hermes gateway run` path: the Hermes media smoke imports the
-adapter directly and installs a test handler, and the Docker/iOS Docker smokes
-use the echo-agent harness. The required additional local gate is a real Hermes
-0.17 gateway admission smoke where a user joins through the invite/PIN flow and
-the agent's platform adapter admits the join without a test handler.
+adapter directly and installs a test handler. The required additional local
+gate is a real Hermes 0.17 gateway admission smoke where a user joins through
+the invite/PIN flow and the agent's platform adapter admits the join without a
+test handler.
 
 ### Phase 5: Prove The Real Runtime Image In Docker
 
@@ -285,25 +364,18 @@ Current Docker smoke:
 scripts/hermes-restic-preflight.py --report target/hermes-docker-smoke/restic-preflight.json
 scripts/hermes-sidecar-docker-smoke.sh
 scripts/hermes-sidecar-docker-s3-emulator-smoke.sh
-scripts/ios-hermes-docker-runtime-e2e.sh
 ```
 
 It builds `containers/agent/Dockerfile` with `hermes-agent==0.17.0`, starts the
-echo agent in Docker, drives a second `finitechat` CLI user in Docker, and
-writes `target/hermes-docker-smoke/report.json`. This proves the packaged Linux
-image has the plugin files, binary, Hermes runtime dependency, invite/PIN flow,
-encrypted echo round trip, restic encrypted repository init, entrypoint-owned
+real Hermes gateway in Docker, drives `finitechat` CLI users through invite/PIN
+admission before and after restore, and writes
+`target/hermes-docker-smoke/report.json`. This proves the packaged Linux image
+has the plugin files, binary, Hermes runtime dependency, real gateway command,
+invite/PIN admission flow, restic encrypted repository init, entrypoint-owned
 encrypted agent state backup on controlled shutdown, repository check, local
 agent volume wipe, latest-by-tag snapshot restore into a fresh
-volume/container, same agent npub, same room, runtime `/healthz`, and a second
-encrypted echo round trip. It does not prove `hermes gateway run` in the final
-Tinfoil runtime image unless the image entrypoint is the same as the Tinfoil
-entrypoint and the report records gateway platform readiness.
-The iOS Docker runtime smoke builds the same runtime image, starts the agent in
-Docker, rewrites the invite server URL for the iOS Simulator, sends encrypted
-image media from the native app, waits for the runtime agent to log media
-receipt, and verifies the app decrypts the runtime echo reply. This closes the
-gap between Docker CLI acceptance and the product client humans will use.
+volume/container, same agent npub, same room, runtime `/healthz`, and restored
+gateway admission. Echo replies are not accepted as Docker runtime proof.
 The smoke defaults to a local bind-mounted restic repository for CI, and can
 point the same restic contract at S3-compatible object storage with
 `FINITE_DOCKER_RESTIC_BACKEND=s3` plus a per-agent repository such as

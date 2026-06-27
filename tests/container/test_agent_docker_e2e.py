@@ -2,8 +2,8 @@
 
 Gated behind FINITE_DOCKER_E2E=1 (run scripts/hermes-sidecar-docker-smoke.sh).
 Builds the real container image from containers/agent/Dockerfile, starts the
-echo agent, drives a second finitechat CLI user in Docker, and writes a JSON
-evidence report for Docker/Tinfoil baseline comparisons.
+real Hermes gateway, drives finitechat CLI users through invite/PIN admission,
+and writes a JSON evidence report for Docker/Tinfoil baseline comparisons.
 """
 
 from __future__ import annotations
@@ -47,6 +47,15 @@ AWS_RESTIC_ENV_ALIASES = {
     "AWS_DEFAULT_REGION": "FINITE_DOCKER_RESTIC_AWS_DEFAULT_REGION",
     "AWS_REGION": "FINITE_DOCKER_RESTIC_AWS_REGION",
 }
+MODEL_ENV_NAMES = (
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "FINITECHAT_HERMES_MODEL",
+    "FINITECHAT_HERMES_PROVIDER",
+    "FINITECHAT_HERMES_BASE_URL",
+    "FINITECHAT_HERMES_API_MODE",
+)
 
 
 def restic_password_from_env(env: Mapping[str, str]) -> str:
@@ -119,7 +128,8 @@ class SmokeReport:
                         "finitechat-server on host",
                         "agent container with persistent state volume",
                         "user finitechat CLI in Docker",
-                        "E2EE echo round trip before restore",
+                        "real Hermes gateway process",
+                        "gateway invite admission before restore",
                         "restic encrypted repository init",
                         "entrypoint restic encrypted agent state snapshot on shutdown",
                         "restic repository check",
@@ -128,7 +138,7 @@ class SmokeReport:
                         "entrypoint restic latest-by-tag restore into fresh volume",
                         "same agent npub after restore",
                         "runtime HTTP health endpoint after restore",
-                        "E2EE echo round trip after restore",
+                        "gateway invite admission after restore",
                     ],
                 },
                 indent=2,
@@ -183,12 +193,18 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.server_proc = None
         self.agent_volume = f"{CONTAINER}-agent-{int(time.time() * 1000)}"
         self.user_volume = f"{CONTAINER}-user-{int(time.time() * 1000)}"
+        self.restored_user_volume = f"{CONTAINER}-restored-user-{int(time.time() * 1000)}"
         self.addCleanup(self._teardown)
 
     def _teardown(self):
         run(["docker", "rm", "-f", CONTAINER], check=False, timeout=120)
         run(["docker", "volume", "rm", "-f", self.agent_volume], check=False, timeout=120)
         run(["docker", "volume", "rm", "-f", self.user_volume], check=False, timeout=120)
+        run(
+            ["docker", "volume", "rm", "-f", self.restored_user_volume],
+            check=False,
+            timeout=120,
+        )
         if self.server_proc is not None:
             self.server_proc.terminate()
             try:
@@ -199,12 +215,17 @@ class AgentDockerE2ETest(unittest.TestCase):
     def docker_args(self) -> list[str]:
         return ["docker", "run", "--rm", "--add-host", f"{DOCKER_HOST}:host-gateway"]
 
-    def docker_user_hermes(self, *args: str, timeout: int = 180) -> dict[str, Any]:
+    def docker_user_hermes(
+        self,
+        *args: str,
+        timeout: int = 180,
+        volume: str | None = None,
+    ) -> dict[str, Any]:
         result = run(
             [
                 *self.docker_args(),
                 "--mount",
-                f"type=volume,src={self.user_volume},dst=/data/user",
+                f"type=volume,src={volume or self.user_volume},dst=/data/user",
                 IMAGE,
                 "finitechat",
                 "hermes",
@@ -241,6 +262,9 @@ class AgentDockerE2ETest(unittest.TestCase):
             "FINITECHAT_HERMES_INBOUND_STREAM=1",
         ]
         env = os.environ.copy()
+        for name in MODEL_ENV_NAMES:
+            if os.environ.get(name):
+                command.extend(["--env", name])
         runtime_repository = restore_repository or backup_repository
         if restore_repository is not None and backup_repository is not None:
             self.assertEqual(restore_repository["kind"], backup_repository["kind"])
@@ -429,8 +453,8 @@ class AgentDockerE2ETest(unittest.TestCase):
     def check_restic_repository(self, repository: dict[str, Any]) -> None:
         self.restic(repository, ["check"], timeout=600)
 
-    def test_docker_agent_pairs_and_echoes_with_json_evidence(self):
-        report = SmokeReport("docker_agent_pairs_and_echoes")
+    def test_docker_real_gateway_admission_and_restore_with_json_evidence(self):
+        report = SmokeReport("docker_real_gateway_admission_and_restore")
         tmp = Path(self.tmp.name)
 
         def build_host_binaries() -> None:
@@ -505,7 +529,10 @@ class AgentDockerE2ETest(unittest.TestCase):
                 backup_repository=repository,
             ),
         )
-        report.time("agent_ready_log", lambda: self._wait_for_log("ECHO_AGENT_READY", 180))
+        report.time(
+            "real_gateway_runtime_log",
+            lambda: self._wait_for_log("FINITE_AGENT_RUNTIME real_hermes_gateway=true", 180),
+        )
         hermes_version = run(
             [
                 "docker",
@@ -546,6 +573,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertTrue(health["ready"])
         self.assertEqual(health["npub"], agent_identity["npub"])
         report.fact("agent_npub", agent_identity["npub"])
+        report.fact("real_gateway_runtime", True)
         invite_url = pin_info["url"]
         pin = pin_info["pin"]
 
@@ -571,30 +599,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertEqual(joined["state"], "joined")
         room_id = joined["room_id"]
         report.fact("room_id", room_id)
-
-        report.time(
-            "user_send_in_docker",
-            lambda: self.docker_user_hermes(
-                "send",
-                "--request-json",
-                json.dumps(
-                    {
-                        "room_id": room_id,
-                        "conversation_id": None,
-                        "text": "ping from docker user",
-                        "kind": "message",
-                        "status": "complete",
-                        "reply_to_message_id": None,
-                    }
-                ),
-            ),
-        )
-        echoed = report.time(
-            "user_poll_echo_in_docker",
-            lambda: self._poll_for_echo(room_id, "echo: ping from docker user"),
-        )
-        self.assertEqual(echoed["text"], "echo: ping from docker user")
-        self.docker_user_ack(echoed)
+        report.fact("gateway_admission_before_restore", True)
 
         agent_config = json.loads(
             run(
@@ -602,7 +607,6 @@ class AgentDockerE2ETest(unittest.TestCase):
                 timeout=60,
             ).stdout
         )
-        self.assertEqual(echoed["source"]["user_id"], agent_config["account_id"])
         report.fact("agent_account_id", agent_config["account_id"])
 
         report.time(
@@ -634,7 +638,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         )
         report.time(
             "agent_ready_log_after_restore",
-            lambda: self._wait_for_log("ECHO_AGENT_READY", 180),
+            lambda: self._wait_for_log("FINITE_AGENT_RUNTIME real_hermes_gateway=true", 180),
         )
         restored_identity = self.agent_identity()
         self.assertEqual(restored_identity["npub"], agent_identity["npub"])
@@ -644,37 +648,59 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertEqual(restored_health["npub"], restored_identity["npub"])
         report.fact("agent_npub_after_restore", restored_identity["npub"])
 
+        restored_pin_info = json.loads(
+            run(
+                [
+                    "docker",
+                    "exec",
+                    CONTAINER,
+                    "finitechat",
+                    "hermes",
+                    "--home",
+                    "/data/agent",
+                    "pin",
+                ],
+                timeout=60,
+            ).stdout
+        )
         report.time(
-            "user_send_after_restore_in_docker",
+            "restored_user_init_in_docker",
             lambda: self.docker_user_hermes(
-                "send",
-                "--request-json",
-                json.dumps(
-                    {
-                        "room_id": room_id,
-                        "conversation_id": None,
-                        "text": "ping after docker restore",
-                        "kind": "message",
-                        "status": "complete",
-                        "reply_to_message_id": None,
-                    }
-                ),
+                "init",
+                "--server",
+                server_url,
+                volume=self.restored_user_volume,
             ),
         )
-        restored_echo = report.time(
-            "user_poll_echo_after_restore_in_docker",
-            lambda: self._poll_for_echo(room_id, "echo: ping after docker restore"),
+        restored_join = report.time(
+            "restored_user_join_in_docker",
+            lambda: self.docker_user_hermes(
+                "join",
+                "--url",
+                restored_pin_info["url"],
+                "--pin",
+                restored_pin_info["pin"],
+                "--name",
+                "Docker Restored E2E User",
+                "--timeout-ms",
+                "120000",
+                timeout=180,
+                volume=self.restored_user_volume,
+            ),
         )
-        self.assertEqual(restored_echo["text"], "echo: ping after docker restore")
-        self.assertEqual(restored_echo["source"]["user_id"], agent_config["account_id"])
-        self.docker_user_ack(restored_echo)
+        self.assertEqual(restored_join["state"], "joined")
+        self.assertEqual(restored_join["room_id"], room_id)
+        report.fact("gateway_admission_after_restore", True)
         report.finish()
 
     def restic_repository_path(self, tmp: Path) -> Path:
         report_path = os.environ.get("FINITE_HERMES_DOCKER_SMOKE_REPORT")
         if not report_path:
             return tmp / "restic-repo"
-        path = Path(report_path).parent / "restic-repo"
+        path = Path(report_path)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        path = path.parent / "restic-repo"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -796,35 +822,6 @@ class AgentDockerE2ETest(unittest.TestCase):
             "created": image.get("Created"),
             "size_bytes": image.get("Size"),
         }
-
-    def docker_user_ack(self, event: dict[str, Any]) -> None:
-        ack = self.docker_user_hermes(
-            "ack",
-            "--request-json",
-            json.dumps(
-                {
-                    "room_id": event["room_id"],
-                    "seq": event["seq"],
-                    "message_id": event["message_id"],
-                }
-            ),
-        )
-        self.assertTrue(ack["acked"])
-
-    def _poll_for_echo(self, room_id: str, expected_text: str) -> dict[str, Any]:
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            poll = self.docker_user_hermes(
-                "poll",
-                "--request-json",
-                json.dumps({"timeout_millis": 10000}),
-                timeout=60,
-            )
-            for event in poll.get("events", []):
-                if event.get("text") == expected_text:
-                    return event
-        logs = run(["docker", "logs", CONTAINER], check=False, timeout=60)
-        self.fail(f"no echo received; agent logs:\n{logs.stdout[-4000:]}")
 
     def _wait_for_health(self, url: str, timeout: float = 30) -> None:
         import urllib.request

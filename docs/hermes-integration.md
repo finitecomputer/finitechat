@@ -145,6 +145,10 @@ CI runs both sides of the boundary:
   the finite-platform plugin into a prepared Hermes checkout, and runs
   `hermes gateway run` without a test echo callback.
 
+That runner is a low-level local debugging aid. It is not the physical-phone
+product canary gate. For the hardened local phone -> remote Docker -> Tinfoil
+promotion loop, use `docs/hermes-phone-canary-loop.md`.
+
 The plugin tests prove:
 
 - registration exposes the `finite` platform contract;

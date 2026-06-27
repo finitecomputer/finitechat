@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -42,6 +43,9 @@ pub enum Cmd {
 
     /// Build/install/launch on iOS/Android/desktop (debug).
     Run(RunArgs),
+
+    /// Run deterministic platform test suites.
+    Test(TestArgs),
 
     /// Delete a whole explicit product harness store root.
     ResetProductStore(ResetProductStoreArgs),
@@ -199,6 +203,35 @@ pub enum RunPlatform {
     Ios,
     Android,
     Iced,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TestArgs {
+    #[arg(value_enum)]
+    pub platform: TestPlatform,
+
+    #[command(flatten)]
+    pub ios_simulator: TestIosSimulatorArgs,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum TestPlatform {
+    IosSimulator,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TestIosSimulatorArgs {
+    /// Dedicated simulator UDID to erase and run against.
+    #[arg(long)]
+    pub udid: Option<String>,
+
+    /// Isolated derived-data root for the test run.
+    #[arg(long, default_value = ".state/xcode-derived-data")]
+    pub derived_data_path: PathBuf,
+
+    /// xcresult bundle path. Existing bundles at this path are deleted first.
+    #[arg(long, default_value = ".state/xcode-results/FiniteChatTests.xcresult")]
+    pub result_bundle_path: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]

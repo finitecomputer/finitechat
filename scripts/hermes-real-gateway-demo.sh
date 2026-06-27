@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Low-level local runner for manual Hermes gateway debugging.
+#
+# This is not the hardened physical-phone canary gate. It may use loopback
+# server URLs and does not prove the full product flow on a phone. For the
+# local phone -> remote Docker -> Tinfoil promotion loop, see
+# docs/hermes-phone-canary-loop.md.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

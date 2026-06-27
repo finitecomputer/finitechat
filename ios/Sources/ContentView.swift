@@ -1305,9 +1305,7 @@ private struct RoomThreadView: View {
     }
 
     private var transcriptRows: [ChatTimelineRow] {
-        let members = typingMembers(for: roomID)
-        guard !members.isEmpty else { return projection.rows }
-        return projection.rows + [.typing(members)]
+        projection.rows
     }
 
     var body: some View {
@@ -1728,10 +1726,6 @@ private struct RoomThreadView: View {
     private func focusedReplyTarget(for message: ChatMessage) -> ChatMessage? {
         guard let replyToMessageId = message.replyToMessageId else { return nil }
         return projection.messagesById[replyToMessageId]
-    }
-
-    private func typingMembers(for roomID: String) -> [AppTypingMember] {
-        model.state?.typingMembers.filter { $0.roomId == roomID } ?? []
     }
 
     private func updateTypingIntent(_ text: String) {
@@ -2503,7 +2497,6 @@ private struct ScanSheet: View {
     let onStartProfileChat: (AppProfileSummary) -> Bool
     @State private var showingCameraScanner = false
     @State private var scanError: String?
-    @State private var scanInFlight = false
 
     var body: some View {
         NavigationStack {
@@ -2548,13 +2541,13 @@ private struct ScanSheet: View {
                         continueWithTarget()
                     } label: {
                         Label(
-                            scanInFlight ? "Opening" : "Continue",
-                            systemImage: scanInFlight ? "hourglass" : "arrow.right.circle"
+                            model.scanInFlight ? "Opening" : "Continue",
+                            systemImage: model.scanInFlight ? "hourglass" : "arrow.right.circle"
                         )
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(scanDraftIsEmpty || scanInFlight)
+                    .disabled(scanDraftIsEmpty || model.scanInFlight)
                     .accessibilityIdentifier("ScanInlineContinueButton")
                 } header: {
                     Text("Invite or Profile Code")
@@ -2606,10 +2599,10 @@ private struct ScanSheet: View {
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(scanInFlight ? "Opening" : "Continue") {
+                    Button(model.scanInFlight ? "Opening" : "Continue") {
                         continueWithTarget()
                     }
-                    .disabled(scanDraftIsEmpty || scanInFlight)
+                    .disabled(scanDraftIsEmpty || model.scanInFlight)
                     .accessibilityIdentifier("ScanContinueButton")
                 }
             }
@@ -2642,10 +2635,8 @@ private struct ScanSheet: View {
             return
         }
 
-        guard !scanInFlight else { return }
-        scanInFlight = true
+        guard !model.scanInFlight else { return }
         model.scanTarget { result in
-            scanInFlight = false
             handleScanResult(result)
         }
     }

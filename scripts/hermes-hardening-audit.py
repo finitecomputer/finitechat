@@ -15,7 +15,8 @@ REQUIRED_DOCKER_PROOF_LAYERS = {
     "hermes-agent 0.17 runtime",
     "finitechat binary in image",
     "finite-platform plugin in image",
-    "E2EE echo round trip before restore",
+    "real Hermes gateway process",
+    "gateway invite admission before restore",
     "entrypoint restic encrypted agent state snapshot on shutdown",
     "restic repository check",
     "agent state volume wipe",
@@ -23,19 +24,7 @@ REQUIRED_DOCKER_PROOF_LAYERS = {
     "entrypoint restic latest-by-tag restore into fresh volume",
     "same agent npub after restore",
     "runtime HTTP health endpoint after restore",
-    "E2EE echo round trip after restore",
-}
-REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS = {
-    "docker image build",
-    "hermes-agent 0.17 runtime",
-    "finitechat binary in image",
-    "finite-platform plugin in image",
-    "finitechat-server on host",
-    "real Docker runtime agent container",
-    "iOS Simulator app joins runtime invite",
-    "iOS sends encrypted media message",
-    "runtime agent receives iOS media",
-    "iOS decrypts runtime agent reply",
+    "gateway invite admission after restore",
 }
 REQUIRED_SIDECAR_PROOF_LAYERS = {
     "finitechat-server",
@@ -79,15 +68,6 @@ REQUIRED_IOS_MEDIA_E2E_STEPS = {
     "ios_app_launch",
     "agent_receive_ios_media",
     "ios_receive_agent_replies",
-}
-REQUIRED_DOCKER_IOS_RUNTIME_STEPS = {
-    "host_server_ready",
-    "docker_image_build",
-    "agent_container_start",
-    "agent_ready_log",
-    "ios_app_launch",
-    "agent_receive_ios_media",
-    "ios_receive_runtime_reply",
 }
 REQUIRED_TINFOIL_PROOF_LAYERS = {
     "Tinfoil container running",
@@ -151,6 +131,9 @@ REQUIRED_PUBLISH_PROOF = {
     "smoke_status": "passed",
     "hermes_agent_version_actual": "0.17.0",
     "restic_backend": "s3",
+    "real_gateway_runtime": True,
+    "gateway_admission_before_restore": True,
+    "gateway_admission_after_restore": True,
 }
 RESTIC_SNAPSHOT_TAG = "finite-agent-state"
 RESTIC_AGENT_STATE_PATH = "/data/agent"
@@ -684,7 +667,6 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     media_e2e_path = Path(args.media_e2e_report)
     ios_media_e2e_path = Path(args.ios_media_e2e_report)
     docker_path = Path(args.docker_report)
-    docker_ios_path = Path(args.docker_ios_report)
     s3_emulator_path = Path(args.s3_emulator_report)
     github_setup_path = Path(args.github_setup_report)
     github_publish_gate_path = Path(args.github_publish_gate_report)
@@ -699,7 +681,6 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     media_e2e = load_optional_json(media_e2e_path)
     ios_media_e2e = load_optional_json(ios_media_e2e_path)
     docker = load_optional_json(docker_path)
-    docker_ios = load_optional_json(docker_ios_path)
     s3_emulator = load_optional_json(s3_emulator_path)
     github_setup = load_optional_json(github_setup_path)
     github_publish_gate = load_optional_json(github_publish_gate_path)
@@ -815,6 +796,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         and not docker_backup_errors
         and docker_facts.get("hermes_agent_version_actual") == "0.17.0"
         and docker_facts.get("agent_npub") == docker_facts.get("agent_npub_after_restore")
+        and docker_facts.get("real_gateway_runtime") is True
+        and docker_facts.get("gateway_admission_before_restore") is True
+        and docker_facts.get("gateway_admission_after_restore") is True
     )
     add_check(
         checks,
@@ -832,51 +816,6 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     s3_smoke_errors = validate_real_s3_smoke_facts(docker_facts)
     s3_smoke = docker_passed and not s3_smoke_errors
 
-    docker_ios_missing = missing_layers(docker_ios or {}, REQUIRED_DOCKER_IOS_RUNTIME_PROOF_LAYERS)
-    docker_ios_facts = docker_ios.get("facts", {}) if isinstance(docker_ios, dict) else {}
-    docker_ios_steps_missing = sorted(
-        REQUIRED_DOCKER_IOS_RUNTIME_STEPS - step_names(docker_ios or {})
-    )
-    docker_ios_texts = docker_ios_facts.get("ios_received_text")
-    docker_ios_media_types = docker_ios_facts.get("agent_received_media_types")
-    docker_ios_health = (
-        docker_ios_facts.get("runtime_health")
-        if isinstance(docker_ios_facts.get("runtime_health"), dict)
-        else {}
-    )
-    docker_ios_passed = (
-        bool(docker_ios)
-        and docker_ios.get("status") == "passed"
-        and docker_ios.get("name") == "ios_simulator_docker_runtime_e2e"
-        and not docker_ios_missing
-        and not docker_ios_steps_missing
-        and docker_ios_facts.get("platform") == "ios_simulator"
-        and bool(docker_ios_facts.get("simulator_udid"))
-        and docker_ios_facts.get("hermes_agent_version_actual") == "0.17.0"
-        and docker_ios_facts.get("agent_received_message_type") == "photo"
-        and isinstance(docker_ios_media_types, list)
-        and "image/png" in docker_ios_media_types
-        and docker_ios_facts.get("invite_rewritten_for_ios") is True
-        and docker_ios_health.get("ready") is True
-        and docker_ios_health.get("npub") == docker_ios_facts.get("agent_npub")
-        and isinstance(docker_ios_texts, list)
-        and "echo: ios docker runtime hello" in docker_ios_texts
-    )
-    add_check(
-        checks,
-        name="docker_runtime_ios_e2e",
-        status="passed" if docker_ios_passed else "missing",
-        evidence=str(docker_ios_path) if docker_ios else None,
-        detail=None
-        if docker_ios_passed
-        else (
-            "requires iOS Simulator smoke against the real Docker runtime image "
-            "with native join, encrypted media send, runtime media receipt, and "
-            "iOS decrypt of runtime reply; missing layers: "
-            f"{', '.join(docker_ios_missing)}; missing steps: {', '.join(docker_ios_steps_missing)}"
-        ),
-    )
-
     s3_emulator_missing = missing_layers(s3_emulator or {}, REQUIRED_DOCKER_PROOF_LAYERS)
     s3_emulator_facts = s3_emulator.get("facts", {}) if isinstance(s3_emulator, dict) else {}
     s3_emulator_backup_errors = validate_agent_state_backup(
@@ -892,6 +831,9 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         and s3_emulator_facts.get("s3_endpoint_kind") == "local_emulator"
         and s3_emulator_facts.get("hermes_agent_version_actual") == "0.17.0"
         and s3_emulator_facts.get("agent_npub") == s3_emulator_facts.get("agent_npub_after_restore")
+        and s3_emulator_facts.get("real_gateway_runtime") is True
+        and s3_emulator_facts.get("gateway_admission_before_restore") is True
+        and s3_emulator_facts.get("gateway_admission_after_restore") is True
     )
     add_check(
         checks,
@@ -1048,10 +990,6 @@ def main() -> int:
     parser.add_argument(
         "--docker-report",
         default="target/hermes-docker-smoke/report.json",
-    )
-    parser.add_argument(
-        "--docker-ios-report",
-        default="target/ios-hermes-docker-runtime-e2e/report.json",
     )
     parser.add_argument(
         "--s3-emulator-report",

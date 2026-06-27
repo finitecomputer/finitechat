@@ -7,6 +7,7 @@ mod init;
 mod product_harness;
 mod product_store;
 mod run;
+mod test_runner;
 mod util;
 
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
                 } => devices::devices_start(&root, args.json, args.verbose, s),
                 cli::Cmd::Bindings(b) => bindings::bindings(&root, args.json, args.verbose, b),
                 cli::Cmd::Run(r) => run::run(&root, args.json, args.verbose, r),
+                cli::Cmd::Test(t) => test_runner::test(&root, args.json, args.verbose, t),
                 cli::Cmd::ResetProductStore(r) => {
                     product_store::reset_product_store(&root, args.json, args.verbose, r)
                 }
