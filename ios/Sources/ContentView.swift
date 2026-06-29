@@ -2772,9 +2772,11 @@ private struct ScanSheet: View {
             dismiss()
         } label: {
             Image(systemName: "xmark")
-                .font(.body.weight(.semibold))
-                .frame(width: 32, height: 32)
+                .font(.footnote.weight(.bold))
+                .frame(width: 36, height: 36)
+                .contentShape(Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel("Close")
         .modifier(ScanCloseButtonStyle())
     }
@@ -2845,11 +2847,9 @@ private struct ScanCloseButtonStyle: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
             content
-                .buttonStyle(.glass)
-                .buttonBorderShape(.circle)
+                .glassEffect(.regular.interactive(), in: .circle)
         } else {
             content
-                .buttonStyle(.borderless)
                 .background(.ultraThinMaterial, in: Circle())
         }
     }
