@@ -6,27 +6,8 @@ struct GlassCircleCloseButton: View {
 
     var body: some View {
         Button(action: action) {
-            ZStack {
-                glassCircle
-                Image(systemName: "xmark")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.primary)
-            }
-            .frame(width: 36, height: 36)
-            .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Close")
-    }
-
-    @ViewBuilder
-    private var glassCircle: some View {
-        if #available(iOS 26.0, *) {
-            Circle()
-                .glassEffect(.regular.interactive())
-        } else {
-            Circle()
-                .fill(.ultraThinMaterial)
+            Label("Close", systemImage: "xmark")
+                .labelStyle(.iconOnly)
         }
     }
 }
