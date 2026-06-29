@@ -1,6 +1,17 @@
 import SwiftUI
 import UIKit
 
+struct GlassCircleCloseButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label("Close", systemImage: "xmark")
+                .labelStyle(.iconOnly)
+        }
+    }
+}
+
 enum AppTab: Hashable {
     case chats
     case people
@@ -528,6 +539,7 @@ struct PeopleView: View {
         }
         .listStyle(.plain)
         .navigationTitle("People")
+        .listNavigationBarChrome()
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button(action: showMyProfile) {
@@ -946,10 +958,8 @@ struct MyNostrProfileSheet: View {
                 await refreshProfileCodeReadiness()
             }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
         }
@@ -1024,10 +1034,8 @@ private struct NostrFollowProfileSheet: View {
             .navigationTitle(profile.displayName)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
         }

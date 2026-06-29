@@ -9,12 +9,55 @@ enum MessageCollectionUpdateKind: Equatable {
 enum MessageCollectionLayout {
     static let jumpButtonSpacing: CGFloat = 12
     static let bottomContentSpacing: CGFloat = 4
+    static let chatTopFadeExtension: CGFloat = 32
+    static let inlineNavigationBarHeight: CGFloat = 44
+
+    static func chatTopFadeHeight(safeAreaTop: CGFloat) -> CGFloat {
+        max(0, safeAreaTop) + inlineNavigationBarHeight + chatTopFadeExtension
+    }
+
+    enum ComposerChrome {
+        static let dockBottomPadding: CGFloat = 8
+        static let iconRowBottomPadding: CGFloat = 10
+        static let iconRowHeight: CGFloat = 34
+        static let fadeLiftAboveIcons: CGFloat = 44
+    }
+
+    enum GroupCreateChrome {
+        static let dockTopPadding: CGFloat = 12
+        static let dockBottomPadding: CGFloat = 8
+        static let buttonHeight: CGFloat = 50
+        static let fadeLiftAboveButton: CGFloat = 40
+    }
+
+    static func groupCreateFadeHeight(safeAreaBottom: CGFloat) -> CGFloat {
+        max(0, safeAreaBottom)
+            + GroupCreateChrome.dockTopPadding
+            + GroupCreateChrome.buttonHeight
+            + GroupCreateChrome.dockBottomPadding
+            + GroupCreateChrome.fadeLiftAboveButton
+    }
+
+    static func safeZoneFadeHeight(safeAreaBottom: CGFloat) -> CGFloat {
+        max(0, safeAreaBottom)
+            + ComposerChrome.dockBottomPadding
+            + ComposerChrome.iconRowBottomPadding
+            + ComposerChrome.iconRowHeight
+            + ComposerChrome.fadeLiftAboveIcons
+    }
 
     static func bottomViewportInset(
         keyboardInset: CGFloat,
-        accessoryHeight: CGFloat
+        accessoryHeight: CGFloat,
+        safeAreaBottom: CGFloat = 0
     ) -> CGFloat {
-        max(max(0, keyboardInset), max(0, accessoryHeight))
+        let keyboard = max(0, keyboardInset)
+        let accessory = max(0, accessoryHeight)
+        let keyboardVisible = keyboard > safeAreaBottom + 20
+        if keyboardVisible {
+            return keyboard + accessory
+        }
+        return accessory
     }
 
     static func shouldPinToBottom(

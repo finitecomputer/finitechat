@@ -18,7 +18,6 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
     let onLongPressMessage: (ChatMessage, CGRect) -> Void
     let onOpenURL: (URL) -> OpenURLAction.Result
     let accessoryContent: AccessoryContent
-    let isInputFocused: Bool
     var canLoadOlder = false
     var onLoadOlderMessages: ((String) -> Void)?
     @Binding var followsBottom: Bool
@@ -111,7 +110,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         }
         context.coordinator.dataSource = dataSource
 
-        viewController.updateAccessory(rootView: accessoryContent, keepVisible: !isInputFocused)
+        viewController.updateAccessory(rootView: accessoryContent)
         viewController.setJumpButtonVisible(!followsBottom, animated: false)
         context.coordinator.applyViewportInsetsIfNeeded()
         context.coordinator.applyRows(rows, animated: false) {
@@ -146,8 +145,7 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
         coordinator.lastContentState = contentState
 
         let accessoryHeightChanged = viewController.updateAccessory(
-            rootView: accessoryContent,
-            keepVisible: !isInputFocused
+            rootView: accessoryContent
         )
         if accessoryHeightChanged, !shouldPinToBottom {
             coordinator.pendingViewportAnchor = anchor
@@ -618,11 +616,16 @@ struct ChatTranscriptView<AccessoryContent: View>: UIViewControllerRepresentable
 
 final class ChatTranscriptHostController<AccessoryContent: View>: UIViewController {
     fileprivate let collectionView: BoundsAwareCollectionView
-    private let accessoryContainerView: InputAccessoryHostingView<AccessoryContent>
+    private let accessoryContainerView: AccessoryHostingView<AccessoryContent>
+    private let topSafeZoneFadeView = EdgeBlurFadeView(direction: .top)
+    private let bottomSafeZoneFadeView = EdgeBlurFadeView(direction: .bottom)
     private let jumpButtonChromeView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
     private let jumpButton = UIButton(type: .system)
     private var lastReportedBottomViewportInset: CGFloat = 0
+    private var accessoryBottomConstraint: NSLayoutConstraint?
     private var jumpButtonBottomConstraint: NSLayoutConstraint?
+    private var bottomFadeHeightConstraint: NSLayoutConstraint?
+    private var topFadeHeightConstraint: NSLayoutConstraint?
     private var isJumpButtonVisible = false
 
     var onViewportGeometryChange: (() -> Void)?
@@ -633,7 +636,8 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
         let keyboardInset = max(0, view.bounds.maxY - view.keyboardLayoutGuide.layoutFrame.minY)
         return MessageCollectionLayout.bottomViewportInset(
             keyboardInset: keyboardInset,
-            accessoryHeight: accessoryContainerView.measuredHeight
+            accessoryHeight: accessoryContainerView.measuredHeight,
+            safeAreaBottom: view.safeAreaInsets.bottom
         )
     }
 
@@ -643,21 +647,13 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
 
     init(layout: UICollectionViewLayout, accessoryContent: AccessoryContent) {
         self.collectionView = BoundsAwareCollectionView(frame: .zero, collectionViewLayout: layout)
-        self.accessoryContainerView = InputAccessoryHostingView(rootView: accessoryContent)
+        self.accessoryContainerView = AccessoryHostingView(rootView: accessoryContent)
         super.init(nibName: nil, bundle: nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
-    }
-
-    override var inputAccessoryView: UIView? {
-        accessoryContainerView
-    }
-
-    override var canBecomeFirstResponder: Bool {
-        true
     }
 
     override func viewDidLoad() {
@@ -672,19 +668,38 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
             collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
+
+        accessoryContainerView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(accessoryContainerView)
+        accessoryBottomConstraint = accessoryContainerView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        NSLayoutConstraint.activate([
+            accessoryContainerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            accessoryContainerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            accessoryBottomConstraint,
+        ].compactMap { $0 })
+
+        configureTopFade()
+        configureBottomFade()
         configureJumpButton()
 
         accessoryContainerView.onHeightChange = { [weak self] in
+            self?.updateAccessoryBottomConstraint()
+            self?.updateBottomFadeLayout()
             self?.updateJumpButtonBottomConstraint()
             self?.onViewportGeometryChange?()
         }
+        bringChromeToFront()
+    }
+
+    private func bringChromeToFront() {
+        view.bringSubviewToFront(topSafeZoneFadeView)
+        view.bringSubviewToFront(bottomSafeZoneFadeView)
+        view.bringSubviewToFront(jumpButtonChromeView)
+        view.bringSubviewToFront(accessoryContainerView)
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        if !isFirstResponder {
-            becomeFirstResponder()
-        }
         DispatchQueue.main.async { [weak self] in
             self?.onViewportGeometryChange?()
         }
@@ -693,18 +708,19 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         onWillDisappear?()
-        if isFirstResponder {
-            resignFirstResponder()
-        }
     }
 
     override func viewSafeAreaInsetsDidChange() {
         super.viewSafeAreaInsetsDidChange()
+        updateTopFadeLayout()
         onViewportGeometryChange?()
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        updateAccessoryBottomConstraint()
+        updateTopFadeLayout()
+        updateBottomFadeLayout()
         updateJumpButtonBottomConstraint()
         let bottomViewportInset = self.bottomViewportInset
         guard abs(bottomViewportInset - lastReportedBottomViewportInset) > 0.5 else { return }
@@ -713,12 +729,8 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
     }
 
     @discardableResult
-    func updateAccessory(rootView: AccessoryContent, keepVisible: Bool) -> Bool {
-        let accessoryHeightChanged = accessoryContainerView.update(rootView: rootView)
-        if keepVisible, view.window != nil, !isFirstResponder {
-            becomeFirstResponder()
-        }
-        return accessoryHeightChanged
+    func updateAccessory(rootView: AccessoryContent) -> Bool {
+        accessoryContainerView.update(rootView: rootView)
     }
 
     func setJumpButtonVisible(_ visible: Bool, animated: Bool) {
@@ -752,6 +764,50 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
         }
     }
 
+    private func configureTopFade() {
+        topSafeZoneFadeView.translatesAutoresizingMaskIntoConstraints = false
+        view.insertSubview(topSafeZoneFadeView, aboveSubview: collectionView)
+        topFadeHeightConstraint = topSafeZoneFadeView.heightAnchor.constraint(equalToConstant: 0)
+        NSLayoutConstraint.activate([
+            topSafeZoneFadeView.topAnchor.constraint(equalTo: view.topAnchor),
+            topSafeZoneFadeView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            topSafeZoneFadeView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            topFadeHeightConstraint,
+        ].compactMap { $0 })
+        updateTopFadeLayout()
+    }
+
+    private func updateTopFadeLayout() {
+        let fadeHeight = MessageCollectionLayout.chatTopFadeHeight(
+            safeAreaTop: view.safeAreaInsets.top
+        )
+        topFadeHeightConstraint?.constant = fadeHeight
+        topSafeZoneFadeView.preferredHeight = fadeHeight
+    }
+
+    private func configureBottomFade() {
+        bottomSafeZoneFadeView.translatesAutoresizingMaskIntoConstraints = false
+        view.insertSubview(bottomSafeZoneFadeView, aboveSubview: collectionView)
+        bottomFadeHeightConstraint = bottomSafeZoneFadeView.heightAnchor.constraint(equalToConstant: 0)
+        NSLayoutConstraint.activate([
+            bottomSafeZoneFadeView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bottomSafeZoneFadeView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bottomSafeZoneFadeView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            bottomFadeHeightConstraint,
+        ].compactMap { $0 })
+        updateBottomFadeLayout()
+    }
+
+    private func updateBottomFadeLayout() {
+        let keyboardInset = max(0, view.bounds.maxY - view.keyboardLayoutGuide.layoutFrame.minY)
+        let keyboardVisible = keyboardInset > view.safeAreaInsets.bottom + 20
+        bottomFadeHeightConstraint?.constant = MessageCollectionLayout.safeZoneFadeHeight(
+            safeAreaBottom: view.safeAreaInsets.bottom
+        )
+        bottomSafeZoneFadeView.preferredHeight = bottomFadeHeightConstraint?.constant ?? 0
+        bottomSafeZoneFadeView.isHidden = keyboardVisible
+    }
+
     private func configureJumpButton() {
         jumpButtonChromeView.translatesAutoresizingMaskIntoConstraints = false
         jumpButtonChromeView.layer.cornerRadius = 18
@@ -775,7 +831,7 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
         jumpButtonChromeView.contentView.addSubview(jumpButton)
 
         jumpButtonBottomConstraint = jumpButtonChromeView.bottomAnchor.constraint(
-            equalTo: view.keyboardLayoutGuide.topAnchor
+            equalTo: accessoryContainerView.topAnchor
         )
 
         guard let jumpButtonBottomConstraint else {
@@ -794,6 +850,27 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
         updateJumpButtonBottomConstraint()
     }
 
+    private func updateAccessoryBottomConstraint() {
+        let keyboardInset = max(0, view.bounds.maxY - view.keyboardLayoutGuide.layoutFrame.minY)
+        let keyboardVisible = keyboardInset > view.safeAreaInsets.bottom + 20
+        let targetAnchor: NSLayoutYAxisAnchor
+        if keyboardVisible {
+            targetAnchor = view.keyboardLayoutGuide.topAnchor
+        } else {
+            targetAnchor = view.bottomAnchor
+        }
+
+        if let accessoryBottomConstraint,
+           accessoryBottomConstraint.secondAnchor === targetAnchor
+        {
+            return
+        }
+
+        accessoryBottomConstraint?.isActive = false
+        accessoryBottomConstraint = accessoryContainerView.bottomAnchor.constraint(equalTo: targetAnchor)
+        accessoryBottomConstraint?.isActive = true
+    }
+
     private func updateJumpButtonBottomConstraint() {
         jumpButtonBottomConstraint?.constant = -MessageCollectionLayout.jumpButtonSpacing
     }
@@ -804,7 +881,7 @@ final class ChatTranscriptHostController<AccessoryContent: View>: UIViewControll
     }
 }
 
-final class InputAccessoryHostingView<AccessoryContent: View>: UIInputView {
+final class AccessoryHostingView<AccessoryContent: View>: UIView {
     private var hostedView: (UIView & UIContentView)?
     private var lastReportedHeight: CGFloat = 0
     var onHeightChange: (() -> Void)?
@@ -813,8 +890,7 @@ final class InputAccessoryHostingView<AccessoryContent: View>: UIInputView {
     }
 
     init(rootView: AccessoryContent) {
-        super.init(frame: .zero, inputViewStyle: .default)
-        allowsSelfSizing = true
+        super.init(frame: .zero)
         backgroundColor = .clear
         isOpaque = false
         clipsToBounds = false
@@ -831,8 +907,11 @@ final class InputAccessoryHostingView<AccessoryContent: View>: UIInputView {
     func update(rootView: AccessoryContent) -> Bool {
         let configuration = UIHostingConfiguration {
             rootView
+                .background(Color.clear)
+                .ignoresSafeArea(edges: .bottom)
         }
         .margins(.all, 0)
+        .background(Color.clear)
 
         if let hostedView {
             hostedView.configuration = configuration

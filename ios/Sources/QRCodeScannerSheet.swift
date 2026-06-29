@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import UIKit
 
 struct QRCodeScannerSheet: View {
     static var canUseCamera: Bool {
@@ -27,14 +28,15 @@ struct QRCodeScannerSheet: View {
             .navigationTitle("Scan Code")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
             .onAppear {
                 ensureCameraPermission()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                refreshCameraAuthorization()
             }
         }
     }
@@ -56,11 +58,7 @@ struct QRCodeScannerSheet: View {
                 .frame(maxWidth: .infinity, minHeight: 240)
 
         case .denied, .restricted:
-            ContentUnavailableView(
-                "Camera Unavailable",
-                systemImage: "camera.fill",
-                description: Text("Paste the invite or profile code instead.")
-            )
+            CameraPermissionUnavailableView()
             .frame(maxWidth: .infinity, minHeight: 240)
 
         @unknown default:
@@ -80,6 +78,183 @@ struct QRCodeScannerSheet: View {
                 scannerNonce = UUID()
             }
         }
+    }
+
+    private func refreshCameraAuthorization() {
+        authStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        scannerNonce = UUID()
+    }
+}
+
+struct QRCodeScannerPanel: View {
+    static let cardCornerRadius: CGFloat = 28
+
+    let cornerRadius: CGFloat
+    let expandsVertically: Bool
+    let onScanned: (String) -> Void
+
+    @State private var authStatus = AVCaptureDevice.authorizationStatus(for: .video)
+    @State private var scannerNonce = UUID()
+
+    init(
+        cornerRadius: CGFloat = QRCodeScannerPanel.cardCornerRadius,
+        expandsVertically: Bool = false,
+        onScanned: @escaping (String) -> Void
+    ) {
+        self.cornerRadius = cornerRadius
+        self.expandsVertically = expandsVertically
+        self.onScanned = onScanned
+    }
+
+    var body: some View {
+        content
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(Color(.separator).opacity(0.28), lineWidth: 1)
+            }
+            .onAppear {
+                ensureCameraPermission()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                refreshCameraAuthorization()
+            }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if !QRCodeScannerSheet.canUseCamera {
+            sizedPanel {
+                unavailableCameraView
+            }
+        } else {
+            switch authStatus {
+            case .authorized:
+                sizedPanel {
+                    ZStack {
+                        QRCodeScannerView(onCode: onScanned)
+                            .id(scannerNonce)
+
+                        ScannerReticle()
+                            .stroke(.white.opacity(0.92), style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+                            .frame(width: 184, height: 184)
+                            .shadow(color: .black.opacity(0.35), radius: 4, x: 0, y: 2)
+                            .accessibilityHidden(true)
+                    }
+                }
+
+            case .notDetermined:
+                sizedPanel {
+                    ProgressView("Requesting camera permission...")
+                }
+
+            case .denied, .restricted:
+                sizedPanel {
+                    cameraPermissionView
+                }
+
+            @unknown default:
+                sizedPanel {
+                    unavailableCameraView
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sizedPanel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        if expandsVertically {
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            content()
+                .frame(maxWidth: .infinity)
+                .aspectRatio(0.78, contentMode: .fit)
+        }
+    }
+
+    private var unavailableCameraView: some View {
+        ContentUnavailableView(
+            "Camera Unavailable",
+            systemImage: "camera.fill",
+            description: Text("Paste the invite or profile code instead.")
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.secondarySystemGroupedBackground))
+    }
+
+    private var cameraPermissionView: some View {
+        CameraPermissionUnavailableView()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.secondarySystemGroupedBackground))
+    }
+
+    private func ensureCameraPermission() {
+        guard QRCodeScannerSheet.canUseCamera else { return }
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        authStatus = status
+        guard status == .notDetermined else { return }
+
+        AVCaptureDevice.requestAccess(for: .video) { granted in
+            DispatchQueue.main.async {
+                authStatus = granted ? .authorized : .denied
+                scannerNonce = UUID()
+            }
+        }
+    }
+
+    private func refreshCameraAuthorization() {
+        guard QRCodeScannerSheet.canUseCamera else { return }
+        authStatus = AVCaptureDevice.authorizationStatus(for: .video)
+        scannerNonce = UUID()
+    }
+}
+
+private struct CameraPermissionUnavailableView: View {
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Camera Permission Needed", systemImage: "camera.fill")
+        } description: {
+            Text("Allow camera access in Settings to scan invite and profile QR codes.")
+        } actions: {
+            Button("Open Settings") {
+                openSettings()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        }
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        openURL(url)
+    }
+}
+
+private struct ScannerReticle: Shape {
+    func path(in rect: CGRect) -> Path {
+        let cornerLength = min(rect.width, rect.height) * 0.22
+        var path = Path()
+
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY + cornerLength))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + cornerLength, y: rect.minY))
+
+        path.move(to: CGPoint(x: rect.maxX - cornerLength, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + cornerLength))
+
+        path.move(to: CGPoint(x: rect.maxX, y: rect.maxY - cornerLength))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX - cornerLength, y: rect.maxY))
+
+        path.move(to: CGPoint(x: rect.minX + cornerLength, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - cornerLength))
+
+        return path
     }
 }
 

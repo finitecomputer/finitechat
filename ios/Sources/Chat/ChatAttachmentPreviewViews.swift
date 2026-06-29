@@ -149,14 +149,13 @@ struct ChatDocumentPreviewView: View {
                 .navigationTitle(previewTitle(item.attachment))
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done", action: onDismiss)
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
                         ShareLink(item: item.url) {
                             Image(systemName: "square.and.arrow.up")
                         }
                         .accessibilityLabel("Share")
+
+                        GlassCircleCloseButton { onDismiss() }
                     }
                 }
         }

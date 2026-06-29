@@ -60,10 +60,8 @@ struct PollComposerView: View {
             .navigationTitle("Poll")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
