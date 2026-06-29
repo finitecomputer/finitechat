@@ -2383,6 +2383,72 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(finalSubmitCount, 1)
     }
 
+    func testInvitePinSubmitAllowsCanonicalEnterPinStatus() async throws {
+        let config = RuntimeConfig(
+            serverURL: "https://chat.finite.computer",
+            deviceID: "qt433"
+        )
+        let pendingState = savedChatState(
+            status: "invite scanned",
+            roomState: .waitingForApproval,
+            roomStatus: "enter PIN to request admission"
+        )
+        let admissionPendingState = savedChatState(
+            status: "pin submitted",
+            roomState: .waitingForApproval,
+            roomStatus: "waiting for room admission",
+            flow: AppFlowState(
+                noticeText: "PIN submitted for Main Room. Waiting for the agent to approve this device.",
+                noticeBusy: false,
+                scanInFlight: false,
+                invitePinSubmissionRoomId: nil,
+                scanResult: .none
+            )
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: pendingState,
+            startRuntimeState: pendingState
+        ) { action, current in
+            if case .submitInvitePin = action {
+                return admissionPendingState
+            }
+            return current
+        }
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        let room = try XCTUnwrap(model.selectedRoom)
+        XCTAssertEqual(room.status, "enter PIN to request admission")
+        XCTAssertTrue(room.requiresInvitePinEntry)
+        XCTAssertFalse(room.isWaitingForInviteApproval)
+
+        model.pinDraft = "123456"
+        XCTAssertTrue(model.submitPin(for: room))
+
+        try await waitUntil {
+            model.userNoticeText == "PIN submitted for Main Room. Waiting for the agent to approve this device."
+        }
+
+        let submitted = runtime.dispatchedActions.contains {
+            if case .submitInvitePin(let pendingRoomId, let pin) = $0 {
+                return pendingRoomId == "room-main" && pin == "123456"
+            }
+            return false
+        }
+        XCTAssertTrue(submitted)
+        XCTAssertEqual(model.pinDraft, "")
+        let waitingRoom = try XCTUnwrap(model.selectedRoom)
+        XCTAssertFalse(waitingRoom.requiresInvitePinEntry)
+        XCTAssertTrue(waitingRoom.isWaitingForInviteApproval)
+    }
+
     func testPendingRoomPresentationHidesLowLevelWelcomeErrors() {
         let room = AppRoomSummary(
             roomId: "room-main",

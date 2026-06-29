@@ -255,7 +255,7 @@ typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProto
 extension AppRoomSummary {
     var requiresInvitePinEntry: Bool {
         state == .waitingForApproval
-            && status.localizedCaseInsensitiveContains("pin")
+            && !isWaitingForInviteApproval
     }
 
     var isWaitingForInviteApproval: Bool {
