@@ -639,6 +639,19 @@ private struct ChatPeoplePickerSheet: View {
                 }
 
                 peopleSection
+
+                if existingRoom == nil {
+                    Section {
+                        Label("Create New Finite Agent", systemImage: "sparkles")
+                            .foregroundStyle(.secondary)
+                        Label("Clawi, Maple, Codex, and Claude sessions", systemImage: "ellipsis.bubble")
+                            .foregroundStyle(.secondary)
+                    } header: {
+                        Text("Agents")
+                    } footer: {
+                        Text("Coming soon")
+                    }
+                }
             }
             .navigationTitle(existingRoom == nil ? "New Chat" : "Add People")
             .navigationBarTitleDisplayMode(.inline)
@@ -2512,122 +2525,95 @@ private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
     let onStartProfileChat: (AppProfileSummary) -> Bool
-    @State private var showingCameraScanner = false
     @State private var scanError: String?
 
     var body: some View {
         NavigationStack {
-            Form {
+            VStack(spacing: 12) {
                 if let notice = model.actionNoticeText {
-                    Section {
-                        Label(notice, systemImage: "exclamationmark.circle")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Section {
-                    if QRCodeScannerSheet.canUseCamera {
-                        Button {
-                            scanError = nil
-                            showingCameraScanner = true
-                        } label: {
-                            Label("Scan with Camera", systemImage: "qrcode.viewfinder")
-                        }
-                    }
-
-                    Button {
-                        scanError = nil
-                        model.scanDraft = UIPasteboard.general.string ?? ""
-                    } label: {
-                        Label("Paste", systemImage: "doc.on.clipboard")
-                    }
-                    .accessibilityIdentifier("ScanPasteButton")
-
-                    TextField("Invite URL, npub, or hex key", text: $model.scanDraft, axis: .vertical)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .lineLimit(3...6)
-                        .submitLabel(.done)
-                        .onSubmit {
-                            continueWithTarget()
-                        }
-                        .accessibilityLabel("Invite URL, npub, or hex key")
-                        .accessibilityIdentifier("ScanCodeField")
-
-                    Button {
-                        continueWithTarget()
-                    } label: {
-                        Label(
-                            model.scanInFlight ? "Opening" : "Continue",
-                            systemImage: model.scanInFlight ? "hourglass" : "arrow.right.circle"
-                        )
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(scanDraftIsEmpty || model.scanInFlight)
-                    .accessibilityIdentifier("ScanInlineContinueButton")
-                } header: {
-                    Text("Invite or Profile Code")
-                }
-
-                if let scanError {
-                    Section {
-                        Label(scanError, systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.red)
-                    }
-                }
-
-                Section {
-                    Label("Create New Finite Agent", systemImage: "sparkles")
+                    Label(notice, systemImage: "exclamationmark.circle")
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Label("Clawi, Maple, Codex, and Claude sessions", systemImage: "ellipsis.bubble")
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("Agents")
-                } footer: {
-                    Text("Coming soon")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
                 }
 
-                if let profile = model.activeProfile {
-                    Section("Profile") {
-                        ProfileRow(profile: profile)
-                        Button {
-                            if onStartProfileChat(profile) {
-                                dismiss()
-                            }
-                        } label: {
-                            Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
-                        }
-                    }
+                QRCodeScannerPanel(expandsVertically: true) { value in
+                    processScannedTarget(value)
                 }
+                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("ScanCameraScanner")
             }
+            .padding(.top, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemGroupedBackground))
             .navigationTitle("Scan")
-            .sheet(isPresented: $showingCameraScanner) {
-                QRCodeScannerSheet { value in
-                    scanError = nil
-                    model.scanDraft = value
-                    continueWithTarget()
-                }
-            }
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
                         dismiss()
                     }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(model.scanInFlight ? "Opening" : "Continue") {
-                        continueWithTarget()
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 12) {
+                    if let scanError {
+                        Label(scanError, systemImage: "exclamationmark.triangle")
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .disabled(scanDraftIsEmpty || model.scanInFlight)
-                    .accessibilityIdentifier("ScanContinueButton")
+
+                    if let profile = model.activeProfile {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ProfileRow(profile: profile)
+                            Button {
+                                if onStartProfileChat(profile) {
+                                    dismiss()
+                                }
+                            } label: {
+                                Label("Start Chat", systemImage: "bubble.left.and.bubble.right")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    Button {
+                        pasteAndContinue()
+                    } label: {
+                        Text(model.scanInFlight ? "Opening" : "Paste")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .buttonBorderShape(.capsule)
+                    .disabled(model.scanInFlight)
+                    .accessibilityIdentifier("ScanPasteButton")
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+                .background(Color(.systemGroupedBackground))
             }
         }
     }
 
-    private var scanDraftIsEmpty: Bool {
-        model.scanDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private func processScannedTarget(_ value: String) {
+        scanError = nil
+        model.scanDraft = value
+        continueWithTarget()
+    }
+
+    private func pasteAndContinue() {
+        let value = UIPasteboard.general.string ?? ""
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            scanError = "There is no invite or profile code on the clipboard."
+            return
+        }
+        processScannedTarget(value)
     }
 
     private func continueWithTarget() {
