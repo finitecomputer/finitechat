@@ -481,7 +481,7 @@ private struct ChatPeoplePickerSheet: View {
     @State private var selectedProfiles: [AppProfileSummary] = []
     @State private var searchText = ""
     @State private var conversationMode: NewConversationMode = .chat
-    @State private var showingCameraScanner = false
+    @State private var showingScan = false
     @State private var parseError: String?
     @FocusState private var focused: Bool
 
@@ -509,7 +509,7 @@ private struct ChatPeoplePickerSheet: View {
         return people.profiles
             .filter { profile in
                 profile.pubkey != selfAccountID
-                    && !selectedIDs.contains(profile.pubkey)
+                    && (isCreatingGroup || !selectedIDs.contains(profile.pubkey))
                     && !existingMembers.contains(profile.pubkey)
             }
             .filter { profile in
@@ -528,7 +528,7 @@ private struct ChatPeoplePickerSheet: View {
         return (model.state?.profiles ?? [])
             .filter { profile in
                 profile.accountId != selfAccountID
-                    && !selectedIDs.contains(profile.accountId)
+                    && (isCreatingGroup || !selectedIDs.contains(profile.accountId))
                     && !existingMembers.contains(profile.accountId)
                     && !followIDs.contains(profile.accountId)
             }
@@ -572,15 +572,25 @@ private struct ChatPeoplePickerSheet: View {
         .map { (letter: $0, profiles: grouped[$0] ?? []) }
     }
 
+    private var isCreatingGroup: Bool {
+        existingRoom == nil && conversationMode == .group
+    }
+
+    private var sheetTitle: String {
+        if existingRoom != nil {
+            return "Add People"
+        }
+        if conversationMode == .group {
+            return "New Group"
+        }
+        return "New Chat"
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     newChatSearchField
-
-                    if showsGroupNameField {
-                        newChatGroupNameCard
-                    }
 
                     if let notice = model.actionNoticeText {
                         newChatNoticeBanner(notice)
@@ -591,12 +601,20 @@ private struct ChatPeoplePickerSheet: View {
                     }
 
                     if existingRoom == nil {
-                        newChatActionsCard
+                        if conversationMode == .group {
+                            groupMemberActionsCard
+                        } else {
+                            newChatActionsCard
+                        }
                     } else {
                         addPeopleActionsCard
                     }
 
-                    if !selectedProfiles.isEmpty {
+                    if showsGroupNameField {
+                        newChatGroupNameCard
+                    }
+
+                    if !selectedProfiles.isEmpty, !isCreatingGroup {
                         selectedPeopleCard
                     }
 
@@ -604,26 +622,44 @@ private struct ChatPeoplePickerSheet: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
-                .padding(.bottom, 24)
+                .padding(.bottom, isCreatingGroup ? 8 : 24)
+                .animation(nil, value: selectedIDs)
             }
             .background(Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .principal) {
-                    Text(existingRoom == nil ? "New Chat" : "Add People")
+                    Text(sheetTitle)
                         .font(.headline)
+                }
+
+                if isCreatingGroup {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            exitGroupMode()
+                        } label: {
+                            Image(systemName: "chevron.left")
+                                .font(.body.weight(.semibold))
+                        }
+                        .accessibilityLabel("Back")
+                    }
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    if existingRoom != nil {
+                        Button(primaryActionTitle, action: create)
+                            .disabled(primaryActionDisabled)
+                            .accessibilityIdentifier("NewRoomCreateButton")
+                    }
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
                     GlassCircleCloseButton { dismiss() }
                 }
-
-                if existingRoom != nil || conversationMode == .group {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button(primaryActionTitle, action: create)
-                            .disabled(primaryActionDisabled)
-                            .accessibilityIdentifier("NewRoomCreateButton")
-                    }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if isCreatingGroup {
+                    groupCreateFloatingButton
                 }
             }
             .task(id: "\(model.activeAccountID ?? "")|\(model.serverURL)") {
@@ -632,13 +668,12 @@ private struct ChatPeoplePickerSheet: View {
             .refreshable {
                 await people.refresh(accountID: model.activeAccountID, serverURL: model.serverURL)
             }
-            .sheet(isPresented: $showingCameraScanner) {
-                QRCodeScannerSheet { value in
-                    addCode(
-                        value,
-                        startDirectChatIfPossible: startsDirectChatFromEnteredCode
-                    )
-                }
+            .sheet(isPresented: $showingScan) {
+                ScanSheet(
+                    model: model,
+                    onStartProfileChat: handleScannedProfile,
+                    onRoomJoined: { dismiss() }
+                )
             }
             .task {
                 focused = existingRoom == nil && conversationMode == .group
@@ -669,15 +704,81 @@ private struct ChatPeoplePickerSheet: View {
         .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
     }
 
+    private var showsGroupNameLabel: Bool {
+        focused || !roomName.isEmpty
+    }
+
     private var newChatGroupNameCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if showsGroupNameLabel {
+                Text("Group name")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+            }
+
+            NewChatCard {
+                TextField("Group name", text: $roomName)
+                    .focused($focused)
+                    .submitLabel(.done)
+                    .onSubmit(create)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .accessibilityIdentifier("NewRoomNameField")
+            }
+
+            if !selectedProfiles.isEmpty {
+                groupSelectedMemberChips
+            }
+        }
+    }
+
+    private var groupSelectedMemberChips: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 112), spacing: 8, alignment: .leading)],
+            alignment: .leading,
+            spacing: 8
+        ) {
+            ForEach(selectedProfiles, id: \.accountId) { profile in
+                GroupMemberChip(profile: profile) {
+                    removeProfile(profile)
+                }
+            }
+        }
+        .accessibilityIdentifier("NewRoomSelectedMembersStrip")
+    }
+
+    private var groupCreateFloatingButton: some View {
+        GroupCreateFloatingButton(
+            title: "Create",
+            isDisabled: primaryActionDisabled,
+            action: create
+        )
+        .accessibilityIdentifier("NewRoomCreateButton")
+    }
+
+    private var groupMemberActionsCard: some View {
         NewChatCard {
-            TextField("Group name", text: $roomName)
-                .focused($focused)
-                .submitLabel(.done)
-                .onSubmit(create)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .accessibilityIdentifier("NewRoomNameField")
+            NewChatActionRow(
+                title: "Paste",
+                systemImage: "doc.on.clipboard"
+            ) {
+                addCode(
+                    UIPasteboard.general.string ?? "",
+                    startDirectChatIfPossible: false
+                )
+            }
+            .accessibilityIdentifier("NewRoomPasteProfileButton")
+
+            NewChatCardDivider()
+
+            NewChatActionRow(
+                title: "Scan",
+                systemImage: "qrcode.viewfinder"
+            ) {
+                showingScan = true
+            }
+            .accessibilityIdentifier("NewRoomScanProfileButton")
         }
     }
 
@@ -737,7 +838,7 @@ private struct ChatPeoplePickerSheet: View {
                 title: "Scan",
                 systemImage: "qrcode.viewfinder"
             ) {
-                showingCameraScanner = true
+                showingScan = true
             }
             .accessibilityIdentifier("NewRoomScanProfileButton")
         }
@@ -762,7 +863,7 @@ private struct ChatPeoplePickerSheet: View {
                 title: "Scan",
                 systemImage: "qrcode.viewfinder"
             ) {
-                showingCameraScanner = true
+                showingScan = true
             }
             .accessibilityIdentifier("NewRoomScanProfileButton")
         }
@@ -832,6 +933,8 @@ private struct ChatPeoplePickerSheet: View {
             )
             .frame(maxWidth: .infinity)
             .padding(.vertical, 24)
+        } else if isCreatingGroup {
+            groupContactsList
         } else {
             ForEach(groupedPickerProfiles, id: \.letter) { section in
                 VStack(alignment: .leading, spacing: 8) {
@@ -848,14 +951,58 @@ private struct ChatPeoplePickerSheet: View {
                             Button {
                                 chooseProfile(profile)
                             } label: {
-                                NewChatPersonRow(profile: profile)
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 10)
-                                    .contentShape(Rectangle())
+                                HStack(spacing: 12) {
+                                    NewChatPersonRow(profile: profile)
+
+                                    if isCreatingGroup {
+                                        GroupContactSelectionIndicator(
+                                            isSelected: selectedIDs.contains(profile.accountId)
+                                        )
+                                    }
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
                     }
+                }
+            }
+        }
+    }
+
+    private var groupContactsList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let minimumGroupMembersHint {
+                newChatNoticeBanner(minimumGroupMembersHint)
+            }
+
+            Text("Contacts")
+                .font(.title3.weight(.bold))
+                .padding(.horizontal, 4)
+
+            NewChatCard {
+                ForEach(Array(allPickerProfiles.enumerated()), id: \.element.accountId) { index, profile in
+                    if index > 0 {
+                        NewChatCardDivider()
+                    }
+
+                    Button {
+                        chooseProfile(profile)
+                    } label: {
+                        HStack(spacing: 12) {
+                            NewChatPersonRow(profile: profile)
+
+                            GroupContactSelectionIndicator(
+                                isSelected: selectedIDs.contains(profile.accountId)
+                            )
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -873,9 +1020,14 @@ private struct ChatPeoplePickerSheet: View {
             return false
         }
         if conversationMode == .group {
-            return trimmedName.isEmpty
+            return trimmedName.isEmpty || selectedProfiles.count < 2
         }
         return selectedProfiles.count != 1
+    }
+
+    private var minimumGroupMembersHint: String? {
+        guard isCreatingGroup, selectedProfiles.count == 1 else { return nil }
+        return "Choose at least one more person for the group."
     }
 
     private var showsGroupNameField: Bool {
@@ -905,6 +1057,15 @@ private struct ChatPeoplePickerSheet: View {
 
     private var startsDirectChatFromEnteredCode: Bool {
         existingRoom == nil && conversationMode == .chat && selectedProfiles.isEmpty
+    }
+
+    @discardableResult
+    private func handleScannedProfile(_ profile: AppProfileSummary) -> Bool {
+        guard addProfile(profile) else { return false }
+        if startsDirectChatFromEnteredCode {
+            create()
+        }
+        return true
     }
 
     private func addCode(
@@ -937,6 +1098,10 @@ private struct ChatPeoplePickerSheet: View {
     }
 
     private func chooseProfile(_ profile: AppProfileSummary) {
+        if isCreatingGroup, selectedIDs.contains(profile.accountId) {
+            removeProfile(profile)
+            return
+        }
         let shouldStartDirectChat = existingRoom == nil
             && conversationMode == .chat
             && selectedProfiles.isEmpty
@@ -960,13 +1125,31 @@ private struct ChatPeoplePickerSheet: View {
             parseError = nil
             return false
         }
-        selectedProfiles.append(profile)
+        withoutSelectionAnimation {
+            selectedProfiles.append(profile)
+        }
         parseError = nil
         return true
     }
 
     private func removeProfile(_ profile: AppProfileSummary) {
-        selectedProfiles.removeAll { $0.accountId == profile.accountId }
+        withoutSelectionAnimation {
+            selectedProfiles.removeAll { $0.accountId == profile.accountId }
+        }
+    }
+
+    private func withoutSelectionAnimation(_ action: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, action)
+    }
+
+    private func exitGroupMode() {
+        conversationMode = .chat
+        roomName = ""
+        selectedProfiles = []
+        parseError = nil
+        searchText = ""
     }
 
     private func profileSummary(accountID: String, npub: String) -> AppProfileSummary {
@@ -992,6 +1175,9 @@ private struct ChatPeoplePickerSheet: View {
 
     private func create() {
         guard !selectedProfiles.isEmpty else { return }
+        if isCreatingGroup {
+            guard !trimmedName.isEmpty, selectedProfiles.count >= 2 else { return }
+        }
         if let existingRoom {
             guard model.addMembers(to: existingRoom, profiles: selectedProfiles, onSuccess: {
                 dismiss()
@@ -1126,6 +1312,94 @@ private func isHexAccountID(_ value: String) -> Bool {
 }
 
 private let newChatCardCornerRadius: CGFloat = 28
+
+private struct GroupContactSelectionIndicator: View {
+    let isSelected: Bool
+
+    var body: some View {
+        ZStack {
+            Image(systemName: "circle")
+                .font(.title2)
+                .foregroundStyle(Color(.tertiaryLabel))
+                .opacity(isSelected ? 0 : 1)
+
+            Image(systemName: "checkmark.circle.fill")
+                .font(.title2)
+                .foregroundStyle(Color.accentColor)
+                .opacity(isSelected ? 1 : 0)
+        }
+        .frame(width: 28, height: 28)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct GroupMemberChip: View {
+    let profile: AppProfileSummary
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ProfileAvatar(profile: profile, size: 28)
+
+            Text(profile.displayName)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(profile.displayName)")
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 8)
+        .padding(.vertical, 4)
+        .background(Color(.secondarySystemGroupedBackground), in: Capsule())
+    }
+}
+
+private struct GroupCreateFloatingButton: View {
+    let title: String
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: action) {
+                Text(title)
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .modifier(GroupCreateFloatingButtonStyle())
+            .disabled(isDisabled)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+        .background(Color(.systemGroupedBackground))
+    }
+}
+
+private struct GroupCreateFloatingButtonStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+                .buttonStyle(.glassProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+                .tint(.accentColor)
+        } else {
+            content
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.large)
+        }
+    }
+}
 
 private struct NewChatCard<Content: View>: View {
     @ViewBuilder let content: Content
@@ -1407,10 +1681,8 @@ private struct RoomOptionsSheet: View {
             .navigationTitle("Room")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
         }
@@ -2439,10 +2711,8 @@ private struct ReactionEmojiPickerSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $searchText, prompt: "Search emoji")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
         }
@@ -2684,6 +2954,7 @@ private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
     let onStartProfileChat: (AppProfileSummary) -> Bool
+    var onRoomJoined: (() -> Void)? = nil
     @State private var scanError: String?
 
     var body: some View {
@@ -2814,6 +3085,7 @@ private struct ScanSheet: View {
         case .room:
             scanError = nil
             dismiss()
+            onRoomJoined?()
         case .unavailable:
             break
         }
@@ -2821,6 +3093,7 @@ private struct ScanSheet: View {
 }
 
 private struct InviteSheet: View {
+    @Environment(\.dismiss) private var dismiss
     let invite: AppInviteState?
 
     var body: some View {
@@ -2854,6 +3127,11 @@ private struct InviteSheet: View {
             .padding()
             .navigationTitle("Invite")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
+                }
+            }
         }
     }
 }
@@ -3061,10 +3339,8 @@ private struct SettingsSheet: View {
                 Text("This removes local chats, config, and the saved nsec from this device.")
             }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
         }
@@ -3149,6 +3425,7 @@ private struct ProfileRow: View {
 
 private struct ProfileAvatar: View {
     let profile: AppProfileSummary
+    var size: CGFloat = 40
 
     var body: some View {
         ZStack {
@@ -3167,14 +3444,14 @@ private struct ProfileAvatar: View {
                 initials
             }
         }
-        .frame(width: 40, height: 40)
+        .frame(width: size, height: size)
         .clipShape(Circle())
         .accessibilityHidden(true)
     }
 
     private var initials: some View {
         Text(profile.displayName.prefix(1).uppercased())
-            .font(.headline)
+            .font(size >= 36 ? .headline : .caption.weight(.semibold))
             .foregroundStyle(.secondary)
     }
 }

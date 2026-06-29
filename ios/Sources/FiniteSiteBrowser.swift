@@ -27,16 +27,7 @@ struct FiniteSiteBrowserView: View {
                 .navigationTitle(title)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button {
-                            dismiss()
-                        } label: {
-                            Image(systemName: "xmark")
-                        }
-                        .accessibilityLabel("Close")
-                    }
-
-                    ToolbarItemGroup(placement: .primaryAction) {
+                    ToolbarItemGroup(placement: .topBarTrailing) {
                         Button {
                             reloadToken = UUID()
                         } label: {
@@ -50,6 +41,8 @@ struct FiniteSiteBrowserView: View {
                             Image(systemName: "safari")
                         }
                         .accessibilityLabel("Open in Safari")
+
+                        GlassCircleCloseButton { dismiss() }
                     }
                 }
         }
