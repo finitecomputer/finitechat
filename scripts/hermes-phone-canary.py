@@ -26,12 +26,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER_URL = "https://chat.finite.computer"
 DEFAULT_HERMES_PACKAGE = "hermes-agent==0.17.0"
 DEFAULT_BUNDLE_ID = "computer.finite.finitechat"
-DEFAULT_TEAM = "JBLHZ83X6T"
+DEFAULT_TEAM = ""
 MODEL_ENV_NAMES = (
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -75,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--room-name",
-        default=os.environ.get("FINITECHAT_PHONE_CANARY_ROOM_NAME", "Paulphone Local Hermes"),
+        default=os.environ.get("FINITECHAT_PHONE_CANARY_ROOM_NAME", "Local Hermes Canary"),
     )
     parser.add_argument("--timeout-ms", type=int, default=60000)
     parser.add_argument(
@@ -102,9 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ios-development-team",
         default=os.environ.get("RMP_IOS_DEVELOPMENT_TEAM") or DEFAULT_TEAM,
-        help="Apple development team for physical-device signing.",
+        help="Apple development team for physical-device signing. If omitted, xcodebuild uses local signing defaults.",
     )
-    parser.add_argument("--bundle-id", default=os.environ.get("FINITECHAT_IOS_BUNDLE_ID", DEFAULT_BUNDLE_ID))
+    parser.add_argument(
+        "--bundle-id", default=os.environ.get("FINITECHAT_IOS_BUNDLE_ID", DEFAULT_BUNDLE_ID)
+    )
     parser.add_argument(
         "--env-file",
         action="append",
@@ -144,18 +145,28 @@ def run(
     return proc
 
 
-def run_inherit(args: list[str], *, cwd: Path = REPO_ROOT, env: dict[str, str] | None = None, timeout: float = 1800) -> None:
+def run_inherit(
+    args: list[str],
+    *,
+    cwd: Path = REPO_ROOT,
+    env: dict[str, str] | None = None,
+    timeout: float = 1800,
+) -> None:
     proc = subprocess.run(args, cwd=cwd, env=env, timeout=timeout)
     if proc.returncode != 0:
         raise CanaryFailure(f"command failed: {args!r} (exit {proc.returncode})")
 
 
-def run_json(args: list[str], *, env: dict[str, str] | None = None, timeout: float = 60) -> dict[str, Any]:
+def run_json(
+    args: list[str], *, env: dict[str, str] | None = None, timeout: float = 60
+) -> dict[str, Any]:
     proc = run(args, env=env, timeout=timeout)
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise CanaryFailure(f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-3000:]}") from exc
+        raise CanaryFailure(
+            f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-3000:]}"
+        ) from exc
 
 
 def free_port() -> int:
@@ -174,7 +185,7 @@ def wait_json_url(url: str, *, timeout: float, name: str) -> dict[str, Any]:
                 if 200 <= response.status < 300:
                     return json.loads(body)
                 last_error = f"HTTP {response.status}: {body[:300]}"
-        except Exception as exc:  # noqa: BLE001 - stored for failure context.
+        except Exception as exc:
             last_error = str(exc)
         time.sleep(0.2)
     raise CanaryFailure(f"{name} did not become ready at {url}: {last_error}")
@@ -189,7 +200,7 @@ def wait_http_ok(url: str, *, timeout: float, name: str) -> None:
                 if 200 <= response.status < 300:
                     return
                 last_error = f"HTTP {response.status}"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_error = str(exc)
         time.sleep(0.2)
     raise CanaryFailure(f"{name} did not become reachable at {url}: {last_error}")
@@ -249,7 +260,9 @@ def parse_env_file(path: Path) -> dict[str, str]:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
             continue
         value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
             value = value[1:-1]
         values[key] = value
     return values
@@ -368,8 +381,10 @@ def write_stop_script(state_root: Path, children: dict[str, subprocess.Popen[str
             quoted = shlex.quote(str(pid_file))
             lines.append(f"if [[ -f {quoted} ]]; then")
             lines.append(f"  pid=$(cat {quoted})")
-            lines.append("  if kill -0 \"$pid\" 2>/dev/null; then")
-            lines.append("    kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true")
+            lines.append('  if kill -0 "$pid" 2>/dev/null; then')
+            lines.append(
+                '    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true'
+            )
             lines.append("  fi")
             lines.append("fi")
     stop_script = state_root / "stop.sh"
@@ -414,7 +429,9 @@ def install_phone_app(args: argparse.Namespace, state_root: Path) -> dict[str, A
     device = discover_device(args.ios_device)
     derived_data = state_root / "xcode-device-derived-data"
     team = args.ios_development_team.strip()
-    run_inherit(["cargo", "run", "-q", "-p", "finitechat-rmp", "--", "bindings", "swift"], timeout=2400)
+    run_inherit(
+        ["cargo", "run", "-q", "-p", "finitechat-rmp", "--", "bindings", "swift"], timeout=2400
+    )
     run_inherit(["xcodegen", "generate"], cwd=REPO_ROOT / "ios", timeout=300)
     xcode_cmd = [
         "xcrun",
@@ -543,7 +560,9 @@ def run_model_smoke(
         )
         last_state = state
         for message in state.get("messages") or []:
-            if not message.get("is_mine") and message_matches_phone_canary(str(message.get("text") or "")):
+            if not message.get("is_mine") and message_matches_phone_canary(
+                str(message.get("text") or "")
+            ):
                 return {
                     "status": "passed",
                     "elapsed_ms": int((time.monotonic() - started) * 1000),
@@ -560,12 +579,17 @@ def run_model_smoke(
         }
         for message in ((last_state or {}).get("messages") or [])[-8:]
     ]
-    raise CanaryFailure(f"Hermes model smoke did not receive expected reply; recent messages={sample!r}")
+    raise CanaryFailure(
+        f"Hermes model smoke did not receive expected reply; recent messages={sample!r}"
+    )
 
 
 def first_matching_mine_message_id(state: dict[str, Any]) -> str | None:
     for message in state.get("messages") or []:
-        if message.get("is_mine") and str(message.get("text") or "") == "Reply with exactly: phone canary cli ok":
+        if (
+            message.get("is_mine")
+            and str(message.get("text") or "") == "Reply with exactly: phone canary cli ok"
+        ):
             value = message.get("message_id")
             return str(value) if value else None
     return None
@@ -575,7 +599,11 @@ def main() -> int:
     args = parse_args()
     reject_phone_loopback(args.server_url)
     run_id = timestamp_id()
-    state_root = Path(args.state_root) if args.state_root else REPO_ROOT / "target/hermes-phone-canary/local" / run_id
+    state_root = (
+        Path(args.state_root)
+        if args.state_root
+        else REPO_ROOT / "target/hermes-phone-canary/local" / run_id
+    )
     report_path = Path(args.report) if args.report else state_root / "report.json"
     state_root.mkdir(parents=True, exist_ok=True)
     logs_dir = state_root / "logs"
@@ -632,8 +660,12 @@ def main() -> int:
     started = time.monotonic()
 
     def step(name: str, **facts: Any) -> None:
-        report["steps"].append({"name": name, "elapsed_ms": int((time.monotonic() - started) * 1000), **facts})
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report["steps"].append(
+            {"name": name, "elapsed_ms": int((time.monotonic() - started) * 1000), **facts}
+        )
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     sidecar: subprocess.Popen[str] | None = None
     gateway: subprocess.Popen[str] | None = None
@@ -800,8 +832,12 @@ def main() -> int:
             text=True,
             start_new_session=True,
         )
-        healthz = wait_json_url(f"{service_url}/healthz", timeout=15, name="finitechat hermes serve healthz")
-        readyz = wait_json_url(f"{service_url}/readyz", timeout=15, name="finitechat hermes serve readyz")
+        healthz = wait_json_url(
+            f"{service_url}/healthz", timeout=15, name="finitechat hermes serve healthz"
+        )
+        readyz = wait_json_url(
+            f"{service_url}/readyz", timeout=15, name="finitechat hermes serve readyz"
+        )
         report["agent"]["healthz"] = healthz
         report["agent"]["readyz"] = readyz
         if not readyz.get("ready", True):
@@ -829,7 +865,9 @@ def main() -> int:
         )
         time.sleep(3.0)
         if gateway.poll() is not None:
-            raise CanaryFailure(f"hermes gateway exited early with {gateway.returncode}: {tail(gateway_log)}")
+            raise CanaryFailure(
+                f"hermes gateway exited early with {gateway.returncode}: {tail(gateway_log)}"
+            )
         step("gateway.started")
 
         join_started = time.monotonic()
@@ -862,8 +900,13 @@ def main() -> int:
         step("admission_probe.joined")
 
         if not args.skip_model_smoke:
-            if not any(env.get(name) for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")):
-                raise CanaryFailure("model smoke requires OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY")
+            if not any(
+                env.get(name)
+                for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+            ):
+                raise CanaryFailure(
+                    "model smoke requires OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY"
+                )
             report["model_smoke"] = run_model_smoke(
                 finitechat_bin=finitechat_bin,
                 probe_home=probe_home,
@@ -871,7 +914,9 @@ def main() -> int:
                 room_id=str(invite["room_id"]),
                 env=env,
             )
-            step("model_smoke.reply", reply_message_id=report["model_smoke"].get("reply_message_id"))
+            step(
+                "model_smoke.reply", reply_message_id=report["model_smoke"].get("reply_message_id")
+            )
 
         fresh_pin = run_json(
             [
@@ -909,7 +954,9 @@ def main() -> int:
             report["agent"]["stop_script"] = str(state_root / "stop.sh")
             report["agent"]["sidecar_pid"] = sidecar.pid
             report["agent"]["gateway_pid"] = gateway.pid
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         print(
             json.dumps(
                 {
@@ -930,7 +977,7 @@ def main() -> int:
             )
         )
         return 0
-    except Exception as exc:  # noqa: BLE001 - normalize into report.
+    except Exception as exc:
         report["status"] = "failed"
         report["failure"] = str(exc)
         report["elapsed_ms"] = int((time.monotonic() - started) * 1000)
@@ -939,8 +986,15 @@ def main() -> int:
                 "finitechat_hermes_serve": tail(logs_dir / "finitechat-hermes-serve.log"),
                 "hermes_gateway": tail(logs_dir / "hermes-gateway.log"),
             }
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(json.dumps({"status": "failed", "report": str(report_path), "failure": str(exc)}, indent=2), file=sys.stderr)
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(
+            json.dumps(
+                {"status": "failed", "report": str(report_path), "failure": str(exc)}, indent=2
+            ),
+            file=sys.stderr,
+        )
         return 1
     finally:
         if not keep_children:

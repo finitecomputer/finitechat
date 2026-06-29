@@ -217,11 +217,27 @@ Required preflight:
 5. The container health endpoint reports the agent npub.
 6. The Docker smoke proves gateway admission before backup and after restore.
 
-Current command:
+Lower-level restore smoke:
 
 ```sh
 scripts/hermes-sidecar-docker-smoke.sh
 ```
+
+Human-handoff remote Docker canary:
+
+```sh
+scripts/hermes-remote-docker-canary.py --keep-running
+```
+
+By default this uses `ssh://finite-lat-2`, builds the real runtime image on
+that remote Docker daemon, starts the container against
+`https://chat.finite.computer`, proves invite/PIN admission and a real Hermes
+model reply, stops the container so the entrypoint writes a restic backup,
+wipes the agent volume, restores into a fresh volume, proves the same user can
+still chat, proves a fresh user can still join, and only then prints a human
+invite/PIN. The restored container is left running only with
+`--keep-running`; otherwise the script cleans up the remote container and
+volumes after writing the report.
 
 For a remote Docker canary, the wrapper should produce the same report shape as
 the local phone canary plus image metadata:

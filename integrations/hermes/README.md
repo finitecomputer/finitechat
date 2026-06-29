@@ -128,6 +128,22 @@ volume, starts a fresh container whose entrypoint restores the latest tagged
 snapshot before the gateway starts, verifies the same npub, verifies the
 runtime `/healthz` endpoint, and admits a second user through the restored
 gateway. Echo replies are not accepted as Docker runtime proof.
+
+For the remote Docker human-handoff canary on `finite-lat-2`:
+
+```bash
+scripts/hermes-remote-docker-canary.py --keep-running
+```
+
+That script is the remote-Docker equivalent of
+`scripts/hermes-phone-canary.py`: it requires a passed local phone report by
+default, builds the real image on the remote Docker daemon, runs against
+`https://chat.finite.computer`, proves invite/PIN admission and real Hermes
+model replies before and after entrypoint backup/restore, then prints the
+stable invite URL plus current rotating PIN only after the restored container
+is alive. The report lands under
+`target/hermes-phone-canary/remote-docker/<run-id>/report.json`.
+
 By default the restic repo is a local bind mount under
 `target/hermes-docker-smoke/restic-repo`. To run the same smoke against
 S3-compatible storage such as Latitude, provide an isolated repository prefix

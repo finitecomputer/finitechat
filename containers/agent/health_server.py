@@ -44,13 +44,52 @@ def identity() -> dict[str, Any]:
     }
 
 
+def finitechat_json(args: list[str]) -> dict[str, Any]:
+    proc = subprocess.run(
+        [FINITECHAT_BIN, *args],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    return json.loads(proc.stdout)
+
+
+def invite() -> dict[str, Any]:
+    identity_payload = identity()
+    if not identity_payload.get("ready"):
+        return identity_payload
+    try:
+        pin = finitechat_json(["hermes", "--agent-home", str(AGENT_HOME), "pin"])
+    except Exception as exc:
+        return {"ready": False, "error": f"invite pin unavailable: {exc}"}
+    return {
+        "ready": True,
+        "agent_npub": identity_payload.get("npub"),
+        "account_id": identity_payload.get("account_id"),
+        "room_id": pin.get("room_id"),
+        "invite_id": pin.get("invite_id"),
+        "url": pin.get("url"),
+        "pin": pin.get("pin"),
+        "pin_window_seconds": pin.get("pin_window_seconds"),
+        "pin_generated_at_unix": pin.get("pin_generated_at_unix"),
+        "seconds_remaining": pin.get("seconds_remaining"),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path != "/healthz":
+        if self.path == "/healthz":
+            payload = identity()
+            self._write(200 if payload["ready"] else 503, payload)
+            return
+        if self.path == "/invite":
+            payload = invite()
+            self._write(200 if payload["ready"] else 503, payload)
+            return
+        else:
             self._write(404, {"ready": False, "error": "not found"})
             return
-        payload = identity()
-        self._write(200 if payload["ready"] else 503, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         return

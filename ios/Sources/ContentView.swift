@@ -2441,24 +2441,41 @@ private struct PendingRoomView: View {
                     .multilineTextAlignment(.center)
             }
 
-            TextField("PIN", text: $model.pinDraft)
-                .keyboardType(.numberPad)
-                .textFieldStyle(.roundedBorder)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 180)
-                .accessibilityLabel("PIN")
-                .disabled(isSubmitting)
+            if room.isWaitingForInviteApproval {
+                ProgressView()
+                    .controlSize(.large)
+                    .accessibilityLabel("Waiting for approval")
+            } else {
+                TextField("PIN", text: $model.pinDraft)
+                    .keyboardType(.numberPad)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 180)
+                    .accessibilityLabel("PIN")
+                    .disabled(isSubmitting)
 
-            Button {
-                model.submitPin(for: room)
-            } label: {
-                Label(
-                    isSubmitting ? "Joining" : "Join",
-                    systemImage: isSubmitting ? "hourglass" : "arrow.right.circle.fill"
+                Button {
+                    model.submitPin(for: room)
+                } label: {
+                    HStack(spacing: 8) {
+                        if isSubmitting {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        }
+                        Label(
+                            isSubmitting ? "Joining" : "Join",
+                            systemImage: isSubmitting ? "hourglass" : "arrow.right.circle.fill"
+                        )
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    isSubmitting
+                        || !room.requiresInvitePinEntry
+                        || model.pinDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(isSubmitting || model.pinDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)

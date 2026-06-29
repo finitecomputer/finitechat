@@ -75,6 +75,38 @@ For the hardened "fresh Hermes instance to Paul's phone" quality loop, use
 remote Docker, and Tinfoil promotion gates and the evidence required before a
 human invite is handed out.
 
+For team testing, the normal Hermes phone canary is:
+
+```sh
+cp .env.example .env
+# Fill in one model provider key in .env, usually OPENROUTER_API_KEY.
+xcrun devicectl list devices
+scripts/hermes-phone-canary.py \
+  --install-phone-app \
+  --ios-device <device identifier or hardware UDID> \
+  --ios-development-team <Apple team id> \
+  --keep-running
+```
+
+The script uses `https://chat.finite.computer`, builds the current
+`finitechat` binary, installs the current iOS app on the paired phone, starts
+real Hermes 0.17 with the `finite-platform` plugin, proves invite/PIN admission
+with a throwaway client, requires a real model reply, then prints the human
+invite URL, current PIN, report path, and `stop.sh`. Do not hand an invite to a
+human from lower-level scripts that have not produced a passed report.
+
+Remote Docker is the next promotion layer for teammates with access to the
+builder host:
+
+```sh
+scripts/hermes-remote-docker-canary.py --keep-running
+```
+
+That wrapper requires a passed local phone report by default, builds the real
+runtime image on `ssh://finite-lat-2`, proves real Hermes chat before and after
+entrypoint backup/restore, and only then prints the invite/PIN for the restored
+container.
+
 The normal app flow is:
 
 1. Sign in with an `nsec` or create a local Nostr identity.

@@ -252,6 +252,18 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
 
 typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProtocol
 
+extension AppRoomSummary {
+    var requiresInvitePinEntry: Bool {
+        state == .waitingForApproval
+            && status.localizedCaseInsensitiveContains("pin")
+    }
+
+    var isWaitingForInviteApproval: Bool {
+        state == .waitingForApproval
+            && status.localizedCaseInsensitiveContains("waiting for room admission")
+    }
+}
+
 struct RuntimeDataStore {
     private static let currentDataDirectoryName = "FiniteChatStore"
     private static let transientDataRootDirectoryName = "FiniteChatTransient"
@@ -1129,6 +1141,9 @@ final class AppModel: ObservableObject, AppReconciler {
         case .room:
             guard let room = selectedRoom else { return .unavailable }
             scanDraft = ""
+            if room.state == .waitingForApproval {
+                pinDraft = ""
+            }
             return .room(room)
         case .unavailable, .none:
             return .unavailable
@@ -1137,7 +1152,7 @@ final class AppModel: ObservableObject, AppReconciler {
 
     @discardableResult
     func submitPin(for room: AppRoomSummary) -> Bool {
-        guard room.state == .waitingForApproval else { return false }
+        guard room.requiresInvitePinEntry else { return false }
         guard invitePinSubmissionRoomID != room.roomId else { return false }
         let pin = pinDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !pin.isEmpty else { return false }
@@ -1163,8 +1178,6 @@ final class AppModel: ObservableObject, AppReconciler {
             return false
         }
 
-        let pendingRoomID = room.roomId
-
         enqueueRuntimeDispatch(
             action,
             runtime: runtime,
@@ -1179,11 +1192,7 @@ final class AppModel: ObservableObject, AppReconciler {
                     event: "\(diagnostic.name).succeeded",
                     details: diagnostic.details
                 )
-                if let room = nextState.rooms.first(where: { $0.roomId == pendingRoomID }) {
-                    if room.state == .connected {
-                        self.pinDraft = ""
-                    }
-                }
+                self.pinDraft = ""
                 self.restartUpdateLoopIfEnabled()
             },
             onFailure: { [weak self] error in

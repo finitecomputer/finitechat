@@ -2280,6 +2280,7 @@ final class AppModelPersistenceTests: XCTestCase {
         }
 
         model.start()
+        model.pinDraft = "654321"
         model.scanDraft = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3"
 
         var scanResult: AppScanTargetResult?
@@ -2298,13 +2299,14 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(room.roomId, "room-main")
         XCTAssertEqual(model.state?.selectedRoomId, "room-main")
         XCTAssertEqual(model.scanDraft, "")
+        XCTAssertEqual(model.pinDraft, "")
         XCTAssertEqual(
             model.userNoticeText,
             "Opened Main Room. Enter the current PIN to request access."
         )
     }
 
-    func testInvitePinSubmitDoesNotClearPinWhileAdmissionIsPending() async throws {
+    func testInvitePinSubmitClearsPinAndLocksWaitingAdmissionRoom() async throws {
         let config = RuntimeConfig(
             serverURL: "https://chat.finite.computer",
             deviceID: "qt433"
@@ -2354,19 +2356,31 @@ final class AppModelPersistenceTests: XCTestCase {
             model.userNoticeText == "PIN submitted for Main Room. Waiting for the agent to approve this device."
         }
 
-        XCTAssertEqual(model.pinDraft, "123456")
+        XCTAssertEqual(model.pinDraft, "")
         XCTAssertEqual(model.state?.rooms.first?.status, "waiting for room admission")
         XCTAssertEqual(
             model.userNoticeText,
             "PIN submitted for Main Room. Waiting for the agent to approve this device."
         )
         XCTAssertNil(model.developerErrorText)
-        XCTAssertTrue(runtime.dispatchedActions.contains {
+        let submitCount = runtime.dispatchedActions.filter {
             if case .submitInvitePin(let pendingRoomId, let pin) = $0 {
                 return pendingRoomId == "room-main" && pin == "123456"
             }
             return false
-        })
+        }.count
+        XCTAssertEqual(submitCount, 1)
+
+        model.pinDraft = "999999"
+        let waitingRoom = try XCTUnwrap(model.selectedRoom)
+        XCTAssertFalse(model.submitPin(for: waitingRoom))
+        let finalSubmitCount = runtime.dispatchedActions.filter {
+            if case .submitInvitePin = $0 {
+                return true
+            }
+            return false
+        }.count
+        XCTAssertEqual(finalSubmitCount, 1)
     }
 
     func testPendingRoomPresentationHidesLowLevelWelcomeErrors() {
