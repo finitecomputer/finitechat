@@ -145,8 +145,8 @@ struct Composer: View {
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
-        .padding(.bottom, 8)
-        .background(.bar)
+        .safeAreaPadding(.bottom, 8)
+        .background(Color.clear)
         .animation(.easeInOut(duration: 0.16), value: stagedAttachments.isEmpty)
         .animation(.snappy(duration: 0.18), value: showsSendButton)
     }
@@ -186,8 +186,10 @@ struct Composer: View {
 private struct ChatComposerSurface: ViewModifier {
     func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            content
-                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 28))
+            GlassEffectContainer(spacing: 0) {
+                content
+                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 28))
+            }
         } else {
             content
                 .background(

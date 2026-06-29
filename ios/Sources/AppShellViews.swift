@@ -539,6 +539,7 @@ struct PeopleView: View {
         }
         .listStyle(.plain)
         .navigationTitle("People")
+        .listNavigationBarChrome()
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button(action: showMyProfile) {

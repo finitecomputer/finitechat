@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        NavigationChrome.configure()
         UNUserNotificationCenter.current().delegate = self
         return true
     }

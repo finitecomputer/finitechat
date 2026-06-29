@@ -319,10 +319,6 @@ private struct RoomListView: View {
 
     var body: some View {
         List {
-            if !model.rooms.isEmpty {
-                chatActionRow
-            }
-
             if model.rooms.isEmpty {
                 VStack(spacing: 14) {
                     ContentUnavailableView(
@@ -358,19 +354,21 @@ private struct RoomListView: View {
                     .frame(maxWidth: .infinity)
                     .listRowSeparator(.hidden)
             } else {
-                ForEach(filteredRooms, id: \.roomId) { room in
+                ForEach(Array(filteredRooms.enumerated()), id: \.element.roomId) { index, room in
                     Button {
                         open(room)
                     } label: {
                         RoomRow(room: room)
                     }
                     .buttonStyle(.plain)
+                    .listRowSeparator(index == 0 ? .hidden : .visible, edges: .top)
                     .accessibilityIdentifier("RoomRow-\(room.roomId)")
                 }
             }
         }
         .listStyle(.plain)
         .navigationTitle("Chats")
+        .listNavigationBarChrome()
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button {
@@ -426,30 +424,6 @@ private struct RoomListView: View {
         .safeAreaInset(edge: .bottom) {
             NoticeBar(text: model.userNoticeText)
         }
-    }
-
-    private var chatActionRow: some View {
-        HStack(spacing: 10) {
-            Button {
-                showingNewRoom = true
-            } label: {
-                Label("New Chat", systemImage: "person.badge.plus")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .accessibilityIdentifier("ChatsInlineNewChatButton")
-
-            Button {
-                present(.scan)
-            } label: {
-                Label("Scan", systemImage: "qrcode.viewfinder")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityIdentifier("ChatsInlineScanButton")
-        }
-        .listRowSeparator(.hidden)
-        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 12, trailing: 16))
     }
 }
 
@@ -1367,6 +1341,12 @@ private struct GroupCreateFloatingButton: View {
     let isDisabled: Bool
     let action: () -> Void
 
+    private var fadeHeight: CGFloat {
+        MessageCollectionLayout.groupCreateFadeHeight(
+            safeAreaBottom: BottomSafeAreaInsets.current
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Button(action: action) {
@@ -1379,8 +1359,14 @@ private struct GroupCreateFloatingButton: View {
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
-        .padding(.bottom, 8)
-        .background(Color(.systemGroupedBackground))
+        .safeAreaPadding(.bottom, 8)
+        .background(alignment: .bottom) {
+            BottomEdgeBlurFade(height: fadeHeight)
+                .frame(height: fadeHeight)
+                .allowsHitTesting(false)
+        }
+        .background(Color.clear)
+        .ignoresSafeArea(edges: .bottom)
     }
 }
 
@@ -1811,8 +1797,10 @@ private struct RoomThreadView: View {
                 .zIndex(10)
             }
         }
+        .background(Color(.systemGroupedBackground).ignoresSafeArea())
         .navigationTitle(room?.displayName ?? "Chat")
         .navigationBarTitleDisplayMode(.inline)
+        .chatNavigationBarChrome()
         .toolbar {
             if let room, room.state == .connected {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -2012,7 +2000,6 @@ private struct RoomThreadView: View {
                 handleOpenURL(url)
             },
             accessoryContent: accessoryContent(),
-            isInputFocused: room.state == .connected && composerFocused,
             canLoadOlder: room.canLoadOlder,
             onLoadOlderMessages: { beforeMessageID in
                 model.loadOlderMessages(roomID: room.roomId, beforeMessageID: beforeMessageID)
@@ -2021,6 +2008,7 @@ private struct RoomThreadView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.systemGroupedBackground))
+        .ignoresSafeArea(edges: [.top, .bottom])
         .accessibilityLabel("Messages")
     }
 

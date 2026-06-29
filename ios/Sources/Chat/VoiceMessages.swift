@@ -408,7 +408,6 @@ struct VoiceRecordingComposerView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.bar)
         .accessibilityElement(children: .contain)
     }
 }

@@ -4404,18 +4404,55 @@ final class MessageCollectionLayoutTests: XCTestCase {
         XCTAssertEqual(inset.bottom, 76)
     }
 
+    func testGroupCreateFadeHeightReachesFloatingButton() {
+        let chrome = MessageCollectionLayout.GroupCreateChrome.self
+        let expected = chrome.dockTopPadding
+            + chrome.buttonHeight
+            + chrome.dockBottomPadding
+            + chrome.fadeLiftAboveButton
+        XCTAssertEqual(
+            MessageCollectionLayout.groupCreateFadeHeight(safeAreaBottom: 34),
+            34 + expected
+        )
+    }
+
+    func testSafeZoneFadeHeightReachesComposerIcons() {
+        let chrome = MessageCollectionLayout.ComposerChrome.self
+        let expected = chrome.dockBottomPadding
+            + chrome.iconRowBottomPadding
+            + chrome.iconRowHeight
+            + chrome.fadeLiftAboveIcons
+        XCTAssertEqual(
+            MessageCollectionLayout.safeZoneFadeHeight(safeAreaBottom: 34),
+            34 + expected
+        )
+        XCTAssertEqual(
+            MessageCollectionLayout.safeZoneFadeHeight(safeAreaBottom: 0),
+            expected
+        )
+    }
+
     func testBottomViewportInsetUsesOccupiedKeyboardOrAccessoryHeight() {
         XCTAssertEqual(
             MessageCollectionLayout.bottomViewportInset(
                 keyboardInset: 330,
-                accessoryHeight: 58
+                accessoryHeight: 58,
+                safeAreaBottom: 34
             ),
-            330
+            388
         )
         XCTAssertEqual(
             MessageCollectionLayout.bottomViewportInset(
                 keyboardInset: -12,
                 accessoryHeight: 58
+            ),
+            58
+        )
+        XCTAssertEqual(
+            MessageCollectionLayout.bottomViewportInset(
+                keyboardInset: 34,
+                accessoryHeight: 58,
+                safeAreaBottom: 34
             ),
             58
         )
