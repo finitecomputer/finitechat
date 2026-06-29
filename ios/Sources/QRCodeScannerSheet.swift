@@ -28,10 +28,8 @@ struct QRCodeScannerSheet: View {
             .navigationTitle("Scan Code")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
             .onAppear {

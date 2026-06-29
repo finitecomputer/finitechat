@@ -615,15 +615,7 @@ private struct ChatPeoplePickerSheet: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .symbolRenderingMode(.hierarchical)
-                            .foregroundStyle(.secondary)
-                            .font(.title2)
-                    }
-                    .accessibilityLabel("Close")
+                    GlassCircleCloseButton { dismiss() }
                 }
 
                 if existingRoom != nil || conversationMode == .group {
@@ -2719,7 +2711,7 @@ private struct ScanSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    scanCloseButton
+                    GlassCircleCloseButton { dismiss() }
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -2764,21 +2756,6 @@ private struct ScanSheet: View {
                 .background(Color(.systemGroupedBackground))
             }
         }
-    }
-
-    @ViewBuilder
-    private var scanCloseButton: some View {
-        Button {
-            dismiss()
-        } label: {
-            Image(systemName: "xmark")
-                .font(.footnote.weight(.bold))
-                .frame(width: 36, height: 36)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Close")
-        .modifier(ScanCloseButtonStyle())
     }
 
     private func processScannedTarget(_ value: String) {
@@ -2839,18 +2816,6 @@ private struct ScanSheet: View {
             dismiss()
         case .unavailable:
             break
-        }
-    }
-}
-
-private struct ScanCloseButtonStyle: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content
-                .glassEffect(.regular.interactive(), in: .circle)
-        } else {
-            content
-                .background(.ultraThinMaterial, in: Circle())
         }
     }
 }
