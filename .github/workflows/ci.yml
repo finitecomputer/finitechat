@@ -130,7 +130,7 @@ jobs:
 
   docker-runtime-smoke:
     name: Docker runtime smoke
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, finite-lat-2, docker]
     needs: test
     timeout-minutes: 75
     if: >-
@@ -160,8 +160,23 @@ jobs:
           echo "publish_runtime_image=true requires restic_backend=s3" >&2
           exit 1
 
+      - name: Set runtime image ref
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image_ref="ghcr.io/${owner}/finite-chat-hermes-runtime:${GITHUB_SHA}"
+          echo "RUNTIME_IMAGE_REF=$image_ref" >> "$GITHUB_ENV"
+          echo "FINITE_DOCKER_IMAGE=$image_ref" >> "$GITHUB_ENV"
+
+      - name: Build runtime image
+        run: |
+          scripts/hermes-build-runtime-image.py \
+            --image-ref "$RUNTIME_IMAGE_REF" \
+            --hermes-agent-version "$FINITE_HERMES_AGENT_VERSION" \
+            --report target/hermes-docker-smoke/image-build.json
+
       - name: Docker runtime smoke
         env:
+          FINITE_DOCKER_SKIP_IMAGE_BUILD: "1"
           FINITE_DOCKER_RESTIC_BACKEND: ${{ github.event_name == 'workflow_dispatch' && inputs.restic_backend || 'local' }}
           FINITE_DOCKER_RESTIC_REPOSITORY: ${{ github.event_name == 'workflow_dispatch' && inputs.restic_repository || '' }}
           FINITE_LATITUDE_STORAGE_BUCKET: ${{ inputs.latitude_storage_bucket || vars.FINITE_LATITUDE_STORAGE_BUCKET || secrets.FINITE_LATITUDE_STORAGE_BUCKET }}
@@ -187,8 +202,6 @@ jobs:
 
       - name: Publish proven runtime image
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime_image }}
-        env:
-          RUNTIME_IMAGE_REF: ghcr.io/${{ github.repository_owner }}/finite-chat-hermes-runtime:${{ github.sha }}
         run: |
           scripts/hermes-publish-proven-image.py \
             --push \
@@ -249,6 +262,7 @@ jobs:
           path: |
             target/hermes-hardening-audit.json
             target/hermes-adapter-regressions/report.json
+            target/hermes-docker-smoke/image-build.json
             target/hermes-docker-smoke/report.json
             target/hermes-docker-smoke/restic-preflight.json
             target/hermes-docker-smoke/image-publish.json

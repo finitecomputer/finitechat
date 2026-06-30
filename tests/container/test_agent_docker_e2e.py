@@ -25,6 +25,12 @@ from tests.container.test_agent_container_e2e import run, stage_build_context
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE = os.environ.get("FINITE_DOCKER_IMAGE", "finite-agent-docker-e2e")
+SKIP_IMAGE_BUILD = os.environ.get("FINITE_DOCKER_SKIP_IMAGE_BUILD", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CONTAINER = os.environ.get("FINITE_DOCKER_CONTAINER", "finite-agent-docker-e2e-run")
 SERVER_PORT = int(os.environ.get("FINITE_DOCKER_SERVER_PORT", "18789"))
 DOCKER_HOST = os.environ.get("FINITE_DOCKER_HOST", "host.docker.internal")
@@ -480,27 +486,32 @@ class AgentDockerE2ETest(unittest.TestCase):
         report.time("host_server_binary_build", build_host_binaries)
         server_bin = REPO_ROOT / "target/release/finitechat-server"
 
-        ctx = tmp / "ctx"
-        ctx.mkdir()
-        report.time("stage_docker_context", lambda: stage_build_context(ctx))
-        report.time(
-            "docker_image_build",
-            lambda: run(
-                [
-                    "docker",
-                    "build",
-                    "--build-arg",
-                    f"HERMES_AGENT_VERSION={HERMES_AGENT_VERSION}",
-                    "--tag",
-                    IMAGE,
-                    "--file",
-                    str(ctx / "finitechat/containers/agent/Dockerfile"),
-                    str(ctx),
-                ],
-                timeout=3600,
-            ),
-        )
+        if SKIP_IMAGE_BUILD:
+            report.step("docker_image_prebuilt", 0)
+            run(["docker", "image", "inspect", IMAGE], timeout=60)
+        else:
+            ctx = tmp / "ctx"
+            ctx.mkdir()
+            report.time("stage_docker_context", lambda: stage_build_context(ctx))
+            report.time(
+                "docker_image_build",
+                lambda: run(
+                    [
+                        "docker",
+                        "build",
+                        "--build-arg",
+                        f"HERMES_AGENT_VERSION={HERMES_AGENT_VERSION}",
+                        "--tag",
+                        IMAGE,
+                        "--file",
+                        str(ctx / "finitechat/containers/agent/Dockerfile"),
+                        str(ctx),
+                    ],
+                    timeout=3600,
+                ),
+            )
         report.fact("image", IMAGE)
+        report.fact("image_build", "prebuilt" if SKIP_IMAGE_BUILD else "smoke")
         image_metadata = self.docker_image_metadata()
         report.fact("image_id", image_metadata["id"])
         report.fact("image_metadata", image_metadata)
