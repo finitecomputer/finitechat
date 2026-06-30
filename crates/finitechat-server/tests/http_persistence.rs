@@ -79,6 +79,13 @@ async fn sqlite_blob_upload_download_survives_restart_over_http() {
 
         let response = get_blob(app, &descriptor.sha256).await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
         assert_eq!(read_body(response).await.as_ref(), ciphertext);
         descriptor
     };
@@ -93,6 +100,55 @@ async fn sqlite_blob_upload_download_survives_restart_over_http() {
     let replayed: BlobDescriptor = read_json(response).await;
     assert_eq!(replayed.sha256, descriptor.sha256);
     assert_eq!(replayed.size_bytes, descriptor.size_bytes);
+}
+
+#[tokio::test]
+async fn sqlite_public_image_blob_upload_download_survives_restart_over_http() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let png = b"\x89PNG\r\n\x1a\nprofile image bytes";
+
+    let descriptor = {
+        let app = persistent_app(&db_path);
+        let response = put_blob_with_content_type(app.clone(), png, "image/png").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let descriptor: BlobDescriptor = read_json(response).await;
+        assert_eq!(descriptor.size_bytes, png.len() as u64);
+        assert_eq!(descriptor.sha256.len(), 64);
+        assert!(descriptor.url.contains("/blobs/"));
+
+        let response = get_blob(app, &descriptor.sha256).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert_eq!(read_body(response).await.as_ref(), png);
+        descriptor
+    };
+
+    let app = persistent_app(&db_path);
+    let response = get_blob(app.clone(), &descriptor.sha256).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(response).await.as_ref(), png);
+
+    let response = put_blob_with_content_type(app, png, "image/png").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replayed: BlobDescriptor = read_json(response).await;
+    assert_eq!(replayed.sha256, descriptor.sha256);
+    assert_eq!(replayed.size_bytes, descriptor.size_bytes);
+}
+
+#[tokio::test]
+async fn public_image_blob_upload_rejects_mismatched_image_content() {
+    let temp = TempDir::new().expect("tempdir");
+    let app = persistent_app(&temp.path().join("delivery.sqlite3"));
+
+    let response = put_blob_with_content_type(app, b"not actually an image", "image/png").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -4551,6 +4607,7 @@ async fn sqlite_nostr_profile_cache_survives_restart_and_reports_stale_reads() {
         picture: Some("https://example.invalid/alice.png".to_owned()),
         bot: None,
         finite_role: None,
+        metadata_json: None,
         fetched_at_ms: 1_000,
         expires_at_ms: 2_000,
     };
@@ -4579,7 +4636,37 @@ async fn sqlite_nostr_profile_cache_survives_restart_and_reports_stale_reads() {
         assert_eq!(response.status(), StatusCode::OK);
         let profiles: GetNostrProfilesResponse = read_json(response).await;
         assert_eq!(profiles.profiles.len(), 1);
-        assert_eq!(profiles.profiles[0].profile, profile);
+        assert_eq!(profiles.profiles[0].profile.account_id, profile.account_id);
+        assert_eq!(profiles.profiles[0].profile.name, profile.name);
+        assert_eq!(
+            profiles.profiles[0].profile.display_name,
+            profile.display_name
+        );
+        assert_eq!(profiles.profiles[0].profile.about, profile.about);
+        assert_eq!(profiles.profiles[0].profile.picture, profile.picture);
+        assert_eq!(profiles.profiles[0].profile.bot, profile.bot);
+        assert_eq!(
+            profiles.profiles[0].profile.finite_role,
+            profile.finite_role
+        );
+        assert_eq!(
+            profiles.profiles[0].profile.fetched_at_ms,
+            profile.fetched_at_ms
+        );
+        assert_eq!(
+            profiles.profiles[0].profile.expires_at_ms,
+            profile.expires_at_ms
+        );
+        let metadata: serde_json::Value = serde_json::from_str(
+            profiles.profiles[0]
+                .profile
+                .metadata_json
+                .as_deref()
+                .expect("normalized profile metadata"),
+        )
+        .expect("metadata json");
+        assert_eq!(metadata["display_name"], "Alice Finite");
+        assert_eq!(metadata["picture"], "https://example.invalid/alice.png");
         assert!(!profiles.profiles[0].stale);
     }
 
@@ -4604,6 +4691,91 @@ async fn sqlite_nostr_profile_cache_survives_restart_and_reports_stale_reads() {
 }
 
 #[tokio::test]
+async fn sqlite_nostr_profile_cache_preserves_unknown_metadata_fields_on_edit() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let app = persistent_app(&db_path);
+    let account_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+
+    let original = NostrProfileRecord {
+        account_id: account_id.clone(),
+        name: Some("alice".to_owned()),
+        display_name: Some("Alice".to_owned()),
+        about: Some("Original profile".to_owned()),
+        picture: Some("https://example.invalid/original.png".to_owned()),
+        bot: Some(true),
+        finite_role: Some("agent".to_owned()),
+        metadata_json: Some(
+            r#"{"about":"Original profile","display_name":"Alice","lud16":"alice@example.com","picture":"https://example.invalid/original.png","website":"https://alice.example"}"#.to_owned(),
+        ),
+        fetched_at_ms: 1_000,
+        expires_at_ms: 2_000,
+    };
+    let response = post_json(
+        app.clone(),
+        "/profiles/nostr",
+        &PutNostrProfileRequest {
+            profile: original.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let edited = NostrProfileRecord {
+        account_id: account_id.clone(),
+        name: Some("alice-updated".to_owned()),
+        display_name: Some("Alice Updated".to_owned()),
+        about: None,
+        picture: Some("https://example.invalid/updated.png".to_owned()),
+        bot: None,
+        finite_role: None,
+        metadata_json: None,
+        fetched_at_ms: 3_000,
+        expires_at_ms: 4_000,
+    };
+    let response = post_json(
+        app.clone(),
+        "/profiles/nostr",
+        &PutNostrProfileRequest { profile: edited },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = post_json(
+        app,
+        "/profiles/nostr/get",
+        &GetNostrProfilesRequest {
+            account_ids: vec![account_id],
+            now_ms: 3_500,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let profiles: GetNostrProfilesResponse = read_json(response).await;
+    assert_eq!(profiles.profiles.len(), 1);
+    let profile = &profiles.profiles[0].profile;
+    assert_eq!(profile.display_name.as_deref(), Some("Alice Updated"));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.invalid/updated.png")
+    );
+    assert_eq!(profile.bot, Some(true));
+    assert_eq!(profile.finite_role.as_deref(), Some("agent"));
+
+    let metadata: serde_json::Value =
+        serde_json::from_str(profile.metadata_json.as_deref().expect("metadata json"))
+            .expect("metadata json object");
+    assert_eq!(metadata["name"], "alice-updated");
+    assert_eq!(metadata["display_name"], "Alice Updated");
+    assert_eq!(metadata["picture"], "https://example.invalid/updated.png");
+    assert_eq!(metadata["lud16"], "alice@example.com");
+    assert_eq!(metadata["website"], "https://alice.example");
+    assert_eq!(metadata["bot"], true);
+    assert_eq!(metadata["finite_role"], "agent");
+    assert!(metadata.get("about").is_none());
+}
+
+#[tokio::test]
 async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
@@ -4622,6 +4794,7 @@ async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects
                 picture: None,
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: 1_000,
                 expires_at_ms: 2_000,
             },
@@ -4644,6 +4817,7 @@ async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects
                 picture: Some("file:///tmp/alice.png".to_owned()),
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: 1_000,
                 expires_at_ms: 2_000,
             },
@@ -5693,11 +5867,19 @@ async fn post_json<T: Serialize>(app: Router, uri: &str, body: &T) -> Response<B
 }
 
 async fn put_blob(app: Router, body: &[u8]) -> Response<Body> {
+    put_blob_with_content_type(app, body, "application/octet-stream").await
+}
+
+async fn put_blob_with_content_type(
+    app: Router,
+    body: &[u8],
+    content_type: &str,
+) -> Response<Body> {
     app.oneshot(
         Request::builder()
             .method(Method::PUT)
             .uri("/upload")
-            .header("content-type", "application/octet-stream")
+            .header("content-type", content_type)
             .header("host", "blob.test")
             .body(Body::from(body.to_vec()))
             .expect("request"),

@@ -760,7 +760,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     assert_eq!(init["profile"]["display_name"], "Finite Agent");
     assert_eq!(
         init["profile"]["picture"],
-        "https://finite.computer/finite-logo.svg"
+        "https://avatars.githubusercontent.com/u/274919006?v=4"
     );
     assert_eq!(init["profile"]["bot"], true);
     assert_eq!(init["profile"]["finite_role"], "agent");

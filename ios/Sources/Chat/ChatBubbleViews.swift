@@ -103,6 +103,7 @@ private struct ChatMessageGroupRow: View {
             ChatAvatar(
                 title: group.senderDisplayName,
                 subtitle: group.senderNpub ?? group.senderAccountId,
+                pictureURL: group.senderPictureURL,
                 size: avatarSize
             )
             .accessibilityHidden(true)
@@ -1704,6 +1705,7 @@ private struct ChatActivityMarkerRow: View {
             ChatAvatar(
                 title: activity.primaryDisplayName,
                 subtitle: activity.primarySubtitle,
+                pictureURL: activity.primaryPictureURL,
                 size: avatarSize
             )
             .accessibilityHidden(true)
@@ -1780,27 +1782,17 @@ private struct TypingDotsGlyph: View {
 private struct ChatAvatar: View {
     let title: String
     let subtitle: String
+    let pictureURL: String?
     let size: CGFloat
 
     var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: size, height: size)
-            .overlay {
-                Text(initials)
-                    .font(.system(size: size * 0.38, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-    }
-
-    private var initials: String {
-        let source = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? subtitle : title
-        let pieces = source
-            .split(separator: " ")
-            .prefix(2)
-            .compactMap(\.first)
-        let value = String(pieces).uppercased()
-        return value.isEmpty ? "#" : value
+        ProfileAvatar(
+            displayName: title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? subtitle : title,
+            pictureURL: pictureURL,
+            size: size,
+            fallbackTint: .white,
+            fallbackBackground: color
+        )
     }
 
     private var color: Color {

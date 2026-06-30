@@ -630,6 +630,11 @@ final class AppModel: ObservableObject, AppReconciler {
         return state.profiles.first { $0.accountId == activeProfileId }
     }
 
+    var myProfile: AppProfileSummary? {
+        guard let accountID = activeAccountID else { return nil }
+        return state?.profiles.first { $0.accountId == accountID }
+    }
+
     var myNpub: String? {
         if let npub = nostrIdentity?.npub {
             return npub
@@ -969,7 +974,7 @@ final class AppModel: ObservableObject, AppReconciler {
         let existingRoomIDs = Set(rooms.map(\.roomId))
         let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
         return dispatchInBackground(.startProfileChat(
-            accountId: profile.accountId,
+            profile: profile,
             displayName: "Chat with \(displayName)"
         )) { [weak self] in
             guard let self else { return }
@@ -1007,17 +1012,13 @@ final class AppModel: ObservableObject, AppReconciler {
         if candidates.count == 1, let profile = candidates.first {
             let displayName = profile.displayName.nonEmptyTrimmed ?? profile.npub
             action = .startProfileChat(
-                accountId: profile.accountId,
+                profile: profile,
                 displayName: "Chat with \(displayName)"
             )
         } else {
             let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let accountIDs = candidates
-                .map(\.accountId)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            guard !name.isEmpty, !accountIDs.isEmpty else { return false }
-            action = .startGroupChat(accountIds: accountIDs, displayName: name)
+            guard !name.isEmpty else { return false }
+            action = .startGroupChat(profiles: candidates, displayName: name)
         }
 
         let existingRoomIDs = Set(rooms.map(\.roomId))
@@ -1041,13 +1042,13 @@ final class AppModel: ObservableObject, AppReconciler {
         onSuccess: (@MainActor () -> Void)? = nil
     ) -> Bool {
         guard room.state == .connected else { return false }
-        let accountIDs = profiles
+        let hasProfiles = profiles
             .map(\.accountId)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !accountIDs.isEmpty else { return false }
+            .contains { !$0.isEmpty }
+        guard hasProfiles else { return false }
         return dispatchInBackground(
-            .addRoomMembers(roomId: room.roomId, accountIds: accountIDs)
+            .addRoomMembers(roomId: room.roomId, profiles: profiles)
         ) { [weak self] in
             guard let self else { return }
             if self.state?.status == "people added" {
@@ -1184,6 +1185,122 @@ final class AppModel: ObservableObject, AppReconciler {
 
     func refreshDevices() {
         dispatchInBackground(.refreshDevices, priority: .utility)
+    }
+
+    @discardableResult
+    func saveMyProfile(
+        displayName: String,
+        about: String,
+        picture: String?,
+        onComplete: @escaping @MainActor (Bool) -> Void
+    ) -> Bool {
+        dispatchInBackground(
+            .saveProfile(displayName: displayName, about: about, picture: picture),
+            priority: .userInitiated,
+            onSuccess: {
+                onComplete(true)
+            },
+            onFailure: { _ in
+                onComplete(false)
+            }
+        )
+    }
+
+    func saveMyProfile(
+        displayName: String,
+        about: String,
+        picture: String?
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let started = saveMyProfile(
+                displayName: displayName,
+                about: about,
+                picture: picture
+            ) { success in
+                continuation.resume(returning: success)
+            }
+            if !started {
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    func saveRoomMetadata(
+        roomID: String,
+        displayName: String,
+        picture: String?
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let started = dispatchInBackground(
+                .saveRoomMetadata(
+                    roomId: roomID,
+                    displayName: displayName,
+                    picture: picture
+                ),
+                priority: .userInitiated,
+                onSuccess: {
+                    continuation.resume(returning: true)
+                },
+                onFailure: { _ in
+                    continuation.resume(returning: false)
+                }
+            )
+            if !started {
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    func uploadImage(data: Data, mimeType: String) async -> String? {
+        appendDiagnostic(
+            category: "image",
+            event: "image.upload.requested",
+            details: ["mime_type": Self.redactedDiagnosticValue(mimeType)]
+        )
+        let runtime: any FiniteChatRuntimeProtocol
+        do {
+            runtime = try currentRuntime()
+        } catch {
+            appendDiagnostic(
+                category: "image",
+                event: "image.upload.failed",
+                details: diagnosticErrorDetails(error)
+            )
+            errorText = String(describing: error)
+            return nil
+        }
+
+        let action = AppAction.uploadImage(bytes: data, contentType: mimeType)
+        do {
+            let nextState = try await Task.detached(priority: .userInitiated) {
+                try runtime.dispatchAndWait(action: action)
+            }.value
+            applyRuntimeSnapshot(nextState)
+            guard let url = nextState.flow.imageUploadUrl?.nonEmptyTrimmed else {
+                let error = "Image upload did not return a URL"
+                appendDiagnostic(
+                    category: "image",
+                    event: "image.upload.failed",
+                    details: diagnosticErrorDetails(error)
+                )
+                errorText = error
+                return nil
+            }
+            appendDiagnostic(
+                category: "image",
+                event: "image.upload.succeeded"
+            )
+            errorText = nil
+            return url
+        } catch {
+            appendDiagnostic(
+                category: "image",
+                event: "image.upload.failed",
+                details: diagnosticErrorDetails(error)
+            )
+            errorText = String(describing: error)
+            return nil
+        }
     }
 
     func revokeDevice(_ device: AppDeviceSummary) {
@@ -1819,7 +1936,8 @@ final class AppModel: ObservableObject, AppReconciler {
         let messages = state.messages + pendingOptimisticMessages.values
         chatProjections = ChatTimeline.roomProjections(
             messages: messages,
-            typingMembers: state.typingMembers
+            typingMembers: state.typingMembers,
+            profiles: state.profiles
         )
     }
 
@@ -2029,23 +2147,41 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "create_room",
                 details: [:]
             )
-        case .startProfileChat(let accountId, _):
+        case .saveProfile:
+            return DiagnosticActionSummary(
+                category: "profile",
+                name: "save_profile",
+                details: [:]
+            )
+        case .uploadImage:
+            return DiagnosticActionSummary(
+                category: "image",
+                name: "upload_image",
+                details: [:]
+            )
+        case .saveRoomMetadata(let roomId, _, _):
+            return DiagnosticActionSummary(
+                category: "room",
+                name: "save_room_metadata",
+                details: ["room": roomId]
+            )
+        case .startProfileChat(let profile, _):
             return DiagnosticActionSummary(
                 category: "transport",
                 name: "start_profile_chat",
-                details: ["account": accountId]
+                details: ["account": profile.accountId]
             )
-        case .startGroupChat(let accountIds, _):
+        case .startGroupChat(let profiles, _):
             return DiagnosticActionSummary(
                 category: "transport",
                 name: "start_group_chat",
-                details: ["members": "\(accountIds.count)"]
+                details: ["members": "\(profiles.count)"]
             )
-        case .addRoomMembers(let roomId, let accountIds):
+        case .addRoomMembers(let roomId, let profiles):
             return DiagnosticActionSummary(
                 category: "transport",
                 name: "add_room_members",
-                details: ["room": roomId, "members": "\(accountIds.count)"]
+                details: ["room": roomId, "members": "\(profiles.count)"]
             )
         case .createInvite(let roomId):
             return DiagnosticActionSummary(

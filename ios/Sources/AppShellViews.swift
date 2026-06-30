@@ -1,5 +1,6 @@
+import Foundation
+import PhotosUI
 import SwiftUI
-import UIKit
 
 struct GlassCircleCloseButton: View {
     let action: () -> Void
@@ -865,32 +866,107 @@ struct MyNostrProfileSheet: View {
     let identity: AppNostrIdentity?
     let myNpub: String?
     let accountID: String?
+    let profile: AppProfileSummary?
     let serverURL: String
     let showsSecretKey: Bool
     private let availabilityService: FiniteInviteAvailabilityService
+    private let onUploadImage: @MainActor (Data, String) async -> String?
+    private let onSaveProfile: @MainActor (String, String, String?) async -> Bool
     @State private var showingSecret = false
     @State private var copiedField: String?
     @State private var profileCodeReadiness: ProfileCodeReadinessState = .checking
+    @State private var draftDisplayName: String
+    @State private var draftAbout: String
+    @State private var draftPictureURL: String
+    @State private var selectedProfilePhotoItem: PhotosPickerItem?
+    @State private var imageUploadInFlight = false
+    @State private var saveInFlight = false
+    @State private var saveStatusText: String?
+    @State private var imageUploadStatusText: String?
 
     init(
         identity: AppNostrIdentity?,
         myNpub: String?,
         accountID: String? = nil,
+        profile: AppProfileSummary? = nil,
         serverURL: String = RuntimeConfig.defaultServerURL,
         showsSecretKey: Bool = true,
-        availabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService()
+        availabilityService: FiniteInviteAvailabilityService = FiniteInviteAvailabilityService(),
+        onUploadImage: @escaping @MainActor (Data, String) async -> String? = { _, _ in nil },
+        onSaveProfile: @escaping @MainActor (String, String, String?) async -> Bool = { _, _, _ in false }
     ) {
         self.identity = identity
         self.myNpub = myNpub
         self.accountID = accountID
+        self.profile = profile
         self.serverURL = serverURL
         self.showsSecretKey = showsSecretKey
         self.availabilityService = availabilityService
+        self.onUploadImage = onUploadImage
+        self.onSaveProfile = onSaveProfile
+        _draftDisplayName = State(initialValue: profile?.displayName ?? "")
+        _draftAbout = State(initialValue: profile?.about ?? "")
+        _draftPictureURL = State(initialValue: profile?.picture ?? "")
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    NostrProfileHeader(
+                        displayName: previewDisplayName,
+                        npub: myNpub ?? accountID ?? "",
+                        about: normalizedDraftAbout,
+                        pictureURL: normalizedDraftPictureURL
+                    )
+                }
+                .listRowBackground(Color.clear)
+
+                Section("Profile") {
+                    TextField("Display name", text: $draftDisplayName)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled(false)
+
+                    TextField("About", text: $draftAbout, axis: .vertical)
+                        .lineLimit(2...5)
+
+                    PhotosPicker(
+                        selection: $selectedProfilePhotoItem,
+                        matching: .images,
+                        photoLibrary: .shared()
+                    ) {
+                        if imageUploadInFlight {
+                            Label("Uploading Image", systemImage: "hourglass")
+                        } else {
+                            Label("Choose Profile Image", systemImage: "photo")
+                        }
+                    }
+                    .disabled(imageUploadInFlight || saveInFlight)
+
+                    if let imageUploadStatusText {
+                        Text(imageUploadStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        saveProfile()
+                    } label: {
+                        if saveInFlight {
+                            Label("Saving", systemImage: "hourglass")
+                        } else {
+                            Label("Save Profile", systemImage: "checkmark.circle")
+                        }
+                    }
+                    .disabled(!canSaveProfile)
+
+                    if let saveStatusText {
+                        Text(saveStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if let npub = myNpub {
                     Section {
                         QRCodeView(value: npub)
@@ -954,6 +1030,12 @@ struct MyNostrProfileSheet: View {
             .task(id: readinessTaskID) {
                 await refreshProfileCodeReadiness()
             }
+            .onChange(of: profileDraftID) { _, _ in
+                resetProfileDrafts()
+            }
+            .onChange(of: selectedProfilePhotoItem) { _, item in
+                uploadSelectedProfilePhoto(item)
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     GlassCircleCloseButton { dismiss() }
@@ -970,6 +1052,125 @@ struct MyNostrProfileSheet: View {
 
     private var readinessTaskID: String {
         "\(normalizedAccountID ?? "")|\(serverURL)"
+    }
+
+    private var profileDraftID: String {
+        [
+            profile?.accountId ?? "",
+            profile?.displayName ?? "",
+            profile?.about ?? "",
+            profile?.picture ?? "",
+        ].joined(separator: "|")
+    }
+
+    private var previewDisplayName: String {
+        let trimmed = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return profile?.displayName
+            ?? myNpub.map(shortenedNpub)
+            ?? normalizedAccountID.map(shortenedNpub)
+            ?? "My Profile"
+    }
+
+    private var normalizedDraftAbout: String? {
+        let trimmed = draftAbout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var normalizedDraftPictureURL: String? {
+        let trimmed = draftPictureURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var pictureURLValidationText: String? {
+        guard let value = normalizedDraftPictureURL else { return nil }
+        guard let components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host?.isEmpty == false
+        else {
+            return "Use an http(s) image URL."
+        }
+        return nil
+    }
+
+    private var hasProfileDraftChanges: Bool {
+        draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            != (profile?.displayName ?? "")
+        || draftAbout.trimmingCharacters(in: .whitespacesAndNewlines)
+            != (profile?.about ?? "")
+        || (normalizedDraftPictureURL ?? "")
+            != (profile?.picture ?? "")
+    }
+
+    private var canSaveProfile: Bool {
+        !saveInFlight
+            && !imageUploadInFlight
+            && pictureURLValidationText == nil
+            && !draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && hasProfileDraftChanges
+    }
+
+    private func resetProfileDrafts() {
+        guard !saveInFlight else { return }
+        draftDisplayName = profile?.displayName ?? ""
+        draftAbout = profile?.about ?? ""
+        draftPictureURL = profile?.picture ?? ""
+        saveStatusText = nil
+        imageUploadStatusText = nil
+    }
+
+    private func uploadSelectedProfilePhoto(_ item: PhotosPickerItem?) {
+        guard let item else { return }
+        selectedProfilePhotoItem = nil
+        imageUploadInFlight = true
+        imageUploadStatusText = nil
+        Task {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else {
+                    throw ImageUploadError.unreadableImage
+                }
+                let payload = try await Task.detached(priority: .userInitiated) {
+                    try ImageUploadPayload(sourceData: data)
+                }.value
+                let url = await onUploadImage(payload.data, payload.mimeType)
+                await MainActor.run {
+                    imageUploadInFlight = false
+                    if let url {
+                        draftPictureURL = url
+                        imageUploadStatusText = "Image uploaded. Save profile to publish it."
+                    } else {
+                        imageUploadStatusText = "Image upload failed."
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    imageUploadInFlight = false
+                    imageUploadStatusText = String(describing: error)
+                }
+            }
+        }
+    }
+
+    private func saveProfile() {
+        guard canSaveProfile else { return }
+        saveInFlight = true
+        saveStatusText = nil
+        let displayName = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let about = draftAbout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let picture = normalizedDraftPictureURL
+        Task {
+            let saved = await onSaveProfile(displayName, about, picture)
+            await MainActor.run {
+                saveInFlight = false
+                if saved {
+                    draftDisplayName = displayName
+                    draftAbout = about
+                    draftPictureURL = picture ?? ""
+                }
+                saveStatusText = saved ? "Saved" : "Could not save profile"
+            }
+        }
     }
 
     @MainActor
@@ -1047,7 +1248,7 @@ private struct NostrProfileHeader: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            NostrAvatar(name: displayName, pictureURL: pictureURL, size: 96)
+            ProfileAvatar(displayName: displayName, pictureURL: pictureURL, size: 96)
                 .frame(maxWidth: .infinity)
 
             Text(displayName)
@@ -1078,7 +1279,7 @@ private struct NostrProfileRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            NostrAvatar(name: profile.displayName, pictureURL: profile.pictureURL, size: 42)
+            ProfileAvatar(displayName: profile.displayName, pictureURL: profile.pictureURL, size: 42)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(profile.displayName)
@@ -1132,7 +1333,7 @@ private struct KnownProfileRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            NostrAvatar(name: profile.displayName, pictureURL: profile.picture, size: 42)
+            ProfileAvatar(displayName: profile.displayName, pictureURL: profile.picture, size: 42)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(profile.displayName)
@@ -1153,45 +1354,6 @@ private struct KnownProfileRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityValue(profile.stale ? "Cached profile" : "")
-    }
-}
-
-private struct NostrAvatar: View {
-    let name: String?
-    let pictureURL: String?
-    let size: CGFloat
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(Color(.tertiarySystemFill))
-
-            if let url = pictureURL.flatMap(URL.init(string:)) {
-                CachedRemoteImage(url: url) { image in
-                    image
-                        .resizable()
-                        .scaledToFill()
-                } placeholder: {
-                    initials
-                }
-            } else {
-                initials
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-    }
-
-    private var initials: some View {
-        Text(initialText)
-            .font(.system(size: max(13, size * 0.36), weight: .semibold))
-            .foregroundStyle(.secondary)
-    }
-
-    private var initialText: String {
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard let first = trimmed.first else { return "#" }
-        return String(first).uppercased()
     }
 }
 

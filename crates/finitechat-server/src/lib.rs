@@ -80,6 +80,8 @@ const MAX_NOSTR_PROFILE_BATCH: usize = 64;
 const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
 const MAX_NOSTR_PROFILE_ABOUT_BYTES: usize = 4 * 1024;
 const MAX_NOSTR_PROFILE_PICTURE_BYTES: usize = 2 * 1024;
+const MAX_NOSTR_PROFILE_METADATA_JSON_BYTES: usize = 16 * 1024;
+const MAX_PUBLIC_IMAGE_BLOB_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PUSH_WAKE_CLAIM_BATCH: usize = 100;
 const MAX_PUSH_WAKE_LEASE_MS: u64 = 5 * 60 * 1_000;
 const MAX_PUSH_WAKE_ATTEMPTS: u32 = 5;
@@ -122,7 +124,7 @@ pub struct HttpServerState {
     welcome_claims: Arc<Mutex<HashMap<MessageId, WelcomeClaimRecord>>>,
     push_tokens: Arc<Mutex<BTreeMap<String, PushTokenRecord>>>,
     push_wakes: Arc<Mutex<BTreeMap<String, PushWakeOutboxRecord>>>,
-    blob_objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    blob_objects: Arc<Mutex<BTreeMap<String, BlobObject>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
     /// Long-poll wake signal (/sync/wait). A single hub: every accepted
     /// publish or invite mutation wakes all waiters, who re-check their
@@ -130,6 +132,12 @@ pub struct HttpServerState {
     /// per-key channels are the documented next step if waiter counts grow.
     wake: Arc<tokio::sync::Notify>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BlobObject {
+    content_type: String,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -264,50 +272,42 @@ impl HttpServerState {
     pub fn put_blob_object(
         &self,
         headers: &HeaderMap,
-        ciphertext: &[u8],
+        bytes: &[u8],
     ) -> Result<BlobDescriptor, ServerHttpError> {
-        let content_type = blob_content_type(headers)?;
-        if content_type != BLOB_CIPHERTEXT_CONTENT_TYPE {
-            return Err(ServerHttpError::InvalidBlobRequest {
-                reason: format!(
-                    "blob upload content type must be {BLOB_CIPHERTEXT_CONTENT_TYPE}, got {content_type}"
-                ),
-            });
-        }
-        BlobPutRequest {
-            ciphertext,
-            content_type,
-        }
-        .validate_limits()
-        .map_err(|error| ServerHttpError::InvalidBlobRequest {
-            reason: error.to_string(),
-        })?;
+        let content_type = normalize_blob_upload_content_type(blob_content_type(headers)?)?;
+        validate_blob_upload(bytes, content_type)?;
 
-        let sha256 = sha256_hex(ciphertext);
+        let sha256 = sha256_hex(bytes);
         let mut objects = self.blob_objects.lock().expect("HTTP blob objects mutex");
         if let Some(existing) = objects.get(&sha256) {
-            if existing.as_slice() == ciphertext {
+            if existing.bytes.as_slice() == bytes {
                 return Ok(BlobDescriptor {
                     url: blob_url(headers, &sha256),
                     sha256,
-                    size_bytes: ciphertext.len() as u64,
+                    size_bytes: bytes.len() as u64,
                 });
             }
             return Err(ServerHttpError::BlobConflict { sha256 });
         }
 
         if let Some(store) = &self.store {
-            store.upsert_blob_object(&sha256, ciphertext)?;
+            store.upsert_blob_object(&sha256, content_type, bytes)?;
         }
-        objects.insert(sha256.clone(), ciphertext.to_vec());
+        objects.insert(
+            sha256.clone(),
+            BlobObject {
+                content_type: content_type.to_owned(),
+                bytes: bytes.to_vec(),
+            },
+        );
         Ok(BlobDescriptor {
             url: blob_url(headers, &sha256),
             sha256,
-            size_bytes: ciphertext.len() as u64,
+            size_bytes: bytes.len() as u64,
         })
     }
 
-    pub fn get_blob_object(&self, sha256: &str) -> Result<Vec<u8>, ServerHttpError> {
+    fn get_blob_object(&self, sha256: &str) -> Result<BlobObject, ServerHttpError> {
         validate_blob_sha256(sha256)?;
         let objects = self.blob_objects.lock().expect("HTTP blob objects mutex");
         objects
@@ -732,14 +732,22 @@ impl HttpServerState {
         &self,
         request: PutNostrProfileRequest,
     ) -> Result<PutNostrProfileResponse, ServerHttpError> {
-        validate_nostr_profile_record(&request.profile)?;
+        let record = {
+            let profiles = self
+                .nostr_profiles
+                .lock()
+                .expect("HTTP nostr-profile mutex");
+            let existing = profiles.get(&request.profile.account_id);
+            normalize_nostr_profile_record(request.profile, existing)?
+        };
+        validate_nostr_profile_record(&record)?;
         let mut profiles = self
             .nostr_profiles
             .lock()
             .expect("HTTP nostr-profile mutex");
-        profiles.insert(request.profile.account_id.clone(), request.profile.clone());
+        profiles.insert(record.account_id.clone(), record.clone());
         if let Some(store) = &self.store {
-            store.upsert_nostr_profile(&request.profile)?;
+            store.upsert_nostr_profile(&record)?;
         }
         Ok(PutNostrProfileResponse { saved: true })
     }
@@ -3257,11 +3265,11 @@ async fn download_blob_object(
     State(state): State<HttpServerState>,
     AxumPath(sha256): AxumPath<String>,
 ) -> Result<impl IntoResponse, ServerHttpError> {
-    let body = state.get_blob_object(&sha256)?;
+    let object = state.get_blob_object(&sha256)?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, BLOB_CIPHERTEXT_CONTENT_TYPE)],
-        body,
+        [(header::CONTENT_TYPE, object.content_type)],
+        object.bytes,
     ))
 }
 
@@ -4116,9 +4124,11 @@ impl SqliteHttpDeliveryStore {
             CREATE TABLE IF NOT EXISTS http_blob_objects (
                 sha256 TEXT PRIMARY KEY,
                 size_bytes INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
                 ciphertext BLOB NOT NULL
             );",
         )?;
+        ensure_blob_content_type_column(&conn)?;
         drop(conn);
         Ok(store)
     }
@@ -4382,10 +4392,10 @@ impl SqliteHttpDeliveryStore {
         Ok(wakes)
     }
 
-    fn load_blob_objects(&self) -> Result<BTreeMap<String, Vec<u8>>, DurableStoreError> {
+    fn load_blob_objects(&self) -> Result<BTreeMap<String, BlobObject>, DurableStoreError> {
         let conn = self.connection();
         let mut statement = conn.prepare(
-            "SELECT sha256, size_bytes, ciphertext
+            "SELECT sha256, size_bytes, content_type, ciphertext
              FROM http_blob_objects
              ORDER BY sha256 ASC",
         )?;
@@ -4393,27 +4403,39 @@ impl SqliteHttpDeliveryStore {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, u64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
             ))
         })?;
         let mut objects = BTreeMap::new();
         for row in rows {
-            let (sha256, size_bytes, ciphertext) = row?;
-            if size_bytes != ciphertext.len() as u64 || sha256 != sha256_hex(&ciphertext) {
+            let (sha256, size_bytes, content_type, bytes) = row?;
+            if size_bytes != bytes.len() as u64 || sha256 != sha256_hex(&bytes) {
                 return Err(DurableStoreError::BlobObjectCorrupt { sha256 });
             }
-            objects.insert(sha256, ciphertext);
+            objects.insert(
+                sha256,
+                BlobObject {
+                    content_type,
+                    bytes,
+                },
+            );
         }
         Ok(objects)
     }
 
-    fn upsert_blob_object(&self, sha256: &str, ciphertext: &[u8]) -> Result<(), DurableStoreError> {
+    fn upsert_blob_object(
+        &self,
+        sha256: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<(), DurableStoreError> {
         let conn = self.connection();
         conn.execute(
-            "INSERT INTO http_blob_objects (sha256, size_bytes, ciphertext)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO http_blob_objects (sha256, size_bytes, content_type, ciphertext)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(sha256) DO NOTHING",
-            params![sha256, ciphertext.len() as u64, ciphertext],
+            params![sha256, bytes.len() as u64, content_type, bytes],
         )?;
         Ok(())
     }
@@ -4931,6 +4953,22 @@ impl SqliteHttpDeliveryStore {
     }
 }
 
+fn ensure_blob_content_type_column(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(http_blob_objects)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == "content_type" {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        "ALTER TABLE http_blob_objects
+         ADD COLUMN content_type TEXT NOT NULL DEFAULT 'application/octet-stream'",
+        [],
+    )?;
+    Ok(())
+}
+
 fn upsert_key_package_inventory_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     record: &KeyPackageInventoryRecord,
@@ -5016,6 +5054,61 @@ fn blob_url(headers: &HeaderMap, sha256: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("localhost");
     format!("{scheme}://{host}/blobs/{sha256}")
+}
+
+fn normalize_blob_upload_content_type(content_type: &str) -> Result<&'static str, ServerHttpError> {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        BLOB_CIPHERTEXT_CONTENT_TYPE => Ok(BLOB_CIPHERTEXT_CONTENT_TYPE),
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/gif" => Ok("image/gif"),
+        "image/webp" => Ok("image/webp"),
+        other => Err(ServerHttpError::InvalidBlobRequest {
+            reason: format!("blob upload content type is not supported: {other}"),
+        }),
+    }
+}
+
+fn validate_blob_upload(bytes: &[u8], content_type: &str) -> Result<(), ServerHttpError> {
+    if content_type == BLOB_CIPHERTEXT_CONTENT_TYPE {
+        return BlobPutRequest {
+            ciphertext: bytes,
+            content_type,
+        }
+        .validate_limits()
+        .map_err(|error| ServerHttpError::InvalidBlobRequest {
+            reason: error.to_string(),
+        });
+    }
+    validate_bytes_non_empty("blob.bytes", bytes.len()).map_err(|error| {
+        ServerHttpError::InvalidBlobRequest {
+            reason: error.to_string(),
+        }
+    })?;
+    validate_bytes_len(
+        "blob.bytes",
+        bytes.len(),
+        MAX_PUBLIC_IMAGE_BLOB_BYTES as u32,
+    )
+    .map_err(|error| ServerHttpError::InvalidBlobRequest {
+        reason: error.to_string(),
+    })?;
+    if public_image_blob_magic_matches(bytes, content_type) {
+        return Ok(());
+    }
+    Err(ServerHttpError::InvalidBlobRequest {
+        reason: format!("blob bytes do not match {content_type}"),
+    })
+}
+
+fn public_image_blob_magic_matches(bytes: &[u8], content_type: &str) -> bool {
+    match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
 }
 
 fn validate_blob_sha256(sha256: &str) -> Result<(), ServerHttpError> {
@@ -5863,6 +5956,82 @@ fn validate_device_liveness_request(
     Ok(())
 }
 
+fn normalize_nostr_profile_record(
+    mut incoming: NostrProfileRecord,
+    existing: Option<&NostrProfileRecord>,
+) -> Result<NostrProfileRecord, ServerHttpError> {
+    if incoming.bot.is_none() {
+        incoming.bot = existing.and_then(|record| record.bot);
+    }
+    if incoming.finite_role.is_none() {
+        incoming.finite_role = existing.and_then(|record| record.finite_role.clone());
+    }
+    incoming.metadata_json = Some(patched_nostr_profile_metadata_json(&incoming, existing)?);
+    Ok(incoming)
+}
+
+fn patched_nostr_profile_metadata_json(
+    incoming: &NostrProfileRecord,
+    existing: Option<&NostrProfileRecord>,
+) -> Result<String, ServerHttpError> {
+    let mut object = existing
+        .and_then(|record| record.metadata_json.as_deref())
+        .or(incoming.metadata_json.as_deref())
+        .map(nostr_profile_metadata_object)
+        .transpose()?
+        .unwrap_or_default();
+
+    patch_json_string_field(&mut object, "name", incoming.name.as_deref());
+    patch_json_string_field(
+        &mut object,
+        "display_name",
+        incoming.display_name.as_deref(),
+    );
+    object.remove("displayName");
+    patch_json_string_field(&mut object, "about", incoming.about.as_deref());
+    patch_json_string_field(&mut object, "picture", incoming.picture.as_deref());
+    object.remove("picture_url");
+    if let Some(bot) = incoming.bot {
+        object.insert("bot".to_owned(), serde_json::Value::Bool(bot));
+    }
+    patch_json_string_field(&mut object, "finite_role", incoming.finite_role.as_deref());
+    object.remove("finiteRole");
+
+    serde_json::to_string(&serde_json::Value::Object(object)).map_err(|error| {
+        ServerHttpError::InvalidNostrProfileRequest {
+            reason: format!("profile.metadata_json could not be encoded: {error}"),
+        }
+    })
+}
+
+fn nostr_profile_metadata_object(
+    metadata_json: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, ServerHttpError> {
+    let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+        ServerHttpError::InvalidNostrProfileRequest {
+            reason: format!("profile.metadata_json must be valid JSON: {error}"),
+        }
+    })?;
+    match value {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: "profile.metadata_json must be a JSON object".to_owned(),
+        }),
+    }
+}
+
+fn patch_json_string_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+    } else {
+        object.remove(key);
+    }
+}
+
 fn validate_nostr_profile_record(record: &NostrProfileRecord) -> Result<(), ServerHttpError> {
     validate_nostr_account_id(&record.account_id)?;
     validate_optional_profile_text(
@@ -5901,6 +6070,34 @@ fn validate_nostr_profile_record(record: &NostrProfileRecord) -> Result<(), Serv
     if record.expires_at_ms <= record.fetched_at_ms {
         return Err(ServerHttpError::InvalidNostrProfileRequest {
             reason: "profile.expires_at_ms must be greater than profile.fetched_at_ms".to_owned(),
+        });
+    }
+    validate_nostr_profile_metadata_json(record.metadata_json.as_deref())?;
+    Ok(())
+}
+
+fn validate_nostr_profile_metadata_json(
+    metadata_json: Option<&str>,
+) -> Result<(), ServerHttpError> {
+    let Some(metadata_json) = metadata_json else {
+        return Ok(());
+    };
+    validate_bytes_len(
+        "profile.metadata_json",
+        metadata_json.len(),
+        MAX_NOSTR_PROFILE_METADATA_JSON_BYTES as u32,
+    )
+    .map_err(|error| ServerHttpError::InvalidNostrProfileRequest {
+        reason: error.to_string(),
+    })?;
+    let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
+        ServerHttpError::InvalidNostrProfileRequest {
+            reason: format!("profile.metadata_json must be valid JSON: {error}"),
+        }
+    })?;
+    if !value.is_object() {
+        return Err(ServerHttpError::InvalidNostrProfileRequest {
+            reason: "profile.metadata_json must be a JSON object".to_owned(),
         });
     }
     Ok(())

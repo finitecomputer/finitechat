@@ -65,9 +65,19 @@ struct ContentView: View {
                     identity: model.nostrIdentity,
                     myNpub: model.myNpub,
                     accountID: model.activeAccountID,
+                    profile: model.myProfile,
                     serverURL: model.serverURL,
-                    showsSecretKey: false
-                )
+                    showsSecretKey: false,
+                    onUploadImage: { data, mimeType in
+                        await model.uploadImage(data: data, mimeType: mimeType)
+                    }
+                ) { displayName, about, picture in
+                    await model.saveMyProfile(
+                        displayName: displayName,
+                        about: about,
+                        picture: picture
+                    )
+                }
             case .scan:
                 ScanSheet(model: model) { profile in
                     startChatFromScannedProfile(profile)
@@ -1463,24 +1473,7 @@ private struct NewGroupFollowRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(Color(.tertiarySystemFill))
-
-                if let url = profile.pictureURL.flatMap(URL.init(string:)) {
-                    CachedRemoteImage(url: url) { image in
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } placeholder: {
-                        initials
-                    }
-                } else {
-                    initials
-                }
-            }
-            .frame(width: 40, height: 40)
-            .clipShape(Circle())
+            ProfileAvatar(displayName: profile.displayName, pictureURL: profile.pictureURL, size: 40)
             .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -1507,13 +1500,6 @@ private struct NewGroupFollowRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
-
-    private var initials: some View {
-        Text(profile.displayName.prefix(1).uppercased())
-            .font(.headline)
-            .foregroundStyle(.secondary)
-    }
-
     private var statusSystemImage: String {
         switch profile.inviteAvailability {
         case .available:
@@ -1588,11 +1574,7 @@ private struct RoomAvatar: View {
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            Circle()
-                .fill(Color(.tertiarySystemFill))
-            Text(initial)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.secondary)
+            ProfileAvatar(displayName: room.displayName, pictureURL: room.picture, size: 40)
 
             Circle()
                 .fill(room.state.tint)
@@ -1603,11 +1585,6 @@ private struct RoomAvatar: View {
         .accessibilityHidden(true)
     }
 
-    private var initial: String {
-        let trimmed = room.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return "#" }
-        return String(first).uppercased()
-    }
 }
 
 private struct RoomOptionsSheet: View {
@@ -1882,6 +1859,16 @@ private struct RoomThreadView: View {
                 },
                 onRevokeDevice: { device in
                     model.revokeDevice(device)
+                },
+                onUploadImage: { data, mimeType in
+                    await model.uploadImage(data: data, mimeType: mimeType)
+                },
+                onSaveMetadata: { roomID, displayName, picture in
+                    await model.saveRoomMetadata(
+                        roomID: roomID,
+                        displayName: displayName,
+                        picture: picture
+                    )
                 }
             )
         }
@@ -3272,8 +3259,18 @@ private struct SettingsSheet: View {
                     identity: model.nostrIdentity,
                     myNpub: model.myNpub,
                     accountID: model.activeAccountID,
-                    serverURL: model.serverURL
-                )
+                    profile: model.myProfile,
+                    serverURL: model.serverURL,
+                    onUploadImage: { data, mimeType in
+                        await model.uploadImage(data: data, mimeType: mimeType)
+                    }
+                ) { displayName, about, picture in
+                    await model.saveMyProfile(
+                        displayName: displayName,
+                        about: about,
+                        picture: picture
+                    )
+                }
             }
             .sheet(isPresented: $showingScan) {
                 ScanSheet(model: model, onStartProfileChat: onStartProfileChat)
@@ -3373,39 +3370,6 @@ private struct ProfileRow: View {
             Spacer(minLength: 8)
         }
         .accessibilityElement(children: .combine)
-    }
-}
-
-private struct ProfileAvatar: View {
-    let profile: AppProfileSummary
-    var size: CGFloat = 40
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .fill(Color(.tertiarySystemFill))
-
-            if let url = profile.picture.flatMap(URL.init(string:)) {
-                CachedRemoteImage(url: url) { image in
-                    image
-                        .resizable()
-                        .scaledToFill()
-                } placeholder: {
-                    initials
-                }
-            } else {
-                initials
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-        .accessibilityHidden(true)
-    }
-
-    private var initials: some View {
-        Text(profile.displayName.prefix(1).uppercased())
-            .font(size >= 36 ? .headline : .caption.weight(.semibold))
-            .foregroundStyle(.secondary)
     }
 }
 

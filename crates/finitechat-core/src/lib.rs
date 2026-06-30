@@ -68,6 +68,11 @@ const DEFAULT_INVITE_TTL_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_INVITE_MAX_JOINS: u32 = 32;
 const DEFAULT_APP_UPDATE_WAIT_MILLIS: u64 = 30_000;
 const DEFAULT_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30_000;
+const DEFAULT_PROFILE_CACHE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+const MAX_PROFILE_DISPLAY_NAME_BYTES: u32 = 128;
+const MAX_PROFILE_ABOUT_BYTES: u32 = 4 * 1024;
+const MAX_PROFILE_PICTURE_BYTES: u32 = 2 * 1024;
+const MAX_PROFILE_IMAGE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MIN_APP_UPDATE_WAIT_MILLIS: u64 = 1_000;
 const MAX_APP_UPDATE_WAIT_MILLIS: u64 = 60_000;
 const MAX_ATTACHMENTS_PER_MESSAGE: u32 = 32;
@@ -379,6 +384,7 @@ pub enum AppRoomState {
 pub struct AppRoomSummary {
     pub room_id: String,
     pub display_name: String,
+    pub picture: Option<String>,
     pub state: AppRoomState,
     pub status: String,
     pub user_status_text: String,
@@ -392,6 +398,7 @@ pub struct AppRoomSummary {
 pub struct AppRoomDetailsState {
     pub room_id: String,
     pub display_name: String,
+    pub picture: Option<String>,
     pub state: AppRoomState,
     pub status: String,
     pub user_status_text: String,
@@ -407,6 +414,7 @@ pub struct AppRoomMemberSummary {
     pub device_id: String,
     pub npub: String,
     pub display_name: String,
+    pub picture: Option<String>,
     pub current_device: bool,
 }
 
@@ -443,6 +451,7 @@ pub struct AppTypingMember {
     pub account_id: String,
     pub device_id: String,
     pub display_name: String,
+    pub picture: Option<String>,
     pub npub: Option<String>,
     pub activity_kind: String,
 }
@@ -463,6 +472,7 @@ pub struct AppFlowState {
     pub scan_in_flight: bool,
     pub invite_join_submission_room_id: Option<String>,
     pub scan_result: AppScanTargetOutcome,
+    pub image_upload_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,17 +543,31 @@ pub enum AppAction {
     CreateRoom {
         display_name: String,
     },
+    SaveProfile {
+        display_name: String,
+        about: String,
+        picture: Option<String>,
+    },
+    UploadImage {
+        bytes: Vec<u8>,
+        content_type: String,
+    },
+    SaveRoomMetadata {
+        room_id: String,
+        display_name: String,
+        picture: Option<String>,
+    },
     StartProfileChat {
-        account_id: String,
+        profile: AppProfileSummary,
         display_name: String,
     },
     StartGroupChat {
-        account_ids: Vec<String>,
+        profiles: Vec<AppProfileSummary>,
         display_name: String,
     },
     AddRoomMembers {
         room_id: String,
-        account_ids: Vec<String>,
+        profiles: Vec<AppProfileSummary>,
     },
     CreateInvite {
         room_id: String,
@@ -739,6 +763,7 @@ struct AppRuntimeState {
     loaded_message_counts: BTreeMap<String, usize>,
     local_read_seq: BTreeMap<String, u64>,
     profile_cache: BTreeMap<String, AppProfileSummary>,
+    profile_records: BTreeMap<String, finitechat_http::NostrProfileRecord>,
     revoked_devices: BTreeSet<String>,
     downloading_attachments: BTreeSet<(String, String, String)>,
 }
@@ -1633,6 +1658,7 @@ impl AppRuntimeState {
             loaded_message_counts,
             local_read_seq,
             profile_cache: BTreeMap::new(),
+            profile_records: BTreeMap::new(),
             revoked_devices,
             downloading_attachments: BTreeSet::new(),
         };
@@ -1661,6 +1687,10 @@ impl AppRuntimeState {
                 self.app.flow.notice_text = Some("Requesting room admission...".to_owned());
                 self.app.flow.notice_busy = true;
                 self.app.flow.scan_in_flight = false;
+                true
+            }
+            AppAction::UploadImage { .. } => {
+                self.app.flow.image_upload_url = None;
                 true
             }
             _ => false,
@@ -1716,18 +1746,31 @@ impl AppRuntimeState {
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
             AppAction::OpenRoom { room_id } => self.open_room(room_id)?,
             AppAction::CreateRoom { display_name } => self.create_room(display_name)?,
-            AppAction::StartProfileChat {
-                account_id,
+            AppAction::SaveProfile {
                 display_name,
-            } => self.start_profile_chat(account_id, display_name)?,
-            AppAction::StartGroupChat {
-                account_ids,
-                display_name,
-            } => self.start_group_chat(account_ids, display_name)?,
-            AppAction::AddRoomMembers {
+                about,
+                picture,
+            } => self.save_profile(display_name, about, picture)?,
+            AppAction::UploadImage {
+                bytes,
+                content_type,
+            } => self.upload_image(bytes, content_type)?,
+            AppAction::SaveRoomMetadata {
                 room_id,
-                account_ids,
-            } => self.add_room_members(room_id, account_ids)?,
+                display_name,
+                picture,
+            } => self.save_room_metadata(room_id, display_name, picture)?,
+            AppAction::StartProfileChat {
+                profile,
+                display_name,
+            } => self.start_profile_chat(profile, display_name)?,
+            AppAction::StartGroupChat {
+                profiles,
+                display_name,
+            } => self.start_group_chat(profiles, display_name)?,
+            AppAction::AddRoomMembers { room_id, profiles } => {
+                self.add_room_members(room_id, profiles)?
+            }
             AppAction::CreateInvite { room_id } => self.create_invite_with_options(
                 room_id,
                 None,
@@ -1819,6 +1862,17 @@ impl AppRuntimeState {
             AppAction::RemovePushToken => self.remove_push_token()?,
         }
         self.bump_rev();
+        Ok(())
+    }
+
+    fn upload_image(
+        &mut self,
+        bytes: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        let image_url = self.core.upload_image_blob(&bytes, &content_type)?;
+        self.app.flow.image_upload_url = Some(image_url);
+        self.app.status = "image uploaded".to_owned();
         Ok(())
     }
 
@@ -2019,6 +2073,7 @@ impl AppRuntimeState {
             self.upsert_room(
                 &app_room.room_id,
                 &app_room.display_name,
+                None,
                 AppRoomState::Connected,
                 "connected",
             );
@@ -2043,6 +2098,7 @@ impl AppRuntimeState {
             self.upsert_room(
                 &room_id,
                 &room_id,
+                None,
                 AppRoomState::UnavailableOnDevice,
                 LOCAL_ROOM_UNAVAILABLE_STATUS,
             );
@@ -2073,6 +2129,7 @@ impl AppRuntimeState {
         self.upsert_room(
             &room_id,
             &display_name,
+            None,
             AppRoomState::Connected,
             "connected",
         );
@@ -2084,14 +2141,45 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn save_room_metadata(
+        &mut self,
+        room_id: String,
+        display_name: String,
+        picture: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let room_id = room_id.trim().to_owned();
+        validate_string_bytes("room_id", &room_id, MAX_OBJECT_ID_BYTES).map_err(client_error)?;
+        let display_name = normalize_required_profile_text("room name", display_name)?;
+        validate_string_bytes(
+            "room display name",
+            &display_name,
+            MAX_INVITE_DISPLAY_NAME_BYTES,
+        )
+        .map_err(client_error)?;
+        let picture = normalize_optional_room_picture_url(picture)?;
+        if let Some(room) = self.room_mut(&room_id) {
+            room.display_name = display_name;
+            room.picture = picture;
+            room.user_status_text = app_room_user_status_text(room);
+        } else {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room not found: {room_id}"),
+            });
+        }
+        sort_app_rooms(&mut self.app.rooms);
+        self.persist_room_projection(&room_id)?;
+        self.sync_selected_room_messages();
+        self.app.status = "room saved".to_owned();
+        Ok(())
+    }
+
     fn start_profile_chat(
         &mut self,
-        account_id: String,
+        profile: AppProfileSummary,
         display_name: String,
     ) -> Result<(), FiniteChatCoreError> {
-        let account_id = account_id.trim().to_owned();
-        validate_string_bytes("profile.account_id", &account_id, MAX_OBJECT_ID_BYTES)
-            .map_err(client_error)?;
+        let profile = normalize_profile_summary_hint(profile)?;
+        let account_id = profile.account_id.clone();
         if account_id == self.app.identity.account_id {
             self.set_online_action_unavailable(
                 "chat unavailable",
@@ -2112,10 +2200,14 @@ impl AppRuntimeState {
         } else {
             label.to_owned()
         };
-        self.remember_profile_hint(
-            &account_id,
-            profile_name_hint_from_chat_label(&display_name, &account_id).as_deref(),
-        )?;
+        let mut profile = profile;
+        if !profile_has_useful_name(&profile, &account_id)
+            && let Some(display_name) =
+                profile_name_hint_from_chat_label(&display_name, &account_id)
+        {
+            profile.display_name = display_name;
+        }
+        self.remember_profile_summary(profile)?;
 
         if let Some(room_id) = self.existing_profile_chat_room_id(&account_id) {
             self.app.selected_room_id = Some(room_id);
@@ -2198,6 +2290,7 @@ impl AppRuntimeState {
         self.upsert_room(
             &room_id,
             &display_name,
+            None,
             AppRoomState::Connected,
             "connected",
         );
@@ -2210,22 +2303,25 @@ impl AppRuntimeState {
 
     fn start_group_chat(
         &mut self,
-        account_ids: Vec<String>,
+        profiles: Vec<AppProfileSummary>,
         display_name: String,
     ) -> Result<(), FiniteChatCoreError> {
         let mut seen = BTreeSet::new();
-        let mut member_account_ids = Vec::new();
-        for account_id in account_ids {
-            let account_id = account_id.trim().to_owned();
+        let mut member_profiles = Vec::new();
+        for profile in profiles {
+            let profile = normalize_profile_summary_hint(profile)?;
+            let account_id = profile.account_id.clone();
             if account_id.is_empty() || account_id == self.app.identity.account_id {
                 continue;
             }
-            validate_string_bytes("group.account_id", &account_id, MAX_OBJECT_ID_BYTES)
-                .map_err(client_error)?;
             if seen.insert(account_id.clone()) {
-                member_account_ids.push(account_id);
+                member_profiles.push(profile);
             }
         }
+        let member_account_ids: Vec<String> = member_profiles
+            .iter()
+            .map(|profile| profile.account_id.clone())
+            .collect();
         if member_account_ids.is_empty() {
             self.set_online_action_unavailable(
                 "chat unavailable",
@@ -2239,8 +2335,8 @@ impl AppRuntimeState {
             MAX_STAGED_WELCOMES_PER_COMMIT,
         )
         .map_err(client_error)?;
-        for account_id in &member_account_ids {
-            self.remember_profile_hint(account_id, None)?;
+        for profile in member_profiles {
+            self.remember_profile_summary(profile)?;
         }
 
         let label = display_name.trim();
@@ -2328,6 +2424,7 @@ impl AppRuntimeState {
         self.upsert_room(
             &room_id,
             &display_name,
+            None,
             AppRoomState::Connected,
             "connected",
         );
@@ -2341,7 +2438,7 @@ impl AppRuntimeState {
     fn add_room_members(
         &mut self,
         room_id: String,
-        account_ids: Vec<String>,
+        profiles: Vec<AppProfileSummary>,
     ) -> Result<(), FiniteChatCoreError> {
         let room_id = room_id.trim().to_owned();
         validate_string_bytes("room_id", &room_id, MAX_OBJECT_ID_BYTES).map_err(client_error)?;
@@ -2354,18 +2451,21 @@ impl AppRuntimeState {
         }
 
         let mut seen = BTreeSet::new();
-        let mut member_account_ids = Vec::new();
-        for account_id in account_ids {
-            let account_id = account_id.trim().to_owned();
+        let mut member_profiles = Vec::new();
+        for profile in profiles {
+            let profile = normalize_profile_summary_hint(profile)?;
+            let account_id = profile.account_id.clone();
             if account_id.is_empty() || account_id == self.app.identity.account_id {
                 continue;
             }
-            validate_string_bytes("room_member.account_id", &account_id, MAX_OBJECT_ID_BYTES)
-                .map_err(client_error)?;
             if seen.insert(account_id.clone()) {
-                member_account_ids.push(account_id);
+                member_profiles.push(profile);
             }
         }
+        let member_account_ids: Vec<String> = member_profiles
+            .iter()
+            .map(|profile| profile.account_id.clone())
+            .collect();
         if member_account_ids.is_empty() {
             self.set_online_action_unavailable(
                 "chat unavailable",
@@ -2379,8 +2479,8 @@ impl AppRuntimeState {
             MAX_STAGED_WELCOMES_PER_COMMIT,
         )
         .map_err(client_error)?;
-        for account_id in &member_account_ids {
-            self.remember_profile_hint(account_id, None)?;
+        for profile in member_profiles {
+            self.remember_profile_summary(profile)?;
         }
 
         let claimed: Result<Option<Vec<ClaimKeyPackageResult>>, FiniteChatCoreError> = {
@@ -2451,6 +2551,7 @@ impl AppRuntimeState {
             self.upsert_room(
                 &room_id,
                 &room.display_name,
+                None,
                 AppRoomState::Connected,
                 "connected",
             );
@@ -2643,6 +2744,7 @@ impl AppRuntimeState {
         self.upsert_room(
             &room_id,
             &display_name,
+            None,
             AppRoomState::WaitingForApproval,
             "requesting room admission",
         );
@@ -2765,6 +2867,7 @@ impl AppRuntimeState {
         self.upsert_room(
             &pending_room_id,
             &display_name,
+            None,
             AppRoomState::WaitingForApproval,
             "waiting for room admission",
         );
@@ -3439,7 +3542,13 @@ impl AppRuntimeState {
         self.core.sync()?;
         self.core.finalize_invite(&pending.invite_url)?;
         self.pending_invites.remove(room_id);
-        self.upsert_room(room_id, &display_name, AppRoomState::Connected, "connected");
+        self.upsert_room(
+            room_id,
+            &display_name,
+            None,
+            AppRoomState::Connected,
+            "connected",
+        );
         self.persist_room_projection(room_id)?;
         self.app.status = "joined".to_owned();
         if let Some(room) = self.room(room_id).cloned() {
@@ -3472,6 +3581,8 @@ impl AppRuntimeState {
                 profile: entry.profile.clone(),
                 stale: entry.stale,
             });
+            self.profile_records
+                .insert(entry.profile.account_id.clone(), entry.profile.clone());
             self.profile_cache.insert(
                 entry.profile.account_id.clone(),
                 profile_from_record(entry.profile, entry.stale),
@@ -3497,8 +3608,11 @@ impl AppRuntimeState {
             .load_app_profiles(&owner)
             .map_err(store_error)?;
         self.profile_cache.clear();
+        self.profile_records.clear();
         for profile in stored {
             let stale = profile.stale || profile.profile.expires_at_ms <= now_ms;
+            self.profile_records
+                .insert(profile.profile.account_id.clone(), profile.profile.clone());
             self.profile_cache.insert(
                 profile.profile.account_id.clone(),
                 profile_from_record(profile.profile, stale),
@@ -3508,9 +3622,80 @@ impl AppRuntimeState {
         Ok(())
     }
 
+    fn save_profile(
+        &mut self,
+        display_name: String,
+        about: String,
+        picture: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let display_name = normalize_required_profile_text("display name", display_name)?;
+        let about = normalize_optional_profile_text(about);
+        let picture = normalize_optional_profile_url(picture)?;
+        let account_id = self.core.device.device_ref().account_id.clone();
+        let now_ms = self.core.now_millis()?;
+        let existing = self.profile_records.get(&account_id).cloned();
+        let bot = existing.as_ref().and_then(|record| record.bot);
+        let finite_role = existing
+            .as_ref()
+            .and_then(|record| record.finite_role.clone());
+        let record = finitechat_http::NostrProfileRecord {
+            account_id: account_id.clone(),
+            name: Some(display_name.clone()),
+            display_name: Some(display_name.clone()),
+            about: about.clone(),
+            picture: picture.clone(),
+            bot,
+            finite_role: finite_role.clone(),
+            metadata_json: profile_metadata_json_for_edit(
+                existing.as_ref(),
+                Some(display_name.as_str()),
+                about.as_deref(),
+                picture.as_deref(),
+                bot,
+                finite_role.as_deref(),
+            )?,
+            fetched_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(DEFAULT_PROFILE_CACHE_TTL_MS),
+        };
+        let mut delivery = self.core.home_delivery();
+        delivery.put_nostr_profile(&record).map_err(runtime_error)?;
+
+        self.persist_profile_record(record, false)?;
+        self.sync_profile_state();
+        self.app.status = "profile saved".to_owned();
+        Ok(())
+    }
+
+    fn persist_profile_record(
+        &mut self,
+        record: finitechat_http::NostrProfileRecord,
+        stale: bool,
+    ) -> Result<(), FiniteChatCoreError> {
+        let owner = self.core.device.device_ref().clone();
+        let stored = StoredAppProfile {
+            profile: record.clone(),
+            stale,
+        };
+        self.core
+            .store
+            .save_app_profiles(&owner, std::slice::from_ref(&stored))
+            .map_err(store_error)?;
+        self.profile_cache.insert(
+            record.account_id.clone(),
+            profile_from_record(record.clone(), stale),
+        );
+        self.profile_records
+            .insert(record.account_id.clone(), record);
+        Ok(())
+    }
+
     fn persist_profile(&mut self, profile: &AppProfileSummary) -> Result<(), FiniteChatCoreError> {
         let owner = self.core.device.device_ref().clone();
         let stored = stored_profile_from_app(profile);
+        self.profile_records
+            .insert(stored.profile.account_id.clone(), stored.profile.clone());
+        self.profile_cache
+            .insert(profile.account_id.clone(), profile.clone());
         self.core
             .store
             .save_app_profiles(&owner, std::slice::from_ref(&stored))
@@ -3529,27 +3714,23 @@ impl AppRuntimeState {
         account_id: &str,
         display_name_hint: Option<&str>,
     ) -> Result<(), FiniteChatCoreError> {
-        let existing = self.profile_cache.get(account_id);
-        if existing
-            .map(|profile| !profile.stale && profile_has_useful_name(profile, account_id))
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let mut profile = existing
-            .cloned()
-            .unwrap_or_else(|| placeholder_profile(account_id));
+        let mut profile = placeholder_profile(account_id);
         if let Some(display_name) =
             normalize_profile_display_name_hint(display_name_hint, account_id)
         {
             profile.display_name = display_name;
-        } else if profile.display_name.trim().is_empty() {
-            profile.display_name = short_account_label(account_id);
         }
-        profile.stale = true;
-        self.persist_profile(&profile)?;
-        self.profile_cache.insert(account_id.to_owned(), profile);
+        self.remember_profile_summary(profile)
+    }
+
+    fn remember_profile_summary(
+        &mut self,
+        profile: AppProfileSummary,
+    ) -> Result<(), FiniteChatCoreError> {
+        let profile = normalize_profile_summary_hint(profile)?;
+        let account_id = profile.account_id.clone();
+        let next = merge_profile_summary_hint(self.profile_cache.get(&account_id), profile);
+        self.persist_profile(&next)?;
         self.sync_profile_state();
         Ok(())
     }
@@ -3557,6 +3738,8 @@ impl AppRuntimeState {
     fn sync_profile_state(&mut self) {
         self.app.profiles = self.profile_cache.values().cloned().collect();
         self.sync_agent_room_flags();
+        self.sync_typing_members();
+        self.sync_selected_room_messages();
     }
 
     fn sync_agent_room_flags(&mut self) {
@@ -3858,6 +4041,7 @@ impl AppRuntimeState {
         self.app.room_details = Some(AppRoomDetailsState {
             room_id,
             display_name: room.display_name.clone(),
+            picture: room.picture.clone(),
             state: room.state.clone(),
             status: room.status.clone(),
             user_status_text: app_room_user_status_text(&room),
@@ -4210,6 +4394,7 @@ impl AppRuntimeState {
         &mut self,
         room_id: &str,
         display_name: &str,
+        picture: Option<String>,
         state: AppRoomState,
         status: &str,
     ) {
@@ -4220,6 +4405,9 @@ impl AppRuntimeState {
             .position(|room| room.room_id == room_id)
         {
             self.app.rooms[index].display_name = display_name.to_owned();
+            if picture.is_some() {
+                self.app.rooms[index].picture = picture;
+            }
             self.app.rooms[index].state = state;
             self.app.rooms[index].status = status.to_owned();
             self.app.rooms[index].user_status_text =
@@ -4232,6 +4420,7 @@ impl AppRuntimeState {
         self.app.rooms.push(AppRoomSummary {
             room_id: room_id.to_owned(),
             display_name: display_name.to_owned(),
+            picture,
             state,
             status: status.to_owned(),
             user_status_text,
@@ -4389,6 +4578,250 @@ fn profile_has_useful_name(profile: &AppProfileSummary, account_id: &str) -> boo
     !name.is_empty() && name != short_account_label(account_id) && name != account_id
 }
 
+fn normalize_profile_summary_hint(
+    profile: AppProfileSummary,
+) -> Result<AppProfileSummary, FiniteChatCoreError> {
+    let account_id = profile.account_id.trim().to_owned();
+    validate_string_bytes("profile.account_id", &account_id, MAX_OBJECT_ID_BYTES)
+        .map_err(client_error)?;
+
+    let npub = profile.npub.trim();
+    let npub = if npub.is_empty() {
+        npub_encode(&account_id).unwrap_or_else(|_| account_id.clone())
+    } else {
+        npub.to_owned()
+    };
+
+    let display_name = profile.display_name.trim();
+    let display_name = if display_name.is_empty() {
+        short_account_label(&account_id)
+    } else {
+        display_name.to_owned()
+    };
+    validate_string_bytes(
+        "profile.display_name",
+        &display_name,
+        MAX_PROFILE_DISPLAY_NAME_BYTES,
+    )
+    .map_err(client_error)?;
+
+    let about = normalize_optional_profile_text_option(profile.about);
+    if let Some(about) = &about {
+        validate_string_bytes("profile.about", about, MAX_PROFILE_ABOUT_BYTES)
+            .map_err(client_error)?;
+    }
+
+    let picture = normalize_optional_profile_url(profile.picture)?;
+    if let Some(picture) = &picture {
+        validate_string_bytes("profile.picture", picture, MAX_PROFILE_PICTURE_BYTES)
+            .map_err(client_error)?;
+    }
+
+    Ok(AppProfileSummary {
+        account_id,
+        npub,
+        display_name,
+        about,
+        picture,
+        stale: profile.stale,
+        is_agent: profile.is_agent,
+    })
+}
+
+fn merge_profile_summary_hint(
+    existing: Option<&AppProfileSummary>,
+    incoming: AppProfileSummary,
+) -> AppProfileSummary {
+    let Some(existing) = existing else {
+        return incoming;
+    };
+
+    let account_id = existing.account_id.clone();
+    let incoming_has_name = profile_has_useful_name(&incoming, &account_id);
+    let existing_has_name = profile_has_useful_name(existing, &account_id);
+    AppProfileSummary {
+        account_id,
+        npub: if incoming.npub.trim().is_empty() || incoming.npub == incoming.account_id {
+            existing.npub.clone()
+        } else {
+            incoming.npub
+        },
+        display_name: if incoming_has_name || !existing_has_name {
+            incoming.display_name
+        } else {
+            existing.display_name.clone()
+        },
+        about: incoming.about.or_else(|| existing.about.clone()),
+        picture: incoming.picture.or_else(|| existing.picture.clone()),
+        stale: existing.stale && incoming.stale,
+        is_agent: existing.is_agent || incoming.is_agent,
+    }
+}
+
+fn normalize_required_profile_text(
+    field: &str,
+    value: String,
+) -> Result<String, FiniteChatCoreError> {
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!("{field} cannot be empty"),
+        });
+    }
+    Ok(trimmed)
+}
+
+fn normalize_optional_profile_text(value: String) -> Option<String> {
+    let trimmed = value.trim().to_owned();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn normalize_optional_profile_text_option(value: Option<String>) -> Option<String> {
+    value.and_then(normalize_optional_profile_text)
+}
+
+fn normalize_optional_profile_url(
+    value: Option<String>,
+) -> Result<Option<String>, FiniteChatCoreError> {
+    normalize_optional_http_url("profile picture URL", value)
+}
+
+fn normalize_optional_room_picture_url(
+    value: Option<String>,
+) -> Result<Option<String>, FiniteChatCoreError> {
+    normalize_optional_http_url("room picture URL", value)
+}
+
+fn normalize_optional_http_url(
+    field: &str,
+    value: Option<String>,
+) -> Result<Option<String>, FiniteChatCoreError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(&trimmed).map_err(|error| FiniteChatCoreError::Client {
+        reason: format!("{field} is invalid: {error}"),
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!("{field} must be http(s)"),
+        });
+    }
+    Ok(Some(trimmed))
+}
+
+fn profile_metadata_json_for_edit(
+    existing: Option<&finitechat_http::NostrProfileRecord>,
+    display_name: Option<&str>,
+    about: Option<&str>,
+    picture: Option<&str>,
+    bot: Option<bool>,
+    finite_role: Option<&str>,
+) -> Result<Option<String>, FiniteChatCoreError> {
+    let mut object = existing
+        .and_then(|record| record.metadata_json.as_deref())
+        .map(profile_metadata_json_object)
+        .transpose()?
+        .unwrap_or_default();
+
+    patch_profile_metadata_string(&mut object, "name", display_name);
+    patch_profile_metadata_string(&mut object, "display_name", display_name);
+    object.remove("displayName");
+    patch_profile_metadata_string(&mut object, "about", about);
+    patch_profile_metadata_string(&mut object, "picture", picture);
+    object.remove("picture_url");
+    if let Some(bot) = bot {
+        object.insert("bot".to_owned(), serde_json::Value::Bool(bot));
+    } else {
+        object.remove("bot");
+    }
+    patch_profile_metadata_string(&mut object, "finite_role", finite_role);
+    object.remove("finiteRole");
+
+    serde_json::to_string(&serde_json::Value::Object(object))
+        .map(Some)
+        .map_err(|error| FiniteChatCoreError::Client {
+            reason: format!("profile metadata could not be encoded: {error}"),
+        })
+}
+
+fn profile_metadata_json_object(
+    metadata_json: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, FiniteChatCoreError> {
+    let value: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|error| FiniteChatCoreError::Client {
+            reason: format!("cached profile metadata is invalid JSON: {error}"),
+        })?;
+    match value {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(FiniteChatCoreError::Client {
+            reason: "cached profile metadata must be a JSON object".to_owned(),
+        }),
+    }
+}
+
+fn patch_profile_metadata_string(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+    } else {
+        object.remove(key);
+    }
+}
+
+fn normalize_image_upload_content_type(
+    content_type: &str,
+) -> Result<&'static str, FiniteChatCoreError> {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Ok("image/jpeg"),
+        "image/png" => Ok("image/png"),
+        "image/gif" => Ok("image/gif"),
+        "image/webp" => Ok("image/webp"),
+        other => Err(FiniteChatCoreError::Client {
+            reason: format!("profile image content type is not supported: {other}"),
+        }),
+    }
+}
+
+fn validate_image_upload(bytes: &[u8], content_type: &str) -> Result<(), FiniteChatCoreError> {
+    if bytes.is_empty() {
+        return Err(FiniteChatCoreError::Client {
+            reason: "profile image cannot be empty".to_owned(),
+        });
+    }
+    if bytes.len() > MAX_PROFILE_IMAGE_UPLOAD_BYTES {
+        return Err(FiniteChatCoreError::Client {
+            reason: format!(
+                "profile image is too large: {} bytes, max {MAX_PROFILE_IMAGE_UPLOAD_BYTES}",
+                bytes.len()
+            ),
+        });
+    }
+    if image_magic_matches(bytes, content_type) {
+        return Ok(());
+    }
+    Err(FiniteChatCoreError::Client {
+        reason: format!("profile image bytes do not match {content_type}"),
+    })
+}
+
+fn image_magic_matches(bytes: &[u8], content_type: &str) -> bool {
+    match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
 fn room_member_summaries(
     members: Vec<DeviceRef>,
     profile_cache: &BTreeMap<String, AppProfileSummary>,
@@ -4401,6 +4834,9 @@ fn room_member_summaries(
                 .get(&member.account_id)
                 .map(|profile| profile.display_name.trim())
                 .filter(|name| !name.is_empty());
+            let picture = profile_cache
+                .get(&member.account_id)
+                .and_then(|profile| profile.picture.clone());
             let is_current_device = &member == current_device;
             let display_name = if is_current_device {
                 "You".to_owned()
@@ -4415,6 +4851,7 @@ fn room_member_summaries(
                 account_id: member.account_id,
                 device_id: member.device_id,
                 display_name,
+                picture,
             }
         })
         .collect::<Vec<_>>();
@@ -4439,6 +4876,7 @@ fn stored_profile_from_app(profile: &AppProfileSummary) -> StoredAppProfile {
             picture: profile.picture.clone(),
             bot: profile.is_agent.then_some(true),
             finite_role: profile.is_agent.then(|| "agent".to_owned()),
+            metadata_json: None,
             fetched_at_ms: 0,
             expires_at_ms: 1,
         },
@@ -4977,6 +5415,48 @@ impl CoreState {
             },
         )
         .map_err(client_error)
+    }
+
+    fn upload_image_blob(
+        &self,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<String, FiniteChatCoreError> {
+        let content_type = normalize_image_upload_content_type(content_type)?;
+        validate_image_upload(bytes, content_type)?;
+        let upload_url = format!("{}/upload", self.server_url.trim_end_matches('/'));
+        let response = reqwest::blocking::Client::new()
+            .put(upload_url)
+            .header(CONTENT_TYPE, content_type)
+            .body(bytes.to_vec())
+            .send()
+            .map_err(delivery_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(delivery_error(format!(
+                "image upload failed with status {status}"
+            )));
+        }
+        let descriptor = response.json::<BlobDescriptor>().map_err(delivery_error)?;
+        let expected_sha256 = sha256_hex(bytes);
+        if descriptor.sha256 != expected_sha256 {
+            return Err(delivery_error(format!(
+                "image upload hash mismatch: expected {expected_sha256}, got {}",
+                descriptor.sha256
+            )));
+        }
+        if descriptor.size_bytes != bytes.len() as u64 {
+            return Err(delivery_error(format!(
+                "image upload size mismatch: expected {}, got {}",
+                bytes.len(),
+                descriptor.size_bytes
+            )));
+        }
+        normalize_optional_http_url("image upload URL", Some(descriptor.url))?.ok_or_else(|| {
+            FiniteChatCoreError::Client {
+                reason: "image upload returned an empty URL".to_owned(),
+            }
+        })
     }
 
     fn download_attachment_blob(
@@ -6174,11 +6654,15 @@ fn typing_member_from_activity(
         .get(&entry.sender.account_id)
         .map(|profile| profile.display_name.trim())
         .filter(|display_name| !display_name.is_empty());
+    let picture = profile_cache
+        .get(&entry.sender.account_id)
+        .and_then(|profile| profile.picture.clone());
     AppTypingMember {
         room_id: entry.room_id.clone(),
         account_id: entry.sender.account_id.clone(),
         device_id: entry.sender.device_id.clone(),
         display_name: sender_display_name(&entry.sender, profile_name, false),
+        picture,
         npub,
         activity_kind: entry.activity_kind.clone(),
     }
@@ -6823,6 +7307,7 @@ fn app_room_from_stored(room: StoredAppRoom, has_mls_room: bool) -> AppRoomSumma
     AppRoomSummary {
         room_id: room.room_id,
         display_name: room.display_name,
+        picture: room.picture,
         state,
         status,
         user_status_text,
@@ -6837,6 +7322,7 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
     AppRoomSummary {
         room_id: room_id.to_owned(),
         display_name: display_name.to_owned(),
+        picture: None,
         state: AppRoomState::Connected,
         status: "connected".to_owned(),
         user_status_text: LOCAL_ROOM_CONNECTED_TEXT.to_owned(),
@@ -6957,6 +7443,7 @@ fn stored_room_from_app(
     StoredAppRoom {
         room_id: room.room_id.clone(),
         display_name: room.display_name.clone(),
+        picture: room.picture.clone(),
         state: stored_app_room_state(&room.state),
         status: room.status.clone(),
         local_read_seq,
@@ -6992,6 +7479,7 @@ fn app_room_metadata(room_id: &str, display_name: Option<&str>) -> StoredAppRoom
     StoredAppRoom {
         room_id: room_id.to_owned(),
         display_name,
+        picture: None,
         state: StoredAppRoomState::Connected,
         status: "connected".to_owned(),
         local_read_seq: 0,
@@ -7388,8 +7876,8 @@ fn invite_error(error: impl std::fmt::Display) -> FiniteChatCoreError {
 mod tests {
     use super::*;
     use finitechat_http::{
-        ApplicationEffectRequest, HttpApplicationDeliveryEffect, NostrProfileRecord,
-        PutNostrProfileRequest,
+        ApplicationEffectRequest, GetNostrProfilesRequest, HttpApplicationDeliveryEffect,
+        NostrProfileRecord, PutNostrProfileRequest,
     };
     use finitechat_server::{HttpServerState, http_router};
 
@@ -8434,6 +8922,7 @@ mod tests {
                 picture: Some("https://example.invalid/alice.png".to_owned()),
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8495,6 +8984,189 @@ mod tests {
     }
 
     #[test]
+    fn app_save_profile_publishes_caches_and_persists_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let account_id = app.state().unwrap().identity.account_id;
+
+        let saved = app
+            .dispatch_and_wait(AppAction::SaveProfile {
+                display_name: "Alice Finite".to_owned(),
+                about: "Encrypted chat operator".to_owned(),
+                picture: Some("https://example.invalid/alice.png".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(saved.status, "profile saved");
+        let profile = saved
+            .profiles
+            .iter()
+            .find(|profile| profile.account_id == account_id)
+            .expect("saved profile in app state");
+        assert_eq!(profile.display_name, "Alice Finite");
+        assert_eq!(profile.about.as_deref(), Some("Encrypted chat operator"));
+        assert_eq!(
+            profile.picture.as_deref(),
+            Some("https://example.invalid/alice.png")
+        );
+        assert!(!profile.stale);
+
+        let server_profiles = get_profiles(&server_url, vec![account_id.clone()]);
+        assert_eq!(server_profiles.profiles.len(), 1);
+        assert_eq!(
+            server_profiles.profiles[0].profile.picture.as_deref(),
+            Some("https://example.invalid/alice.png")
+        );
+
+        drop(app);
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let cached = reopened.state().unwrap();
+        let profile = cached
+            .profiles
+            .iter()
+            .find(|profile| profile.account_id == account_id)
+            .expect("saved profile survives offline relaunch");
+        assert_eq!(
+            profile.picture.as_deref(),
+            Some("https://example.invalid/alice.png")
+        );
+    }
+
+    #[test]
+    fn app_upload_image_returns_public_blob_url_for_profile_and_room_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let account_id = app.state().unwrap().identity.account_id;
+        let png = b"\x89PNG\r\n\x1a\nprofile image bytes".to_vec();
+
+        let picture_url = app
+            .dispatch_and_wait(AppAction::UploadImage {
+                bytes: png.clone(),
+                content_type: "image/png".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(picture_url.status, "image uploaded");
+        let picture_url = picture_url
+            .flow
+            .image_upload_url
+            .expect("image upload action returns blob URL");
+        assert!(picture_url.starts_with(&format!("{server_url}/blobs/")));
+
+        let response = reqwest::blocking::Client::new()
+            .get(&picture_url)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert_eq!(response.bytes().unwrap().as_ref(), png.as_slice());
+
+        let saved = app
+            .dispatch_and_wait(AppAction::SaveProfile {
+                display_name: "Alice Finite".to_owned(),
+                about: "Encrypted chat operator".to_owned(),
+                picture: Some(picture_url.clone()),
+            })
+            .unwrap();
+        let profile = saved
+            .profiles
+            .iter()
+            .find(|profile| profile.account_id == account_id)
+            .expect("saved profile in app state");
+        assert_eq!(profile.picture.as_deref(), Some(picture_url.as_str()));
+
+        let room_state = app
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "Room Metadata".to_owned(),
+            })
+            .unwrap();
+        let room_id = room_state
+            .selected_room_id
+            .as_deref()
+            .expect("selected created room")
+            .to_owned();
+        let saved_room = app
+            .dispatch_and_wait(AppAction::SaveRoomMetadata {
+                room_id: room_id.clone(),
+                display_name: "Room Metadata Saved".to_owned(),
+                picture: Some(picture_url.clone()),
+            })
+            .unwrap();
+        let room = app_room(&saved_room, &room_id);
+        assert_eq!(room.display_name, "Room Metadata Saved");
+        assert_eq!(room.picture.as_deref(), Some(picture_url.as_str()));
+        let details = saved_room.room_details.as_ref().expect("room details");
+        assert_eq!(details.display_name, "Room Metadata Saved");
+        assert_eq!(details.picture.as_deref(), Some(picture_url.as_str()));
+        drop(app);
+
+        let reopened = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let reopened_state = reopened.state().unwrap();
+        let room = app_room(&reopened_state, &room_id);
+        assert_eq!(room.display_name, "Room Metadata Saved");
+        assert_eq!(room.picture.as_deref(), Some(picture_url.as_str()));
+    }
+
+    #[test]
+    fn app_upload_image_rejects_mismatched_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+
+        let error = app
+            .dispatch_and_wait(AppAction::UploadImage {
+                bytes: b"not an image".to_vec(),
+                content_type: "image/png".to_owned(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("do not match image/png"));
+    }
+
+    #[test]
     fn app_scan_nprofile_loads_server_backed_profile_cache() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
@@ -8513,6 +9185,7 @@ mod tests {
                 picture: None,
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8612,6 +9285,7 @@ mod tests {
                 picture: None,
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8659,6 +9333,7 @@ mod tests {
                 picture: None,
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -9110,7 +9785,11 @@ mod tests {
 
         let alice_state = alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: bob_account_id.clone(),
+                profile: test_profile_with_picture(
+                    &bob_account_id,
+                    "Bob",
+                    "https://example.invalid/bob.png",
+                ),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -9119,10 +9798,26 @@ mod tests {
         assert_eq!(room.display_name, "Chat with Bob");
         assert_eq!(room.state, AppRoomState::Connected);
         let room_id = room.room_id.clone();
+        let bob_profile = app_profile(&alice_state, &bob_account_id);
+        assert_eq!(bob_profile.display_name, "Bob");
+        assert_eq!(
+            bob_profile.picture.as_deref(),
+            Some("https://example.invalid/bob.png")
+        );
+        let details = alice_state
+            .room_details
+            .as_ref()
+            .expect("direct room details");
+        let bob_member = room_details_member(details, &bob_account_id, "bob-ios");
+        assert_eq!(bob_member.display_name, "Bob");
+        assert_eq!(
+            bob_member.picture.as_deref(),
+            Some("https://example.invalid/bob.png")
+        );
 
         let reopened_state = alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: bob_account_id.clone(),
+                profile: test_profile(&bob_account_id, "Bob"),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -9148,7 +9843,7 @@ mod tests {
         .unwrap();
         let disk_reopened_state = reopened_alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: bob_account_id.clone(),
+                profile: test_profile(&bob_account_id, "Bob"),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -9202,7 +9897,7 @@ mod tests {
 
         let state = alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: account_id.clone(),
+                profile: test_profile(&account_id, "Missing"),
                 display_name: "Chat with Missing".to_owned(),
             })
             .unwrap();
@@ -9270,7 +9965,18 @@ mod tests {
 
         let alice_state = alice
             .dispatch_and_wait(AppAction::StartGroupChat {
-                account_ids: vec![bob_account_id.clone(), carol_account_id.clone()],
+                profiles: vec![
+                    test_profile_with_picture(
+                        &bob_account_id,
+                        "Bob",
+                        "https://example.invalid/bob.png",
+                    ),
+                    test_profile_with_picture(
+                        &carol_account_id,
+                        "Carol",
+                        "https://example.invalid/carol.png",
+                    ),
+                ],
                 display_name: "Weekend plans".to_owned(),
             })
             .unwrap();
@@ -9286,10 +9992,22 @@ mod tests {
         assert_member_in_room_details(details, &alice_state.identity.account_id, "alice-ios", true);
         assert_member_in_room_details(details, &bob_account_id, "bob-ios", false);
         assert_member_in_room_details(details, &carol_account_id, "carol-ios", false);
+        assert_eq!(
+            room_details_member(details, &bob_account_id, "bob-ios")
+                .picture
+                .as_deref(),
+            Some("https://example.invalid/bob.png")
+        );
+        assert_eq!(
+            room_details_member(details, &carol_account_id, "carol-ios")
+                .picture
+                .as_deref(),
+            Some("https://example.invalid/carol.png")
+        );
 
         let direct_state = alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: bob_account_id.clone(),
+                profile: test_profile(&bob_account_id, "Bob"),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -9377,7 +10095,10 @@ mod tests {
 
         let state = alice
             .dispatch_and_wait(AppAction::StartGroupChat {
-                account_ids: vec![bob_account_id, missing_account_id.clone()],
+                profiles: vec![
+                    test_profile(&bob_account_id, "Bob"),
+                    test_profile(&missing_account_id, "Missing"),
+                ],
                 display_name: "Broken group".to_owned(),
             })
             .unwrap();
@@ -9429,7 +10150,7 @@ mod tests {
 
         let alice_state = alice
             .dispatch_and_wait(AppAction::StartProfileChat {
-                account_id: bob_account_id.clone(),
+                profile: test_profile(&bob_account_id, "Bob"),
                 display_name: "Chat with Bob".to_owned(),
             })
             .unwrap();
@@ -9448,7 +10169,7 @@ mod tests {
         let alice_state = alice
             .dispatch_and_wait(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
-                account_ids: vec![carol_account_id.clone()],
+                profiles: vec![test_profile(&carol_account_id, "Carol")],
             })
             .unwrap();
         assert_eq!(alice_state.status, "people added");
@@ -9527,7 +10248,7 @@ mod tests {
         let state = alice
             .dispatch_and_wait(AppAction::AddRoomMembers {
                 room_id: room_id.clone(),
-                account_ids: vec![missing_account_id.clone()],
+                profiles: vec![test_profile(&missing_account_id, "Missing")],
             })
             .unwrap();
         assert_eq!(state.status, "chat unavailable");
@@ -9562,6 +10283,17 @@ mod tests {
             now_unix_seconds: Some(NOW),
         })
         .unwrap();
+        let bob_account_id = bob.state().unwrap().identity.account_id;
+        let bob_npub = npub_encode(&bob_account_id).unwrap();
+        bob.dispatch_and_wait(AppAction::SaveProfile {
+            display_name: "Bob Finite".to_owned(),
+            about: String::new(),
+            picture: Some("https://example.invalid/bob.png".to_owned()),
+        })
+        .unwrap();
+        alice
+            .dispatch_and_wait(AppAction::ScanTarget { value: bob_npub })
+            .unwrap();
 
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -9584,8 +10316,22 @@ mod tests {
             pending_room_id: room_id.clone(),
         })
         .unwrap();
-        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        let alice_joined = alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        let bob_member = alice_joined
+            .room_details
+            .as_ref()
+            .and_then(|details| {
+                details
+                    .members
+                    .iter()
+                    .find(|member| member.account_id == bob_account_id)
+            })
+            .expect("bob member summary");
+        assert_eq!(
+            bob_member.picture.as_deref(),
+            Some("https://example.invalid/bob.png")
+        );
 
         bob.dispatch_and_wait(AppAction::SetTyping {
             room_id: room_id.clone(),
@@ -9599,6 +10345,10 @@ mod tests {
         assert_eq!(
             alice_state.typing_members[0].activity_kind,
             FINITECHAT_ACTIVITY_KIND_TYPING
+        );
+        assert_eq!(
+            alice_state.typing_members[0].picture.as_deref(),
+            Some("https://example.invalid/bob.png")
         );
 
         drop(alice);
@@ -12206,6 +12956,7 @@ mod tests {
                 StoredAppRoom {
                     room_id: room_id.clone(),
                     display_name: "Missing MLS Room".to_owned(),
+                    picture: None,
                     state: StoredAppRoomState::UnavailableOnDevice,
                     status: LOCAL_ROOM_UNAVAILABLE_STATUS.to_owned(),
                     local_read_seq: 0,
@@ -12273,6 +13024,7 @@ mod tests {
             StoredAppRoom {
                 room_id: "room_missing_local_mls".to_owned(),
                 display_name: "Saved Room".to_owned(),
+                picture: None,
                 state: StoredAppRoomState::Connected,
                 status: "connected".to_owned(),
                 local_read_seq: 0,
@@ -12290,6 +13042,7 @@ mod tests {
             StoredAppRoom {
                 room_id: "room_stale_missing_local_mls".to_owned(),
                 display_name: "Stale Saved Room".to_owned(),
+                picture: None,
                 state: StoredAppRoomState::UnavailableOnDevice,
                 status: LOCAL_ROOM_UNAVAILABLE_TEXT.to_owned(),
                 local_read_seq: 0,
@@ -12307,6 +13060,7 @@ mod tests {
             StoredAppRoom {
                 room_id: "room_stale_but_available".to_owned(),
                 display_name: "Available Saved Room".to_owned(),
+                picture: None,
                 state: StoredAppRoomState::UnavailableOnDevice,
                 status: LOCAL_ROOM_UNAVAILABLE_TEXT.to_owned(),
                 local_read_seq: 0,
@@ -12356,6 +13110,29 @@ mod tests {
             .iter()
             .find(|profile| profile.account_id == account_id)
             .unwrap_or_else(|| panic!("missing app profile {account_id}"))
+    }
+
+    fn test_profile(account_id: &str, display_name: &str) -> AppProfileSummary {
+        AppProfileSummary {
+            account_id: account_id.to_owned(),
+            npub: npub_encode(account_id).unwrap_or_else(|_| account_id.to_owned()),
+            display_name: display_name.to_owned(),
+            about: None,
+            picture: None,
+            stale: true,
+            is_agent: false,
+        }
+    }
+
+    fn test_profile_with_picture(
+        account_id: &str,
+        display_name: &str,
+        picture: &str,
+    ) -> AppProfileSummary {
+        let mut profile = test_profile(account_id, display_name);
+        profile.picture = Some(picture.to_owned());
+        profile.stale = false;
+        profile
     }
 
     fn assert_outbound_undelivered(message: &ChatMessage) {
@@ -12460,14 +13237,22 @@ mod tests {
         device_id: &str,
         current_device: bool,
     ) {
-        let member = details
-            .members
-            .iter()
-            .find(|member| member.account_id == account_id && member.device_id == device_id)
-            .unwrap_or_else(|| panic!("missing room details member {account_id}/{device_id}"));
+        let member = room_details_member(details, account_id, device_id);
         assert_eq!(member.current_device, current_device);
         assert!(!member.display_name.trim().is_empty());
         assert!(member.npub.starts_with("npub1") || member.npub == account_id);
+    }
+
+    fn room_details_member<'a>(
+        details: &'a AppRoomDetailsState,
+        account_id: &str,
+        device_id: &str,
+    ) -> &'a AppRoomMemberSummary {
+        details
+            .members
+            .iter()
+            .find(|member| member.account_id == account_id && member.device_id == device_id)
+            .unwrap_or_else(|| panic!("missing room details member {account_id}/{device_id}"))
     }
 
     fn assert_reaction(
@@ -12586,6 +13371,22 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    fn get_profiles(
+        server_url: &str,
+        account_ids: Vec<String>,
+    ) -> finitechat_http::GetNostrProfilesResponse {
+        let response = reqwest::blocking::Client::new()
+            .post(format!("{server_url}/profiles/nostr/get"))
+            .json(&GetNostrProfilesRequest {
+                account_ids,
+                now_ms: NOW.saturating_mul(1000),
+            })
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json().unwrap()
     }
 
     fn append_test_activity(

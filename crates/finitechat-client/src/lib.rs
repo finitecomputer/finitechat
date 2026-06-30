@@ -110,6 +110,7 @@ const MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES: u32 = MAX_ENVELOPE_PAYLOAD_BYTES 
 const MAX_APP_OUTBOX_METADATA_CIPHERTEXT_BYTES: u32 =
     MAX_APP_OUTBOX_METADATA_PLAINTEXT_BYTES + CLIENT_STORE_AEAD_TAG_BYTES;
 const MAX_APP_ROOM_DISPLAY_NAME_BYTES: u32 = 256;
+const MAX_APP_ROOM_PICTURE_BYTES: u32 = 2 * 1024;
 const MAX_APP_ROOM_STATUS_BYTES: u32 = 512;
 const MAX_APP_ROOM_INVITE_URL_BYTES: u32 = 4096;
 const MAX_APP_ROOM_METADATA_PLAINTEXT_BYTES: u32 = 8192;
@@ -479,6 +480,7 @@ struct StoredOutboundMessageMetadataV1 {
 pub struct StoredAppRoom {
     pub room_id: RoomId,
     pub display_name: String,
+    pub picture: Option<String>,
     pub state: StoredAppRoomState,
     pub status: String,
     pub local_read_seq: u64,
@@ -504,6 +506,7 @@ impl StoredAppRoom {
             MAX_APP_ROOM_DISPLAY_NAME_BYTES,
         )?;
         validate_bytes_non_empty("app_room.display_name", self.display_name.len())?;
+        validate_optional_app_room_picture("app_room.picture", self.picture.as_deref())?;
         validate_string_bytes("app_room.status", &self.status, MAX_APP_ROOM_STATUS_BYTES)?;
         validate_optional_app_room_url("app_room.pending_invite_url", &self.pending_invite_url)?;
         validate_optional_app_room_url("app_room.owned_invite_url", &self.owned_invite_url)?;
@@ -514,6 +517,8 @@ impl StoredAppRoom {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredAppRoomMetadataV1 {
     display_name: String,
+    #[serde(default)]
+    picture: Option<String>,
     state: StoredAppRoomState,
     status: String,
     local_read_seq: u64,
@@ -3382,6 +3387,7 @@ impl SqliteClientStore {
             let room = StoredAppRoom {
                 room_id,
                 display_name: metadata.display_name,
+                picture: metadata.picture,
                 state: metadata.state,
                 status: metadata.status,
                 local_read_seq: metadata.local_read_seq,
@@ -5790,6 +5796,8 @@ pub enum ClientError {
     PreparedCommitMessageIdMismatch,
     #[error("profile picture URL must be http(s): {0}")]
     ProfilePictureUrl(String),
+    #[error("room picture URL must be http(s): {0}")]
+    RoomPictureUrl(String),
     #[error(
         "profile expires_at_ms {expires_at_ms} must be greater than fetched_at_ms {fetched_at_ms}"
     )]
@@ -6622,6 +6630,20 @@ fn validate_optional_app_room_url(
     Ok(())
 }
 
+fn validate_optional_app_room_picture(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ClientError> {
+    validate_optional_profile_text(field, value, MAX_APP_ROOM_PICTURE_BYTES)?;
+    if let Some(picture) = value
+        && !picture.starts_with("http://")
+        && !picture.starts_with("https://")
+    {
+        return Err(ClientError::RoomPictureUrl(picture.to_owned()));
+    }
+    Ok(())
+}
+
 fn validate_nostr_profile_record(profile: &NostrProfileRecord) -> Result<(), ClientError> {
     decode_lower_hex_32(&profile.account_id)?;
     validate_optional_profile_text(
@@ -7380,6 +7402,7 @@ fn encrypt_app_room_metadata(
     room.validate_limits()?;
     let metadata = StoredAppRoomMetadataV1 {
         display_name: room.display_name.clone(),
+        picture: room.picture.clone(),
         state: room.state,
         status: room.status.clone(),
         local_read_seq: room.local_read_seq,
@@ -10406,6 +10429,7 @@ mod tests {
         StoredAppRoom {
             room_id: room_id.to_owned(),
             display_name: display_name.to_owned(),
+            picture: None,
             state: StoredAppRoomState::Connected,
             status: "connected".to_owned(),
             local_read_seq: 0,
@@ -10480,6 +10504,7 @@ mod tests {
                 picture: Some(format!("https://example.invalid/{seed}.png")),
                 bot: None,
                 finite_role: None,
+                metadata_json: None,
                 fetched_at_ms: NOW.saturating_mul(1000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },

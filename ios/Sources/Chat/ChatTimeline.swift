@@ -5,6 +5,7 @@ struct ChatTimelineMessageGroup: Identifiable, Equatable {
     let senderDeviceId: String
     let senderDisplayName: String
     let senderNpub: String?
+    let senderPictureURL: String?
     let isMine: Bool
     var messages: [ChatMessage]
 
@@ -136,6 +137,10 @@ struct ChatTimelineActivity: Identifiable, Equatable {
         primaryMember?.npub ?? primaryMember?.accountId ?? kind.id
     }
 
+    var primaryPictureURL: String? {
+        primaryMember?.picture
+    }
+
     var label: String {
         if members.count <= 1 {
             return "\(primaryDisplayName) is \(kind.verb)"
@@ -189,9 +194,11 @@ enum ChatTimelineRow: Identifiable, Equatable {
 enum ChatTimeline {
     static func roomProjections(
         messages: [ChatMessage],
-        typingMembers: [AppTypingMember] = []
+        typingMembers: [AppTypingMember] = [],
+        profiles: [AppProfileSummary] = []
     ) -> [String: ChatRoomProjection] {
         guard !messages.isEmpty || !typingMembers.isEmpty else { return [:] }
+        let profilesByAccountID = profilesByAccountID(profiles)
 
         var messagesByRoom: [String: [ChatMessage]] = [:]
         messagesByRoom.reserveCapacity(8)
@@ -216,7 +223,8 @@ enum ChatTimeline {
                 messages: ordered,
                 rows: rows(
                     orderedMessages: ordered,
-                    typingMembers: liveMembersByRoom[roomID] ?? []
+                    typingMembers: liveMembersByRoom[roomID] ?? [],
+                    profilesByAccountID: profilesByAccountID
                 ),
                 messagesById: messagesById(ordered)
             )
@@ -226,9 +234,15 @@ enum ChatTimeline {
 
     static func rows(
         messages: [ChatMessage],
-        typingMembers: [AppTypingMember] = []
+        typingMembers: [AppTypingMember] = [],
+        profiles: [AppProfileSummary] = []
     ) -> [ChatTimelineRow] {
-        rows(orderedMessages: orderedMessages(messages), typingMembers: typingMembers)
+        let profilesByAccountID = profilesByAccountID(profiles)
+        return rows(
+            orderedMessages: orderedMessages(messages),
+            typingMembers: typingMembers,
+            profilesByAccountID: profilesByAccountID
+        )
     }
 
     static func messagesById(_ messages: [ChatMessage]) -> [String: ChatMessage] {
@@ -255,7 +269,8 @@ enum ChatTimeline {
 
     private static func rows(
         orderedMessages ordered: [ChatMessage],
-        typingMembers: [AppTypingMember]
+        typingMembers: [AppTypingMember],
+        profilesByAccountID: [String: AppProfileSummary]
     ) -> [ChatTimelineRow] {
         var rows: [ChatTimelineRow] = []
         rows.reserveCapacity(ordered.count + (typingMembers.isEmpty ? 0 : 1))
@@ -280,6 +295,7 @@ enum ChatTimeline {
                         senderDeviceId: message.senderDeviceId,
                         senderDisplayName: message.senderDisplayName,
                         senderNpub: message.senderNpub,
+                        senderPictureURL: profilesByAccountID[message.senderAccountId]?.picture,
                         isMine: message.isMine,
                         messages: [message]
                     )
@@ -292,5 +308,14 @@ enum ChatTimeline {
         }
 
         return rows
+    }
+
+    private static func profilesByAccountID(_ profiles: [AppProfileSummary]) -> [String: AppProfileSummary] {
+        var result: [String: AppProfileSummary] = [:]
+        result.reserveCapacity(profiles.count)
+        for profile in profiles {
+            result[profile.accountId] = profile
+        }
+        return result
     }
 }

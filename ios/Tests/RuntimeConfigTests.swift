@@ -643,6 +643,30 @@ final class ChatTimelineActivityTests: XCTestCase {
         XCTAssertNil(ChatTimeline.rowID(containingMessageID: "missing-message", rows: rows))
     }
 
+    func testMessageGroupUsesCachedProfilePicture() {
+        let message = chatMessage(id: "message-1", seq: 1, text: "hello")
+        let rows = ChatTimeline.rows(
+            messages: [message],
+            profiles: [
+                AppProfileSummary(
+                    accountId: "alice-account",
+                    npub: "npub1alice",
+                    displayName: "Alice",
+                    about: nil,
+                    picture: "https://example.invalid/alice.png",
+                    stale: false,
+                    isAgent: false
+                ),
+            ]
+        )
+
+        guard case .messageGroup(let group) = rows.first else {
+            XCTFail("expected message group")
+            return
+        }
+        XCTAssertEqual(group.senderPictureURL, "https://example.invalid/alice.png")
+    }
+
     func testRoomProjectionIncludesActivityOnlyRoom() {
         let projections = ChatTimeline.roomProjections(
             messages: [],
@@ -664,6 +688,7 @@ final class ChatTimelineActivityTests: XCTestCase {
         }
         XCTAssertEqual(activity.kind, .working)
         XCTAssertEqual(activity.label, "Hermes is working")
+        XCTAssertNil(activity.primaryPictureURL)
         XCTAssertTrue(projections["room-empty"]?.messages.isEmpty ?? false)
     }
 
@@ -695,11 +720,34 @@ final class ChatTimelineActivityTests: XCTestCase {
         XCTAssertEqual(activity.label, "Hermes is working")
     }
 
+    func testActivityUsesMemberPicture() {
+        let rows = ChatTimeline.rows(
+            messages: [],
+            typingMembers: [
+                appTypingMember(
+                    roomID: "room-main",
+                    deviceID: "hermes-agent",
+                    displayName: "Hermes",
+                    picture: "https://example.invalid/agent.png",
+                    activityKind: "working"
+                ),
+            ]
+        )
+
+        guard case .activity(let activity) = rows.first else {
+            XCTFail("expected activity marker")
+            return
+        }
+        XCTAssertEqual(activity.primaryPictureURL, "https://example.invalid/agent.png")
+    }
+
+
     private func appTypingMember(
         roomID: String,
         accountID: String = "alice-account",
         deviceID: String,
         displayName: String,
+        picture: String? = nil,
         activityKind: String
     ) -> AppTypingMember {
         AppTypingMember(
@@ -707,6 +755,7 @@ final class ChatTimelineActivityTests: XCTestCase {
             accountId: accountID,
             deviceId: deviceID,
             displayName: displayName,
+            picture: picture,
             npub: nil,
             activityKind: activityKind
         )
@@ -1552,13 +1601,14 @@ final class AppModelPersistenceTests: XCTestCase {
                 let room = AppRoomSummary(
                     roomId: "room-bob",
                     displayName: displayName,
+                    picture: nil,
                     state: .connected,
                     status: "connected",
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
                     canLoadOlder: false,
-                isAgentChat: false
+                    isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -1625,7 +1675,15 @@ final class AppModelPersistenceTests: XCTestCase {
             [
                 .startRuntime,
                 .startProfileChat(
-                    accountId: bobAccountID,
+                    profile: AppProfileSummary(
+                        accountId: bobAccountID,
+                        npub: bobNpub,
+                        displayName: shortenedDisplayNpub(bobNpub),
+                        about: nil,
+                        picture: nil,
+                        stale: true,
+                        isAgent: false
+                    ),
                     displayName: "Chat with \(shortenedDisplayNpub(bobNpub))"
                 ),
                 .sendMessage(
@@ -1993,13 +2051,14 @@ final class AppModelPersistenceTests: XCTestCase {
         state.rooms.append(AppRoomSummary(
             roomId: "room-secondary",
             displayName: "Secondary Room",
+            picture: nil,
             state: .connected,
             status: "connected",
             userStatusText: "Connected",
             lastMessagePreview: "",
             unreadCount: 0,
             canLoadOlder: false,
-        isAgentChat: false
+            isAgentChat: false
         ))
         let runtime = FakeFiniteChatRuntime(
             initialState: state,
@@ -2257,7 +2316,8 @@ final class AppModelPersistenceTests: XCTestCase {
                 noticeBusy: false,
                 scanInFlight: false,
                 inviteJoinSubmissionRoomId: nil,
-                scanResult: .room
+                scanResult: .room,
+                imageUploadUrl: nil
             )
         )
         let runtime = FakeFiniteChatRuntime(
@@ -2307,6 +2367,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let room = AppRoomSummary(
             roomId: "room-main",
             displayName: "Main Room",
+            picture: nil,
             state: .waitingForApproval,
             status: "client error: this device has no accepted Welcome for room 'room-main'",
             userStatusText: "Waiting for approval",
@@ -2637,13 +2698,14 @@ final class AppModelPersistenceTests: XCTestCase {
                 let room = AppRoomSummary(
                     roomId: "room-bob",
                     displayName: displayName,
+                    picture: nil,
                     state: .connected,
                     status: "connected",
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
                     canLoadOlder: false,
-                isAgentChat: false
+                    isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2666,7 +2728,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.startProfileChat(for: profile))
         let expectedActions: [AppAction] = [
             .startRuntime,
-            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            .startProfileChat(profile: profile, displayName: "Chat with Bob"),
         ]
         try await waitUntil {
             runtime.dispatchedActions == expectedActions
@@ -2691,13 +2753,14 @@ final class AppModelPersistenceTests: XCTestCase {
         let existingRoom = AppRoomSummary(
             roomId: "room-bob",
             displayName: "Chat with Bob",
+            picture: nil,
             state: .connected,
             status: "connected",
             userStatusText: "Connected",
             lastMessagePreview: "",
             unreadCount: 0,
             canLoadOlder: false,
-        isAgentChat: false
+            isAgentChat: false
         )
         var existingState = emptyChatState()
         existingState.rooms = [existingRoom]
@@ -2726,7 +2789,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.startProfileChat(for: profile))
         let expectedActions: [AppAction] = [
             .startRuntime,
-            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            .startProfileChat(profile: profile, displayName: "Chat with Bob"),
         ]
         try await waitUntil {
             runtime.dispatchedActions == expectedActions
@@ -2774,7 +2837,7 @@ final class AppModelPersistenceTests: XCTestCase {
         try await waitUntil {
             runtime.dispatchedActions == [
                 .startRuntime,
-                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+                .startProfileChat(profile: profile, displayName: "Chat with Bob"),
             ]
                 && model.userNoticeText == "Ask them to open Finite Chat, then try again"
         }
@@ -2806,13 +2869,14 @@ final class AppModelPersistenceTests: XCTestCase {
                 let room = AppRoomSummary(
                     roomId: "room-bob",
                     displayName: displayName,
+                    picture: nil,
                     state: .connected,
                     status: "connected",
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
                     canLoadOlder: false,
-                isAgentChat: false
+                    isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2833,7 +2897,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.startNewChat(named: "", with: [bob]))
         let expectedActions: [AppAction] = [
             .startRuntime,
-            .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+            .startProfileChat(profile: bob, displayName: "Chat with Bob"),
         ]
         try await waitUntil {
             runtime.dispatchedActions == expectedActions
@@ -2843,7 +2907,7 @@ final class AppModelPersistenceTests: XCTestCase {
             runtime.dispatchedActions,
             [
                 .startRuntime,
-                .startProfileChat(accountId: "bob-account", displayName: "Chat with Bob"),
+                .startProfileChat(profile: bob, displayName: "Chat with Bob"),
             ]
         )
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
@@ -2878,13 +2942,14 @@ final class AppModelPersistenceTests: XCTestCase {
                 let room = AppRoomSummary(
                     roomId: "room-group",
                     displayName: displayName,
+                    picture: nil,
                     state: .connected,
                     status: "connected",
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
                     canLoadOlder: false,
-                isAgentChat: false
+                    isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2908,7 +2973,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let expectedActions: [AppAction] = [
             .startRuntime,
             .startGroupChat(
-                accountIds: ["bob-account", "carol-account"],
+                profiles: [bob, carol],
                 displayName: "Weekend plans"
             ),
         ]
@@ -2948,13 +3013,14 @@ final class AppModelPersistenceTests: XCTestCase {
                 let room = AppRoomSummary(
                     roomId: "room-group",
                     displayName: displayName,
+                    picture: nil,
                     state: .connected,
                     status: "connected",
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
                     canLoadOlder: false,
-                isAgentChat: false
+                    isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2976,7 +3042,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let expectedActions: [AppAction] = [
             .startRuntime,
             .startGroupChat(
-                accountIds: ["bob-account", "carol-account"],
+                profiles: [bob, carol],
                 displayName: "Weekend plans"
             ),
         ]
@@ -3033,7 +3099,7 @@ final class AppModelPersistenceTests: XCTestCase {
             runtime.dispatchedActions == [
                 .startRuntime,
                 .startGroupChat(
-                    accountIds: ["bob-account", "carol-account"],
+                    profiles: [bob, carol],
                     displayName: "Weekend plans"
                 ),
             ]
@@ -3082,7 +3148,7 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(model.addMembers(to: room, profiles: [bob]))
         let expectedActions: [AppAction] = [
             .startRuntime,
-            .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
+            .addRoomMembers(roomId: "room-main", profiles: [bob]),
         ]
         try await waitUntil {
             runtime.dispatchedActions == expectedActions
@@ -3128,7 +3194,7 @@ final class AppModelPersistenceTests: XCTestCase {
         try await waitUntil {
             runtime.dispatchedActions == [
                 .startRuntime,
-                .addRoomMembers(roomId: "room-main", accountIds: ["bob-account"]),
+                .addRoomMembers(roomId: "room-main", profiles: [bob]),
             ]
                 && model.userNoticeText == "Ask everyone to open Finite Chat, then try again"
         }
@@ -3156,7 +3222,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeBusy: false,
                     scanInFlight: false,
                     inviteJoinSubmissionRoomId: nil,
-                    scanResult: .unavailable
+                    scanResult: .unavailable,
+                    imageUploadUrl: nil
                 )
             }
             return state
@@ -3216,7 +3283,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeBusy: false,
                     scanInFlight: false,
                     inviteJoinSubmissionRoomId: nil,
-                    scanResult: .profile
+                    scanResult: .profile,
+                    imageUploadUrl: nil
                 )
             }
             return state
@@ -3261,23 +3329,24 @@ final class AppModelPersistenceTests: XCTestCase {
             startRuntimeState: emptyChatState()
         ) { action, currentState in
             var state = currentState
-            if case .startProfileChat(let accountId, let displayName) = action {
+            if case .startProfileChat(let dispatchedProfile, let displayName) = action {
                 state.rooms = [
                     AppRoomSummary(
                         roomId: "room-bob",
                         displayName: displayName,
+                        picture: nil,
                         state: .connected,
                         status: "connected",
                         userStatusText: "Connected",
                         lastMessagePreview: "",
                         unreadCount: 0,
                         canLoadOlder: false,
-                    isAgentChat: false
+                        isAgentChat: false
                     ),
                 ]
                 state.selectedRoomId = "room-bob"
                 state.status = "chat created"
-                XCTAssertEqual(accountId, bob.accountId)
+                XCTAssertEqual(dispatchedProfile.accountId, bob.accountId)
             }
             return state
         }
@@ -3300,7 +3369,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let expectedActions: [AppAction] = [
             .startRuntime,
             .startProfileChat(
-                accountId: bob.accountId,
+                profile: profile,
                 displayName: "Chat with \(profile.displayName)"
             ),
         ]
@@ -3350,19 +3419,20 @@ final class AppModelPersistenceTests: XCTestCase {
             startRuntimeState: emptyChatState()
         ) { action, currentState in
             var state = currentState
-            if case .startProfileChat(let accountId, let displayName) = action {
-                XCTAssertEqual(accountId, bobAccountID)
+            if case .startProfileChat(let dispatchedProfile, let displayName) = action {
+                XCTAssertEqual(dispatchedProfile.accountId, bobAccountID)
                 state.rooms = [
                     AppRoomSummary(
                         roomId: "room-bob",
                         displayName: displayName,
+                        picture: nil,
                         state: .connected,
                         status: "connected",
                         userStatusText: "Connected",
                         lastMessagePreview: "",
                         unreadCount: 0,
                         canLoadOlder: false,
-                    isAgentChat: false
+                        isAgentChat: false
                     ),
                 ]
                 state.selectedRoomId = "room-bob"
@@ -3389,7 +3459,7 @@ final class AppModelPersistenceTests: XCTestCase {
         let expectedActions: [AppAction] = [
             .startRuntime,
             .startProfileChat(
-                accountId: bobAccountID,
+                profile: profile,
                 displayName: "Chat with \(profile.displayName)"
             ),
         ]
@@ -3476,7 +3546,8 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeBusy: false,
             scanInFlight: false,
             inviteJoinSubmissionRoomId: nil,
-            scanResult: .none
+            scanResult: .none,
+            imageUploadUrl: nil
         )
     ) -> AppState {
         let identity = Identity(
@@ -3487,13 +3558,14 @@ final class AppModelPersistenceTests: XCTestCase {
         let room = AppRoomSummary(
             roomId: "room-main",
             displayName: "Main Room",
+            picture: nil,
             state: roomState,
             status: roomStatus,
             userStatusText: roomUserStatusText(state: roomState, status: roomStatus),
             lastMessagePreview: "saved before force close",
             unreadCount: 0,
             canLoadOlder: false,
-        isAgentChat: false
+            isAgentChat: false
         )
         let message = ChatMessage(
             roomId: "room-main",
@@ -3607,7 +3679,8 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeBusy: false,
             scanInFlight: false,
             inviteJoinSubmissionRoomId: nil,
-            scanResult: .none
+            scanResult: .none,
+            imageUploadUrl: nil
         )
     ) -> AppState {
         AppState(

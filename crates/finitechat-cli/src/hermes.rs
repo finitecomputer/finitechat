@@ -69,7 +69,7 @@ const DEFAULT_HERMES_SERVICE_ADDR: &str = "127.0.0.1:0";
 const DEFAULT_DEVICE_ID: &str = "agent";
 const DEFAULT_AGENT_PROFILE_NAME: &str = "Finite Agent";
 const DEFAULT_AGENT_PROFILE_ABOUT: &str = "A Finite Computer agent you can chat with.";
-const DEFAULT_AGENT_PROFILE_PICTURE: &str = "https://finite.computer/finite-logo.svg";
+const DEFAULT_AGENT_PROFILE_PICTURE: &str = "https://avatars.githubusercontent.com/u/274919006?v=4";
 const DEFAULT_MAX_JOINS: u32 = 8;
 const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CREDENTIAL_VALIDITY_SECONDS: u64 = 90 * 24 * 60 * 60;
@@ -842,6 +842,7 @@ fn publish_agent_profile(
         picture: Some(picture.clone()),
         bot: Some(true),
         finite_role: Some("agent".to_owned()),
+        metadata_json: None,
         fetched_at_ms: now,
         expires_at_ms: now + CREDENTIAL_VALIDITY_SECONDS * 1000,
     };
@@ -2165,7 +2166,11 @@ mod tests {
         let mut output = Vec::new();
         cmd_init(
             &home,
-            vec!["--server".to_owned(), "http://127.0.0.1:1".to_owned()],
+            vec![
+                "--server".to_owned(),
+                "http://127.0.0.1:1".to_owned(),
+                "--skip-agent-profile".to_owned(),
+            ],
             &mut output,
         )
         .expect("init");
