@@ -113,7 +113,7 @@ class ResticPreflightTest(unittest.TestCase):
             {
                 "FINITE_DOCKER_RESTIC_BACKEND": "s3",
                 "FINITE_DOCKER_RESTIC_REPOSITORY": (
-                    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"
+                    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"
                 ),
                 "FINITE_DOCKER_RESTIC_PASSWORD": "temporary-canary-backup-secret",
                 "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": "access",
@@ -125,7 +125,7 @@ class ResticPreflightTest(unittest.TestCase):
         self.assertEqual(report["status"], "ok")
         self.assertEqual(
             report["repository"],
-            "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state",
+            "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic",
         )
         env = report["env"]
         self.assertTrue(env["AWS_ACCESS_KEY_ID"])
@@ -141,14 +141,32 @@ class ResticPreflightTest(unittest.TestCase):
                 "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": "access",
                 "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY": "secret",
                 "FINITE_LATITUDE_STORAGE_BUCKET": "tinfoil-agent-spike",
-                "FINITE_DOCKER_RESTIC_PREFIX": "agents/finite-agent-tinfoil-user-canary/state",
+                "FINITE_DOCKER_RESTIC_PREFIX": "agent-runtimes/tinfoil-canary-001/restic",
             }
         )
 
         self.assertEqual(status, 0)
         self.assertEqual(
             report["repository"],
-            "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state",
+            "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic",
+        )
+
+    def test_refuses_latitude_bucket_without_explicit_prefix(self) -> None:
+        status, report = preflight.validate(
+            {
+                "FINITE_DOCKER_RESTIC_BACKEND": "s3",
+                "FINITE_DOCKER_RESTIC_PASSWORD": "temporary-canary-backup-secret",
+                "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": "access",
+                "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY": "secret",
+                "FINITE_LATITUDE_STORAGE_BUCKET": "tinfoil-agent-spike",
+            }
+        )
+
+        self.assertEqual(status, 2)
+        self.assertIn(
+            "FINITE_DOCKER_RESTIC_PREFIX is required when deriving "
+            "FINITE_DOCKER_RESTIC_REPOSITORY from FINITE_LATITUDE_STORAGE_BUCKET",
+            report["errors"],
         )
 
     def test_s3_backend_requires_explicit_backup_secret(self) -> None:
@@ -156,7 +174,7 @@ class ResticPreflightTest(unittest.TestCase):
             {
                 "FINITE_DOCKER_RESTIC_BACKEND": "s3",
                 "FINITE_DOCKER_RESTIC_REPOSITORY": (
-                    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"
+                    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"
                 ),
                 "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID": "access",
                 "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY": "secret",

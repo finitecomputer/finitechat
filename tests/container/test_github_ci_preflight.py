@@ -16,6 +16,16 @@ def write_json(path: Path, value: list[dict[str, str]]) -> None:
     path.write_text(json.dumps(value) + "\n", encoding="utf-8")
 
 
+def required_variables() -> list[dict[str, str]]:
+    return [
+        {"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"},
+        {
+            "name": "FINITE_DOCKER_RESTIC_PREFIX",
+            "value": "agent-runtimes/tinfoil-canary-001/restic",
+        },
+    ]
+
+
 def run_preflight(
     tmp: Path,
     *,
@@ -58,7 +68,7 @@ class GithubCiPreflightTest(unittest.TestCase):
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN"},
                     {"name": "OPENROUTER_API_KEY"},
                 ],
-                variables=[{"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"}],
+                variables=required_variables(),
             )
 
         self.assertEqual(result.returncode, 0)
@@ -75,7 +85,7 @@ class GithubCiPreflightTest(unittest.TestCase):
             result, report = run_preflight(
                 Path(tmp_value),
                 secrets=[],
-                variables=[{"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"}],
+                variables=required_variables(),
             )
 
         self.assertEqual(result.returncode, 2)
@@ -87,7 +97,7 @@ class GithubCiPreflightTest(unittest.TestCase):
             report["missing_required_secrets"],
         )
 
-    def test_fails_without_bucket_variable(self) -> None:
+    def test_fails_without_required_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             result, report = run_preflight(
                 Path(tmp_value),
@@ -102,7 +112,10 @@ class GithubCiPreflightTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["missing_required_variables"], ["FINITE_LATITUDE_STORAGE_BUCKET"])
+        self.assertEqual(
+            report["missing_required_variables"],
+            ["FINITE_DOCKER_RESTIC_PREFIX", "FINITE_LATITUDE_STORAGE_BUCKET"],
+        )
 
     def test_optional_secrets_do_not_block_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
@@ -114,7 +127,7 @@ class GithubCiPreflightTest(unittest.TestCase):
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY"},
                     {"name": "OPENROUTER_API_KEY"},
                 ],
-                variables=[{"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"}],
+                variables=required_variables(),
             )
 
         self.assertEqual(result.returncode, 0)

@@ -23,10 +23,10 @@ OPTIONAL_SECRETS = {
 }
 REQUIRED_VARIABLES = {
     "FINITE_LATITUDE_STORAGE_BUCKET",
+    "FINITE_DOCKER_RESTIC_PREFIX",
 }
 OPTIONAL_VARIABLES_WITH_WORKFLOW_DEFAULTS = {
     "FINITE_LATITUDE_OBJECT_ENDPOINT": "https://objects.nyc.storage.sh",
-    "FINITE_DOCKER_RESTIC_PREFIX": "agents/finite-agent-tinfoil-user-canary/state",
     "FINITECHAT_HERMES_MODEL": "anthropic/claude-sonnet-4.6",
     "FINITECHAT_HERMES_PROVIDER": "openrouter",
 }

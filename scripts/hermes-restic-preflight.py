@@ -27,7 +27,6 @@ AWS_SHARED_ENV_NAMES = (
     "AWS_SESSION_TOKEN",
     "AWS_REGION",
 )
-DEFAULT_RESTIC_PREFIX = "agents/finite-agent-tinfoil-user-canary/state"
 
 
 def aws_config_section(profile: str) -> str:
@@ -137,9 +136,9 @@ def normalized_env(env: dict[str, str]) -> dict[str, str]:
             "FINITE_LATITUDE_OBJECT_ENDPOINT", "https://objects.nyc.storage.sh"
         ).rstrip("/")
         bucket = normalized["FINITE_LATITUDE_STORAGE_BUCKET"].strip().strip("/")
-        prefix = normalized.get("FINITE_DOCKER_RESTIC_PREFIX", DEFAULT_RESTIC_PREFIX)
-        prefix = prefix.strip().strip("/")
-        normalized["FINITE_DOCKER_RESTIC_REPOSITORY"] = f"s3:{endpoint}/{bucket}/{prefix}"
+        prefix = normalized.get("FINITE_DOCKER_RESTIC_PREFIX", "").strip().strip("/")
+        if prefix:
+            normalized["FINITE_DOCKER_RESTIC_REPOSITORY"] = f"s3:{endpoint}/{bucket}/{prefix}"
     return normalized
 
 
@@ -175,6 +174,7 @@ def validate(env: dict[str, str]) -> tuple[int, dict[str, object]]:
                 env.get("FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY")
             ),
             "FINITE_LATITUDE_STORAGE_BUCKET": bool(env.get("FINITE_LATITUDE_STORAGE_BUCKET")),
+            "FINITE_DOCKER_RESTIC_PREFIX": bool(env.get("FINITE_DOCKER_RESTIC_PREFIX")),
         },
         "warnings": warnings,
         "errors": errors,
@@ -190,6 +190,13 @@ def validate(env: dict[str, str]) -> tuple[int, dict[str, object]]:
 
     if backend == "s3":
         if not repository:
+            if env.get("FINITE_LATITUDE_STORAGE_BUCKET") and not env.get(
+                "FINITE_DOCKER_RESTIC_PREFIX"
+            ):
+                errors.append(
+                    "FINITE_DOCKER_RESTIC_PREFIX is required when deriving "
+                    "FINITE_DOCKER_RESTIC_REPOSITORY from FINITE_LATITUDE_STORAGE_BUCKET"
+                )
             errors.append("FINITE_DOCKER_RESTIC_REPOSITORY is required for backend=s3")
         elif not repository.startswith("s3:"):
             errors.append("FINITE_DOCKER_RESTIC_REPOSITORY must start with 's3:'")

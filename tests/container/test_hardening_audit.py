@@ -13,8 +13,12 @@ AUDIT_SCRIPT = REPO_ROOT / "scripts" / "hermes-hardening-audit.py"
 IMAGE_ID = "sha256:local-image"
 IMAGE_REF = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:v0.1.0@sha256:published"
-RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"
-EMULATOR_RESTIC_REPOSITORY = "s3:http://127.0.0.1:39000/finite-hermes-runtime-smoke/agents/finite-agent-tinfoil-user-canary/state"
+RESTIC_REPOSITORY = (
+    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"
+)
+EMULATOR_RESTIC_REPOSITORY = (
+    "s3:http://127.0.0.1:39000/finite-hermes-runtime-smoke/agent-runtimes/tinfoil-canary-001/restic"
+)
 SNAPSHOT_ID = "88929f1f90c5fcadd1d19e33f26609e595af4c2afb1e72b724695435e051900f"
 CONFIG_REPO = "finitecomputer/tinfoil-agent-runtime-canary"
 RELEASE_TAG = "v0.1.0"
@@ -225,7 +229,7 @@ def s3_emulator_report() -> dict:
     report["facts"]["s3_emulator"] = {
         "endpoint": "http://127.0.0.1:39000",
         "bucket": "finite-hermes-runtime-smoke",
-        "prefix": "agents/finite-agent-tinfoil-user-canary/state",
+        "prefix": "agent-runtimes/tinfoil-canary-001/restic",
     }
     return report
 
@@ -367,7 +371,7 @@ def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> No
                 '      - FINITE_AGENT_BACKUP_ON_EXIT: "1"',
                 (
                     "      - FINITE_AGENT_RESTIC_REPOSITORY: "
-                    '"s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"'
+                    '"s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"'
                 ),
                 '      - FINITE_AGENT_RESTIC_BACKUP_TAG: "finite-agent-state"',
                 '      - FINITECHAT_HERMES_INBOUND_STREAM: "1"',

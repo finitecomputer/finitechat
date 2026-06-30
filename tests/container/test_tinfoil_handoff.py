@@ -10,7 +10,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HANDOFF_SCRIPT = REPO_ROOT / "scripts" / "hermes-tinfoil-handoff.py"
-RESTIC_REPOSITORY = "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agents/finite-agent-tinfoil-user-canary/state"
+RESTIC_REPOSITORY = (
+    "s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"
+)
 SNAPSHOT_ID = "88929f1f90c5fcadd1d19e33f26609e595af4c2afb1e72b724695435e051900f"
 IMAGE_REF = "ghcr.io/finitecomputer/finite-chat-hermes-runtime:canary"
 IMAGE_DIGEST = "ghcr.io/finitecomputer/finite-chat-hermes-runtime@sha256:published"
