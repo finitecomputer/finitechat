@@ -237,6 +237,19 @@ class AgentDockerE2ETest(unittest.TestCase):
         )
         return json.loads(result.stdout)
 
+    def runtime_invite(self) -> dict[str, Any]:
+        result = run(
+            [
+                "docker",
+                "exec",
+                CONTAINER,
+                "cat",
+                "/tmp/finitechat-invite.json",
+            ],
+            timeout=60,
+        )
+        return json.loads(result.stdout)
+
     def start_agent_container(
         self,
         server_url: str,
@@ -553,22 +566,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertTrue(restic_version.startswith("restic "))
         report.fact("restic_version", restic_version)
 
-        invite_info = json.loads(
-            run(
-                [
-                    "docker",
-                    "exec",
-                    CONTAINER,
-                    "finitechat",
-                    "hermes",
-                    "--home",
-                    "/data/agent",
-                    "invite",
-                    "--json",
-                ],
-                timeout=60,
-            ).stdout
-        )
+        invite_info = self.runtime_invite()
         agent_identity = self.agent_identity()
         health = report.time("agent_http_health", self.agent_http_health)
         self.assertTrue(health["ready"])
@@ -644,22 +642,9 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertEqual(restored_health["npub"], restored_identity["npub"])
         report.fact("agent_npub_after_restore", restored_identity["npub"])
 
-        restored_invite_info = json.loads(
-            run(
-                [
-                    "docker",
-                    "exec",
-                    CONTAINER,
-                    "finitechat",
-                    "hermes",
-                    "--home",
-                    "/data/agent",
-                    "invite",
-                    "--json",
-                ],
-                timeout=60,
-            ).stdout
-        )
+        restored_invite_info = self.runtime_invite()
+        self.assertEqual(restored_invite_info["room_id"], room_id)
+        self.assertEqual(restored_invite_info["invite_id"], invite_info["invite_id"])
         report.time(
             "restored_user_init_in_docker",
             lambda: self.docker_user_hermes(
