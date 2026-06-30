@@ -134,6 +134,7 @@ def tinfoil_config(
             f"  upstream-port: {http_port}",
             "  paths:",
             "    - /healthz",
+            "    - /invite",
             "",
         ]
     )
@@ -209,6 +210,7 @@ def runbook(
         f"tinfoil container get {container_name} -o json",
         f"tinfoil container connect {container_name} -p 3301",
         "curl http://127.0.0.1:3301/healthz",
+        "curl http://127.0.0.1:3301/invite",
         "scripts/hermes-tinfoil-canary-evidence.py \\",
         "  --handoff-report target/hermes-docker-smoke/tinfoil-handoff.json \\",
         "  --canary-summary target/hermes-docker-smoke/tinfoil-canary/tinfoil-canary-summary.json \\",
@@ -277,8 +279,8 @@ def runbook(
         "- Container reaches Running.",
         "- `curl http://127.0.0.1:3301/healthz` returns `ready: true` through",
         "  the attested local proxy.",
-        "- Finite Chat invite URL is captured from logs or the next runtime control",
-        "  surface.",
+        "- `curl http://127.0.0.1:3301/invite` returns the same runtime invite",
+        "  shape used by the Docker canary.",
         "- User chats once from Finite Chat and the resulting event ID is recorded.",
         "- Container is stopped cleanly so the entrypoint writes a fresh backup.",
         "- Restart restores the latest tagged restic snapshot and the same npub.",

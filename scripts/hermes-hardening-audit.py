@@ -90,6 +90,7 @@ REQUIRED_CANARY_CONFIG_SNIPPETS = {
     "FINITECHAT_HERMES_INBOUND_STREAM",
     "OPENROUTER_API_KEY",
     "/healthz",
+    "/invite",
     "upstream-port: 8080",
 }
 REQUIRED_CANARY_RUNBOOK_SNIPPETS = {

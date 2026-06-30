@@ -384,6 +384,7 @@ def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> No
                 "  upstream-port: 8080",
                 "  paths:",
                 "    - /healthz",
+                "    - /invite",
                 "",
             ]
         ),
