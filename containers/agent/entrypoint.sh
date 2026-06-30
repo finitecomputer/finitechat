@@ -28,6 +28,26 @@ export_restic_env() {
     export RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/tmp/restic-cache}"
 }
 
+backup_activity_active() {
+    local marker="${FINITE_AGENT_BACKUP_ACTIVITY_FILE:-$agent_home/.finitechat-backup-active}"
+    if [[ ! -e "$marker" ]]; then
+        return 1
+    fi
+
+    local stale_secs="${FINITE_AGENT_BACKUP_ACTIVITY_STALE_SECS:-300}"
+    local now
+    now="$(date +%s)"
+    local mtime
+    mtime="$(stat -c %Y "$marker" 2>/dev/null || printf '%s' "$now")"
+    local age=$((now - mtime))
+    if [[ "$age" -lt "$stale_secs" ]]; then
+        echo "FINITE_AGENT_BACKUP_SKIPPED activity_active=true age_secs=$age marker=$marker"
+        return 0
+    fi
+    echo "FINITE_AGENT_BACKUP_ACTIVITY_STALE age_secs=$age marker=$marker"
+    return 1
+}
+
 restore_agent_state() {
     if ! truthy "${FINITE_AGENT_RESTORE_ON_START:-0}"; then
         return 0
@@ -93,6 +113,9 @@ backup_agent_state() {
     fi
     if [[ ! -d "$agent_home" ]]; then
         echo "FINITE_AGENT_BACKUP_SKIPPED missing_home=true home=$agent_home"
+        return 0
+    fi
+    if backup_activity_active; then
         return 0
     fi
 

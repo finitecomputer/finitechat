@@ -289,6 +289,46 @@ class AgentEntrypointTest(unittest.TestCase):
         self.assertIn("child-done", result.stdout)
         self.assertIn("missing FINITE_AGENT_RESTIC_REPOSITORY", result.stderr)
 
+    def test_backup_skips_while_finitechat_activity_marker_is_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            fake_bin = tmp / "bin"
+            fake_bin.mkdir()
+            fake_restic = fake_bin / "restic"
+            log_path = tmp / "restic.log"
+            home = tmp / "agent"
+            home.mkdir()
+            (home / "config.json").write_text("{}", encoding="utf-8")
+            (home / ".finitechat-backup-active").write_text("active", encoding="utf-8")
+            fake_restic.write_text(
+                '#!/usr/bin/env sh\necho "$@" >> "$RESTIC_FAKE_LOG"\nexit 9\n',
+                encoding="utf-8",
+            )
+            fake_restic.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                    "RESTIC_FAKE_LOG": str(log_path),
+                    "FINITECHAT_HOME": str(home),
+                    "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                    "FINITE_AGENT_RESTIC_REPOSITORY": "s3:https://example.invalid/bucket/prefix",
+                    "FINITE_AGENT_RESTIC_PASSWORD": "secret",
+                    "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
+                }
+            )
+            result = subprocess.run(
+                [str(ENTRYPOINT), "sh", "-c", "echo child-done"],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+
+            self.assertFalse(log_path.exists())
+            self.assertIn("child-done", result.stdout)
+            self.assertIn("FINITE_AGENT_BACKUP_SKIPPED activity_active=true", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

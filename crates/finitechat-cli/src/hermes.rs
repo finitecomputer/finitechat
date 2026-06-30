@@ -55,6 +55,7 @@ const INVITES_FILE: &str = "invites.json";
 const HERMES_INBOX_FILE: &str = "hermes-inbox.json";
 const HERMES_RUNNING_FILE: &str = "hermes-running.json";
 const HERMES_HOME_CHANNEL_FILE: &str = "hermes-home-channel.json";
+const BACKUP_ACTIVITY_FILE: &str = ".finitechat-backup-active";
 const STORE_FILE: &str = "client.sqlite3";
 const ATTACHMENT_CACHE_DIR: &str = "attachments";
 const HERMES_PLUGIN_INSTALL_NAME: &str = "finite";
@@ -106,12 +107,24 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "home-channel" => cmd_home_channel(&home_dir, rest, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "join" => cmd_join(&home_dir, rest, output),
-        "poll" => cmd_poll(&home_dir, read_request(request_json)?, output),
-        "ack" => cmd_ack(&home_dir, read_request(request_json)?, output),
-        "send" => cmd_send(&home_dir, read_request(request_json)?, output),
-        "edit" => cmd_edit(&home_dir, read_request(request_json)?, output),
-        "recover" => cmd_recover(&home_dir, read_request(request_json)?, output),
-        "activity" => cmd_activity(&home_dir, read_request(request_json)?, output),
+        "poll" => with_backup_activity(&home_dir, "poll", || {
+            cmd_poll(&home_dir, read_request(request_json)?, output)
+        }),
+        "ack" => with_backup_activity(&home_dir, "ack", || {
+            cmd_ack(&home_dir, read_request(request_json)?, output)
+        }),
+        "send" => with_backup_activity(&home_dir, "send", || {
+            cmd_send(&home_dir, read_request(request_json)?, output)
+        }),
+        "edit" => with_backup_activity(&home_dir, "edit", || {
+            cmd_edit(&home_dir, read_request(request_json)?, output)
+        }),
+        "recover" => with_backup_activity(&home_dir, "recover", || {
+            cmd_recover(&home_dir, read_request(request_json)?, output)
+        }),
+        "activity" => with_backup_activity(&home_dir, "activity", || {
+            cmd_activity(&home_dir, read_request(request_json)?, output)
+        }),
         _ => Err(CliError::Usage(hermes_usage())),
     }
 }
@@ -453,6 +466,16 @@ fn handle_hermes_bridge_action(
     action: &str,
     payload: Value,
 ) -> Result<Value, CliError> {
+    with_backup_activity(home_dir, action, || {
+        handle_hermes_bridge_action_inner(home_dir, action, payload)
+    })
+}
+
+fn handle_hermes_bridge_action_inner(
+    home_dir: &Path,
+    action: &str,
+    payload: Value,
+) -> Result<Value, CliError> {
     let mut output = Vec::new();
     match action {
         "invite" => cmd_invite(home_dir, Vec::new(), true, &mut output)?,
@@ -493,6 +516,15 @@ fn handle_hermes_inbound_stream(
     home_dir: &Path,
     query: HermesInboundQuery,
 ) -> Result<String, CliError> {
+    with_backup_activity(home_dir, "inbound", || {
+        handle_hermes_inbound_stream_inner(home_dir, query)
+    })
+}
+
+fn handle_hermes_inbound_stream_inner(
+    home_dir: &Path,
+    query: HermesInboundQuery,
+) -> Result<String, CliError> {
     let mut request = serde_json::Map::new();
     if let Some(room_id) = query.room_id {
         request.insert("room_id".to_owned(), Value::String(room_id));
@@ -508,6 +540,42 @@ fn handle_hermes_inbound_stream(
     cmd_poll(home_dir, Value::Object(request), &mut output)?;
     let payload: Value = serde_json::from_slice(&output).map_err(CliError::Json)?;
     hermes_inbound_ndjson(&payload)
+}
+
+struct BackupActivityGuard {
+    path: PathBuf,
+}
+
+impl BackupActivityGuard {
+    fn enter(home_dir: &Path, action: &str) -> Result<Self, CliError> {
+        fs::create_dir_all(home_dir).map_err(|error| CliError::Hermes(error.to_string()))?;
+        let path = home_dir.join(BACKUP_ACTIVITY_FILE);
+        let marker = json!({
+            "pid": std::process::id(),
+            "action": action,
+            "started_at_ms": now_ms(),
+        });
+        write_private(
+            path.clone(),
+            &serde_json::to_string(&marker).map_err(CliError::Serialize)?,
+        )?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for BackupActivityGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn with_backup_activity<T>(
+    home_dir: &Path,
+    action: &str,
+    f: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let _guard = BackupActivityGuard::enter(home_dir, action)?;
+    f()
 }
 
 fn hermes_inbound_ndjson(payload: &Value) -> Result<String, CliError> {
@@ -2103,6 +2171,20 @@ mod tests {
         assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
         assert!(env.contains("FINITECHAT_BIN=/usr/local/bin/finitechat"));
         assert!(env.contains("FINITECHAT_HERMES_SERVICE_URL=http://127.0.0.1:4321"));
+    }
+
+    #[test]
+    fn backup_activity_guard_marks_and_unmarks_agent_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let marker = home.join(BACKUP_ACTIVITY_FILE);
+        {
+            let _guard = BackupActivityGuard::enter(&home, "send").unwrap();
+            assert!(marker.exists());
+            let value: Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+            assert_eq!(value["action"], "send");
+        }
+        assert!(!marker.exists());
     }
 
     #[test]
