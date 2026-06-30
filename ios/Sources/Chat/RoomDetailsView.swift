@@ -12,6 +12,40 @@ struct RoomDetailsView: View {
     let onUploadImage: @MainActor (Data, String) async -> String?
     let onSaveMetadata: @MainActor (String, String, String?) async -> Bool
 
+    @State private var draftDisplayName: String
+    @State private var draftPictureURL: String
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var photoPickerPresented = false
+    @State private var draftRoomID: String?
+    @State private var imageUploadInFlight = false
+    @State private var saveInFlight = false
+    @State private var statusText: String?
+
+    init(
+        details: AppRoomDetailsState?,
+        mediaItems: [ChatMediaGalleryItem],
+        onDownloadAttachment: @escaping (ChatMediaGalleryItem) -> Void,
+        onCreateInvite: @escaping () -> Void,
+        onAddPeople: @escaping () -> Void,
+        onRefreshDevices: @escaping () -> Void,
+        onRevokeDevice: @escaping (AppDeviceSummary) -> Void,
+        onUploadImage: @escaping @MainActor (Data, String) async -> String?,
+        onSaveMetadata: @escaping @MainActor (String, String, String?) async -> Bool
+    ) {
+        self.details = details
+        self.mediaItems = mediaItems
+        self.onDownloadAttachment = onDownloadAttachment
+        self.onCreateInvite = onCreateInvite
+        self.onAddPeople = onAddPeople
+        self.onRefreshDevices = onRefreshDevices
+        self.onRevokeDevice = onRevokeDevice
+        self.onUploadImage = onUploadImage
+        self.onSaveMetadata = onSaveMetadata
+        _draftDisplayName = State(initialValue: details?.displayName ?? "")
+        _draftPictureURL = State(initialValue: details?.picture ?? "")
+        _draftRoomID = State(initialValue: details?.roomId)
+    }
+
     var body: some View {
         Group {
             if let details {
@@ -23,8 +57,22 @@ struct RoomDetailsView: View {
                     Section("Room") {
                         RoomMetadataEditor(
                             details: details,
-                            onUploadImage: onUploadImage,
-                            onSaveMetadata: onSaveMetadata
+                            draftDisplayName: $draftDisplayName,
+                            draftPictureURL: $draftPictureURL,
+                            imageUploadInFlight: imageUploadInFlight,
+                            saveInFlight: saveInFlight,
+                            statusText: statusText,
+                            canSave: canSave(details),
+                            onChooseImage: {
+                                photoPickerPresented = true
+                            },
+                            onRemoveImage: {
+                                draftPictureURL = ""
+                                statusText = nil
+                            },
+                            onSave: {
+                                saveMetadata(details)
+                            }
                         )
                     }
 
@@ -102,167 +150,67 @@ struct RoomDetailsView: View {
         .task {
             onRefreshDevices()
         }
-    }
-}
-
-private struct RoomDetailsHeader: View {
-    let details: AppRoomDetailsState
-
-    var body: some View {
-        HStack(spacing: 14) {
-            ProfileAvatar(displayName: details.displayName, pictureURL: details.picture, size: 52)
-            .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(details.displayName)
-                    .font(.headline)
-                    .lineLimit(2)
-                Text(details.userStatusText)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if !details.status.isEmpty, details.status != details.userStatusText.lowercased() {
-                    Text(details.status)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(2)
-                }
-            }
-        }
-        .padding(.vertical, 8)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct RoomMetadataEditor: View {
-    let details: AppRoomDetailsState
-    let onUploadImage: @MainActor (Data, String) async -> String?
-    let onSaveMetadata: @MainActor (String, String, String?) async -> Bool
-
-    @State private var draftDisplayName: String
-    @State private var draftPictureURL: String
-    @State private var selectedPhotoItem: PhotosPickerItem?
-    @State private var photoPickerPresented = false
-    @State private var draftRoomID: String
-    @State private var imageUploadInFlight = false
-    @State private var saveInFlight = false
-    @State private var statusText: String?
-
-    init(
-        details: AppRoomDetailsState,
-        onUploadImage: @escaping @MainActor (Data, String) async -> String?,
-        onSaveMetadata: @escaping @MainActor (String, String, String?) async -> Bool
-    ) {
-        self.details = details
-        self.onUploadImage = onUploadImage
-        self.onSaveMetadata = onSaveMetadata
-        _draftDisplayName = State(initialValue: details.displayName)
-        _draftPictureURL = State(initialValue: details.picture ?? "")
-        _draftRoomID = State(initialValue: details.roomId)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                ProfileAvatar(displayName: previewDisplayName, pictureURL: normalizedDraftPictureURL, size: 46)
-                    .accessibilityHidden(true)
-
-                TextField("Name", text: $draftDisplayName)
-                    .textInputAutocapitalization(.words)
-                    .autocorrectionDisabled(false)
-                    .disabled(saveInFlight)
-            }
-
-            HStack(spacing: 12) {
-                Button {
-                    photoPickerPresented = true
-                } label: {
-                    if imageUploadInFlight {
-                        Label("Uploading Image", systemImage: "hourglass")
-                    } else {
-                        Label("Choose Image", systemImage: "photo")
-                    }
-                }
-                .disabled(imageUploadInFlight || saveInFlight)
-                .photosPicker(
-                    isPresented: $photoPickerPresented,
-                    selection: $selectedPhotoItem,
-                    matching: .images,
-                    photoLibrary: .shared()
-                )
-
-                if normalizedDraftPictureURL != nil {
-                    Button(role: .destructive) {
-                        draftPictureURL = ""
-                        statusText = nil
-                    } label: {
-                        Label("Remove Image", systemImage: "trash")
-                    }
-                    .disabled(imageUploadInFlight || saveInFlight)
-                }
-            }
-
-            Button {
-                saveMetadata()
-            } label: {
-                if saveInFlight {
-                    Label("Saving", systemImage: "hourglass")
-                } else {
-                    Label("Save Room", systemImage: "checkmark.circle")
-                }
-            }
-            .disabled(!canSave)
-            .accessibilityIdentifier("RoomDetailsSaveMetadataButton")
-
-            if let statusText {
-                Text(statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
+        .photosPicker(
+            isPresented: $photoPickerPresented,
+            selection: $selectedPhotoItem,
+            matching: .images,
+            photoLibrary: .shared()
+        )
         .onChange(of: selectedPhotoItem) { _, item in
             uploadSelectedPhoto(item)
         }
         .onChange(of: detailsDraftID) { _, _ in
-            if draftRoomID != details.roomId {
-                resetDrafts(force: true)
-            } else if !hasChanges {
-                resetDrafts(force: false)
+            guard let details else {
+                resetDraftsForMissingDetails()
+                return
             }
+            if draftRoomID != details.roomId {
+                resetDrafts(details, force: true)
+            } else if !hasChanges(details) {
+                resetDrafts(details, force: false)
+            }
+        }
+        .onAppear {
+            guard let details, draftRoomID == nil else { return }
+            resetDrafts(details, force: true)
         }
     }
 
     private var detailsDraftID: String {
-        [
+        guard let details else { return "" }
+        return [
             details.roomId,
             details.displayName,
             details.picture ?? "",
         ].joined(separator: "|")
     }
 
-    private var previewDisplayName: String {
-        let trimmed = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? details.displayName : trimmed
-    }
-
-    private var normalizedDraftPictureURL: String? {
+    private func normalizedDraftPictureURL() -> String? {
         let trimmed = draftPictureURL.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private var hasChanges: Bool {
+    private func hasChanges(_ details: AppRoomDetailsState) -> Bool {
         draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines) != details.displayName
-            || (normalizedDraftPictureURL ?? "") != (details.picture ?? "")
+            || (normalizedDraftPictureURL() ?? "") != (details.picture ?? "")
     }
 
-    private var canSave: Bool {
+    private func canSave(_ details: AppRoomDetailsState) -> Bool {
         !saveInFlight
             && !imageUploadInFlight
             && !draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && hasChanges
+            && hasChanges(details)
     }
 
-    private func resetDrafts(force: Bool) {
+    private func resetDraftsForMissingDetails() {
+        guard !saveInFlight && !imageUploadInFlight else { return }
+        draftRoomID = nil
+        draftDisplayName = ""
+        draftPictureURL = ""
+        statusText = nil
+    }
+
+    private func resetDrafts(_ details: AppRoomDetailsState, force: Bool) {
         guard force || (!saveInFlight && !imageUploadInFlight) else { return }
         draftRoomID = details.roomId
         draftDisplayName = details.displayName
@@ -304,25 +252,132 @@ private struct RoomMetadataEditor: View {
         }
     }
 
-    private func saveMetadata() {
-        guard canSave else { return }
+    private func saveMetadata(_ details: AppRoomDetailsState) {
+        guard canSave(details) else { return }
         photoPickerPresented = false
         selectedPhotoItem = nil
         saveInFlight = true
         statusText = nil
         let displayName = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let picture = normalizedDraftPictureURL
+        let picture = normalizedDraftPictureURL()
         Task {
             let saved = await onSaveMetadata(details.roomId, displayName, picture)
             await MainActor.run {
                 saveInFlight = false
                 if saved {
+                    draftRoomID = details.roomId
                     draftDisplayName = displayName
                     draftPictureURL = picture ?? ""
                 }
                 statusText = saved ? "Saved" : "Could not save room"
             }
         }
+    }
+}
+
+private struct RoomDetailsHeader: View {
+    let details: AppRoomDetailsState
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ProfileAvatar(displayName: details.displayName, pictureURL: details.picture, size: 52)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(details.displayName)
+                    .font(.headline)
+                    .lineLimit(2)
+                Text(details.userStatusText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if !details.status.isEmpty, details.status != details.userStatusText.lowercased() {
+                    Text(details.status)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct RoomMetadataEditor: View {
+    let details: AppRoomDetailsState
+    @Binding var draftDisplayName: String
+    @Binding var draftPictureURL: String
+    let imageUploadInFlight: Bool
+    let saveInFlight: Bool
+    let statusText: String?
+    let canSave: Bool
+    let onChooseImage: () -> Void
+    let onRemoveImage: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                ProfileAvatar(displayName: previewDisplayName, pictureURL: normalizedDraftPictureURL, size: 46)
+                    .accessibilityHidden(true)
+
+                TextField("Name", text: $draftDisplayName)
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled(false)
+                    .disabled(saveInFlight)
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    onChooseImage()
+                } label: {
+                    if imageUploadInFlight {
+                        Label("Uploading Image", systemImage: "hourglass")
+                    } else {
+                        Label("Choose Image", systemImage: "photo")
+                    }
+                }
+                .disabled(imageUploadInFlight || saveInFlight)
+
+                if normalizedDraftPictureURL != nil {
+                    Button(role: .destructive) {
+                        onRemoveImage()
+                    } label: {
+                        Label("Remove Image", systemImage: "trash")
+                    }
+                    .disabled(imageUploadInFlight || saveInFlight)
+                }
+            }
+
+            Button {
+                onSave()
+            } label: {
+                if saveInFlight {
+                    Label("Saving", systemImage: "hourglass")
+                } else {
+                    Label("Save Room", systemImage: "checkmark.circle")
+                }
+            }
+            .disabled(!canSave)
+            .accessibilityIdentifier("RoomDetailsSaveMetadataButton")
+
+            if let statusText {
+                Text(statusText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var previewDisplayName: String {
+        let trimmed = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? details.displayName : trimmed
+    }
+
+    private var normalizedDraftPictureURL: String? {
+        let trimmed = draftPictureURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
