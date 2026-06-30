@@ -117,6 +117,24 @@ class GithubPublishGateTest(unittest.TestCase):
                 copied = json.loads((repo_root / relative_path).read_text(encoding="utf-8"))
                 self.assertEqual(copied, {"index": index})
 
+    def test_ingest_artifacts_accepts_github_downloads_without_target_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            artifact_root = tmp / "artifacts" / "hermes-docker-smoke-report"
+            repo_root = tmp / "repo"
+            for index, relative_path in enumerate(publish_gate.CANONICAL_ARTIFACTS):
+                source = artifact_root / Path(*Path(relative_path).parts[1:])
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(json.dumps({"index": index}) + "\n", encoding="utf-8")
+
+            result = publish_gate.ingest_artifacts(tmp / "artifacts", repo_root=repo_root)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["missing"], [])
+            for index, relative_path in enumerate(publish_gate.CANONICAL_ARTIFACTS):
+                copied = json.loads((repo_root / relative_path).read_text(encoding="utf-8"))
+                self.assertEqual(copied, {"index": index})
+
     def test_ingest_artifacts_reports_missing_required_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             tmp = Path(tmp_value)

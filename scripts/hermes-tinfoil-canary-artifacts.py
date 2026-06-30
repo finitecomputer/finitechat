@@ -21,6 +21,7 @@ REQUIRED_RUNTIME_ENV = {
     "FINITE_AGENT_RESTORE_ON_START",
     "FINITE_AGENT_RESTORE_LATEST",
     "FINITE_AGENT_BACKUP_ON_EXIT",
+    "FINITE_AGENT_BACKUP_INTERVAL_SECS",
     "FINITE_AGENT_RESTIC_REPOSITORY",
     "FINITE_AGENT_RESTIC_BACKUP_TAG",
     "FINITECHAT_HERMES_INBOUND_STREAM",
@@ -92,6 +93,7 @@ def tinfoil_config(
     restore = context["restore"]
     env = {
         "FINITE_SERVER_URL": finite_server_url,
+        "FINITECHAT_SERVER_URL": finite_server_url,
         "FINITECHAT_HOME": "/data/agent",
         "FINITE_AGENT_HTTP_PORT": http_port,
         **context["container_env"],
@@ -282,7 +284,7 @@ def runbook(
         "- `curl http://127.0.0.1:3301/invite` returns the same runtime invite",
         "  shape used by the Docker canary.",
         "- User chats once from Finite Chat and the resulting event ID is recorded.",
-        "- Container is stopped cleanly so the entrypoint writes a fresh backup.",
+        "- A fresh periodic or exit restic backup is observed before restart.",
         "- Restart restores the latest tagged restic snapshot and the same npub.",
         "- User chats again after restore and the resulting event ID is recorded.",
         "- `scripts/hermes-tinfoil-canary-result.py` writes a passed",

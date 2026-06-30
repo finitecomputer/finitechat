@@ -35,6 +35,7 @@ def ready_handoff() -> dict:
             "finite_agent_restore_on_start": "1",
             "finite_agent_restore_latest": "1",
             "finite_agent_backup_on_exit": "1",
+            "finite_agent_backup_interval_secs": "30",
         },
         "restore": {
             "backend": "s3",
@@ -59,6 +60,7 @@ def ready_handoff() -> dict:
                 "FINITE_AGENT_RESTORE_ON_START": "1",
                 "FINITE_AGENT_RESTORE_LATEST": "1",
                 "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                "FINITE_AGENT_BACKUP_INTERVAL_SECS": "30",
                 "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
@@ -102,7 +104,9 @@ class TinfoilCanaryArtifactsTest(unittest.TestCase):
         self.assertEqual(summary["status"], "ready")
         self.assertIn(f'image: "{IMAGE_DIGEST}"', config)
         self.assertIn('FINITE_SERVER_URL: "https://chat.finite.computer"', config)
+        self.assertIn('FINITECHAT_SERVER_URL: "https://chat.finite.computer"', config)
         self.assertIn('FINITE_AGENT_RESTORE_LATEST: "1"', config)
+        self.assertIn('FINITE_AGENT_BACKUP_INTERVAL_SECS: "30"', config)
         self.assertNotIn("FINITE_AGENT_RESTIC_SNAPSHOT_ID", config)
         self.assertIn("FINITE_AGENT_RESTIC_PASSWORD", config)
         self.assertIn("OPENROUTER_API_KEY", config)

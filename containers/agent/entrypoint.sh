@@ -18,6 +18,10 @@ restic_password() {
     printf '%s' "${FINITE_AGENT_RESTIC_PASSWORD:-${FINITE_DOCKER_RESTIC_PASSWORD:-}}"
 }
 
+positive_integer() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
+}
+
 export_restic_env() {
     local password="$1"
     export RESTIC_PASSWORD="$password"
@@ -92,10 +96,63 @@ backup_agent_state() {
         return 0
     fi
 
+    local lock_dir="${FINITE_AGENT_BACKUP_LOCK_DIR:-/tmp/finite-agent-backup.lock}"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        echo "FINITE_AGENT_BACKUP_SKIPPED backup_running=true home=$agent_home tag=$tag"
+        return 0
+    fi
+
     export_restic_env "$password"
     echo "FINITE_AGENT_BACKUP_START home=$agent_home tag=$tag"
-    restic -r "$repository" backup "$agent_home" --tag "$tag" --json
+    local status=0
+    restic -r "$repository" backup "$agent_home" --tag "$tag" --json || status="$?"
+    rmdir "$lock_dir" 2>/dev/null || true
+    if [[ "$status" -ne 0 ]]; then
+        echo "FINITE_AGENT_BACKUP_ERROR restic_status=$status home=$agent_home tag=$tag" >&2
+        return "$status"
+    fi
     echo "FINITE_AGENT_BACKUP_COMPLETE home=$agent_home tag=$tag"
+}
+
+start_periodic_backup() {
+    local interval="${FINITE_AGENT_BACKUP_INTERVAL_SECS:-0}"
+    if [[ -z "$interval" || "$interval" == "0" ]]; then
+        return 0
+    fi
+    if ! positive_integer "$interval"; then
+        echo "FINITE_AGENT_BACKUP_ERROR invalid FINITE_AGENT_BACKUP_INTERVAL_SECS=$interval" >&2
+        return 64
+    fi
+    if ! truthy "${FINITE_AGENT_BACKUP_ON_EXIT:-0}"; then
+        echo "FINITE_AGENT_BACKUP_ERROR FINITE_AGENT_BACKUP_INTERVAL_SECS requires FINITE_AGENT_BACKUP_ON_EXIT=1" >&2
+        return 64
+    fi
+
+    (
+        while true; do
+            sleep "$interval" || exit 0
+            backup_agent_state || true
+        done
+    ) &
+    backup_loop_pid="$!"
+    echo "FINITE_AGENT_BACKUP_PERIODIC_START interval_secs=$interval pid=$backup_loop_pid"
+}
+
+stop_periodic_backup() {
+    if [[ -n "${backup_loop_pid:-}" ]] && kill -0 "$backup_loop_pid" 2>/dev/null; then
+        local lock_dir="${FINITE_AGENT_BACKUP_LOCK_DIR:-/tmp/finite-agent-backup.lock}"
+        local wait_secs="${FINITE_AGENT_BACKUP_STOP_WAIT_SECS:-30}"
+        local waited=0
+        while [[ -d "$lock_dir" && "$waited" -lt "$wait_secs" ]]; do
+            if [[ "$waited" -eq 0 ]]; then
+                echo "FINITE_AGENT_BACKUP_PERIODIC_WAIT backup_running=true wait_secs=$wait_secs"
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -TERM "$backup_loop_pid" 2>/dev/null || true
+        wait "$backup_loop_pid" 2>/dev/null || true
+    fi
 }
 
 restore_agent_state
@@ -106,8 +163,16 @@ fi
 
 "$@" &
 child_pid="$!"
+backup_loop_pid=""
 child_status=0
 terminating=0
+backup_loop_status=0
+start_periodic_backup || backup_loop_status="$?"
+if [[ "$backup_loop_status" -ne 0 ]]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
+    exit "$backup_loop_status"
+fi
 
 shutdown() {
     if [[ "$terminating" -eq 1 ]]; then
@@ -125,5 +190,6 @@ wait "$child_pid" || child_status="$?"
 if [[ "$terminating" -eq 1 ]] && kill -0 "$child_pid" 2>/dev/null; then
     wait "$child_pid" || child_status="$?"
 fi
+stop_periodic_backup
 backup_agent_state
 exit "$child_status"

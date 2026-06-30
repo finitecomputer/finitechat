@@ -12,6 +12,7 @@ from typing import Any
 
 DEFAULT_HERMES_MODEL = "anthropic/claude-sonnet-4.6"
 DEFAULT_HERMES_PROVIDER = "openrouter"
+DEFAULT_AGENT_BACKUP_INTERVAL_SECS = "30"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -108,6 +109,7 @@ def main() -> int:
             "finite_agent_restore_on_start": "1",
             "finite_agent_restore_latest": "1",
             "finite_agent_backup_on_exit": "1",
+            "finite_agent_backup_interval_secs": DEFAULT_AGENT_BACKUP_INTERVAL_SECS,
         },
         "restore": {
             "backend": facts.get("restic_backend"),
@@ -134,6 +136,7 @@ def main() -> int:
                 "FINITE_AGENT_RESTORE_ON_START": "1",
                 "FINITE_AGENT_RESTORE_LATEST": "1",
                 "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                "FINITE_AGENT_BACKUP_INTERVAL_SECS": DEFAULT_AGENT_BACKUP_INTERVAL_SECS,
                 "FINITE_AGENT_RESTIC_REPOSITORY": repository.get("repository"),
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": backup.get("tag"),
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
@@ -148,7 +151,7 @@ def main() -> int:
             "restore with temporary canary restic password secret",
             "print invite URL",
             "chat once from Finite Chat",
-            "stop cleanly so entrypoint snapshots agent state",
+            "observe a fresh periodic or exit snapshot of agent state",
             "restart container from empty local disk",
             "restore again",
             "chat again",

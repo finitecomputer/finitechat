@@ -65,7 +65,7 @@ TINFOIL_LAYERS = [
     "attested health proxy ready",
     "agent npub observed before restart",
     "Finite Chat round trip before restart",
-    "entrypoint backup observed on clean stop",
+    "fresh restic backup observed before restart",
     "latest-by-tag restore observed after restart",
     "same agent npub after restore",
     "Finite Chat round trip after restore",
@@ -271,6 +271,7 @@ def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
             "finite_agent_restore_on_start": "1",
             "finite_agent_restore_latest": "1",
             "finite_agent_backup_on_exit": "1",
+            "finite_agent_backup_interval_secs": "30",
         },
         "restore": {
             "backend": "s3",
@@ -295,6 +296,7 @@ def handoff_report(image_digest: str = IMAGE_DIGEST) -> dict:
                 "FINITE_AGENT_RESTORE_ON_START": "1",
                 "FINITE_AGENT_RESTORE_LATEST": "1",
                 "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                "FINITE_AGENT_BACKUP_INTERVAL_SECS": "30",
                 "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
@@ -366,9 +368,12 @@ def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> No
                 f'  - name: "{CONTAINER_NAME}"',
                 f'    image: "{image_digest}"',
                 "    env:",
+                '      - FINITE_SERVER_URL: "https://chat.finite.computer"',
+                '      - FINITECHAT_SERVER_URL: "https://chat.finite.computer"',
                 '      - FINITE_AGENT_RESTORE_ON_START: "1"',
                 '      - FINITE_AGENT_RESTORE_LATEST: "1"',
                 '      - FINITE_AGENT_BACKUP_ON_EXIT: "1"',
+                '      - FINITE_AGENT_BACKUP_INTERVAL_SECS: "30"',
                 (
                     "      - FINITE_AGENT_RESTIC_REPOSITORY: "
                     '"s3:https://objects.nyc.storage.sh/tinfoil-agent-spike/agent-runtimes/tinfoil-canary-001/restic"'

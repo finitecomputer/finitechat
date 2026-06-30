@@ -215,6 +215,57 @@ class AgentEntrypointTest(unittest.TestCase):
                 f"-r s3:https://example.invalid/bucket/prefix backup {home} --tag finite-agent-state --json",
             )
 
+    def test_periodic_backup_runs_while_command_is_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_value:
+            tmp = Path(tmp_value)
+            fake_bin = tmp / "bin"
+            fake_bin.mkdir()
+            fake_restic = fake_bin / "restic"
+            log_path = tmp / "restic.log"
+            home = tmp / "agent"
+            home.mkdir()
+            (home / "config.json").write_text("{}", encoding="utf-8")
+            fake_restic.write_text(
+                "#!/usr/bin/env sh\n"
+                'echo "$@" >> "$RESTIC_FAKE_LOG"\n'
+                'test "$RESTIC_PASSWORD" = secret\n'
+                'printf \'{"message_type":"summary","snapshot_id":"snapshot-periodic"}\\n\'\n',
+                encoding="utf-8",
+            )
+            fake_restic.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                    "RESTIC_FAKE_LOG": str(log_path),
+                    "FINITECHAT_HOME": str(home),
+                    "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                    "FINITE_AGENT_BACKUP_INTERVAL_SECS": "1",
+                    "FINITE_AGENT_RESTIC_REPOSITORY": "s3:https://example.invalid/bucket/prefix",
+                    "FINITE_AGENT_RESTIC_PASSWORD": "secret",
+                    "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
+                }
+            )
+            result = subprocess.run(
+                [str(ENTRYPOINT), "sh", "-c", "sleep 2; echo child-done"],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+
+            log_lines = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("FINITE_AGENT_BACKUP_PERIODIC_START", result.stdout)
+            self.assertIn("child-done", result.stdout)
+            self.assertGreaterEqual(len(log_lines), 2)
+            self.assertTrue(
+                all(
+                    line
+                    == f"-r s3:https://example.invalid/bucket/prefix backup {home} --tag finite-agent-state --json"
+                    for line in log_lines
+                )
+            )
+
     def test_backup_requires_repository(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_value:
             home = Path(tmp_value) / "agent"

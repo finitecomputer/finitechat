@@ -17,7 +17,7 @@ REQUIRED_PROOF_LAYERS = {
     "attested health proxy ready",
     "agent npub observed before restart",
     "Finite Chat round trip before restart",
-    "entrypoint backup observed on clean stop",
+    "fresh restic backup observed before restart",
     "latest-by-tag restore observed after restart",
     "same agent npub after restore",
     "Finite Chat round trip after restore",
@@ -200,7 +200,7 @@ def validate(evidence: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         proof_layers,
         errors,
         condition=backup_observed,
-        layer="entrypoint backup observed on clean stop",
+        layer="fresh restic backup observed before restart",
         error="restart_restore.backup_observed=true is required",
     )
     add_layer(

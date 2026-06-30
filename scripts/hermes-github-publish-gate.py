@@ -144,10 +144,15 @@ def find_downloaded_file(artifact_dir: Path, relative_path: str) -> Path | None:
     direct = artifact_dir / relative_path
     if direct.is_file():
         return direct
-    suffix_parts = Path(relative_path).parts
+    suffixes = [Path(relative_path).parts]
+    if relative_path.startswith("target/"):
+        suffixes.append(Path(relative_path).parts[1:])
     for path in artifact_dir.rglob(Path(relative_path).name):
-        if path.is_file() and path.parts[-len(suffix_parts) :] == suffix_parts:
-            return path
+        if not path.is_file():
+            continue
+        for suffix_parts in suffixes:
+            if path.parts[-len(suffix_parts) :] == suffix_parts:
+                return path
     return None
 
 

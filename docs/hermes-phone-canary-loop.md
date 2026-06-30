@@ -281,7 +281,7 @@ Tinfoil acceptance:
 - Runtime exposes stable invite URL after launch.
 - Tinfoil owner-side admission probe passes before human testing.
 - Paul joins or resumes from the phone app and receives a real Hermes reply.
-- Clean stop writes a new encrypted backup.
+- A fresh periodic or exit encrypted backup is observed before restart.
 - Full restart restores same npub and can chat again.
 - Any failure is classified as image pull, runtime state, object storage,
   network, secrets/unlock, attestation, or Tinfoil control plane before

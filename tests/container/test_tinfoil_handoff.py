@@ -107,6 +107,7 @@ class TinfoilHandoffTest(unittest.TestCase):
         self.assertEqual(handoff["runtime"]["finite_agent_restore_on_start"], "1")
         self.assertEqual(handoff["runtime"]["finite_agent_restore_latest"], "1")
         self.assertEqual(handoff["runtime"]["finite_agent_backup_on_exit"], "1")
+        self.assertEqual(handoff["runtime"]["finite_agent_backup_interval_secs"], "30")
         self.assertEqual(handoff["restore"]["seed_snapshot_id"], SNAPSHOT_ID)
         self.assertEqual(handoff["restore"]["restore_selector"], "latest")
         self.assertEqual(handoff["restore"]["restore_tag"], "finite-agent-state")
@@ -125,6 +126,7 @@ class TinfoilHandoffTest(unittest.TestCase):
                 "FINITE_AGENT_RESTORE_ON_START": "1",
                 "FINITE_AGENT_RESTORE_LATEST": "1",
                 "FINITE_AGENT_BACKUP_ON_EXIT": "1",
+                "FINITE_AGENT_BACKUP_INTERVAL_SECS": "30",
                 "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
@@ -133,7 +135,7 @@ class TinfoilHandoffTest(unittest.TestCase):
             },
         )
         self.assertIn(
-            "stop cleanly so entrypoint snapshots agent state",
+            "observe a fresh periodic or exit snapshot of agent state",
             handoff["acceptance"],
         )
         self.assertIn(
