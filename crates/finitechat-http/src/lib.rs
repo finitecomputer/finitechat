@@ -537,7 +537,7 @@ pub enum HttpInviteSessionState {
     Expired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HttpInviteJoinRequestRecord {
     pub request_id: String,
     pub joiner: DeviceRef,
@@ -547,6 +547,43 @@ pub struct HttpInviteJoinRequestRecord {
     pub display_name: Option<String>,
     pub submitted_at_ms: u64,
     pub state: HttpInviteJoinState,
+}
+
+impl<'de> Deserialize<'de> for HttpInviteJoinRequestRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            request_id: String,
+            joiner: DeviceRef,
+            key_package: Vec<u8>,
+            #[serde(default)]
+            join_proof: Option<String>,
+            #[serde(default)]
+            pin_proof: Option<String>,
+            #[serde(default)]
+            display_name: Option<String>,
+            submitted_at_ms: u64,
+            state: HttpInviteJoinState,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let join_proof = wire
+            .join_proof
+            .or(wire.pin_proof)
+            .ok_or_else(|| serde::de::Error::missing_field("join_proof"))?;
+        Ok(Self {
+            request_id: wire.request_id,
+            joiner: wire.joiner,
+            key_package: wire.key_package,
+            join_proof,
+            display_name: wire.display_name,
+            submitted_at_ms: wire.submitted_at_ms,
+            state: wire.state,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,4 +743,57 @@ pub struct PublishKeyPackageResponse {
 pub struct ErrorResponse {
     pub kind: String,
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_join_record_reads_legacy_pin_proof_as_join_proof() {
+        let record: HttpInviteJoinRequestRecord = serde_json::from_value(serde_json::json!({
+            "request_id": "request-1",
+            "joiner": {
+                "account_id": "acct",
+                "device_id": "device"
+            },
+            "key_package": [1, 2, 3],
+            "pin_proof": "legacy-proof",
+            "display_name": "Paul",
+            "submitted_at_ms": 42,
+            "state": "Pending"
+        }))
+        .expect("legacy stored invite join record should decode");
+
+        assert_eq!(record.join_proof, "legacy-proof");
+        assert_eq!(record.request_id, "request-1");
+        assert_eq!(record.joiner, DeviceRef::new("acct", "device"));
+        assert_eq!(record.key_package, vec![1, 2, 3]);
+        assert_eq!(record.display_name.as_deref(), Some("Paul"));
+        assert_eq!(record.submitted_at_ms, 42);
+        assert_eq!(record.state, HttpInviteJoinState::Pending);
+    }
+
+    #[test]
+    fn invite_join_record_serializes_only_join_proof() {
+        let record = HttpInviteJoinRequestRecord {
+            request_id: "request-1".to_owned(),
+            joiner: DeviceRef::new("acct", "device"),
+            key_package: vec![1, 2, 3],
+            join_proof: "new-proof".to_owned(),
+            display_name: None,
+            submitted_at_ms: 42,
+            state: HttpInviteJoinState::Pending,
+        };
+
+        let value = serde_json::to_value(record).expect("record should serialize");
+        assert_eq!(
+            value.get("join_proof").and_then(serde_json::Value::as_str),
+            Some("new-proof")
+        );
+        assert!(
+            value.get("pin_proof").is_none(),
+            "new records must not write legacy pin_proof"
+        );
+    }
 }
