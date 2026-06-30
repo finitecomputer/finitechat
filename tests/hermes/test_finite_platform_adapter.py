@@ -472,14 +472,12 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             if old_home is not None:
                 os.environ["FINITECHAT_HOME"] = old_home
 
-    def test_connect_surfaces_invite_qr_url_and_pin(self):
+    def test_connect_surfaces_invite_qr_url(self):
         adapter = self.adapter(room_id=None)
         calls = []
 
         async def fake_json(action, payload, *, timeout):
             calls.append(action)
-            if action == "pin":
-                return self.module._FiniteChatResult(False, {}, "no stored invites", False)
             if action == "invite":
                 return self.module._FiniteChatResult(
                     True,
@@ -496,8 +494,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
         adapter._finitechat_json = fake_json
         asyncio.run(adapter._surface_invite())
-        # Falls back from the stored-invite lookup to creating one.
-        self.assertEqual(calls, ["pin", "invite"])
+        self.assertEqual(calls, ["invite"])
 
     def _record_json(self, calls):
         async def fake_json(action, payload, *, timeout):

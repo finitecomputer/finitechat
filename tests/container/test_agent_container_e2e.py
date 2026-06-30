@@ -12,9 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def run(args, *, timeout=600, check=True, **kwargs):
-    return subprocess.run(
-        args, capture_output=True, text=True, timeout=timeout, check=check, **kwargs
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, check=False, **kwargs
     )
+    if check and result.returncode != 0:
+        raise AssertionError(
+            f"command failed with exit {result.returncode}: {args!r}\n"
+            f"stdout:\n{result.stdout[-4000:]}\n"
+            f"stderr:\n{result.stderr[-4000:]}"
+        )
+    return result
 
 
 def stage_build_context(ctx: Path) -> None:
@@ -49,7 +56,7 @@ def stage_build_context(ctx: Path) -> None:
 
 class BuildContextStagingTest(unittest.TestCase):
     def test_stage_build_context_excludes_local_state_and_secrets(self) -> None:
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT / "target") as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             source_files = [
                 REPO_ROOT / ".finitechat/canary-secret",
                 REPO_ROOT / ".state/canary-secret",
