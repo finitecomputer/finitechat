@@ -1877,7 +1877,13 @@ impl AppRuntimeState {
     }
 
     fn start_runtime(&mut self) -> Result<(), FiniteChatCoreError> {
-        match self.runtime_tick() {
+        let runtime_result = self.runtime_tick();
+        if let Err(error) = self.refresh_own_profile() {
+            if !online_action_failure(&error) {
+                return Err(error);
+            }
+        }
+        match runtime_result {
             Ok(()) => Ok(()),
             Err(error @ FiniteChatCoreError::Delivery { .. }) => {
                 if std::env::var_os("FINITECHAT_DEBUG_START_RUNTIME_DELIVERY").is_some() {
@@ -1889,6 +1895,11 @@ impl AppRuntimeState {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn refresh_own_profile(&mut self) -> Result<(), FiniteChatCoreError> {
+        let account_id = self.core.device.device_ref().account_id.clone();
+        self.fetch_profiles(vec![account_id]).map(|_| ())
     }
 
     fn wait_plan(&self, timeout_millis: u64) -> AppRuntimeWaitPlan {
@@ -8981,6 +8992,55 @@ mod tests {
             Some(account_id.as_str())
         );
         assert_eq!(scanned_offline.profiles[0].display_name, "Alice Finite");
+    }
+
+    #[test]
+    fn app_start_runtime_loads_signed_in_profile_from_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("alice");
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let account_id = app.state().unwrap().identity.account_id;
+        let npub = npub_encode(&account_id).unwrap();
+
+        put_profile(
+            &server_url,
+            NostrProfileRecord {
+                account_id: account_id.clone(),
+                name: Some("alice".to_owned()),
+                display_name: Some("Alice Real Npub".to_owned()),
+                about: Some("signed-in profile".to_owned()),
+                picture: Some("https://example.invalid/alice-real.png".to_owned()),
+                bot: None,
+                finite_role: None,
+                metadata_json: None,
+                fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
+                expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
+            },
+        );
+
+        let started = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert_eq!(started.active_profile_id, None);
+        let profile = started
+            .profiles
+            .iter()
+            .find(|profile| profile.account_id == account_id)
+            .expect("signed-in profile in app state");
+        assert_eq!(profile.npub, npub);
+        assert_eq!(profile.display_name, "Alice Real Npub");
+        assert_eq!(profile.about.as_deref(), Some("signed-in profile"));
+        assert_eq!(
+            profile.picture.as_deref(),
+            Some("https://example.invalid/alice-real.png")
+        );
+        assert!(!profile.stale);
     }
 
     #[test]

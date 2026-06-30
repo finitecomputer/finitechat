@@ -142,6 +142,8 @@ private struct RoomMetadataEditor: View {
     @State private var draftDisplayName: String
     @State private var draftPictureURL: String
     @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var photoPickerPresented = false
+    @State private var draftRoomID: String
     @State private var imageUploadInFlight = false
     @State private var saveInFlight = false
     @State private var statusText: String?
@@ -156,6 +158,7 @@ private struct RoomMetadataEditor: View {
         self.onSaveMetadata = onSaveMetadata
         _draftDisplayName = State(initialValue: details.displayName)
         _draftPictureURL = State(initialValue: details.picture ?? "")
+        _draftRoomID = State(initialValue: details.roomId)
     }
 
     var body: some View {
@@ -171,11 +174,9 @@ private struct RoomMetadataEditor: View {
             }
 
             HStack(spacing: 12) {
-                PhotosPicker(
-                    selection: $selectedPhotoItem,
-                    matching: .images,
-                    photoLibrary: .shared()
-                ) {
+                Button {
+                    photoPickerPresented = true
+                } label: {
                     if imageUploadInFlight {
                         Label("Uploading Image", systemImage: "hourglass")
                     } else {
@@ -183,6 +184,12 @@ private struct RoomMetadataEditor: View {
                     }
                 }
                 .disabled(imageUploadInFlight || saveInFlight)
+                .photosPicker(
+                    isPresented: $photoPickerPresented,
+                    selection: $selectedPhotoItem,
+                    matching: .images,
+                    photoLibrary: .shared()
+                )
 
                 if normalizedDraftPictureURL != nil {
                     Button(role: .destructive) {
@@ -217,7 +224,11 @@ private struct RoomMetadataEditor: View {
             uploadSelectedPhoto(item)
         }
         .onChange(of: detailsDraftID) { _, _ in
-            resetDrafts()
+            if draftRoomID != details.roomId {
+                resetDrafts(force: true)
+            } else if !hasChanges {
+                resetDrafts(force: false)
+            }
         }
     }
 
@@ -251,8 +262,9 @@ private struct RoomMetadataEditor: View {
             && hasChanges
     }
 
-    private func resetDrafts() {
-        guard !saveInFlight else { return }
+    private func resetDrafts(force: Bool) {
+        guard force || (!saveInFlight && !imageUploadInFlight) else { return }
+        draftRoomID = details.roomId
         draftDisplayName = details.displayName
         draftPictureURL = details.picture ?? ""
         statusText = nil
@@ -260,7 +272,7 @@ private struct RoomMetadataEditor: View {
 
     private func uploadSelectedPhoto(_ item: PhotosPickerItem?) {
         guard let item else { return }
-        selectedPhotoItem = nil
+        photoPickerPresented = false
         imageUploadInFlight = true
         statusText = nil
         Task {
@@ -273,6 +285,7 @@ private struct RoomMetadataEditor: View {
                 }.value
                 let url = await onUploadImage(payload.data, payload.mimeType)
                 await MainActor.run {
+                    selectedPhotoItem = nil
                     imageUploadInFlight = false
                     if let url {
                         draftPictureURL = url
@@ -283,6 +296,7 @@ private struct RoomMetadataEditor: View {
                 }
             } catch {
                 await MainActor.run {
+                    selectedPhotoItem = nil
                     imageUploadInFlight = false
                     statusText = String(describing: error)
                 }
@@ -292,6 +306,8 @@ private struct RoomMetadataEditor: View {
 
     private func saveMetadata() {
         guard canSave else { return }
+        photoPickerPresented = false
+        selectedPhotoItem = nil
         saveInFlight = true
         statusText = nil
         let displayName = draftDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)

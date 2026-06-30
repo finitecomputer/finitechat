@@ -434,6 +434,7 @@ final class AppModel: ObservableObject, AppReconciler {
     @Published private(set) var runtimeStorePath: String?
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
     @Published private(set) var nostrIdentity: AppNostrIdentity?
+    @Published private(set) var relayedMyProfile: AppProfileSummary?
     @Published private(set) var requiresNostrLogin: Bool
     @Published private(set) var canRecoverRuntimeIdentity: Bool
 
@@ -450,10 +451,14 @@ final class AppModel: ObservableObject, AppReconciler {
     private let runtimeFactory: AppRuntimeFactory
     private let startsUpdateLoop: Bool
     private let nostrIdentityStore: AppNostrIdentityStoring
+    private let nostrProfileService: NostrRelayProfileService
+    private let nostrPeopleCache: NostrPeopleCache?
     private var updateTask: Task<Void, Never>?
     private var launchAutomationTask: Task<Void, Never>?
     private var postSendCatchUpTask: Task<Void, Never>?
     private var runtimeDispatchTail: Task<Void, Never>?
+    private var myProfileHydrationTask: Task<Void, Never>?
+    private var myProfileHydrationKey: String?
     private var lastAppliedRuntimeRev: UInt64 = 0
     private var attachmentDownloadsInFlight = Set<String>()
     private var messageRetriesInFlight = Set<String>()
@@ -468,6 +473,7 @@ final class AppModel: ObservableObject, AppReconciler {
         launchAutomationTask?.cancel()
         postSendCatchUpTask?.cancel()
         runtimeDispatchTail?.cancel()
+        myProfileHydrationTask?.cancel()
     }
 
     init(
@@ -477,6 +483,8 @@ final class AppModel: ObservableObject, AppReconciler {
         args: [String] = CommandLine.arguments,
         requiresNostrLogin: Bool = false,
         nostrIdentityStore: AppNostrIdentityStoring = KeychainNostrIdentityStore(),
+        nostrProfileService: NostrRelayProfileService = NostrRelayProfileService(),
+        nostrPeopleCache: NostrPeopleCache? = .shared,
         startsUpdateLoop: Bool = true,
         runtimeFactory: @escaping AppRuntimeFactory = { options in
             try FiniteChatRuntime.open(options: options)
@@ -501,6 +509,8 @@ final class AppModel: ObservableObject, AppReconciler {
         self.runtimeFactory = runtimeFactory
         self.startsUpdateLoop = startsUpdateLoop
         self.nostrIdentityStore = nostrIdentityStore
+        self.nostrProfileService = nostrProfileService
+        self.nostrPeopleCache = nostrPeopleCache
         let storedNostrIdentity = nostrIdentityStore.load()
         let hasRecoverableRuntimeIdentity = !usesTransientStore
             && storedNostrIdentity == nil
@@ -549,6 +559,7 @@ final class AppModel: ObservableObject, AppReconciler {
         }
         lastAppliedRuntimeRev = nextState.rev
         state = nextState
+        hydrateMyProfileFromNostrIfNeeded()
     }
 
     var rooms: [AppRoomSummary] {
@@ -631,8 +642,23 @@ final class AppModel: ObservableObject, AppReconciler {
     }
 
     var myProfile: AppProfileSummary? {
-        guard let accountID = activeAccountID else { return nil }
-        return state?.profiles.first { $0.accountId == accountID }
+        guard let accountID = activeAccountID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !accountID.isEmpty
+        else {
+            return nil
+        }
+        let stateProfile = state?.profiles.first {
+            $0.accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == accountID
+        }
+        guard let stateProfile else {
+            return relayedMyProfile?.accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == accountID ? relayedMyProfile : nil
+        }
+        guard let relayedMyProfile,
+              relayedMyProfile.accountId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == accountID
+        else {
+            return stateProfile
+        }
+        return mergedProfile(primary: stateProfile, fallback: relayedMyProfile)
     }
 
     var myNpub: String? {
@@ -648,6 +674,52 @@ final class AppModel: ObservableObject, AppReconciler {
     var activeAccountID: String? {
         nostrIdentity?.accountID.nonEmptyTrimmed
             ?? state?.identity.accountId.nonEmptyTrimmed
+    }
+
+    private func mergedProfile(
+        primary: AppProfileSummary,
+        fallback: AppProfileSummary
+    ) -> AppProfileSummary {
+        if primary.stale && !fallback.stale {
+            return fallback
+        }
+        return primary
+    }
+
+    private func hydrateMyProfileFromNostrIfNeeded() {
+        guard let accountID = activeAccountID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !accountID.isEmpty
+        else {
+            myProfileHydrationTask?.cancel()
+            myProfileHydrationTask = nil
+            myProfileHydrationKey = nil
+            relayedMyProfile = nil
+            return
+        }
+        let key = "\(serverURL)|\(accountID)"
+        guard myProfileHydrationKey != key else { return }
+        myProfileHydrationKey = key
+        myProfileHydrationTask?.cancel()
+        let profileService = nostrProfileService
+        let cache = nostrPeopleCache
+        myProfileHydrationTask = Task { [weak self, profileService, cache, accountID, key] in
+            if let cached = await cache?.loadProfile(accountID: accountID) {
+                await MainActor.run {
+                    guard let self, self.myProfileHydrationKey == key else { return }
+                    self.relayedMyProfile = cached.appProfileSummary
+                    self.appendDiagnostic(category: "profile", event: "nostr_profile.cache_loaded")
+                }
+            }
+            guard !Task.isCancelled else { return }
+            if let fetched = await profileService.fetchProfile(forAccountID: accountID) {
+                await cache?.saveProfile(fetched)
+                await MainActor.run {
+                    guard let self, self.myProfileHydrationKey == key else { return }
+                    self.relayedMyProfile = fetched.appProfileSummary
+                    self.appendDiagnostic(category: "profile", event: "nostr_profile.loaded")
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -703,6 +775,7 @@ final class AppModel: ObservableObject, AppReconciler {
         pendingPushToken = nil
         nostrIdentityStore.clear()
         closeRuntime()
+        resetMyProfileHydration()
         try? RuntimeDataStore.deleteDataDir(
             deviceID: deviceID,
             applicationSupportURL: applicationSupportURL,
@@ -718,6 +791,13 @@ final class AppModel: ObservableObject, AppReconciler {
         requiresNostrLogin = true
         canRecoverRuntimeIdentity = false
         errorText = nil
+    }
+
+    private func resetMyProfileHydration() {
+        myProfileHydrationTask?.cancel()
+        myProfileHydrationTask = nil
+        myProfileHydrationKey = nil
+        relayedMyProfile = nil
     }
 
     func useDefaultServer() {
@@ -1607,6 +1687,7 @@ final class AppModel: ObservableObject, AppReconciler {
         }
         nostrIdentityStore.save(identity)
         nostrIdentity = identity
+        resetMyProfileHydration()
         requiresNostrLogin = false
         canRecoverRuntimeIdentity = false
         appendDiagnostic(category: "persistence", event: "nostr_identity.applied")

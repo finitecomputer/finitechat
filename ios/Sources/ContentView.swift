@@ -3092,7 +3092,7 @@ private struct SettingsSheet: View {
                         showingMyProfile = true
                     } label: {
                         HStack(spacing: 12) {
-                            if let profile = model.activeProfile {
+                            if let profile = model.myProfile {
                                 ProfileAvatar(profile: profile)
                             } else {
                                 Image(systemName: "person.crop.circle")
@@ -3102,7 +3102,7 @@ private struct SettingsSheet: View {
                             }
 
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(model.activeProfile?.displayName ?? "My Profile")
+                                Text(model.myProfile?.displayName ?? "My Profile")
                                     .foregroundStyle(.primary)
                                 Text(profileSubtitle)
                                     .font(.caption)

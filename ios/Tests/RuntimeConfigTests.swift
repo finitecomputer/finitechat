@@ -790,6 +790,177 @@ final class ChatTimelineActivityTests: XCTestCase {
 
 @MainActor
 final class AppModelPersistenceTests: XCTestCase {
+    func testMyProfileUsesSignedInProfileNotActiveScannedProfile() async throws {
+        var state = savedChatState()
+        let ownProfile = AppProfileSummary(
+            accountId: state.identity.accountId,
+            npub: "npub1paul",
+            displayName: "Paul",
+            about: nil,
+            picture: "https://example.invalid/paul.png",
+            stale: false,
+            isAgent: false
+        )
+        let scannedProfile = AppProfileSummary(
+            accountId: "bob-account",
+            npub: "npub1bob",
+            displayName: "Bob",
+            about: nil,
+            picture: "https://example.invalid/bob.png",
+            stale: false,
+            isAgent: false
+        )
+        state.profiles = [scannedProfile, ownProfile]
+        state.activeProfileId = scannedProfile.accountId
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "alice-phone"
+            ),
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        try await waitForActions(runtime, [.startRuntime])
+
+        XCTAssertEqual(model.activeProfile?.displayName, "Bob")
+        XCTAssertEqual(model.myProfile?.displayName, "Paul")
+        XCTAssertEqual(model.myProfile?.picture, "https://example.invalid/paul.png")
+    }
+
+    func testMyProfileHydratesFromSignedInNostrMetadata() async throws {
+        let material = try createNostrIdentity()
+        var state = emptyChatState(deviceID: "qt433")
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [0],
+                   filter.authors == [material.accountId]
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: material.accountId,
+                            createdAt: 1_800_000_100,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"name":"paul","display_name":"Relay Paul","about":"from nostr","picture":"https://example.com/relay-paul.jpg"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "qt433"
+            ),
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: MemoryNostrIdentityStore(identity: AppNostrIdentity(material: material)),
+            nostrProfileService: relayService,
+            nostrPeopleCache: NostrPeopleCache(directory: try temporarySupportURL()),
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        try await waitForActions(runtime, [.startRuntime])
+        try await waitUntil {
+            model.myProfile?.displayName == "Relay Paul"
+        }
+
+        XCTAssertEqual(model.myProfile?.about, "from nostr")
+        XCTAssertEqual(model.myProfile?.picture, "https://example.com/relay-paul.jpg")
+    }
+
+    func testSavedMyProfileWinsOverRelayedNostrMetadata() async throws {
+        let material = try createNostrIdentity()
+        var state = emptyChatState(deviceID: "qt433")
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: "qt433",
+            accountSecretHex: material.accountSecretHex
+        )
+        state.profiles = [
+            AppProfileSummary(
+                accountId: material.accountId,
+                npub: material.npub,
+                displayName: "Finite Paul",
+                about: nil,
+                picture: nil,
+                stale: false,
+                isAgent: false
+            ),
+        ]
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let relayService = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [0],
+                   filter.authors == [material.accountId]
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: material.accountId,
+                            createdAt: 1_800_000_100,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"display_name":"Relay Paul","picture":"https://example.com/relay-paul.jpg"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+        let model = AppModel(
+            config: RuntimeConfig(
+                serverURL: "https://chat.finite.computer",
+                deviceID: "qt433"
+            ),
+            applicationSupportURL: try temporarySupportURL(),
+            requiresNostrLogin: true,
+            nostrIdentityStore: MemoryNostrIdentityStore(identity: AppNostrIdentity(material: material)),
+            nostrProfileService: relayService,
+            nostrPeopleCache: NostrPeopleCache(directory: try temporarySupportURL()),
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        try await waitForActions(runtime, [.startRuntime])
+        try await waitUntil {
+            model.relayedMyProfile?.displayName == "Relay Paul"
+        }
+
+        XCTAssertEqual(model.myProfile?.displayName, "Finite Paul")
+        XCTAssertNil(model.myProfile?.picture)
+    }
+
     func testForceCloseStyleRelaunchUsesSameStableStoreAndKeepsSavedProjection() async throws {
         let supportURL = try temporarySupportURL()
         let configURL = supportURL.appendingPathComponent("finitechat_config.json")

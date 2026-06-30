@@ -230,8 +230,32 @@ actor NostrPeopleCache: Sendable {
         return firstResult.map { enrich($0, metadata: metadata) }
     }
 
+    func loadProfile(accountID: String) -> NostrFollowProfile? {
+        let key = accountCacheKey(accountID)
+        guard let metadata = loadProfileMetadata()[key],
+              let npub = try? npubFromAccountId(accountId: key)
+        else {
+            return nil
+        }
+        return NostrFollowProfile(
+            pubkey: key,
+            npub: npub,
+            name: metadata.name,
+            username: metadata.username,
+            about: metadata.about,
+            pictureURL: metadata.pictureURL,
+            relayHint: nil,
+            inviteAvailability: .available,
+            isAgent: metadata.isAgent
+        )
+    }
+
     func enrich(_ result: NostrFollowFetchResult) -> NostrFollowFetchResult {
         enrich(result, metadata: loadProfileMetadata())
+    }
+
+    func saveProfile(_ profile: NostrFollowProfile) {
+        saveProfileMetadata(from: [profile])
     }
 
     func save(
@@ -891,6 +915,35 @@ final class NostrRelayProfileService: Sendable {
     func fetchFollowProfiles(forAccountID accountID: String) async throws -> NostrFollowFetchResult {
         let seeds = try await fetchFollowProfileSeeds(forAccountID: accountID)
         return await enrichFollowProfileSeeds(seeds)
+    }
+
+    func fetchProfile(forAccountID accountID: String) async -> NostrFollowProfile? {
+        let normalizedAccountID = accountID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard Self.isHexPubkey(normalizedAccountID),
+              let npub = try? npubFromAccountId(accountId: normalizedAccountID)
+        else {
+            return nil
+        }
+        let primaryRelays = await contactListRelays(
+            forAccountID: normalizedAccountID,
+            bootstrapRelays: relays
+        )
+        let metadata = await fetchMetadataWithDiscoveryFallback(
+            forPubkeys: [normalizedAccountID],
+            primaryRelays: primaryRelays
+        )
+        guard let profile = metadata[normalizedAccountID] else { return nil }
+        return NostrFollowProfile(
+            pubkey: normalizedAccountID,
+            npub: npub,
+            name: profile.displayName ?? profile.name,
+            username: profile.name,
+            about: profile.about,
+            pictureURL: profile.pictureURL,
+            relayHint: nil,
+            inviteAvailability: .available,
+            isAgent: profile.isAgent
+        )
     }
 
     func fetchFollowProfileSeeds(forAccountID accountID: String) async throws -> NostrFollowSeedResult {

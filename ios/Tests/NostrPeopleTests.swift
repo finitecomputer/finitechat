@@ -374,6 +374,32 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(loaded?.profiles.map(\.inviteAvailability), [.unknown])
     }
 
+    func testPeopleCacheLoadsSingleProfileMetadata() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let cache = NostrPeopleCache(directory: temporaryCacheDirectory())
+        await cache.saveProfile(
+            NostrFollowProfile(
+                pubkey: owner,
+                npub: try npubFromAccountId(accountId: owner),
+                name: "Cached Paul",
+                username: "paul",
+                about: "cached profile",
+                pictureURL: "https://example.com/paul.jpg",
+                relayHint: nil,
+                inviteAvailability: .unknown
+            )
+        )
+
+        let loaded = await cache.loadProfile(accountID: owner.uppercased())
+
+        XCTAssertEqual(loaded?.pubkey, owner)
+        XCTAssertEqual(loaded?.displayName, "Cached Paul")
+        XCTAssertEqual(loaded?.username, "paul")
+        XCTAssertEqual(loaded?.about, "cached profile")
+        XCTAssertEqual(loaded?.pictureURL, "https://example.com/paul.jpg")
+        XCTAssertEqual(loaded?.inviteAvailability, .available)
+    }
+
     func testPeopleCachePrefersNonEmptyLegacyCacheOverEmptyCurrentCache() async throws {
         let owner = "555ae69c929b24dcd4e0057f052bf3c8f3a85f3fd84a2b8b4516fae5d0dff7d9"
         let bob = "7bc70ce80a898cc4b3e17d0992fa17264df188e1c806b60ed54424e8b41f5686"
@@ -970,6 +996,41 @@ final class NostrPeopleTests: XCTestCase {
         XCTAssertEqual(result.profiles[0].pictureURL, "https://example.com/bob.jpg")
         XCTAssertEqual(result.profiles[0].relayHint, "wss://relay.example")
         XCTAssertEqual(result.profiles[1].displayName, result.profiles[1].shortenedNpub)
+    }
+
+    func testFetchProfileLoadsSignedInKindZeroMetadata() async throws {
+        let owner = String(repeating: "a", count: 64)
+        let service = NostrRelayProfileService(
+            relays: ["wss://relay.example"],
+            discoveryRelays: [],
+            eventLoader: { _, filter, _, _ in
+                if filter.kinds == [0],
+                   filter.authors == [owner],
+                   filter.limit == 1
+                {
+                    return [
+                        NostrRelayEvent(
+                            pubkey: owner,
+                            createdAt: 1_800_000_100,
+                            kind: 0,
+                            tags: [],
+                            content: #"{"name":"paul","display_name":"Paul","about":"Finite","picture":"https://example.com/paul.jpg"}"#
+                        ),
+                    ]
+                }
+                return []
+            }
+        )
+
+        let profile = await service.fetchProfile(forAccountID: owner.uppercased())
+
+        XCTAssertEqual(profile?.pubkey, owner)
+        XCTAssertEqual(profile?.npub, try npubFromAccountId(accountId: owner))
+        XCTAssertEqual(profile?.displayName, "Paul")
+        XCTAssertEqual(profile?.username, "paul")
+        XCTAssertEqual(profile?.about, "Finite")
+        XCTAssertEqual(profile?.pictureURL, "https://example.com/paul.jpg")
+        XCTAssertEqual(profile?.inviteAvailability, .available)
     }
 
     func testFetchFollowProfileSeedsDoesNotWaitForMetadata() async throws {
