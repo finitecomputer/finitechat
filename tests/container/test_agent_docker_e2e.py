@@ -553,7 +553,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertTrue(restic_version.startswith("restic "))
         report.fact("restic_version", restic_version)
 
-        pin_info = json.loads(
+        invite_info = json.loads(
             run(
                 [
                     "docker",
@@ -563,7 +563,8 @@ class AgentDockerE2ETest(unittest.TestCase):
                     "hermes",
                     "--home",
                     "/data/agent",
-                    "pin",
+                    "invite",
+                    "--json",
                 ],
                 timeout=60,
             ).stdout
@@ -574,8 +575,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertEqual(health["npub"], agent_identity["npub"])
         report.fact("agent_npub", agent_identity["npub"])
         report.fact("real_gateway_runtime", True)
-        invite_url = pin_info["url"]
-        pin = pin_info["pin"]
+        invite_url = invite_info["url"]
 
         report.time(
             "user_init_in_docker",
@@ -587,8 +587,6 @@ class AgentDockerE2ETest(unittest.TestCase):
                 "join",
                 "--url",
                 invite_url,
-                "--pin",
-                pin,
                 "--name",
                 "Docker E2E User",
                 "--timeout-ms",
@@ -648,7 +646,7 @@ class AgentDockerE2ETest(unittest.TestCase):
         self.assertEqual(restored_health["npub"], restored_identity["npub"])
         report.fact("agent_npub_after_restore", restored_identity["npub"])
 
-        restored_pin_info = json.loads(
+        restored_invite_info = json.loads(
             run(
                 [
                     "docker",
@@ -658,7 +656,8 @@ class AgentDockerE2ETest(unittest.TestCase):
                     "hermes",
                     "--home",
                     "/data/agent",
-                    "pin",
+                    "invite",
+                    "--json",
                 ],
                 timeout=60,
             ).stdout
@@ -677,9 +676,7 @@ class AgentDockerE2ETest(unittest.TestCase):
             lambda: self.docker_user_hermes(
                 "join",
                 "--url",
-                restored_pin_info["url"],
-                "--pin",
-                restored_pin_info["pin"],
+                restored_invite_info["url"],
                 "--name",
                 "Docker Restored E2E User",
                 "--timeout-ms",
