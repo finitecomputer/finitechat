@@ -114,6 +114,7 @@ class TinfoilHandoffTest(unittest.TestCase):
                 "FINITE_AGENT_RESTIC_PASSWORD",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
+                "OPENROUTER_API_KEY",
             ],
         )
         self.assertEqual(
@@ -125,6 +126,8 @@ class TinfoilHandoffTest(unittest.TestCase):
                 "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+                "FINITECHAT_HERMES_MODEL": "anthropic/claude-sonnet-4.6",
+                "FINITECHAT_HERMES_PROVIDER": "openrouter",
             },
         )
         self.assertIn(

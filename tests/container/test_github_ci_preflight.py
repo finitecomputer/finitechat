@@ -56,6 +56,7 @@ class GithubCiPreflightTest(unittest.TestCase):
                     {"name": "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN"},
+                    {"name": "OPENROUTER_API_KEY"},
                 ],
                 variables=[{"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"}],
             )
@@ -80,6 +81,7 @@ class GithubCiPreflightTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(report["status"], "failed")
         self.assertIn("FINITE_DOCKER_RESTIC_PASSWORD", report["missing_required_secrets"])
+        self.assertIn("OPENROUTER_API_KEY", report["missing_required_secrets"])
         self.assertIn(
             "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY",
             report["missing_required_secrets"],
@@ -93,6 +95,7 @@ class GithubCiPreflightTest(unittest.TestCase):
                     {"name": "FINITE_DOCKER_RESTIC_PASSWORD"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY"},
+                    {"name": "OPENROUTER_API_KEY"},
                 ],
                 variables=[],
             )
@@ -109,6 +112,7 @@ class GithubCiPreflightTest(unittest.TestCase):
                     {"name": "FINITE_DOCKER_RESTIC_PASSWORD"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_ACCESS_KEY_ID"},
                     {"name": "FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY"},
+                    {"name": "OPENROUTER_API_KEY"},
                 ],
                 variables=[{"name": "FINITE_LATITUDE_STORAGE_BUCKET", "value": "bucket"}],
             )

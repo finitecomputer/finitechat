@@ -173,6 +173,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.FINITE_DOCKER_RESTIC_AWS_SECRET_ACCESS_KEY }}
           AWS_SESSION_TOKEN: ${{ secrets.FINITE_DOCKER_RESTIC_AWS_SESSION_TOKEN }}
           AWS_REGION: ${{ secrets.FINITE_DOCKER_RESTIC_AWS_REGION }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FINITECHAT_HERMES_MODEL: ${{ vars.FINITECHAT_HERMES_MODEL || 'anthropic/claude-sonnet-4.6' }}
+          FINITECHAT_HERMES_PROVIDER: ${{ vars.FINITECHAT_HERMES_PROVIDER || 'openrouter' }}
         run: scripts/hermes-sidecar-docker-smoke.sh
 
       - name: Login to GHCR

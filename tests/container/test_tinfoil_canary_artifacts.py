@@ -50,6 +50,7 @@ def ready_handoff() -> dict:
                 "FINITE_AGENT_RESTIC_PASSWORD",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
+                "OPENROUTER_API_KEY",
             ],
             "optional_secret_env": ["AWS_REGION", "AWS_DEFAULT_REGION", "AWS_SESSION_TOKEN"],
             "container_env": {
@@ -59,6 +60,8 @@ def ready_handoff() -> dict:
                 "FINITE_AGENT_RESTIC_REPOSITORY": RESTIC_REPOSITORY,
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+                "FINITECHAT_HERMES_MODEL": "anthropic/claude-sonnet-4.6",
+                "FINITECHAT_HERMES_PROVIDER": "openrouter",
             },
         },
     }
@@ -100,9 +103,13 @@ class TinfoilCanaryArtifactsTest(unittest.TestCase):
         self.assertIn('FINITE_AGENT_RESTORE_LATEST: "1"', config)
         self.assertNotIn("FINITE_AGENT_RESTIC_SNAPSHOT_ID", config)
         self.assertIn("FINITE_AGENT_RESTIC_PASSWORD", config)
+        self.assertIn("OPENROUTER_API_KEY", config)
+        self.assertIn('FINITECHAT_HERMES_PROVIDER: "openrouter"', config)
         self.assertIn("upstream-port: 8080", config)
         self.assertIn("/healthz", config)
         self.assertIn("tinfoil container create finite-agent-tinfoil-user-canary", runbook)
+        self.assertIn("--debug", runbook)
+        self.assertIn("--ssh-key", runbook)
         self.assertIn("scripts/hermes-tinfoil-canary-evidence.py", runbook)
         self.assertIn("scripts/hermes-tinfoil-canary-result.py", runbook)
         self.assertIn("tinfoil-canary-evidence.json", runbook)

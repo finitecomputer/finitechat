@@ -24,6 +24,8 @@ REQUIRED_RUNTIME_ENV = {
     "FINITE_AGENT_RESTIC_REPOSITORY",
     "FINITE_AGENT_RESTIC_BACKUP_TAG",
     "FINITECHAT_HERMES_INBOUND_STREAM",
+    "FINITECHAT_HERMES_MODEL",
+    "FINITECHAT_HERMES_PROVIDER",
 }
 
 
@@ -178,6 +180,10 @@ def runbook(
         "target still needs user-mediated or attestation-gated key release before",
         "this path can satisfy an operator-can't-peek threat model.",
         "",
+        "This canary must be created with Tinfoil debug mode so the runtime can be",
+        "inspected while we are still validating the deployment shape. Debug mode is",
+        "not attested and is not a production privacy posture.",
+        "",
         "## Files",
         "",
         f"- Copy `{config_path}` to the root of the public config repo as",
@@ -187,6 +193,8 @@ def runbook(
         "",
         "```bash",
         "tinfoil whoami",
+        "tinfoil ssh-key list",
+        'debug_ssh_key="${TINFOIL_DEBUG_SSH_KEY:?set TINFOIL_DEBUG_SSH_KEY to a Tinfoil SSH key name}"',
         *[
             f"tinfoil secret create {name} --value-file -  # paste value, then Ctrl-D"
             for name in secret_names
@@ -195,6 +203,8 @@ def runbook(
         f"tinfoil container create {container_name} \\",
         f"  --repo {config_repo} \\",
         f"  --tag {release_tag} \\",
+        "  --debug \\",
+        '  --ssh-key "$debug_ssh_key" \\',
         f"  {secret_flags}",
         f"tinfoil container get {container_name} -o json",
         f"tinfoil container connect {container_name} -p 3301",
@@ -351,6 +361,8 @@ def main() -> int:
         "image_digest": handoff["image"]["digest"],
         "finite_server_url": args.finite_server_url,
         "secret_env": handoff["restore"]["required_secret_env"],
+        "tinfoil_debug": True,
+        "tinfoil_debug_ssh_key_env": "TINFOIL_DEBUG_SSH_KEY",
     }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))

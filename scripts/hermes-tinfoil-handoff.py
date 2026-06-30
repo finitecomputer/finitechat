@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+DEFAULT_HERMES_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_HERMES_PROVIDER = "openrouter"
+
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -100,6 +103,8 @@ def main() -> int:
             "hermes_agent_version": facts.get("hermes_agent_version_actual"),
             "restic_version": facts.get("restic_version"),
             "finitechat_hermes_inbound_stream": "1",
+            "finitechat_hermes_model": DEFAULT_HERMES_MODEL,
+            "finitechat_hermes_provider": DEFAULT_HERMES_PROVIDER,
             "finite_agent_restore_on_start": "1",
             "finite_agent_restore_latest": "1",
             "finite_agent_backup_on_exit": "1",
@@ -116,8 +121,15 @@ def main() -> int:
                 "FINITE_AGENT_RESTIC_PASSWORD",
                 "AWS_ACCESS_KEY_ID",
                 "AWS_SECRET_ACCESS_KEY",
+                "OPENROUTER_API_KEY",
             ],
-            "optional_secret_env": ["AWS_REGION", "AWS_DEFAULT_REGION", "AWS_SESSION_TOKEN"],
+            "optional_secret_env": [
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+                "AWS_SESSION_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+            ],
             "container_env": {
                 "FINITE_AGENT_RESTORE_ON_START": "1",
                 "FINITE_AGENT_RESTORE_LATEST": "1",
@@ -125,6 +137,8 @@ def main() -> int:
                 "FINITE_AGENT_RESTIC_REPOSITORY": repository.get("repository"),
                 "FINITE_AGENT_RESTIC_BACKUP_TAG": backup.get("tag"),
                 "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+                "FINITECHAT_HERMES_MODEL": DEFAULT_HERMES_MODEL,
+                "FINITECHAT_HERMES_PROVIDER": DEFAULT_HERMES_PROVIDER,
             },
         },
         "acceptance": [

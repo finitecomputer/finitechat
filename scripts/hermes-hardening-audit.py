@@ -88,6 +88,7 @@ REQUIRED_CANARY_CONFIG_SNIPPETS = {
     "FINITE_AGENT_RESTIC_REPOSITORY",
     "FINITE_AGENT_RESTIC_BACKUP_TAG",
     "FINITECHAT_HERMES_INBOUND_STREAM",
+    "OPENROUTER_API_KEY",
     "/healthz",
     "upstream-port: 8080",
 }
@@ -99,11 +100,14 @@ REQUIRED_CANARY_RUNBOOK_SNIPPETS = {
     "--restore-tag finite-agent-state",
     "--chat-before-message-id",
     "--chat-after-message-id",
+    "--debug",
+    "--ssh-key",
 }
 REQUIRED_CANARY_SECRET_ENV = {
     "FINITE_AGENT_RESTIC_PASSWORD",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
+    "OPENROUTER_API_KEY",
 }
 REQUIRED_GITHUB_PUBLISH_ARTIFACTS = {
     "target/hermes-hardening-audit.json",
@@ -126,6 +130,8 @@ REQUIRED_HANDOFF_CONTAINER_ENV = {
     "FINITE_AGENT_BACKUP_ON_EXIT": "1",
     "FINITE_AGENT_RESTIC_BACKUP_TAG": "finite-agent-state",
     "FINITECHAT_HERMES_INBOUND_STREAM": "1",
+    "FINITECHAT_HERMES_MODEL": "anthropic/claude-sonnet-4.6",
+    "FINITECHAT_HERMES_PROVIDER": "openrouter",
 }
 REQUIRED_PUBLISH_PROOF = {
     "smoke_status": "passed",
