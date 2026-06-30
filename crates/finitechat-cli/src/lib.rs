@@ -429,7 +429,7 @@ fn invite_join_request(
             device_id,
         },
         key_package: parse_hex("--key-package-hex", &key_package_hex)?,
-        join_proof: join_proof,
+        join_proof,
         display_name,
         submitted_at_ms: parse_u64("--submitted-at-ms", &submitted_at_ms)?,
     };

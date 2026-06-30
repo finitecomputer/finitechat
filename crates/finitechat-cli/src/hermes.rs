@@ -1267,7 +1267,7 @@ fn recover_stored_hermes_events(
 fn load_recent_agent_app_events(home: &AgentHome) -> Result<Vec<StoredAppEvent>, CliError> {
     let (store, device, _) = open_agent(home)?;
     store
-        .load_app_events(&device.device_ref(), HERMES_STORED_EVENT_RECOVERY_LIMIT)
+        .load_app_events(device.device_ref(), HERMES_STORED_EVENT_RECOVERY_LIMIT)
         .map_err(|error| CliError::Hermes(error.to_string()))
 }
 

@@ -1878,10 +1878,10 @@ impl AppRuntimeState {
 
     fn start_runtime(&mut self) -> Result<(), FiniteChatCoreError> {
         let runtime_result = self.runtime_tick();
-        if let Err(error) = self.refresh_own_profile() {
-            if !online_action_failure(&error) {
-                return Err(error);
-            }
+        if let Err(error) = self.refresh_own_profile()
+            && !online_action_failure(&error)
+        {
+            return Err(error);
         }
         match runtime_result {
             Ok(()) => Ok(()),
