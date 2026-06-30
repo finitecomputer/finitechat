@@ -25,6 +25,7 @@ def run(args, *, timeout=600, check=True, **kwargs):
 
 
 def stage_build_context(ctx: Path) -> None:
+    ctx.mkdir(parents=True, exist_ok=True)
     for name, source in (("finitechat", REPO_ROOT),):
         run(
             [
