@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -312,6 +313,8 @@ def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     report["watch_stderr_tail"] = "\n".join(watch_result.stderr.splitlines()[-20:])
 
     artifact_dir = Path(args.artifact_dir)
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
     download_command = [
         "gh",
