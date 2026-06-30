@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import tempfile
 import unittest
@@ -67,7 +68,5 @@ class BuildContextStagingTest(unittest.TestCase):
                 for path in source_files:
                     path.unlink(missing_ok=True)
                 for dirname in ("secrets", ".state"):
-                    try:
+                    with contextlib.suppress(OSError):
                         (REPO_ROOT / dirname).rmdir()
-                    except OSError:
-                        pass

@@ -28,7 +28,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT = REPO_ROOT / "target/hermes-real-gateway-admission-smoke/report.json"
 
@@ -39,12 +38,33 @@ class SmokeFailure(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--report", default=os.environ.get("FINITECHAT_HERMES_REAL_GATEWAY_REPORT", str(DEFAULT_REPORT)))
-    parser.add_argument("--keep-state", action="store_true", help="Keep the temporary state directory after the run.")
-    parser.add_argument("--timeout-ms", type=int, default=int(os.environ.get("FINITECHAT_HERMES_REAL_GATEWAY_TIMEOUT_MS", "30000")))
-    parser.add_argument("--hermes-package", default=os.environ.get("FINITECHAT_HERMES_PACKAGE", "hermes-agent==0.17.0"))
-    parser.add_argument("--skip-build", action="store_true", help="Use existing target/debug binaries.")
-    parser.add_argument("--hold-seconds", type=int, default=0, help="Keep the local server, sidecar, and gateway alive after the proof join.")
+    parser.add_argument(
+        "--report",
+        default=os.environ.get("FINITECHAT_HERMES_REAL_GATEWAY_REPORT", str(DEFAULT_REPORT)),
+    )
+    parser.add_argument(
+        "--keep-state",
+        action="store_true",
+        help="Keep the temporary state directory after the run.",
+    )
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=int(os.environ.get("FINITECHAT_HERMES_REAL_GATEWAY_TIMEOUT_MS", "30000")),
+    )
+    parser.add_argument(
+        "--hermes-package",
+        default=os.environ.get("FINITECHAT_HERMES_PACKAGE", "hermes-agent==0.17.0"),
+    )
+    parser.add_argument(
+        "--skip-build", action="store_true", help="Use existing target/debug binaries."
+    )
+    parser.add_argument(
+        "--hold-seconds",
+        type=int,
+        default=0,
+        help="Keep the local server, sidecar, and gateway alive after the proof join.",
+    )
     return parser.parse_args()
 
 
@@ -96,7 +116,9 @@ def run_json(
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise SmokeFailure(f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-2000:]}") from exc
+        raise SmokeFailure(
+            f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-2000:]}"
+        ) from exc
 
 
 def wait_http_ok(url: str, *, timeout: float, name: str) -> None:
@@ -108,7 +130,7 @@ def wait_http_ok(url: str, *, timeout: float, name: str) -> None:
                 if 200 <= response.status < 300:
                     return
                 last_error = f"HTTP {response.status}"
-        except Exception as exc:  # noqa: BLE001 - stored for report context.
+        except Exception as exc:
             last_error = str(exc)
         time.sleep(0.1)
     raise SmokeFailure(f"{name} did not become ready at {url}: {last_error}")
@@ -125,7 +147,9 @@ def terminate(child: subprocess.Popen[str] | None) -> None:
         child.wait(timeout=5)
 
 
-def write_hermes_config(path: Path, *, agent_home: Path, service_url: str, service_addr: str) -> None:
+def write_hermes_config(
+    path: Path, *, agent_home: Path, service_url: str, service_addr: str
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"""model:
@@ -169,13 +193,17 @@ def main() -> int:
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     finitechat_bin = Path(os.environ.get("FINITECHAT_BIN", REPO_ROOT / "target/debug/finitechat"))
-    server_bin = Path(os.environ.get("FINITECHAT_SERVER_BIN", REPO_ROOT / "target/debug/finitechat-server"))
+    server_bin = Path(
+        os.environ.get("FINITECHAT_SERVER_BIN", REPO_ROOT / "target/debug/finitechat-server")
+    )
     uvx_bin = shutil.which("uvx")
     if uvx_bin is None:
         raise SmokeFailure("uvx is required to run hermes-agent 0.17")
 
     if not args.skip_build:
-        run(["cargo", "build", "-q", "-p", "finitechat-cli", "-p", "finitechat-server"], timeout=240)
+        run(
+            ["cargo", "build", "-q", "-p", "finitechat-cli", "-p", "finitechat-server"], timeout=240
+        )
     if not finitechat_bin.exists():
         raise SmokeFailure(f"finitechat binary not found: {finitechat_bin}")
     if not server_bin.exists():
@@ -213,7 +241,9 @@ def main() -> int:
     }
 
     def step(name: str, **facts: Any) -> None:
-        report["steps"].append({"name": name, "elapsed_ms": int((time.monotonic() - started) * 1000), **facts})
+        report["steps"].append(
+            {"name": name, "elapsed_ms": int((time.monotonic() - started) * 1000), **facts}
+        )
 
     try:
         server_log = logs_dir / "finitechat-server.log"
@@ -228,14 +258,33 @@ def main() -> int:
         step("server.ready")
 
         agent_init = run_json(
-            [str(finitechat_bin), "hermes", "--agent-home", str(agent_home), "init", "--server", server_url],
+            [
+                str(finitechat_bin),
+                "hermes",
+                "--agent-home",
+                str(agent_home),
+                "init",
+                "--server",
+                server_url,
+            ],
             timeout=30,
         )
         user_init = run_json(
-            [str(finitechat_bin), "hermes", "--agent-home", str(user_home), "init", "--server", server_url],
+            [
+                str(finitechat_bin),
+                "hermes",
+                "--agent-home",
+                str(user_home),
+                "init",
+                "--server",
+                server_url,
+            ],
             timeout=30,
         )
-        report["agent"] = {"account_id": agent_init.get("account_id"), "npub": agent_init.get("npub")}
+        report["agent"] = {
+            "account_id": agent_init.get("account_id"),
+            "npub": agent_init.get("npub"),
+        }
         report["user"] = {"account_id": user_init.get("account_id"), "npub": user_init.get("npub")}
         step("homes.initialized")
 
@@ -260,7 +309,12 @@ def main() -> int:
             timeout=30,
         )
         report["plugin_install"] = install
-        write_hermes_config(hermes_home / "config.yaml", agent_home=agent_home, service_url=service_url, service_addr=service_addr)
+        write_hermes_config(
+            hermes_home / "config.yaml",
+            agent_home=agent_home,
+            service_url=service_url,
+            service_addr=service_addr,
+        )
         step("plugin.installed", plugin_dir=install.get("plugin_dir"))
 
         invite = run_json(
@@ -391,7 +445,7 @@ def main() -> int:
             )
             time.sleep(args.hold_seconds)
         return 0
-    except Exception as exc:  # noqa: BLE001 - failures are normalized into the report.
+    except Exception as exc:
         report["status"] = "failed"
         report["failure"] = str(exc)
         report["elapsed_ms"] = int((time.monotonic() - started) * 1000)
@@ -410,7 +464,9 @@ def main() -> int:
             "finitechat_hermes_serve": tail(logs_dir / "finitechat-hermes-serve.log"),
             "hermes_gateway": tail(logs_dir / "hermes-gateway.log"),
         }
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
         if report["status"] == "passed" and not args.keep_state:
             state_ctx.cleanup()
@@ -423,4 +479,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except SmokeFailure as error:
         print(f"error: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from error

@@ -399,7 +399,7 @@ def write_canary_artifacts(tmp: Path, *, image_digest: str = IMAGE_DIGEST) -> No
                 f"- Image digest: `{image_digest}`",
                 "tinfoil container create finite-agent-tinfoil-user-canary \\",
                 "  --debug \\",
-                "  --ssh-key \"$debug_ssh_key\"",
+                '  --ssh-key "$debug_ssh_key"',
                 "scripts/hermes-tinfoil-canary-evidence.py \\",
                 "  --image-digest '<digest-observed-from-tinfoil-container-json>' \\",
                 "  --storage-backend s3 \\",

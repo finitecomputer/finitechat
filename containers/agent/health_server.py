@@ -68,15 +68,17 @@ def invite() -> dict[str, Any]:
         if INVITE_FILE.exists():
             invite_payload = json.loads(INVITE_FILE.read_text(encoding="utf-8"))
         else:
-            invite_payload = finitechat_json([
-                "hermes",
-                "--agent-home",
-                str(AGENT_HOME),
-                "invite",
-                "--room-name",
-                ROOM_NAME,
-                "--json",
-            ])
+            invite_payload = finitechat_json(
+                [
+                    "hermes",
+                    "--agent-home",
+                    str(AGENT_HOME),
+                    "invite",
+                    "--room-name",
+                    ROOM_NAME,
+                    "--json",
+                ]
+            )
             INVITE_FILE.write_text(json.dumps(invite_payload, indent=2), encoding="utf-8")
     except Exception as exc:
         return {"ready": False, "error": f"invite unavailable: {exc}"}
