@@ -90,9 +90,9 @@ scripts/hermes-phone-canary.py \
 
 The script uses `https://chat.finite.computer`, builds the current
 `finitechat` binary, installs the current iOS app on the paired phone, starts
-real Hermes 0.17 with the `finite-platform` plugin, proves invite/PIN admission
+real Hermes 0.17 with the `finite-platform` plugin, proves invite admission
 with a throwaway client, requires a real model reply, then prints the human
-invite URL, current PIN, report path, and `stop.sh`. Do not hand an invite to a
+invite URL, report path, and `stop.sh`. Do not hand an invite to a
 human from lower-level scripts that have not produced a passed report.
 
 Remote Docker is the next promotion layer for teammates with access to the
@@ -104,7 +104,7 @@ scripts/hermes-remote-docker-canary.py --keep-running
 
 That wrapper requires a passed local phone report by default, builds the real
 runtime image on `ssh://finite-lat-2`, proves real Hermes chat before and after
-entrypoint backup/restore, and only then prints the invite/PIN for the restored
+entrypoint backup/restore, and only then prints the invite URL for the restored
 container.
 
 The normal app flow is:

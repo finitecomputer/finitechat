@@ -14,6 +14,11 @@ AGENT_HOME = Path(os.environ.get("FINITECHAT_HOME", "/data/agent"))
 FINITECHAT_BIN = os.environ.get("FINITECHAT_BIN", "/usr/local/bin/finitechat")
 HOST = os.environ.get("FINITE_AGENT_HTTP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FINITE_AGENT_HTTP_PORT", "8080"))
+INVITE_FILE = AGENT_HOME / "current-invite.json"
+ROOM_NAME = os.environ.get(
+    "FINITECHAT_HERMES_ROOM_NAME",
+    os.environ.get("FINITE_AGENT_NAME", "Finite Agent"),
+)
 
 
 def identity() -> dict[str, Any]:
@@ -60,20 +65,28 @@ def invite() -> dict[str, Any]:
     if not identity_payload.get("ready"):
         return identity_payload
     try:
-        pin = finitechat_json(["hermes", "--agent-home", str(AGENT_HOME), "pin"])
+        if INVITE_FILE.exists():
+            invite_payload = json.loads(INVITE_FILE.read_text(encoding="utf-8"))
+        else:
+            invite_payload = finitechat_json([
+                "hermes",
+                "--agent-home",
+                str(AGENT_HOME),
+                "invite",
+                "--room-name",
+                ROOM_NAME,
+                "--json",
+            ])
+            INVITE_FILE.write_text(json.dumps(invite_payload, indent=2), encoding="utf-8")
     except Exception as exc:
-        return {"ready": False, "error": f"invite pin unavailable: {exc}"}
+        return {"ready": False, "error": f"invite unavailable: {exc}"}
     return {
         "ready": True,
         "agent_npub": identity_payload.get("npub"),
         "account_id": identity_payload.get("account_id"),
-        "room_id": pin.get("room_id"),
-        "invite_id": pin.get("invite_id"),
-        "url": pin.get("url"),
-        "pin": pin.get("pin"),
-        "pin_window_seconds": pin.get("pin_window_seconds"),
-        "pin_generated_at_unix": pin.get("pin_generated_at_unix"),
-        "seconds_remaining": pin.get("seconds_remaining"),
+        "room_id": invite_payload.get("room_id"),
+        "invite_id": invite_payload.get("invite_id"),
+        "url": invite_payload.get("url"),
     }
 
 

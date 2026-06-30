@@ -1557,7 +1557,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
-                    canLoadOlder: false
+                    canLoadOlder: false,
+                isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -1997,7 +1998,8 @@ final class AppModelPersistenceTests: XCTestCase {
             userStatusText: "Connected",
             lastMessagePreview: "",
             unreadCount: 0,
-            canLoadOlder: false
+            canLoadOlder: false,
+        isAgentChat: false
         ))
         let runtime = FakeFiniteChatRuntime(
             initialState: state,
@@ -2214,9 +2216,6 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertFalse(model.canSend)
         XCTAssertFalse(model.send())
         XCTAssertFalse(model.createInvite(for: selectedRoom))
-        model.pinDraft = "123456"
-        XCTAssertFalse(model.submitPin(for: selectedRoom))
-        XCTAssertEqual(model.pinDraft, "123456")
         XCTAssertFalse(model.sendPoll(
             roomID: selectedRoom.roomId,
             question: "Should not leave Swift?",
@@ -2250,14 +2249,14 @@ final class AppModelPersistenceTests: XCTestCase {
         )
         let readyState = savedChatState()
         let scannedState = savedChatState(
-            status: "invite scanned",
+            status: "join requested",
             roomState: .waitingForApproval,
-            roomStatus: "enter PIN to request admission",
+            roomStatus: "waiting for room admission",
             flow: AppFlowState(
-                noticeText: "Opened Main Room. Enter the current PIN to request access.",
+                noticeText: "Access requested for Main Room. Waiting for the agent to approve this device.",
                 noticeBusy: false,
                 scanInFlight: false,
-                invitePinSubmissionRoomId: nil,
+                inviteJoinSubmissionRoomId: nil,
                 scanResult: .room
             )
         )
@@ -2280,7 +2279,6 @@ final class AppModelPersistenceTests: XCTestCase {
         }
 
         model.start()
-        model.pinDraft = "654321"
         model.scanDraft = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3"
 
         var scanResult: AppScanTargetResult?
@@ -2299,154 +2297,10 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(room.roomId, "room-main")
         XCTAssertEqual(model.state?.selectedRoomId, "room-main")
         XCTAssertEqual(model.scanDraft, "")
-        XCTAssertEqual(model.pinDraft, "")
         XCTAssertEqual(
             model.userNoticeText,
-            "Opened Main Room. Enter the current PIN to request access."
+            "Access requested for Main Room. Waiting for the agent to approve this device."
         )
-    }
-
-    func testInvitePinSubmitClearsPinAndLocksWaitingAdmissionRoom() async throws {
-        let config = RuntimeConfig(
-            serverURL: "https://chat.finite.computer",
-            deviceID: "qt433"
-        )
-        let pendingState = savedChatState(
-            status: "invite scanned",
-            roomState: .waitingForApproval,
-            roomStatus: "enter PIN to request admission"
-        )
-        let admissionPendingState = savedChatState(
-            status: "pin submitted",
-            roomState: .waitingForApproval,
-            roomStatus: "waiting for room admission",
-            flow: AppFlowState(
-                noticeText: "PIN submitted for Main Room. Waiting for the agent to approve this device.",
-                noticeBusy: false,
-                scanInFlight: false,
-                invitePinSubmissionRoomId: nil,
-                scanResult: .none
-            )
-        )
-        let runtime = FakeFiniteChatRuntime(
-            initialState: pendingState,
-            startRuntimeState: pendingState
-        ) { action, current in
-            if case .submitInvitePin = action {
-                return admissionPendingState
-            }
-            return current
-        }
-        let model = AppModel(
-            config: config,
-            applicationSupportURL: try temporarySupportURL(),
-            args: ["FiniteChat"],
-            startsUpdateLoop: false
-        ) { _ in
-            runtime
-        }
-
-        model.start()
-        let room = try XCTUnwrap(model.selectedRoom)
-        model.pinDraft = "123456"
-
-        XCTAssertTrue(model.submitPin(for: room))
-
-        try await waitUntil {
-            model.userNoticeText == "PIN submitted for Main Room. Waiting for the agent to approve this device."
-        }
-
-        XCTAssertEqual(model.pinDraft, "")
-        XCTAssertEqual(model.state?.rooms.first?.status, "waiting for room admission")
-        XCTAssertEqual(
-            model.userNoticeText,
-            "PIN submitted for Main Room. Waiting for the agent to approve this device."
-        )
-        XCTAssertNil(model.developerErrorText)
-        let submitCount = runtime.dispatchedActions.filter {
-            if case .submitInvitePin(let pendingRoomId, let pin) = $0 {
-                return pendingRoomId == "room-main" && pin == "123456"
-            }
-            return false
-        }.count
-        XCTAssertEqual(submitCount, 1)
-
-        model.pinDraft = "999999"
-        let waitingRoom = try XCTUnwrap(model.selectedRoom)
-        XCTAssertFalse(model.submitPin(for: waitingRoom))
-        let finalSubmitCount = runtime.dispatchedActions.filter {
-            if case .submitInvitePin = $0 {
-                return true
-            }
-            return false
-        }.count
-        XCTAssertEqual(finalSubmitCount, 1)
-    }
-
-    func testInvitePinSubmitAllowsCanonicalEnterPinStatus() async throws {
-        let config = RuntimeConfig(
-            serverURL: "https://chat.finite.computer",
-            deviceID: "qt433"
-        )
-        let pendingState = savedChatState(
-            status: "invite scanned",
-            roomState: .waitingForApproval,
-            roomStatus: "enter PIN to request admission"
-        )
-        let admissionPendingState = savedChatState(
-            status: "pin submitted",
-            roomState: .waitingForApproval,
-            roomStatus: "waiting for room admission",
-            flow: AppFlowState(
-                noticeText: "PIN submitted for Main Room. Waiting for the agent to approve this device.",
-                noticeBusy: false,
-                scanInFlight: false,
-                invitePinSubmissionRoomId: nil,
-                scanResult: .none
-            )
-        )
-        let runtime = FakeFiniteChatRuntime(
-            initialState: pendingState,
-            startRuntimeState: pendingState
-        ) { action, current in
-            if case .submitInvitePin = action {
-                return admissionPendingState
-            }
-            return current
-        }
-        let model = AppModel(
-            config: config,
-            applicationSupportURL: try temporarySupportURL(),
-            args: ["FiniteChat"],
-            startsUpdateLoop: false
-        ) { _ in
-            runtime
-        }
-
-        model.start()
-        let room = try XCTUnwrap(model.selectedRoom)
-        XCTAssertEqual(room.status, "enter PIN to request admission")
-        XCTAssertTrue(room.requiresInvitePinEntry)
-        XCTAssertFalse(room.isWaitingForInviteApproval)
-
-        model.pinDraft = "123456"
-        XCTAssertTrue(model.submitPin(for: room))
-
-        try await waitUntil {
-            model.userNoticeText == "PIN submitted for Main Room. Waiting for the agent to approve this device."
-        }
-
-        let submitted = runtime.dispatchedActions.contains {
-            if case .submitInvitePin(let pendingRoomId, let pin) = $0 {
-                return pendingRoomId == "room-main" && pin == "123456"
-            }
-            return false
-        }
-        XCTAssertTrue(submitted)
-        XCTAssertEqual(model.pinDraft, "")
-        let waitingRoom = try XCTUnwrap(model.selectedRoom)
-        XCTAssertFalse(waitingRoom.requiresInvitePinEntry)
-        XCTAssertTrue(waitingRoom.isWaitingForInviteApproval)
     }
 
     func testPendingRoomPresentationHidesLowLevelWelcomeErrors() {
@@ -2458,7 +2312,8 @@ final class AppModelPersistenceTests: XCTestCase {
             userStatusText: "Waiting for approval",
             lastMessagePreview: "",
             unreadCount: 0,
-            canLoadOlder: false
+            canLoadOlder: false,
+            isAgentChat: false
         )
 
         XCTAssertNil(PendingRoomPresentation(room: room).detailText)
@@ -2769,7 +2624,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -2786,7 +2642,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
-                    canLoadOlder: false
+                    canLoadOlder: false,
+                isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2828,7 +2685,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let existingRoom = AppRoomSummary(
             roomId: "room-bob",
@@ -2838,7 +2696,8 @@ final class AppModelPersistenceTests: XCTestCase {
             userStatusText: "Connected",
             lastMessagePreview: "",
             unreadCount: 0,
-            canLoadOlder: false
+            canLoadOlder: false,
+        isAgentChat: false
         )
         var existingState = emptyChatState()
         existingState.rooms = [existingRoom]
@@ -2887,7 +2746,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -2934,7 +2794,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -2950,7 +2811,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
-                    canLoadOlder: false
+                    canLoadOlder: false,
+                isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -2994,7 +2856,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let carol = AppProfileSummary(
             accountId: "carol-account",
@@ -3002,7 +2865,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Carol",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -3019,7 +2883,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
-                    canLoadOlder: false
+                    canLoadOlder: false,
+                isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -3062,7 +2927,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let carol = AppProfileSummary(
             accountId: "carol-account",
@@ -3070,7 +2936,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Carol",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -3086,7 +2953,8 @@ final class AppModelPersistenceTests: XCTestCase {
                     userStatusText: "Connected",
                     lastMessagePreview: "",
                     unreadCount: 0,
-                    canLoadOlder: false
+                    canLoadOlder: false,
+                isAgentChat: false
                 )
                 state.rooms = [room]
                 state.selectedRoomId = room.roomId
@@ -3127,7 +2995,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let carol = AppProfileSummary(
             accountId: "carol-account",
@@ -3135,7 +3004,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Carol",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -3184,7 +3054,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: savedChatState(),
@@ -3228,7 +3099,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "Bob",
             about: nil,
             picture: nil,
-            stale: false
+            stale: false,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: savedChatState(),
@@ -3283,7 +3155,7 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeText: "Profile unavailable",
                     noticeBusy: false,
                     scanInFlight: false,
-                    invitePinSubmissionRoomId: nil,
+                    inviteJoinSubmissionRoomId: nil,
                     scanResult: .unavailable
                 )
             }
@@ -3326,7 +3198,8 @@ final class AppModelPersistenceTests: XCTestCase {
             displayName: "bob-acc…ount",
             about: nil,
             picture: nil,
-            stale: true
+            stale: true,
+        isAgent: false
         )
         let runtime = FakeFiniteChatRuntime(
             initialState: emptyChatState(),
@@ -3342,7 +3215,7 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeText: "Profile opened.",
                     noticeBusy: false,
                     scanInFlight: false,
-                    invitePinSubmissionRoomId: nil,
+                    inviteJoinSubmissionRoomId: nil,
                     scanResult: .profile
                 )
             }
@@ -3398,7 +3271,8 @@ final class AppModelPersistenceTests: XCTestCase {
                         userStatusText: "Connected",
                         lastMessagePreview: "",
                         unreadCount: 0,
-                        canLoadOlder: false
+                        canLoadOlder: false,
+                    isAgentChat: false
                     ),
                 ]
                 state.selectedRoomId = "room-bob"
@@ -3487,7 +3361,8 @@ final class AppModelPersistenceTests: XCTestCase {
                         userStatusText: "Connected",
                         lastMessagePreview: "",
                         unreadCount: 0,
-                        canLoadOlder: false
+                        canLoadOlder: false,
+                    isAgentChat: false
                     ),
                 ]
                 state.selectedRoomId = "room-bob"
@@ -3600,7 +3475,7 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeText: nil,
             noticeBusy: false,
             scanInFlight: false,
-            invitePinSubmissionRoomId: nil,
+            inviteJoinSubmissionRoomId: nil,
             scanResult: .none
         )
     ) -> AppState {
@@ -3617,7 +3492,8 @@ final class AppModelPersistenceTests: XCTestCase {
             userStatusText: roomUserStatusText(state: roomState, status: roomStatus),
             lastMessagePreview: "saved before force close",
             unreadCount: 0,
-            canLoadOlder: false
+            canLoadOlder: false,
+        isAgentChat: false
         )
         let message = ChatMessage(
             roomId: "room-main",
@@ -3730,7 +3606,7 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeText: nil,
             noticeBusy: false,
             scanInFlight: false,
-            invitePinSubmissionRoomId: nil,
+            inviteJoinSubmissionRoomId: nil,
             scanResult: .none
         )
     ) -> AppState {
@@ -3762,9 +3638,6 @@ final class AppModelPersistenceTests: XCTestCase {
         case .connected:
             return "Connected"
         case .waitingForApproval:
-            if status.localizedCaseInsensitiveContains("pin") {
-                return "Enter the invite PIN"
-            }
             return "Waiting for approval"
         case .joining:
             return "Joining"

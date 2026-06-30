@@ -2,7 +2,7 @@
 # Human-facing Hermes sidecar smoke.
 #
 # Exercises the strongest local encrypted flow:
-#   live finitechat server -> agent home -> invite/PIN -> user join
+#   live finitechat server -> agent home -> invite URL -> user join
 #   -> finitechat hermes serve -> /v1/hermes/inbound NDJSON
 #   -> ack/drain -> agent reply -> user decrypts.
 #

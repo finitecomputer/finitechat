@@ -4864,7 +4864,7 @@ pub struct CreateRoomInviteParams<'a> {
 
 /// Create an invite session for a room this device administers and return
 /// the invite code. The code carries the only copy of the invite token;
-/// print it as a URL/QR and show `invite_current_pin` beside it.
+/// print it as a URL/QR. The URL carries the invite token used for join proof.
 pub fn create_room_invite<D: RuntimeDelivery>(
     device: &FiniteChatDevice,
     delivery: &mut D,
@@ -4908,15 +4908,15 @@ pub struct InviteAcceptReport {
 }
 
 /// Inviter-side processing of pending join requests (ADR 0006): verify each
-/// proof for the current PIN window ±1, reject failures, and admit all
-/// verified joiners in a single Add commit with their Welcomes. Nothing
-/// enters the MLS group before its proof verifies.
+/// proof for the invite token, reject failures, and admit all verified joiners
+/// in a single Add commit with their Welcomes. Nothing enters the MLS group
+/// before its proof verifies.
 pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
     store: &mut SqliteClientStore,
     device: &mut FiniteChatDevice,
     delivery: &mut D,
     code: &InviteCodeV1,
-    now_ms: u64,
+    _now_ms: u64,
 ) -> Result<InviteAcceptReport, RuntimeWorkerError<D::Error>> {
     let mut report = InviteAcceptReport::default();
     let listing = delivery
@@ -4952,11 +4952,10 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
     for join in pending {
         let proof_ok = verify_invite_join_proof(
             &code.invite_token,
-            now_ms / 1000,
             &join.joiner.account_id,
             &join.joiner.device_id,
             &join.key_package,
-            &join.pin_proof,
+            &join.join_proof,
         );
         let upload = proof_ok
             .then(|| serde_json::from_slice::<UploadKeyPackageRequest>(&join.key_package).ok())
@@ -5057,15 +5056,14 @@ pub struct InviteJoinHandle {
 }
 
 /// Joiner-side join request (ADR 0006): build a fresh single-use KeyPackage,
-/// persist its private material, and submit it with a proof binding the
-/// typed PIN and the invite token to this exact identity and key material.
-/// The raw PIN never leaves the device.
+/// persist its private material, and submit it with a proof binding the invite
+/// token to this exact identity and key material. The raw invite token never
+/// leaves the device.
 pub fn submit_invite_join_request<D: RuntimeDelivery>(
     store: &mut SqliteClientStore,
     device: &mut FiniteChatDevice,
     delivery: &mut D,
     code: &InviteCodeV1,
-    pin: &str,
     display_name: Option<String>,
     now_ms: u64,
 ) -> Result<InviteJoinHandle, RuntimeWorkerError<D::Error>> {
@@ -5076,9 +5074,8 @@ pub fn submit_invite_join_request<D: RuntimeDelivery>(
     // device: the agent may commit the Add immediately.
     store.save_device_state(device)?;
     let request_id = device.generate_object_id("join")?;
-    let pin_proof = invite_join_proof(
+    let join_proof = invite_join_proof(
         &code.invite_token,
-        pin,
         &device.device_ref().account_id,
         &device.device_ref().device_id,
         &key_package_bytes,
@@ -5089,7 +5086,7 @@ pub fn submit_invite_join_request<D: RuntimeDelivery>(
             request_id: request_id.clone(),
             joiner: device.device_ref().clone(),
             key_package: key_package_bytes,
-            pin_proof,
+            join_proof,
             display_name,
             submitted_at_ms: now_ms,
         })
@@ -6646,6 +6643,11 @@ fn validate_nostr_profile_record(profile: &NostrProfileRecord) -> Result<(), Cli
         "profile.picture",
         profile.picture.as_deref(),
         MAX_APP_PROFILE_PICTURE_BYTES,
+    )?;
+    validate_optional_profile_text(
+        "profile.finite_role",
+        profile.finite_role.as_deref(),
+        MAX_APP_PROFILE_NAME_BYTES,
     )?;
     if let Some(picture) = &profile.picture
         && !picture.starts_with("http://")
@@ -10476,6 +10478,8 @@ mod tests {
                 display_name: Some(display_name.to_owned()),
                 about: None,
                 picture: Some(format!("https://example.invalid/{seed}.png")),
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: NOW.saturating_mul(1000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },

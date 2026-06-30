@@ -19,7 +19,7 @@ use finitechat_client::{
 };
 use finitechat_http::{SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{DurableAppEventKind, InviteCodeV1, invite_current_pin};
+use finitechat_proto::{DurableAppEventKind, InviteCodeV1};
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
 use std::io::Write as _;
@@ -137,14 +137,12 @@ fn bridge_path_latency_breakdown() {
     user_store.save_device_state(&user).unwrap();
     let mut user_delivery =
         HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
-    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
     let pairing_started = Instant::now();
     submit_invite_join_request(
         &mut user_store,
         &mut user,
         &mut user_delivery,
         &code,
-        &pin,
         None,
         now_ms(),
     )
@@ -180,7 +178,6 @@ fn bridge_path_latency_breakdown() {
         &mut agent2,
         &mut agent2_delivery,
         &code,
-        &invite_current_pin(&code.invite_token, now_ms() / 1000),
         None,
         now_ms(),
     )
@@ -337,9 +334,9 @@ fn bridge_path_latency_breakdown() {
 
     // Leg 6b: subprocess floor — the cheapest store-opening command.
     time_n(16, |_| {
-        cli(&["pin"]);
+        cli(&["invite", "--room-id", &room_id, "--json"]);
     })
-    .report("leg 6b `hermes pin` subprocess (spawn+store open only)");
+    .report("leg 6b `hermes invite --json` subprocess (spawn+store open only)");
 
     // Leg 7: end-to-end wake-to-delivered — user holds a poll-shaped wait
     // then syncs, while the agent CLI sends.

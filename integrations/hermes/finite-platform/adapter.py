@@ -163,27 +163,42 @@ class FiniteChatAdapter(BasePlatformAdapter):
         return True
 
     async def _surface_invite(self) -> None:
-        """Print the join QR/URL/PIN at startup (the agentnoise pattern for
-        headless boxes). Reuses the stored invite; creates one on first run."""
-        result = await self._finitechat_json("pin", {}, timeout=30)
-        if not result.ok:
+        """Print the stored join URL for headless boxes, creating one only on first run."""
+        url = self._latest_stored_invite_url()
+        qr = ""
+        if not url:
             result = await self._finitechat_json("invite", {}, timeout=60)
-        if not result.ok:
-            logger.warning("[finite] could not prepare an invite: %s", result.error)
-            return
-        qr = result.data.get("qr") or ""
-        url = result.data.get("url") or ""
-        pin = result.data.get("pin") or ""
+            if not result.ok:
+                logger.warning("[finite] could not prepare an invite: %s", result.error)
+                return
+            qr = result.data.get("qr") or ""
+            url = result.data.get("url") or ""
         if qr:
             print(qr, flush=True)
         if url:
             print(f"Scan or open in Finite Chat:\n  {url}", flush=True)
-        if pin:
-            print(
-                f"Challenge PIN (rotates every "
-                f"{result.data.get('pin_window_seconds') or 30}s): {pin}",
-                flush=True,
-            )
+
+    def _latest_stored_invite_url(self) -> str:
+        invites_path = Path(self.home) / "invites.json"
+        try:
+            raw = invites_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            logger.warning("[finite] could not read stored invites from %s: %s", invites_path, exc)
+            return ""
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("[finite] stored invites file is not valid JSON: %s", exc)
+            return ""
+        if not isinstance(values, list):
+            logger.warning("[finite] stored invites file is not a JSON array")
+            return ""
+        for value in reversed(values):
+            if isinstance(value, str) and value.startswith("finite://join?"):
+                return value
+        return ""
 
     async def _recover_interrupted_turns(self) -> None:
         result = await self._finitechat_json("recover", {}, timeout=60)

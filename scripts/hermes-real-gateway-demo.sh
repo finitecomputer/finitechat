@@ -113,7 +113,11 @@ for env_file in "${env_files[@]}"; do
 done
 
 if [[ ! -f "${agent_home}/config.json" ]]; then
-  "${finitechat_bin}" hermes --home "${agent_home}" init --server "${server_url}" --device-id "${agent_device_id}" >/dev/null
+  "${finitechat_bin}" hermes --home "${agent_home}" init \
+    --server "${server_url}" \
+    --device-id "${agent_device_id}" \
+    --agent-name "${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}" \
+    >/dev/null
 elif command -v jq >/dev/null 2>&1; then
   configured_server="$(jq -r '.server_url // empty' "${agent_home}/config.json")"
   if [[ "${configured_server}" != "${server_url}" ]]; then

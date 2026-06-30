@@ -1,6 +1,6 @@
 //! The `finitechat hermes` subcommand family: the JSON bridge
 //! the Hermes platform plugin shells to (ADR 0002), plus agent onboarding
-//! (ADR 0006: init → invite URL/QR/PIN → chat).
+//! (ADR 0006: init → invite URL/QR → chat).
 //!
 //! The agent's durable home lives under `--home` / `$FINITECHAT_HOME`:
 //! `agent.nsec` (0600), `config.json`, `invites.json` (0600, each line is a
@@ -38,12 +38,11 @@ use finitechat_hermes::{
     HermesAckRequestV1, HermesActivityRequestV1, HermesEditRequestV1, HermesMessagePayloadV1,
     HermesMessageStatusV1, HermesPollEventV1, HermesSendRequestV1, MAX_HERMES_POLL_TIMEOUT_MILLIS,
 };
-use finitechat_http::{SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
+use finitechat_http::{NostrProfileRecord, SyncWaitInvite, SyncWaitRequest, SyncWaitRoom};
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     AttachmentBlobReferenceV1, DecryptedApplicationEventV1, DurableAppEventKind,
-    EphemeralActivityActionV1, INVITE_PIN_WINDOW_SECONDS, InviteCodeV1, invite_current_pin,
-    npub_encode,
+    EphemeralActivityActionV1, InviteCodeV1, npub_encode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +67,9 @@ const HERMES_PLUGIN_YAML: &str =
 const HERMES_PLUGIN_ENV_FILE: &str = "finitechat.env";
 const DEFAULT_HERMES_SERVICE_ADDR: &str = "127.0.0.1:0";
 const DEFAULT_DEVICE_ID: &str = "agent";
+const DEFAULT_AGENT_PROFILE_NAME: &str = "Finite Agent";
+const DEFAULT_AGENT_PROFILE_ABOUT: &str = "A Finite Computer agent you can chat with.";
+const DEFAULT_AGENT_PROFILE_PICTURE: &str = "https://finite.computer/finite-logo.svg";
 const DEFAULT_MAX_JOINS: u32 = 8;
 const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CREDENTIAL_VALIDITY_SECONDS: u64 = 90 * 24 * 60 * 60;
@@ -103,7 +105,6 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "serve" => cmd_serve(&home_dir, rest, json_mode, output),
         "home-channel" => cmd_home_channel(&home_dir, rest, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
-        "pin" => cmd_pin(&home_dir, rest, output),
         "join" => cmd_join(&home_dir, rest, output),
         "poll" => cmd_poll(&home_dir, read_request(request_json)?, output),
         "ack" => cmd_ack(&home_dir, read_request(request_json)?, output),
@@ -455,7 +456,6 @@ fn handle_hermes_bridge_action(
     let mut output = Vec::new();
     match action {
         "invite" => cmd_invite(home_dir, Vec::new(), true, &mut output)?,
-        "pin" => cmd_pin(home_dir, Vec::new(), &mut output)?,
         "poll" => cmd_poll(home_dir, payload, &mut output)?,
         "ack" => cmd_ack(home_dir, payload, &mut output)?,
         "send" => cmd_send(home_dir, payload, &mut output)?,
@@ -748,6 +748,13 @@ fn cmd_init<W: Write>(
     let server_url = crate::required_option(&mut args, "--server")?;
     let device_id = crate::take_option(&mut args, "--device-id")?
         .unwrap_or_else(|| DEFAULT_DEVICE_ID.to_owned());
+    let agent_name = crate::take_option(&mut args, "--agent-name")?
+        .unwrap_or_else(|| DEFAULT_AGENT_PROFILE_NAME.to_owned());
+    let agent_about = crate::take_option(&mut args, "--agent-about")?
+        .unwrap_or_else(|| DEFAULT_AGENT_PROFILE_ABOUT.to_owned());
+    let agent_picture = crate::take_option(&mut args, "--agent-picture-url")?
+        .unwrap_or_else(|| DEFAULT_AGENT_PROFILE_PICTURE.to_owned());
+    let skip_agent_profile = take_flag(&mut args, "--skip-agent-profile");
     crate::reject_extra_args(&args)?;
     if home_dir.join(CONFIG_FILE).exists() {
         return Err(CliError::Hermes(format!(
@@ -786,6 +793,16 @@ fn cmd_init<W: Write>(
 
     let npub = npub_encode(&config.account_id)
         .map_err(|error| CliError::Hermes(format!("npub encoding failed: {error}")))?;
+    let profile = if skip_agent_profile {
+        None
+    } else {
+        Some(publish_agent_profile(
+            &config,
+            normalize_agent_profile_text("--agent-name", agent_name)?,
+            normalize_agent_profile_text("--agent-about", agent_about)?,
+            normalize_agent_profile_picture(agent_picture)?,
+        )?)
+    };
     crate::write_pretty_json(
         output,
         &json!({
@@ -794,8 +811,74 @@ fn cmd_init<W: Write>(
             "device_id": config.device_id,
             "account_id": config.account_id,
             "npub": npub,
+            "profile": profile,
         }),
     )
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HermesAgentProfileSummary {
+    account_id: String,
+    display_name: String,
+    about: String,
+    picture: String,
+    bot: bool,
+    finite_role: String,
+    saved: bool,
+}
+
+fn publish_agent_profile(
+    config: &AgentConfig,
+    display_name: String,
+    about: String,
+    picture: String,
+) -> Result<HermesAgentProfileSummary, CliError> {
+    let now = now_ms();
+    let profile = NostrProfileRecord {
+        account_id: config.account_id.clone(),
+        name: Some(display_name.clone()),
+        display_name: Some(display_name.clone()),
+        about: Some(about.clone()),
+        picture: Some(picture.clone()),
+        bot: Some(true),
+        finite_role: Some("agent".to_owned()),
+        fetched_at_ms: now,
+        expires_at_ms: now + CREDENTIAL_VALIDITY_SECONDS * 1000,
+    };
+    let mut delivery =
+        HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(config.server_url.clone()));
+    let response = delivery
+        .put_nostr_profile(&profile)
+        .map_err(|error| CliError::Hermes(format!("could not publish agent profile: {error}")))?;
+    Ok(HermesAgentProfileSummary {
+        account_id: profile.account_id,
+        display_name,
+        about,
+        picture,
+        bot: true,
+        finite_role: "agent".to_owned(),
+        saved: response.saved,
+    })
+}
+
+fn normalize_agent_profile_text(name: &str, value: String) -> Result<String, CliError> {
+    let trimmed = value.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(CliError::Usage(format!("{name} cannot be empty")));
+    }
+    Ok(trimmed)
+}
+
+fn normalize_agent_profile_picture(value: String) -> Result<String, CliError> {
+    let trimmed = normalize_agent_profile_text("--agent-picture-url", value)?;
+    let url = reqwest::Url::parse(&trimmed)
+        .map_err(|error| CliError::Usage(format!("invalid --agent-picture-url: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CliError::Usage(
+            "--agent-picture-url must be an http(s) URL".to_owned(),
+        ));
+    }
+    Ok(trimmed)
 }
 
 fn cmd_invite<W: Write>(
@@ -846,7 +929,6 @@ fn cmd_invite<W: Write>(
     append_invite(home_dir, &url)?;
 
     let code = InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?;
-    let pin = invite.pin;
     let npub = npub_encode(&code.inviter_account_id)
         .map_err(|error| CliError::Hermes(format!("npub encoding failed: {error}")))?;
     let qr = render_qr(&url)?;
@@ -857,8 +939,6 @@ fn cmd_invite<W: Write>(
             &json!({
                 "url": url,
                 "qr": qr,
-                "pin": pin,
-                "pin_window_seconds": INVITE_PIN_WINDOW_SECONDS,
                 "invite_id": code.invite_id,
                 "room_id": room_id,
                 "npub": npub,
@@ -868,59 +948,12 @@ fn cmd_invite<W: Write>(
         writeln!(output, "{qr}").map_err(CliError::Output)?;
         writeln!(output, "Scan or open in Finite Chat:\n  {url}").map_err(CliError::Output)?;
         writeln!(output, "Agent identity: {npub}").map_err(CliError::Output)?;
-        writeln!(
-            output,
-            "Challenge PIN (rotates every {INVITE_PIN_WINDOW_SECONDS}s): {pin}"
-        )
-        .map_err(CliError::Output)?;
-        writeln!(
-            output,
-            "Re-display with: finitechat hermes pin --invite-id {}",
-            code.invite_id
-        )
-        .map_err(CliError::Output)
+        Ok(())
     }
 }
 
-fn cmd_pin<W: Write>(
-    home_dir: &Path,
-    mut args: Vec<String>,
-    output: &mut W,
-) -> Result<(), CliError> {
-    let invite_id = crate::take_option(&mut args, "--invite-id")?;
-    crate::reject_extra_args(&args)?;
-    let invites = load_invites(home_dir)?;
-    let code = match invite_id {
-        Some(invite_id) => invites
-            .into_iter()
-            .find(|code| code.invite_id == invite_id)
-            .ok_or_else(|| CliError::Hermes(format!("no stored invite {invite_id}")))?,
-        None => invites
-            .into_iter()
-            .next_back()
-            .ok_or_else(|| CliError::Hermes("no stored invites".to_owned()))?,
-    };
-    let now = now_secs();
-    let pin = invite_current_pin(&code.invite_token, now);
-    let url = code
-        .encode()
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    crate::write_pretty_json(
-        output,
-        &json!({
-            "invite_id": code.invite_id,
-            "room_id": code.room_id,
-            "url": url,
-            "qr": render_qr(&url)?,
-            "pin": pin,
-            "pin_window_seconds": INVITE_PIN_WINDOW_SECONDS,
-            "seconds_remaining": INVITE_PIN_WINDOW_SECONDS - (now % INVITE_PIN_WINDOW_SECONDS),
-        }),
-    )
-}
-
-/// User-side join: scan/paste the invite URL, type the PIN, land in the
-/// chat (ADR 0006). Submits the proof-bound join request, waits for the
+/// User-side join: scan/paste the invite URL and land in the chat (ADR 0006).
+/// Submits the proof-bound join request, waits for the
 /// inviter's verdict, activates the Welcome from the room's server,
 /// verifies the inviter credential, and pins the room to its server.
 fn cmd_join<W: Write>(
@@ -929,8 +962,6 @@ fn cmd_join<W: Write>(
     output: &mut W,
 ) -> Result<(), CliError> {
     let url = crate::required_option(&mut args, "--url")?;
-    let pin = crate::required_option(&mut args, "--pin")?;
-    let display_name = crate::take_option(&mut args, "--name")?;
     let timeout_ms = crate::take_option(&mut args, "--timeout-ms")?
         .map(|value| crate::parse_u64("--timeout-ms", &value))
         .transpose()?
@@ -942,9 +973,6 @@ fn cmd_join<W: Write>(
     let runtime = open_agent_runtime(&home)?;
     runtime
         .dispatch_and_wait(AppAction::ScanTarget { value: url.clone() })
-        .map_err(map_core_hermes_error)?;
-    runtime
-        .submit_invite_pin_with_display_name_and_wait(code.room_id.clone(), pin, display_name)
         .map_err(map_core_hermes_error)?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -960,9 +988,7 @@ fn cmd_join<W: Write>(
                         output,
                         &json!({ "state": "rejected", "room_id": code.room_id }),
                     )?;
-                    return Err(CliError::Hermes(
-                        "join was rejected (wrong or expired PIN?)".to_owned(),
-                    ));
+                    return Err(CliError::Hermes("join was rejected".to_owned()));
                 }
                 AppRoomState::WaitingForApproval | AppRoomState::Joining => {}
             }
@@ -2032,7 +2058,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] pin [--invite-id ID]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL --pin PIN [--name NAME] [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID] [--agent-name NAME] [--agent-about TEXT] [--agent-picture-url URL] [--skip-agent-profile]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]

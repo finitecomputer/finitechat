@@ -1,14 +1,13 @@
-//! Invite code v1 (ADR 0006): the URL/QR payload, the rotating challenge
-//! PIN, and the join proof that binds PIN + invite token to the joiner's
-//! exact identity and KeyPackage bytes.
+//! Invite code v1 (ADR 0006): the URL/QR payload and the join proof that
+//! binds the invite token to the joiner's exact identity and KeyPackage bytes.
 //!
 //! Everything here is pure protocol: no I/O, no clocks (callers pass unix
 //! seconds), no server trust. The rendezvous server never sees the invite
 //! token and cannot mint a passing proof.
 
 use crate::{
-    INVITE_CODE_VERSION_V1, INVITE_JOIN_PROOF_DOMAIN, INVITE_PIN_DOMAIN, INVITE_PIN_WINDOW_SECONDS,
-    INVITE_TOKEN_BYTES, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, MAX_ROOM_ID_BYTES,
+    INVITE_CODE_VERSION_V1, INVITE_JOIN_PROOF_DOMAIN, INVITE_TOKEN_BYTES,
+    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES, MAX_ROOM_ID_BYTES,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -21,9 +20,6 @@ pub const INVITE_URL_PREFIX: &str = "finite://join?";
 pub const NOSTR_NPUB_HRP: &str = "npub";
 pub const NOSTR_NPROFILE_HRP: &str = "nprofile";
 pub const NOSTR_NSEC_HRP: &str = "nsec";
-/// Accept proofs computed in nearby PIN windows to absorb clock skew and the
-/// human copy/paste delay in local/manual invite flows.
-pub const INVITE_PIN_WINDOW_SKEW: u64 = 10;
 pub const MAX_INVITE_URL_BYTES: usize = 2048;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -193,42 +189,16 @@ fn check_field(field: &'static str, value: &str, max_bytes: usize) -> Result<(),
     Ok(())
 }
 
-/// The PIN window for a unix timestamp.
-pub fn invite_pin_window(unix_seconds: u64) -> u64 {
-    unix_seconds / INVITE_PIN_WINDOW_SECONDS
-}
-
-/// The 6-digit challenge PIN for a window (agentnoise's window scheme with
-/// finite domain separation, keyed by the invite token).
-pub fn invite_pin_for_window(invite_token: &[u8], window: u64) -> String {
-    let mut mac = HmacSha256::new_from_slice(invite_token).expect("HMAC accepts any key length");
-    mac.update(INVITE_PIN_DOMAIN);
-    mac.update(&window.to_be_bytes());
-    let bytes = mac.finalize().into_bytes();
-    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000;
-    format!("{value:06}")
-}
-
-/// The PIN to display right now.
-pub fn invite_current_pin(invite_token: &[u8], unix_seconds: u64) -> String {
-    invite_pin_for_window(invite_token, invite_pin_window(unix_seconds))
-}
-
-/// The proof a joiner submits instead of the raw PIN. Binds the invite
-/// token and the typed PIN to the joiner's account, device, and the exact
-/// KeyPackage bytes, so the rendezvous server can neither brute-force the
-/// six digits (it lacks the token) nor substitute identity or key material.
+/// The proof a joiner submits. Binds the invite token to the joiner's account,
+/// device, and exact KeyPackage bytes, so the rendezvous server cannot mint a
+/// proof or substitute identity/key material.
 pub fn invite_join_proof(
     invite_token: &[u8],
-    pin: &str,
     account_id: &str,
     device_id: &str,
     key_package: &[u8],
 ) -> String {
-    let mut key = Vec::with_capacity(invite_token.len() + pin.len());
-    key.extend_from_slice(invite_token);
-    key.extend_from_slice(pin.as_bytes());
-    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(invite_token).expect("HMAC accepts any key length");
     mac.update(INVITE_JOIN_PROOF_DOMAIN);
     mac.update(account_id.as_bytes());
     mac.update(&[0]);
@@ -238,29 +208,19 @@ pub fn invite_join_proof(
     hex_lower(&mac.finalize().into_bytes())
 }
 
-/// Inviter-side verification: recompute the proof for the current window
-/// plus/minus the allowed skew.
+/// Inviter-side verification: recompute the proof from the invite token and
+/// the pending request material.
 pub fn verify_invite_join_proof(
     invite_token: &[u8],
-    unix_seconds: u64,
     account_id: &str,
     device_id: &str,
     key_package: &[u8],
     proof: &str,
 ) -> bool {
-    let window = invite_pin_window(unix_seconds);
-    let first = window.saturating_sub(INVITE_PIN_WINDOW_SKEW);
-    let last = window.saturating_add(INVITE_PIN_WINDOW_SKEW);
-    for candidate in first..=last {
-        let pin = invite_pin_for_window(invite_token, candidate);
-        let expected = invite_join_proof(invite_token, &pin, account_id, device_id, key_package);
-        // Proofs are one-shot rendezvous artifacts, not an oracle the
-        // attacker can query repeatedly, so plain comparison is fine here.
-        if expected == proof {
-            return true;
-        }
-    }
-    false
+    let expected = invite_join_proof(invite_token, account_id, device_id, key_package);
+    // Proofs are one-shot rendezvous artifacts, not an oracle the attacker can
+    // query repeatedly, so plain comparison is fine here.
+    expected == proof
 }
 
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
@@ -472,53 +432,25 @@ mod tests {
     }
 
     #[test]
-    fn pin_rotates_per_window_and_is_six_digits() {
-        let first = invite_pin_for_window(&TOKEN, 1);
-        let second = invite_pin_for_window(&TOKEN, 2);
-        assert_eq!(first.len(), 6);
-        assert!(first.bytes().all(|b| b.is_ascii_digit()));
-        assert_ne!(first, second);
-        assert_eq!(
-            invite_current_pin(&TOKEN, 45),
-            invite_pin_for_window(&TOKEN, 1)
-        );
-    }
-
-    #[test]
-    fn join_proof_verifies_within_skew_and_binds_identity_and_bytes() {
-        let now = 1_000_000;
-        let pin = invite_current_pin(&TOKEN, now);
-        let proof = invite_join_proof(&TOKEN, &pin, "acct", "device", b"kp-bytes");
+    fn join_proof_verifies_and_binds_token_identity_and_bytes() {
+        let proof = invite_join_proof(&TOKEN, "acct", "device", b"kp-bytes");
         assert!(verify_invite_join_proof(
             &TOKEN,
-            now,
             "acct",
             "device",
             b"kp-bytes",
             &proof
         ));
-        // Previous-window proofs still verify (skew).
-        assert!(verify_invite_join_proof(
-            &TOKEN,
-            now + INVITE_PIN_WINDOW_SECONDS,
+        // Any tampering kills it: token, identity, device, or key package bytes.
+        assert!(!verify_invite_join_proof(
+            &[8; 16],
             "acct",
             "device",
             b"kp-bytes",
             &proof
         ));
-        // Proofs outside the tolerated manual-entry window die.
         assert!(!verify_invite_join_proof(
             &TOKEN,
-            now + (INVITE_PIN_WINDOW_SKEW + 2) * INVITE_PIN_WINDOW_SECONDS,
-            "acct",
-            "device",
-            b"kp-bytes",
-            &proof
-        ));
-        // Any tampering kills it: identity, device, or key package bytes.
-        assert!(!verify_invite_join_proof(
-            &TOKEN,
-            now,
             "other",
             "device",
             b"kp-bytes",
@@ -526,7 +458,6 @@ mod tests {
         ));
         assert!(!verify_invite_join_proof(
             &TOKEN,
-            now,
             "acct",
             "other",
             b"kp-bytes",
@@ -534,18 +465,11 @@ mod tests {
         ));
         assert!(!verify_invite_join_proof(
             &TOKEN,
-            now,
             "acct",
             "device",
             b"tampered",
             &proof
         ));
-        // A wrong PIN produces a proof that fails verification.
-        let bad = invite_join_proof(&TOKEN, "000000", "acct", "device", b"kp-bytes");
-        assert!(
-            !verify_invite_join_proof(&TOKEN, now, "acct", "device", b"kp-bytes", &bad)
-                || invite_current_pin(&TOKEN, now) == "000000"
-        );
     }
 
     #[test]

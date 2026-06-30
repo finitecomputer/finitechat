@@ -131,17 +131,13 @@ pub(crate) fn run<W: Write>(mut args: Vec<String>, output: &mut W) -> Result<(),
                     .map_err(map_core_error)?,
             )
         }
-        "submit-pin" => {
+        "submit-join" => {
             let pending_room_id = required_option(&mut args, "--room-id")?;
-            let pin = required_option(&mut args, "--pin")?;
             reject_extra_args(&args)?;
             write_state(
                 output,
                 runtime
-                    .dispatch_and_wait(AppAction::SubmitInvitePin {
-                        pending_room_id,
-                        pin,
-                    })
+                    .dispatch_and_wait(AppAction::SubmitInviteJoin { pending_room_id })
                     .map_err(map_core_error)?,
             )
         }
@@ -180,7 +176,7 @@ pub(crate) fn run<W: Write>(mut args: Vec<String>, output: &mut W) -> Result<(),
 }
 
 pub(crate) fn usage() -> String {
-    "app commands:\n  finitechat app [--data-dir DIR] [--server URL] [--device-id ID] [--account-secret-hex HEX] [--now SECONDS] identity\n  finitechat app [options] state [--start-runtime] [--wait-update-ms MS] [--room-id ID]\n  finitechat app [options] start\n  finitechat app [options] wait [--timeout-ms MS]\n  finitechat app [options] stop\n  finitechat app [options] open-room --room-id ID\n  finitechat app [options] create-room [--display-name NAME]\n  finitechat app [options] create-invite --room-id ID\n  finitechat app [options] scan --value INVITE_OR_PROFILE\n  finitechat app [options] submit-pin --room-id ID --pin PIN\n  finitechat app [options] send --room-id ID --text TEXT\n  finitechat app [options] mark-read --room-id ID\n  finitechat app [options] refresh-devices".to_owned()
+    "app commands:\n  finitechat app [--data-dir DIR] [--server URL] [--device-id ID] [--account-secret-hex HEX] [--now SECONDS] identity\n  finitechat app [options] state [--start-runtime] [--wait-update-ms MS] [--room-id ID]\n  finitechat app [options] start\n  finitechat app [options] wait [--timeout-ms MS]\n  finitechat app [options] stop\n  finitechat app [options] open-room --room-id ID\n  finitechat app [options] create-room [--display-name NAME]\n  finitechat app [options] create-invite --room-id ID\n  finitechat app [options] scan --value INVITE_OR_PROFILE\n  finitechat app [options] submit-join --room-id ID\n  finitechat app [options] send --room-id ID --text TEXT\n  finitechat app [options] mark-read --room-id ID\n  finitechat app [options] refresh-devices".to_owned()
 }
 
 fn write_state<W: Write>(output: &mut W, state: AppState) -> Result<(), CliError> {

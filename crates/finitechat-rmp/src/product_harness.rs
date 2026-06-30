@@ -1439,15 +1439,6 @@ fn establish_peer_membership(
     .map_err(|error| {
         CliError::operational(format!("{label}: peer failed to scan invite: {error}"))
     })?;
-    peer.dispatch_and_wait(AppAction::SubmitInvitePin {
-        pending_room_id: room_id.to_owned(),
-        pin: invite.pin,
-    })
-    .map_err(|error| {
-        CliError::operational(format!(
-            "{label}: peer failed to submit invite PIN: {error}"
-        ))
-    })?;
     owner
         .dispatch_and_wait(AppAction::StartRuntime)
         .map_err(|error| {

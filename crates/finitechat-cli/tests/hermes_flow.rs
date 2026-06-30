@@ -1,5 +1,5 @@
 //! End-to-end exercise of the `hermes` subcommand family against a live
-//! server: init → invite (URL/QR/PIN) → a user device joins via the invite
+//! server: init → invite (URL/QR) → a user device joins via the invite
 //! → poll admits the join → send/edit/activity round trips. This is the
 //! same surface the Python platform plugin shells to.
 
@@ -12,9 +12,7 @@ use finitechat_core::{AppAction, AppRoomState, ChatMediaKind, FiniteChatRuntime,
 use finitechat_hermes::{HermesMessagePayloadV1, HermesMessageStatusV1, HermesSendKindV1};
 use finitechat_http::GetEphemeralActivitiesRequest;
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{
-    DecryptedEphemeralActivityV1, DurableAppEventKind, InviteCodeV1, invite_current_pin,
-};
+use finitechat_proto::{DecryptedEphemeralActivityV1, DurableAppEventKind, InviteCodeV1};
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -159,13 +157,11 @@ impl TestHermesUser {
     }
 
     fn submit_invite_join(&mut self, code: &InviteCodeV1, display_name: &str) {
-        let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
         submit_invite_join_request(
             &mut self.store,
             &mut self.device,
             &mut self.delivery,
             code,
-            &pin,
             Some(display_name.to_owned()),
             now_ms(),
         )
@@ -291,6 +287,7 @@ fn hermes_init_reuses_existing_agent_identity() {
         "init",
         "--server",
         "http://127.0.0.1:1",
+        "--skip-agent-profile",
     ]);
     assert_eq!(hermes_init["account_id"], identity["account_id"]);
     assert_eq!(hermes_init["npub"], identity["npub"]);
@@ -349,6 +346,7 @@ fn hermes_serve_reports_process_health() {
         "init",
         "--server",
         "http://127.0.0.1:1",
+        "--skip-agent-profile",
     ]);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_finitechat"))
@@ -530,13 +528,19 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
     })
     .unwrap();
 
-    app.dispatch_and_wait(AppAction::ScanTarget {
-        value: invite["url"].as_str().unwrap().to_owned(),
-    })
-    .unwrap();
-    app.dispatch_and_wait(AppAction::SubmitInvitePin {
+    let scanned = app
+        .dispatch_and_wait(AppAction::ScanTarget {
+            value: invite["url"].as_str().unwrap().to_owned(),
+        })
+        .unwrap();
+    assert!(
+        scanned
+            .rooms
+            .iter()
+            .any(|room| room.room_id == room_id && room.is_agent_chat)
+    );
+    app.dispatch_and_wait(AppAction::SubmitInviteJoin {
         pending_room_id: room_id.clone(),
-        pin: invite["pin"].as_str().unwrap().to_owned(),
     })
     .unwrap();
     let admitted = hermes(&[
@@ -752,6 +756,15 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     });
     let agent_account = init["account_id"].as_str().unwrap().to_owned();
     assert!(init["npub"].as_str().unwrap().starts_with("npub1"));
+    assert_eq!(init["profile"]["account_id"], agent_account);
+    assert_eq!(init["profile"]["display_name"], "Finite Agent");
+    assert_eq!(
+        init["profile"]["picture"],
+        "https://finite.computer/finite-logo.svg"
+    );
+    assert_eq!(init["profile"]["bot"], true);
+    assert_eq!(init["profile"]["finite_role"], "agent");
+    assert_eq!(init["profile"]["saved"], true);
     smoke.fact("agent_account_id", json!(agent_account.clone()));
     smoke.fact("agent_npub", init["npub"].clone());
     #[cfg(unix)]
@@ -764,7 +777,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         assert_eq!(mode & 0o777, 0o600);
     }
 
-    // invite: creates the room, prints URL + QR + PIN.
+    // invite: creates the room, prints URL + QR.
     let invite = smoke.time("invite_create", || {
         hermes(&[
             "hermes",
@@ -780,16 +793,10 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let room_id = invite["room_id"].as_str().unwrap().to_owned();
     smoke.fact("room_id", json!(room_id.clone()));
     assert!(!invite["qr"].as_str().unwrap().is_empty());
-    assert_eq!(invite["pin"].as_str().unwrap().len(), 6);
     let code = InviteCodeV1::parse(url).expect("printed URL is a valid invite code");
     assert_eq!(code.inviter_account_id, agent_account);
     assert_eq!(code.room_id, room_id);
-
-    // pin: re-displays the current PIN for headless agents.
-    let pin_out = hermes(&["hermes", "--home", &home_arg, "pin"]);
-    assert_eq!(pin_out["invite_id"], invite["invite_id"]);
-
-    // The user scans the QR and types the PIN.
+    // The user scans the QR and submits the invite proof.
     let user_config = FiniteChatDeviceConfig {
         account_secret_key: NostrSecretKey::from_bytes(USER_SECRET).unwrap(),
         device_id: "user_phone".to_owned(),
@@ -810,14 +817,12 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     user_store.save_device_state(&user).unwrap();
     let mut user_delivery =
         HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
-    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
     smoke.time("user_submit_join", || {
         submit_invite_join_request(
             &mut user_store,
             &mut user,
             &mut user_delivery,
             &code,
-            &pin,
             Some("Paul".to_owned()),
             now_ms(),
         )
@@ -1309,7 +1314,6 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
     ]);
     let code = InviteCodeV1::parse(invite["url"].as_str().unwrap()).unwrap();
     let room_id = code.room_id.clone();
-    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
     let home_channel_before = hermes(&["hermes", "--home", &home_arg, "home-channel", "show"]);
     assert_eq!(home_channel_before["home_channel"], Value::Null);
     let home_channel_set = hermes(&[
@@ -1371,7 +1375,6 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
         &mut alice,
         &mut alice_delivery,
         &code,
-        &pin,
         Some("Alice".to_owned()),
         now_ms(),
     )
@@ -1381,7 +1384,6 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
         &mut bob,
         &mut bob_delivery,
         &code,
-        &pin,
         Some("Bob".to_owned()),
         now_ms(),
     )
@@ -1588,7 +1590,6 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
     ]);
     let room_id = invite["room_id"].as_str().unwrap().to_owned();
     let invite_url = invite["url"].as_str().unwrap().to_owned();
-    let pin = invite["pin"].as_str().unwrap().to_owned();
 
     let user = FiniteChatRuntime::open(OpenOptions {
         data_dir: dir.path().join("ios-user").to_string_lossy().into_owned(),
@@ -1600,9 +1601,8 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
     .unwrap();
     user.dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
         .unwrap();
-    user.dispatch_and_wait(AppAction::SubmitInvitePin {
+    user.dispatch_and_wait(AppAction::SubmitInviteJoin {
         pending_room_id: room_id.clone(),
-        pin,
     })
     .unwrap();
 
@@ -1742,8 +1742,6 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
     ]);
     let invite = hermes(&["hermes", "--home", &agent_home, "invite", "--json"]);
     let url = invite["url"].as_str().unwrap().to_owned();
-    let code = InviteCodeV1::parse(&url).unwrap();
-    let pin = invite_current_pin(&code.invite_token, now_ms() / 1000);
 
     // The joiner's request sits pending until the agent polls; run the
     // join in a thread while the agent admits it.
@@ -1759,10 +1757,6 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
                 "join",
                 "--url",
                 &join_url,
-                "--pin",
-                &pin,
-                "--name",
-                "CLI User",
                 "--timeout-ms",
                 "30000",
             ]

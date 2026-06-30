@@ -1139,7 +1139,8 @@ private struct ChatPeoplePickerSheet: View {
             displayName: shortenedDisplayNpub(npub),
             about: nil,
             picture: nil,
-            stale: true
+            stale: true,
+            isAgent: false
         )
     }
 
@@ -1187,7 +1188,8 @@ func profileSummaryFromScannedProfileCode(
         displayName: shortenedDisplayNpub(npub),
         about: nil,
         picture: nil,
-        stale: true
+        stale: true,
+        isAgent: false
     )
 }
 
@@ -2871,48 +2873,16 @@ private struct PendingRoomView: View {
                     .multilineTextAlignment(.center)
             }
 
-            if room.isWaitingForInviteApproval {
-                ProgressView()
-                    .controlSize(.large)
-                    .accessibilityLabel("Waiting for approval")
-            } else {
-                TextField("PIN", text: $model.pinDraft)
-                    .keyboardType(.numberPad)
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 180)
-                    .accessibilityLabel("PIN")
-                    .disabled(isSubmitting)
-
-                Button {
-                    model.submitPin(for: room)
-                } label: {
-                    HStack(spacing: 8) {
-                        if isSubmitting {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.white)
-                        }
-                        Label(
-                            isSubmitting ? "Joining" : "Join",
-                            systemImage: isSubmitting ? "hourglass" : "arrow.right.circle.fill"
-                        )
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    isSubmitting
-                        || !room.requiresInvitePinEntry
-                        || model.pinDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            }
+            ProgressView()
+                .controlSize(.large)
+                .accessibilityLabel(isSubmitting ? "Requesting access" : room.userStatusText)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var isSubmitting: Bool {
-        model.invitePinSubmissionRoomID == room.roomId
+        model.inviteJoinSubmissionRoomID == room.roomId
     }
 
     private var detailText: String? {
@@ -3092,17 +3062,12 @@ private struct InviteSheet: View {
                         .frame(width: 220, height: 220)
                         .accessibilityLabel("Invite QR")
 
-                    VStack(spacing: 6) {
-                        Text(invite.pin)
-                            .font(.system(size: 36, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                        Text(invite.inviteUrl)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .textSelection(.enabled)
-                            .lineLimit(4)
-                    }
+                    Text(invite.inviteUrl)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                        .lineLimit(4)
 
                     ShareLink(item: invite.inviteUrl) {
                         Label("Share", systemImage: "square.and.arrow.up")

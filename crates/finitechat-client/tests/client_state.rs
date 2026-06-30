@@ -17,7 +17,7 @@ use finitechat_proto::LogEntryKind;
 use finitechat_proto::{
     AppendEventRequest, CreateRoomRequest, DurableAppEventKind, EventAccepted, InviteCodeV1,
     ListAccountRoomsRequest, RoomProtocol, RoomSyncProjection, WelcomeRecord, envelope,
-    invite_current_pin, lease_token_for,
+    lease_token_for,
 };
 use finitechat_server::{HttpServerState, http_router};
 use rusqlite::{Connection, params};
@@ -2742,7 +2742,7 @@ fn assert_application_acceptance(accepted: &EventAccepted, sent_plaintexts: &[Se
 }
 
 #[test]
-fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
+fn invite_flow_admits_via_url_and_join_proof_and_pins_room_server_over_http() {
     let dir = tempfile::tempdir().unwrap();
     let server_db = dir.path().join("finitechat-http.sqlite3");
     let now_ms = NOW * 1000;
@@ -2768,7 +2768,7 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
 
     let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
 
-    // The agent creates its room and an invite, printed as a URL + QR + PIN.
+    // The agent creates its room and an invite, printed as a URL + QR.
     agent.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();
     agent_store.save_device_state(&agent).unwrap();
     delivery
@@ -2799,27 +2799,25 @@ fn invite_flow_admits_via_url_and_pin_and_pins_room_server_over_http() {
     assert_eq!(scanned, code);
     assert_eq!(scanned.inviter_account_id, agent.device_ref().account_id);
 
-    // Bob types the PIN currently shown on the agent's terminal.
-    let pin = invite_current_pin(&scanned.invite_token, now_ms / 1000);
+    // Bob submits the proof derived from the invite URL.
     let bob_join = submit_invite_join_request(
         &mut bob_store,
         &mut bob,
         &mut delivery,
         &scanned,
-        &pin,
         Some("Bob".to_owned()),
         now_ms,
     )
     .unwrap();
 
-    // Mallory guesses a PIN (pick one that is definitely wrong).
-    let wrong_pin = if pin == "123456" { "654321" } else { "123456" };
+    // Mallory has the invite id but not the real invite token, so her proof fails.
+    let mut tampered = scanned.clone();
+    tampered.invite_token[0] ^= 0xff;
     let mallory_join = submit_invite_join_request(
         &mut mallory_store,
         &mut mallory,
         &mut delivery,
-        &scanned,
-        wrong_pin,
+        &tampered,
         Some("Definitely Bob".to_owned()),
         now_ms,
     )
@@ -3039,20 +3037,11 @@ fn invite_accept_defers_while_a_pending_commit_is_unmerged() {
         },
     )
     .unwrap();
-    let pin = invite_current_pin(&code.invite_token, now_ms / 1000);
 
     // First joiner is accepted; the add commit is pending until the agent
     // observes it in the log.
-    submit_invite_join_request(
-        &mut bob_store,
-        &mut bob,
-        &mut delivery,
-        &code,
-        &pin,
-        None,
-        now_ms,
-    )
-    .unwrap();
+    submit_invite_join_request(&mut bob_store, &mut bob, &mut delivery, &code, None, now_ms)
+        .unwrap();
     let first =
         accept_pending_invite_joins(&mut agent_store, &mut agent, &mut delivery, &code, now_ms)
             .unwrap();
@@ -3064,7 +3053,6 @@ fn invite_accept_defers_while_a_pending_commit_is_unmerged() {
         &mut dana,
         &mut delivery,
         &code,
-        &pin,
         None,
         now_ms,
     )

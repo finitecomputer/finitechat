@@ -252,6 +252,10 @@ pub struct NostrProfileRecord {
     pub about: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finite_role: Option<String>,
     pub fetched_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -438,7 +442,7 @@ pub struct SubmitInviteJoinRequest {
     pub request_id: String,
     pub joiner: DeviceRef,
     pub key_package: Vec<u8>,
-    pub pin_proof: String,
+    pub join_proof: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub submitted_at_ms: u64,
@@ -538,7 +542,7 @@ pub struct HttpInviteJoinRequestRecord {
     pub request_id: String,
     pub joiner: DeviceRef,
     pub key_package: Vec<u8>,
-    pub pin_proof: String,
+    pub join_proof: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub submitted_at_ms: u64,

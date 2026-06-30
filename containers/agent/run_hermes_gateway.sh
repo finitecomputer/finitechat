@@ -7,6 +7,8 @@ server_url="${FINITE_SERVER_URL:-${FINITECHAT_SERVER_URL:-}}"
 device_id="${FINITECHAT_HERMES_AGENT_DEVICE_ID:-agent}"
 finitechat_bin="${FINITECHAT_BIN:-/usr/local/bin/finitechat}"
 plugin_name="${FINITECHAT_HERMES_PLUGIN_NAME:-finite-platform}"
+agent_name="${FINITECHAT_HERMES_AGENT_NAME:-${FINITE_AGENT_NAME:-${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}}}"
+agent_picture_url="${FINITECHAT_HERMES_AGENT_PICTURE_URL:-https://finite.computer/finite-logo.svg}"
 model="${FINITECHAT_HERMES_MODEL:-anthropic/claude-sonnet-4.6}"
 provider="${FINITECHAT_HERMES_PROVIDER:-openrouter}"
 base_url="${FINITECHAT_HERMES_BASE_URL:-https://openrouter.ai/api/v1}"
@@ -25,7 +27,7 @@ export FINITECHAT_ALLOW_ALL_USERS="${FINITECHAT_ALLOW_ALL_USERS:-true}"
 export FINITE_ALLOW_ALL_USERS="${FINITE_ALLOW_ALL_USERS:-true}"
 export GATEWAY_ALLOW_ALL_USERS="${GATEWAY_ALLOW_ALL_USERS:-true}"
 export FINITE_AGENT_ID="${FINITE_AGENT_ID:-agent_${device_id}}"
-export FINITE_AGENT_NAME="${FINITE_AGENT_NAME:-Finite Agent}"
+export FINITE_AGENT_NAME="$agent_name"
 
 mkdir -p "$agent_home" "$hermes_home/plugins" "$workspace"
 
@@ -37,6 +39,8 @@ if [[ ! -f "${agent_home}/config.json" ]]; then
     "$finitechat_bin" hermes --home "$agent_home" init \
         --server "$server_url" \
         --device-id "$device_id" \
+        --agent-name "$agent_name" \
+        --agent-picture-url "$agent_picture_url" \
         >/dev/null
 fi
 
@@ -48,11 +52,15 @@ fi
     --json \
     >/dev/null
 
-if ! "$finitechat_bin" hermes --home "$agent_home" pin >/tmp/finitechat-invite.json 2>/dev/null; then
+invite_file="${agent_home}/current-invite.json"
+if [[ -f "$invite_file" ]]; then
+    cp "$invite_file" /tmp/finitechat-invite.json
+else
     "$finitechat_bin" hermes --home "$agent_home" invite \
-        --room-name "${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}" \
+        --room-name "$agent_name" \
         --json \
-        >/tmp/finitechat-invite.json
+        >"$invite_file"
+    cp "$invite_file" /tmp/finitechat-invite.json
 fi
 
 cat >"${hermes_home}/config.yaml" <<EOF

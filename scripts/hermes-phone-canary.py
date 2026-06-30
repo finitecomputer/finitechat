@@ -4,7 +4,7 @@
 This is the local layer of docs/hermes-phone-canary-loop.md. It uses the
 hosted Finite Chat server by default, starts finitechat hermes serve before the
 real Hermes gateway, proves owner-side invite admission with a throwaway CLI
-client, then prints a fresh human invite/PIN only after the preflight passes.
+client, then prints a human invite URL only after the preflight passes.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--server-url",
         default=os.environ.get("FINITECHAT_PHONE_CANARY_SERVER_URL", DEFAULT_SERVER_URL),
-        help="Finite Chat server URL. Physical-phone canaries must not use loopback.",
+        help="Finite Chat server URL. Product phone canaries must use https://chat.finite.computer.",
     )
     parser.add_argument(
         "--state-root",
@@ -206,11 +206,22 @@ def wait_http_ok(url: str, *, timeout: float, name: str) -> None:
     raise CanaryFailure(f"{name} did not become reachable at {url}: {last_error}")
 
 
-def reject_phone_loopback(server_url: str) -> None:
+def enforce_product_server_url(server_url: str) -> None:
     parsed = urllib.parse.urlparse(server_url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or not host:
         raise CanaryFailure(f"server URL must be an http(s) origin, got {server_url!r}")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise CanaryFailure(f"server URL must be an origin, got {server_url!r}")
+    normalized = f"{parsed.scheme}://{host}"
+    if parsed.port is not None:
+        normalized = f"{normalized}:{parsed.port}"
+    if normalized.rstrip("/") != DEFAULT_SERVER_URL:
+        raise CanaryFailure(
+            "product phone canary must use "
+            f"{DEFAULT_SERVER_URL}; got {server_url!r}. Use lower-level simulator or "
+            "gateway diagnostics for local delivery-server experiments."
+        )
     if host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127."):
         raise CanaryFailure(
             f"server URL {server_url!r} is loopback; a physical phone cannot reach the Mac through loopback"
@@ -597,7 +608,7 @@ def first_matching_mine_message_id(state: dict[str, Any]) -> str | None:
 
 def main() -> int:
     args = parse_args()
-    reject_phone_loopback(args.server_url)
+    enforce_product_server_url(args.server_url)
     run_id = timestamp_id()
     state_root = (
         Path(args.state_root)
@@ -710,6 +721,8 @@ def main() -> int:
                 args.server_url,
                 "--device-id",
                 args.agent_device_id,
+                "--agent-name",
+                args.room_name,
             ],
             env=env,
             timeout=60,
@@ -718,6 +731,7 @@ def main() -> int:
             {
                 "account_id": agent_init.get("account_id"),
                 "npub": agent_init.get("npub"),
+                "profile": agent_init.get("profile"),
             }
         )
         step("agent.init")
@@ -733,6 +747,7 @@ def main() -> int:
                 args.server_url,
                 "--device-id",
                 "probe",
+                "--skip-agent-profile",
             ],
             env=env,
             timeout=60,
@@ -783,9 +798,6 @@ def main() -> int:
             "room_id": invite.get("room_id"),
             "invite_id": invite.get("invite_id"),
             "url": invite.get("url"),
-            "pin": None,
-            "pin_window_seconds": invite.get("pin_window_seconds"),
-            "pin_generated_at_unix": None,
         }
         step("invite.created", room_id=invite.get("room_id"))
 
@@ -880,10 +892,6 @@ def main() -> int:
                 "join",
                 "--url",
                 str(invite["url"]),
-                "--pin",
-                str(invite["pin"]),
-                "--name",
-                "Hermes Phone Canary Probe",
                 "--timeout-ms",
                 str(args.timeout_ms),
             ],
@@ -918,30 +926,6 @@ def main() -> int:
                 "model_smoke.reply", reply_message_id=report["model_smoke"].get("reply_message_id")
             )
 
-        fresh_pin = run_json(
-            [
-                str(finitechat_bin),
-                "hermes",
-                "--agent-home",
-                str(agent_home),
-                "pin",
-                "--invite-id",
-                str(invite["invite_id"]),
-            ],
-            env=env,
-            timeout=60,
-        )
-        report["invite"].update(
-            {
-                "url": fresh_pin.get("url") or invite.get("url"),
-                "pin": fresh_pin.get("pin"),
-                "pin_window_seconds": fresh_pin.get("pin_window_seconds"),
-                "seconds_remaining": fresh_pin.get("seconds_remaining"),
-                "pin_generated_at_unix": int(time.time()),
-            }
-        )
-        step("invite.fresh_pin")
-
         report["status"] = "passed"
         report["elapsed_ms"] = int((time.monotonic() - started) * 1000)
         report["logs"] = {
@@ -950,7 +934,8 @@ def main() -> int:
         }
         if args.keep_running:
             keep_children = True
-            write_stop_script(state_root, {"sidecar": sidecar, "gateway": gateway})
+            children = {"sidecar": sidecar, "gateway": gateway}
+            write_stop_script(state_root, children)
             report["agent"]["stop_script"] = str(state_root / "stop.sh")
             report["agent"]["sidecar_pid"] = sidecar.pid
             report["agent"]["gateway_pid"] = gateway.pid
@@ -968,8 +953,6 @@ def main() -> int:
                     "room_id": report["invite"].get("room_id"),
                     "invite_id": report["invite"].get("invite_id"),
                     "invite_url": report["invite"].get("url"),
-                    "pin": report["invite"].get("pin"),
-                    "seconds_remaining": report["invite"].get("seconds_remaining"),
                     "kept_running": bool(args.keep_running),
                 },
                 indent=2,

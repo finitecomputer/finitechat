@@ -2,7 +2,7 @@
 # Docker runtime smoke for the Finite Chat Hermes sidecar.
 #
 # Builds containers/agent/Dockerfile, starts the real Hermes gateway in Docker,
-# admits finitechat CLI users through invite/PIN before and after restore,
+# admits finitechat CLI users through invite URL before and after restore,
 # snapshots/restores agent state through restic, and writes a JSON report.
 set -euo pipefail
 

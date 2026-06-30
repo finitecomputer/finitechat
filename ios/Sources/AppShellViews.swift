@@ -687,10 +687,7 @@ struct AgentsView: View {
     @State private var searchText = ""
 
     private var agentRooms: [AppRoomSummary] {
-        model.rooms.filter { room in
-            let name = room.displayName.lowercased()
-            return name.contains("agent") || name.contains("hermes")
-        }
+        model.rooms.filter(\.isAgentChat)
     }
 
     private var filteredAgentRooms: [AppRoomSummary] {

@@ -44,6 +44,14 @@ def require(condition: bool, message: str, errors: list[str]) -> None:
         errors.append(message)
 
 
+def require_product_server_url(finite_server_url: str) -> None:
+    if finite_server_url.rstrip("/") != DEFAULT_FINITE_SERVER_URL:
+        raise ValueError(
+            "Tinfoil product canary artifacts must use "
+            f"{DEFAULT_FINITE_SERVER_URL}; got {finite_server_url!r}"
+        )
+
+
 def validate_handoff(handoff: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     image = object_dict(handoff.get("image"))
@@ -259,7 +267,7 @@ def runbook(
         "- Container reaches Running.",
         "- `curl http://127.0.0.1:3301/healthz` returns `ready: true` through",
         "  the attested local proxy.",
-        "- Finite Chat invite/PIN is captured from logs or the next runtime control",
+        "- Finite Chat invite URL is captured from logs or the next runtime control",
         "  surface.",
         "- User chats once from Finite Chat and the resulting event ID is recorded.",
         "- Container is stopped cleanly so the entrypoint writes a fresh backup.",
@@ -295,6 +303,11 @@ def main() -> int:
 
     handoff_path = Path(args.handoff_report)
     output_dir = Path(args.output_dir)
+    try:
+        require_product_server_url(args.finite_server_url)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     handoff = load_json(handoff_path)
     _, errors = validate_handoff(handoff)
     if errors:

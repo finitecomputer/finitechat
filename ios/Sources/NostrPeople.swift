@@ -27,6 +27,19 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
     let pictureURL: String?
     let relayHint: String?
     let inviteAvailability: InviteAvailability
+    let isAgent: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case pubkey
+        case npub
+        case name
+        case username
+        case about
+        case pictureURL
+        case relayHint
+        case inviteAvailability
+        case isAgent
+    }
 
     init(
         pubkey: String,
@@ -36,7 +49,8 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
         about: String?,
         pictureURL: String?,
         relayHint: String?,
-        inviteAvailability: InviteAvailability = .unknown
+        inviteAvailability: InviteAvailability = .unknown,
+        isAgent: Bool = false
     ) {
         self.pubkey = pubkey
         self.npub = npub
@@ -46,6 +60,33 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
         self.pictureURL = pictureURL
         self.relayHint = relayHint
         self.inviteAvailability = inviteAvailability
+        self.isAgent = isAgent
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pubkey = try container.decode(String.self, forKey: .pubkey)
+        npub = try container.decode(String.self, forKey: .npub)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        username = try container.decodeIfPresent(String.self, forKey: .username)
+        about = try container.decodeIfPresent(String.self, forKey: .about)
+        pictureURL = try container.decodeIfPresent(String.self, forKey: .pictureURL)
+        relayHint = try container.decodeIfPresent(String.self, forKey: .relayHint)
+        inviteAvailability = try container.decodeIfPresent(InviteAvailability.self, forKey: .inviteAvailability) ?? .unknown
+        isAgent = try container.decodeIfPresent(Bool.self, forKey: .isAgent) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(pubkey, forKey: .pubkey)
+        try container.encode(npub, forKey: .npub)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(username, forKey: .username)
+        try container.encodeIfPresent(about, forKey: .about)
+        try container.encodeIfPresent(pictureURL, forKey: .pictureURL)
+        try container.encodeIfPresent(relayHint, forKey: .relayHint)
+        try container.encode(inviteAvailability, forKey: .inviteAvailability)
+        try container.encode(isAgent, forKey: .isAgent)
     }
 
     var id: String { pubkey }
@@ -73,6 +114,9 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
     }
 
     var hasProfileMetadata: Bool {
+        if isAgent {
+            return true
+        }
         for candidate in [name, username, about, pictureURL] {
             if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
                !value.isEmpty
@@ -98,7 +142,8 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
             about: about.nostrPreferredValue(over: metadata.about),
             pictureURL: pictureURL.nostrPreferredValue(over: metadata.pictureURL),
             relayHint: relayHint,
-            inviteAvailability: inviteAvailability
+            inviteAvailability: inviteAvailability,
+            isAgent: isAgent || metadata.isAgent
         )
     }
 
@@ -111,7 +156,8 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
             about: about,
             pictureURL: pictureURL,
             relayHint: relayHint,
-            inviteAvailability: availability
+            inviteAvailability: availability,
+            isAgent: isAgent
         )
     }
 
@@ -122,7 +168,8 @@ struct NostrFollowProfile: Codable, Identifiable, Equatable, Sendable {
             displayName: displayName,
             about: about,
             picture: pictureURL,
-            stale: inviteAvailability == .unknown
+            stale: inviteAvailability == .unknown,
+            isAgent: isAgent
         )
     }
 }
@@ -285,6 +332,7 @@ actor NostrPeopleCache: Sendable {
                     username: profile.username.nostrPreferredValue(over: existing?.username),
                     about: profile.about.nostrPreferredValue(over: existing?.about),
                     pictureURL: profile.pictureURL.nostrPreferredValue(over: existing?.pictureURL),
+                    isAgent: profile.isAgent || (existing?.isAgent == true),
                     cachedAt: now
                 )
                 changed = true
@@ -295,6 +343,7 @@ actor NostrPeopleCache: Sendable {
                     username: nil,
                     about: nil,
                     pictureURL: nil,
+                    isAgent: false,
                     cachedAt: now
                 )
                 changed = true
@@ -361,7 +410,58 @@ struct NostrCachedProfileMetadata: Codable, Equatable, Sendable {
     let username: String?
     let about: String?
     let pictureURL: String?
+    let isAgent: Bool
     let cachedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case pubkey
+        case name
+        case username
+        case about
+        case pictureURL
+        case isAgent
+        case cachedAt
+    }
+
+    init(
+        pubkey: String,
+        name: String?,
+        username: String?,
+        about: String?,
+        pictureURL: String?,
+        isAgent: Bool = false,
+        cachedAt: Date
+    ) {
+        self.pubkey = pubkey
+        self.name = name
+        self.username = username
+        self.about = about
+        self.pictureURL = pictureURL
+        self.isAgent = isAgent
+        self.cachedAt = cachedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pubkey = try container.decode(String.self, forKey: .pubkey)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        username = try container.decodeIfPresent(String.self, forKey: .username)
+        about = try container.decodeIfPresent(String.self, forKey: .about)
+        pictureURL = try container.decodeIfPresent(String.self, forKey: .pictureURL)
+        isAgent = try container.decodeIfPresent(Bool.self, forKey: .isAgent) ?? false
+        cachedAt = try container.decode(Date.self, forKey: .cachedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(pubkey, forKey: .pubkey)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(username, forKey: .username)
+        try container.encodeIfPresent(about, forKey: .about)
+        try container.encodeIfPresent(pictureURL, forKey: .pictureURL)
+        try container.encode(isAgent, forKey: .isAgent)
+        try container.encode(cachedAt, forKey: .cachedAt)
+    }
 
     func withPubkey(_ pubkey: String) -> NostrCachedProfileMetadata {
         NostrCachedProfileMetadata(
@@ -370,6 +470,7 @@ struct NostrCachedProfileMetadata: Codable, Equatable, Sendable {
             username: username,
             about: about,
             pictureURL: pictureURL,
+            isAgent: isAgent,
             cachedAt: cachedAt
         )
     }
@@ -861,7 +962,8 @@ final class NostrRelayProfileService: Sendable {
                 username: profile?.name,
                 about: profile?.about,
                 pictureURL: profile?.pictureURL,
-                relayHint: contact.relayHint
+                relayHint: contact.relayHint,
+                isAgent: profile?.isAgent ?? false
             )
         }
         return sortedFollowProfiles(profiles)
@@ -881,7 +983,8 @@ final class NostrRelayProfileService: Sendable {
                 about: profile?.about ?? seed.about,
                 pictureURL: profile?.pictureURL ?? seed.pictureURL,
                 relayHint: seed.relayHint,
-                inviteAvailability: seed.inviteAvailability
+                inviteAvailability: seed.inviteAvailability,
+                isAgent: (profile?.isAgent ?? false) || seed.isAgent
             )
         }
         return sortedFollowProfiles(profiles)
@@ -1396,6 +1499,7 @@ private struct NostrProfileMetadata: Sendable {
     let displayName: String?
     let about: String?
     let pictureURL: String?
+    let isAgent: Bool
 
     init(event: NostrRelayEvent) {
         createdAt = event.createdAt
@@ -1404,6 +1508,27 @@ private struct NostrProfileMetadata: Sendable {
         displayName = (object?["display_name"] as? String) ?? (object?["displayName"] as? String)
         about = object?["about"] as? String
         pictureURL = (object?["picture"] as? String) ?? (object?["picture_url"] as? String)
+        let finiteRole = ((object?["finite_role"] as? String) ?? (object?["finiteRole"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        isAgent = Self.boolValue(object?["bot"]) == true || finiteRole == "agent"
+    }
+
+    private static func boolValue(_ value: Any?) -> Bool? {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let string = value as? String {
+            switch string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                return true
+            case "false", "0", "no":
+                return false
+            default:
+                return nil
+            }
+        }
+        return nil
     }
 }
 

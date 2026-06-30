@@ -41,8 +41,8 @@ use finitechat_proto::{
     FINITECHAT_ACTIVITY_KIND_TYPING, FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1,
     INVITE_URL_PREFIX, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
     MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1,
-    invite_current_pin, nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode,
-    validate_item_count, validate_string_bytes,
+    nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
+    validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -179,7 +179,6 @@ pub struct BootstrapRoomResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct InviteResult {
     pub invite_url: String,
-    pub pin: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -386,6 +385,7 @@ pub struct AppRoomSummary {
     pub last_message_preview: String,
     pub unread_count: u32,
     pub can_load_older: bool,
+    pub is_agent_chat: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -414,7 +414,6 @@ pub struct AppRoomMemberSummary {
 pub struct AppInviteState {
     pub room_id: String,
     pub invite_url: String,
-    pub pin: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -425,6 +424,7 @@ pub struct AppProfileSummary {
     pub about: Option<String>,
     pub picture: Option<String>,
     pub stale: bool,
+    pub is_agent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -461,7 +461,7 @@ pub struct AppFlowState {
     pub notice_text: Option<String>,
     pub notice_busy: bool,
     pub scan_in_flight: bool,
-    pub invite_pin_submission_room_id: Option<String>,
+    pub invite_join_submission_room_id: Option<String>,
     pub scan_result: AppScanTargetOutcome,
 }
 
@@ -551,9 +551,8 @@ pub enum AppAction {
     ScanTarget {
         value: String,
     },
-    SubmitInvitePin {
+    SubmitInviteJoin {
         pending_room_id: String,
-        pin: String,
     },
     SendMessage {
         room_id: String,
@@ -678,9 +677,8 @@ enum AppRuntimeCommand {
         ttl_ms: u64,
         response: mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>,
     },
-    SubmitInvitePinWithDisplayName {
+    SubmitInviteJoinWithDisplayName {
         pending_room_id: String,
-        pin: String,
         display_name: Option<String>,
         response: mpsc::SyncSender<Result<AppState, FiniteChatCoreError>>,
     },
@@ -1109,17 +1107,15 @@ impl FiniteChatRuntime {
             })?
     }
 
-    pub fn submit_invite_pin_with_display_name_and_wait(
+    pub fn submit_invite_join_with_display_name_and_wait(
         &self,
         pending_room_id: String,
-        pin: String,
         display_name: Option<String>,
     ) -> Result<AppState, FiniteChatCoreError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.command_tx
-            .send(AppRuntimeCommand::SubmitInvitePinWithDisplayName {
+            .send(AppRuntimeCommand::SubmitInviteJoinWithDisplayName {
                 pending_room_id,
-                pin,
                 display_name,
                 response: response_tx,
             })
@@ -1129,7 +1125,7 @@ impl FiniteChatRuntime {
         response_rx
             .recv()
             .map_err(|_| FiniteChatCoreError::Client {
-                reason: "runtime actor stopped before submitting invite PIN".to_owned(),
+                reason: "runtime actor stopped before submitting invite join".to_owned(),
             })?
     }
 
@@ -1390,21 +1386,18 @@ fn spawn_app_runtime_worker(
                     })();
                     let _ = response.send(result);
                 }
-                AppRuntimeCommand::SubmitInvitePinWithDisplayName {
+                AppRuntimeCommand::SubmitInviteJoinWithDisplayName {
                     pending_room_id,
-                    pin,
                     display_name,
                     response,
                 } => {
-                    state.app.flow.invite_pin_submission_room_id = Some(pending_room_id.clone());
-                    state.app.flow.notice_text = Some("Submitting PIN...".to_owned());
+                    state.app.flow.invite_join_submission_room_id = Some(pending_room_id.clone());
+                    state.app.flow.notice_text = Some("Requesting room admission...".to_owned());
                     state.app.flow.notice_busy = true;
                     publish_app_update(&state.app.clone(), &shared_state, &reconciler);
-                    let result = match state.submit_invite_pin_with_display_name(
-                        pending_room_id.clone(),
-                        pin,
-                        display_name,
-                    ) {
+                    let result = match state
+                        .submit_invite_join_with_display_name(pending_room_id.clone(), display_name)
+                    {
                         Ok(()) => {
                             state.bump_rev();
                             let snapshot = state.app.clone();
@@ -1413,10 +1406,7 @@ fn spawn_app_runtime_worker(
                         }
                         Err(error) => {
                             if state.finish_failed_dispatch(
-                                &AppAction::SubmitInvitePin {
-                                    pending_room_id,
-                                    pin: String::new(),
-                                },
+                                &AppAction::SubmitInviteJoin { pending_room_id },
                                 &error,
                             ) {
                                 state.bump_rev();
@@ -1666,11 +1656,9 @@ impl AppRuntimeState {
                 self.app.flow.scan_result = AppScanTargetOutcome::None;
                 true
             }
-            AppAction::SubmitInvitePin {
-                pending_room_id, ..
-            } => {
-                self.app.flow.invite_pin_submission_room_id = Some(pending_room_id.clone());
-                self.app.flow.notice_text = Some("Submitting PIN...".to_owned());
+            AppAction::SubmitInviteJoin { pending_room_id } => {
+                self.app.flow.invite_join_submission_room_id = Some(pending_room_id.clone());
+                self.app.flow.notice_text = Some("Requesting room admission...".to_owned());
                 self.app.flow.notice_busy = true;
                 self.app.flow.scan_in_flight = false;
                 true
@@ -1689,16 +1677,14 @@ impl AppRuntimeState {
                 self.app.status = "scan unavailable".to_owned();
                 true
             }
-            AppAction::SubmitInvitePin {
-                pending_room_id, ..
-            } => {
-                if self.app.flow.invite_pin_submission_room_id.as_deref()
+            AppAction::SubmitInviteJoin { pending_room_id } => {
+                if self.app.flow.invite_join_submission_room_id.as_deref()
                     == Some(pending_room_id.as_str())
                 {
-                    self.app.flow.invite_pin_submission_room_id = None;
+                    self.app.flow.invite_join_submission_room_id = None;
                 }
                 self.app.flow.notice_busy = false;
-                self.app.flow.notice_text = Some(invite_pin_failure_message(error));
+                self.app.flow.notice_text = Some(invite_join_failure_message(error));
                 self.app.status = "join request failed".to_owned();
                 true
             }
@@ -1709,14 +1695,14 @@ impl AppRuntimeState {
     fn finish_scan_target(&mut self, outcome: AppScanTargetOutcome, notice_text: Option<String>) {
         self.app.flow.scan_in_flight = false;
         self.app.flow.notice_busy = false;
-        self.app.flow.invite_pin_submission_room_id = None;
+        self.app.flow.invite_join_submission_room_id = None;
         self.app.flow.scan_result = outcome;
         self.app.flow.notice_text = notice_text;
     }
 
-    fn finish_invite_pin(&mut self, room_id: &str, notice_text: Option<String>) {
-        if self.app.flow.invite_pin_submission_room_id.as_deref() == Some(room_id) {
-            self.app.flow.invite_pin_submission_room_id = None;
+    fn finish_invite_join(&mut self, room_id: &str, notice_text: Option<String>) {
+        if self.app.flow.invite_join_submission_room_id.as_deref() == Some(room_id) {
+            self.app.flow.invite_join_submission_room_id = None;
         }
         self.app.flow.notice_busy = false;
         self.app.flow.notice_text = notice_text;
@@ -1749,10 +1735,9 @@ impl AppRuntimeState {
                 DEFAULT_INVITE_TTL_MS,
             )?,
             AppAction::ScanTarget { value } => self.scan_target(value)?,
-            AppAction::SubmitInvitePin {
-                pending_room_id,
-                pin,
-            } => self.submit_invite_pin(pending_room_id, pin)?,
+            AppAction::SubmitInviteJoin { pending_room_id } => {
+                self.submit_invite_join(pending_room_id)?
+            }
             AppAction::SendMessage { room_id, text } => self.send_message(room_id, text)?,
             AppAction::SendReply {
                 room_id,
@@ -2559,7 +2544,6 @@ impl AppRuntimeState {
         self.app.active_invite = Some(AppInviteState {
             room_id: room_id.clone(),
             invite_url: invite.invite_url,
-            pin: invite.pin,
         });
         self.persist_room_projection(&room_id)?;
         self.app.status = "invite ready".to_owned();
@@ -2600,6 +2584,13 @@ impl AppRuntimeState {
             .clone()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| room_id.clone());
+        match self.fetch_profiles(vec![code.inviter_account_id.clone()]) {
+            Ok(_) => {}
+            Err(error) if online_action_failure(&error) => {
+                self.remember_profile_hint(&code.inviter_account_id, code.display_name.as_deref())?;
+            }
+            Err(error) => return Err(error),
+        }
         self.app.active_profile_id = None;
         if let Some(existing) = self.room(&room_id).cloned() {
             match existing.state {
@@ -2607,20 +2598,16 @@ impl AppRuntimeState {
                     self.app.selected_room_id = Some(room_id);
                     self.persist_app_state()?;
                     self.app.status = "invite scanned".to_owned();
-                    self.finish_scan_target(
-                        AppScanTargetOutcome::Room,
-                        Some(invite_scan_notice_for_room(&existing)),
-                    );
+                    let notice = invite_scan_notice_for_room(&existing);
+                    self.finish_scan_target(AppScanTargetOutcome::Room, Some(notice));
                     return Ok(());
                 }
                 AppRoomState::UnavailableOnDevice => {
                     self.app.selected_room_id = Some(room_id);
                     self.persist_app_state()?;
                     self.app.status = "invite unavailable".to_owned();
-                    self.finish_scan_target(
-                        AppScanTargetOutcome::Room,
-                        Some(invite_scan_notice_for_room(&existing)),
-                    );
+                    let notice = invite_scan_notice_for_room(&existing);
+                    self.finish_scan_target(AppScanTargetOutcome::Room, Some(notice));
                     return Ok(());
                 }
                 AppRoomState::WaitingForApproval | AppRoomState::Joining => {
@@ -2634,10 +2621,14 @@ impl AppRuntimeState {
                     self.persist_room_projection(&room_id)?;
                     self.persist_app_state()?;
                     self.app.status = "invite scanned".to_owned();
-                    self.finish_scan_target(
-                        AppScanTargetOutcome::Room,
-                        Some(invite_scan_notice_for_room(&existing)),
-                    );
+                    let notice = invite_scan_notice_for_room(&existing);
+                    self.finish_scan_target(AppScanTargetOutcome::Room, Some(notice));
+                    if existing.status != "waiting for room admission" {
+                        self.submit_invite_join_with_display_name(
+                            room_id,
+                            Some(self.app.identity.device_id.clone()),
+                        )?;
+                    }
                     return Ok(());
                 }
                 AppRoomState::Connected => {}
@@ -2653,19 +2644,20 @@ impl AppRuntimeState {
             &room_id,
             &display_name,
             AppRoomState::WaitingForApproval,
-            "enter PIN to request admission",
+            "requesting room admission",
         );
         self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id.clone());
         self.persist_app_state()?;
         self.app.status = "invite scanned".to_owned();
-        if let Some(room) = self.room(&room_id).cloned() {
-            self.finish_scan_target(
-                AppScanTargetOutcome::Room,
-                Some(invite_scan_notice_for_room(&room)),
-            );
-        }
-        Ok(())
+        self.finish_scan_target(
+            AppScanTargetOutcome::Room,
+            Some(format!("Opening {display_name}. Requesting access.")),
+        );
+        self.submit_invite_join_with_display_name(
+            room_id,
+            Some(self.app.identity.device_id.clone()),
+        )
     }
 
     fn scan_profile_account_id(&mut self, account_id: String) -> Result<(), FiniteChatCoreError> {
@@ -2704,24 +2696,27 @@ impl AppRuntimeState {
         Ok(())
     }
 
-    fn submit_invite_pin(
-        &mut self,
-        pending_room_id: String,
-        pin: String,
-    ) -> Result<(), FiniteChatCoreError> {
-        self.submit_invite_pin_with_display_name(
+    fn submit_invite_join(&mut self, pending_room_id: String) -> Result<(), FiniteChatCoreError> {
+        self.submit_invite_join_with_display_name(
             pending_room_id,
-            pin,
             Some(self.app.identity.device_id.clone()),
         )
     }
 
-    fn submit_invite_pin_with_display_name(
+    fn submit_invite_join_with_display_name(
         &mut self,
         pending_room_id: String,
-        pin: String,
         display_name: Option<String>,
     ) -> Result<(), FiniteChatCoreError> {
+        if self.room(&pending_room_id).is_some_and(|room| {
+            room.state == AppRoomState::WaitingForApproval
+                && room.status == "waiting for room admission"
+        }) {
+            if let Some(room) = self.room(&pending_room_id).cloned() {
+                self.finish_invite_join(&pending_room_id, Some(invite_join_notice_for_room(&room)));
+            }
+            return Ok(());
+        }
         if self
             .room(&pending_room_id)
             .is_some_and(|room| room.state == AppRoomState::UnavailableOnDevice)
@@ -2730,7 +2725,7 @@ impl AppRuntimeState {
                 "invite unavailable",
                 "Join request could not be sent",
             );
-            self.finish_invite_pin(
+            self.finish_invite_join(
                 &pending_room_id,
                 Some(invite_unavailable_notice_for_room(
                     self.room(&pending_room_id),
@@ -2746,20 +2741,20 @@ impl AppRuntimeState {
                 reason: format!("no pending invite for room '{pending_room_id}'"),
             })?
             .clone();
-        match self
-            .core
-            .join_invite(&pending.invite_url, pin.trim(), display_name)
-        {
+        match self.core.join_invite(&pending.invite_url, display_name) {
             Ok(_) => {}
             Err(error) => {
-                if !online_action_failure(&error) {
+                if !transient_join_request_failure(&error) {
                     return Err(error);
                 }
                 self.set_online_action_unavailable(
                     "invite unavailable",
                     "Join request could not be sent",
                 );
-                self.finish_invite_pin(&pending_room_id, Some(invite_pin_failure_message(&error)));
+                self.finish_invite_join(
+                    &pending_room_id,
+                    Some(invite_join_failure_message(&error)),
+                );
                 return Ok(());
             }
         }
@@ -2778,7 +2773,7 @@ impl AppRuntimeState {
         self.persist_app_state()?;
         self.app.status = "join requested".to_owned();
         if let Some(room) = self.room(&pending_room_id).cloned() {
-            self.finish_invite_pin(&pending_room_id, Some(invite_pin_notice_for_room(&room)));
+            self.finish_invite_join(&pending_room_id, Some(invite_join_notice_for_room(&room)));
         }
         Ok(())
     }
@@ -3448,7 +3443,7 @@ impl AppRuntimeState {
         self.persist_room_projection(room_id)?;
         self.app.status = "joined".to_owned();
         if let Some(room) = self.room(room_id).cloned() {
-            self.finish_invite_pin(room_id, Some(invite_pin_notice_for_room(&room)));
+            self.finish_invite_join(room_id, Some(invite_join_notice_for_room(&room)));
         }
         Ok(())
     }
@@ -3561,6 +3556,40 @@ impl AppRuntimeState {
 
     fn sync_profile_state(&mut self) {
         self.app.profiles = self.profile_cache.values().cloned().collect();
+        self.sync_agent_room_flags();
+    }
+
+    fn sync_agent_room_flags(&mut self) {
+        let own_account_id = self.core.device.device_ref().account_id.clone();
+        let mut flags = BTreeMap::new();
+        for room in &self.app.rooms {
+            let pending_inviter_is_agent = self
+                .pending_invites
+                .get(&room.room_id)
+                .and_then(|pending| parse_invite(&pending.invite_url).ok())
+                .and_then(|code| self.profile_cache.get(&code.inviter_account_id))
+                .is_some_and(|profile| profile.is_agent);
+            let connected_agent_member = self
+                .core
+                .device
+                .room_members(&room.room_id)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter(|member| member.account_id != own_account_id)
+                .any(|member| {
+                    self.profile_cache
+                        .get(&member.account_id)
+                        .is_some_and(|profile| profile.is_agent)
+                });
+            flags.insert(
+                room.room_id.clone(),
+                pending_inviter_is_agent || connected_agent_member,
+            );
+        }
+        for room in &mut self.app.rooms {
+            room.is_agent_chat = flags.get(&room.room_id).copied().unwrap_or(false);
+        }
     }
 
     fn refresh_devices(&mut self) -> Result<(), FiniteChatCoreError> {
@@ -4195,6 +4224,7 @@ impl AppRuntimeState {
             self.app.rooms[index].status = status.to_owned();
             self.app.rooms[index].user_status_text =
                 app_room_user_status_text(&self.app.rooms[index]);
+            self.sync_agent_room_flags();
             sort_app_rooms(&mut self.app.rooms);
             return;
         }
@@ -4208,7 +4238,9 @@ impl AppRuntimeState {
             last_message_preview: String::new(),
             unread_count: 0,
             can_load_older: false,
+            is_agent_chat: false,
         });
+        self.sync_agent_room_flags();
         sort_app_rooms(&mut self.app.rooms);
     }
 
@@ -4300,6 +4332,7 @@ fn profile_from_record(
         .unwrap_or_else(|| short_account_label(&record.account_id));
     AppProfileSummary {
         npub: npub_encode(&record.account_id).unwrap_or_else(|_| record.account_id.clone()),
+        is_agent: profile_record_is_agent(&record),
         account_id: record.account_id,
         display_name,
         about: record.about,
@@ -4316,7 +4349,16 @@ fn placeholder_profile(account_id: &str) -> AppProfileSummary {
         about: None,
         picture: None,
         stale: true,
+        is_agent: false,
     }
+}
+
+fn profile_record_is_agent(record: &finitechat_http::NostrProfileRecord) -> bool {
+    record.bot.unwrap_or(false)
+        || record
+            .finite_role
+            .as_deref()
+            .is_some_and(|role| role.eq_ignore_ascii_case("agent"))
 }
 
 fn profile_name_hint_from_chat_label(label: &str, account_id: &str) -> Option<String> {
@@ -4395,6 +4437,8 @@ fn stored_profile_from_app(profile: &AppProfileSummary) -> StoredAppProfile {
             display_name: Some(profile.display_name.clone()),
             about: profile.about.clone(),
             picture: profile.picture.clone(),
+            bot: profile.is_agent.then_some(true),
+            finite_role: profile.is_agent.then(|| "agent".to_owned()),
             fetched_at_ms: 0,
             expires_at_ms: 1,
         },
@@ -4639,17 +4683,14 @@ impl CoreState {
             },
         )
         .map_err(runtime_error)?;
-        let pin = invite_current_pin(&code.invite_token, self.now_unix_seconds()?);
         Ok(InviteResult {
             invite_url: code.encode().map_err(invite_error)?,
-            pin,
         })
     }
 
     fn join_invite(
         &mut self,
         invite_url: &str,
-        pin: &str,
         display_name: Option<String>,
     ) -> Result<JoinRequestResult, FiniteChatCoreError> {
         let code = parse_invite(invite_url)?;
@@ -4660,7 +4701,6 @@ impl CoreState {
             &mut self.device,
             &mut delivery,
             &code,
-            pin,
             display_name,
             now_ms,
         )
@@ -4695,7 +4735,7 @@ impl CoreState {
             .filter(|device| !accepted_set.contains(device))
             .collect::<Vec<_>>();
         let rejected_reason = (!rejected.is_empty()).then(|| {
-            "join proof did not verify; the PIN was probably expired/incorrect, or the join request carried malformed key material".to_owned()
+            "join proof did not verify; the join proof was invalid, or the join request carried malformed key material".to_owned()
         });
         if !report.deferred_pending_commit && !report.accepted.is_empty() {
             self.sync()?;
@@ -6789,6 +6829,7 @@ fn app_room_from_stored(room: StoredAppRoom, has_mls_room: bool) -> AppRoomSumma
         last_message_preview: String::new(),
         unread_count: 0,
         can_load_older: false,
+        is_agent_chat: false,
     }
 }
 
@@ -6802,6 +6843,7 @@ fn connected_app_room(room_id: &str, display_name: &str) -> AppRoomSummary {
         last_message_preview: String::new(),
         unread_count: 0,
         can_load_older: false,
+        is_agent_chat: false,
     }
 }
 
@@ -6809,16 +6851,10 @@ fn app_room_user_status_text(room: &AppRoomSummary) -> String {
     app_room_user_status_text_from_parts(&room.state, &room.status)
 }
 
-fn app_room_user_status_text_from_parts(state: &AppRoomState, status: &str) -> String {
+fn app_room_user_status_text_from_parts(state: &AppRoomState, _status: &str) -> String {
     match state {
         AppRoomState::Connected => LOCAL_ROOM_CONNECTED_TEXT.to_owned(),
-        AppRoomState::WaitingForApproval => {
-            if status.to_ascii_lowercase().contains("pin") {
-                "Enter the invite PIN".to_owned()
-            } else {
-                "Waiting for approval".to_owned()
-            }
-        }
+        AppRoomState::WaitingForApproval => "Waiting for approval".to_owned(),
         AppRoomState::Joining => "Joining".to_owned(),
         AppRoomState::UnavailableOnDevice => LOCAL_ROOM_UNAVAILABLE_TEXT.to_owned(),
     }
@@ -6840,14 +6876,10 @@ fn invite_scan_notice_for_room(room: &AppRoomSummary) -> String {
             format!("Opened {name}. This invite points to a room already on this device.")
         }
         AppRoomState::WaitingForApproval => {
-            if room
-                .status
-                .to_ascii_lowercase()
-                .contains("waiting for room admission")
-            {
+            if room.status.to_ascii_lowercase().contains("waiting") {
                 format!("Opened {name}. Your join request is waiting for agent approval.")
             } else {
-                format!("Opened {name}. Enter the current PIN to request access.")
+                format!("Opened {name}. Requesting access.")
             }
         }
         AppRoomState::Joining => format!("Opened {name}. Finishing room setup."),
@@ -6857,7 +6889,7 @@ fn invite_scan_notice_for_room(room: &AppRoomSummary) -> String {
     }
 }
 
-fn invite_pin_notice_for_room(room: &AppRoomSummary) -> String {
+fn invite_join_notice_for_room(room: &AppRoomSummary) -> String {
     let name = invite_room_display_name(room);
     match room.state {
         AppRoomState::Connected => format!("Joined {name}."),
@@ -6865,9 +6897,9 @@ fn invite_pin_notice_for_room(room: &AppRoomSummary) -> String {
         AppRoomState::WaitingForApproval => {
             let status = room.status.to_ascii_lowercase();
             if status.contains("waiting for room admission") {
-                format!("PIN submitted for {name}. Waiting for the agent to approve this device.")
-            } else if status.contains("pin") {
-                format!("Enter the current PIN for {name}.")
+                format!(
+                    "Access requested for {name}. Waiting for the agent to approve this device."
+                )
             } else if room.status.trim().is_empty() {
                 room.user_status_text.clone()
             } else {
@@ -6881,7 +6913,7 @@ fn invite_pin_notice_for_room(room: &AppRoomSummary) -> String {
 }
 
 fn invite_unavailable_notice_for_room(room: Option<&AppRoomSummary>, room_id: &str) -> String {
-    room.map(invite_pin_notice_for_room)
+    room.map(invite_join_notice_for_room)
         .unwrap_or_else(|| format!("{room_id} is unavailable on this device."))
 }
 
@@ -6894,15 +6926,13 @@ fn scan_target_failure_message(error: &FiniteChatCoreError) -> String {
     }
 }
 
-fn invite_pin_failure_message(error: &FiniteChatCoreError) -> String {
+fn invite_join_failure_message(error: &FiniteChatCoreError) -> String {
     let raw = error.to_string();
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("pin") {
-        "That PIN did not complete the join. Check the current PIN and try again.".to_owned()
-    } else if lower.contains("invite") {
+    if lower.contains("invite") {
         "The invite could not be joined. Check that the invite is still valid.".to_owned()
     } else {
-        "The join request failed. Check the current PIN and try again.".to_owned()
+        "The join request failed. Check your connection and try again.".to_owned()
     }
 }
 
@@ -7277,6 +7307,13 @@ fn online_action_failure(error: &FiniteChatCoreError) -> bool {
     )
 }
 
+fn transient_join_request_failure(error: &FiniteChatCoreError) -> bool {
+    let FiniteChatCoreError::Delivery { reason } = error else {
+        return false;
+    };
+    !reason.to_ascii_lowercase().contains("server returned")
+}
+
 fn device_label(device: &DeviceRef) -> String {
     format!("{}/{}", device.account_id, device.device_id)
 }
@@ -7550,9 +7587,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
 
@@ -7592,7 +7628,7 @@ mod tests {
     }
 
     #[test]
-    fn app_runtime_invite_uses_pin_bound_key_package_when_stale_inventory_exists() {
+    fn app_runtime_invite_uses_join_request_key_package_when_stale_inventory_exists() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_secret_hex = hex::encode([1_u8; 32]);
@@ -7651,9 +7687,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
 
@@ -7662,7 +7697,7 @@ mod tests {
         assert_eq!(
             app_room(&bob_joined, &room_id).state,
             AppRoomState::Connected,
-            "invite admission must ignore stale server inventory and use the PIN-bound KeyPackage"
+            "invite admission must ignore stale server inventory and use the token-bound KeyPackage"
         );
     }
 
@@ -8397,6 +8432,8 @@ mod tests {
                 display_name: Some("Alice Finite".to_owned()),
                 about: Some("profile cache test".to_owned()),
                 picture: Some("https://example.invalid/alice.png".to_owned()),
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8474,6 +8511,8 @@ mod tests {
                 display_name: Some("Alice Nprofile".to_owned()),
                 about: Some("nprofile cache test".to_owned()),
                 picture: None,
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8571,6 +8610,8 @@ mod tests {
                 display_name: Some("Alice URL".to_owned()),
                 about: None,
                 picture: None,
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8616,6 +8657,8 @@ mod tests {
                 display_name: Some("Alice URL Nprofile".to_owned()),
                 about: None,
                 picture: None,
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: NOW.saturating_mul(1000).saturating_sub(1_000),
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
@@ -8709,7 +8752,7 @@ mod tests {
 
         let pending = app_room(&scanned, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
-        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(pending.status, "requesting room admission");
         assert_eq!(scanned.active_profile_id, None);
     }
 
@@ -8798,20 +8841,19 @@ mod tests {
     }
 
     #[test]
-    fn app_invite_pin_offline_is_transient_and_keeps_scanned_invite() {
+    fn app_invite_join_offline_is_transient_and_keeps_scanned_invite() {
         let dir = tempfile::tempdir().unwrap();
-        let room_id = "room-offline-pin".to_owned();
+        let room_id = "room-offline-join".to_owned();
         let invite_code = InviteCodeV1 {
             server_url: unavailable_http_server_url(),
             room_id: room_id.clone(),
-            invite_id: "invite-offline-pin".to_owned(),
+            invite_id: "invite-offline-join".to_owned(),
             invite_token: vec![9; 16],
             inviter_account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
-            display_name: Some("Offline PIN".to_owned()),
+            display_name: Some("Offline Join".to_owned()),
         };
         let invite_url = invite_code.encode().unwrap();
-        let pin = invite_current_pin(&invite_code.invite_token, NOW);
         let data_dir = dir.path().join("bob");
         let app = FiniteChatRuntime::open(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
@@ -8827,12 +8869,11 @@ mod tests {
             .unwrap();
         let pending = app_room(&scanned, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
-        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(pending.status, "requesting room admission");
 
         let submitted = app
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin,
             })
             .unwrap();
         assert_eq!(submitted.status, "invite unavailable");
@@ -8842,7 +8883,7 @@ mod tests {
         );
         let pending = app_room(&submitted, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
-        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(pending.status, "requesting room admission");
         assert!(submitted.messages.is_empty());
         assert!(runtime_outbox(&app).is_empty());
         drop(app);
@@ -8858,13 +8899,13 @@ mod tests {
         let reopened_state = reopened.state().unwrap();
         let pending = app_room(&reopened_state, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
-        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(pending.status, "requesting room admission");
         assert!(reopened_state.messages.is_empty());
         assert!(runtime_outbox(&reopened).is_empty());
     }
 
     #[test]
-    fn app_invite_pin_flow_publishes_busy_and_final_state() {
+    fn app_invite_join_flow_publishes_busy_and_final_state() {
         struct TestReconciler {
             tx: Mutex<std::sync::mpsc::Sender<AppUpdate>>,
         }
@@ -8876,18 +8917,17 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let room_id = "room-flow-pin".to_owned();
+        let room_id = "room-flow-join".to_owned();
         let invite_code = InviteCodeV1 {
             server_url: unavailable_http_server_url(),
             room_id: room_id.clone(),
-            invite_id: "invite-flow-pin".to_owned(),
+            invite_id: "invite-flow-join".to_owned(),
             invite_token: vec![4; 16],
             inviter_account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
-            display_name: Some("Flow PIN".to_owned()),
+            display_name: Some("Flow Join".to_owned()),
         };
         let invite_url = invite_code.encode().unwrap();
-        let pin = invite_current_pin(&invite_code.invite_token, NOW);
         let app = FiniteChatRuntime::open(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
@@ -8897,43 +8937,32 @@ mod tests {
         })
         .unwrap();
 
-        let scanned = app
-            .dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
-            .unwrap();
-        assert_eq!(scanned.flow.scan_result, AppScanTargetOutcome::Room);
-        assert_eq!(
-            scanned.flow.notice_text.as_deref(),
-            Some("Opened Flow PIN. Enter the current PIN to request access.")
-        );
-
         let (tx, rx) = std::sync::mpsc::channel();
         app.listen_for_updates(Box::new(TestReconciler { tx: Mutex::new(tx) }));
         let AppUpdate::FullState(initial) =
             rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
 
-        let submitted = app
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
-                pending_room_id: room_id.clone(),
-                pin,
-            })
+        let scanned = app
+            .dispatch_and_wait(AppAction::ScanTarget { value: invite_url })
             .unwrap();
-        assert_eq!(submitted.status, "invite unavailable");
-        assert_eq!(submitted.flow.invite_pin_submission_room_id, None);
-        assert!(!submitted.flow.notice_busy);
+        assert_eq!(scanned.status, "invite unavailable");
+        assert_eq!(scanned.flow.scan_result, AppScanTargetOutcome::Room);
+        assert_eq!(scanned.flow.invite_join_submission_room_id, None);
+        assert!(!scanned.flow.notice_busy);
 
         let mut saw_busy = false;
         let mut saw_final = false;
         for _ in 0..4 {
             let AppUpdate::FullState(state) =
                 rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-            if state.flow.invite_pin_submission_room_id.as_deref() == Some(room_id.as_str()) {
+            if state.flow.scan_in_flight {
                 assert_eq!(state.rev, initial.rev);
                 assert!(state.flow.notice_busy);
-                assert_eq!(state.flow.notice_text.as_deref(), Some("Submitting PIN..."));
+                assert_eq!(state.flow.notice_text, None);
                 saw_busy = true;
             }
             if state.rev > initial.rev && state.status == "invite unavailable" {
-                assert_eq!(state.flow.invite_pin_submission_room_id, None);
+                assert_eq!(state.flow.invite_join_submission_room_id, None);
                 assert!(!state.flow.notice_busy);
                 assert_eq!(
                     state.flow.notice_text.as_deref(),
@@ -8943,8 +8972,8 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_busy, "missing Rust-owned PIN busy update");
-        assert!(saw_final, "missing final PIN state update");
+        assert!(saw_busy, "missing Rust-owned scan busy update");
+        assert!(saw_final, "missing final join state update");
     }
 
     #[test]
@@ -8993,12 +9022,11 @@ mod tests {
             .unwrap();
         let pending = app_room(&bob_state, &room_id);
         assert_eq!(pending.state, AppRoomState::WaitingForApproval);
-        assert_eq!(pending.status, "enter PIN to request admission");
+        assert_eq!(pending.status, "waiting for room admission");
 
         let bob_state = bob
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin: invite.pin,
             })
             .unwrap();
         let pending = app_room(&bob_state, &room_id);
@@ -9552,9 +9580,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -9657,9 +9684,8 @@ mod tests {
             })
             .unwrap();
         hermes
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin: invite.pin,
             })
             .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -10344,9 +10370,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -10855,9 +10880,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11012,9 +11036,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11194,7 +11217,7 @@ mod tests {
         );
         assert_eq!(
             app_room(&scanned, &room_id).status,
-            "enter PIN to request admission"
+            "waiting for room admission"
         );
         drop(bob);
 
@@ -11213,12 +11236,11 @@ mod tests {
         );
         assert_eq!(
             app_room(&recovered, &room_id).status,
-            "enter PIN to request admission"
+            "waiting for room admission"
         );
         let requested = bob
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin: invite.pin,
             })
             .unwrap();
         assert_eq!(
@@ -11302,9 +11324,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
 
@@ -11377,9 +11398,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11478,9 +11498,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11607,9 +11626,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11708,9 +11726,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -11801,9 +11818,8 @@ mod tests {
             value: invite.invite_url.clone(),
         })
         .unwrap();
-        app.dispatch_and_wait(AppAction::SubmitInvitePin {
+        app.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         agent.accept_invite_joins(&invite.invite_url).unwrap();
@@ -11895,9 +11911,8 @@ mod tests {
             value: invite.invite_url,
         })
         .unwrap();
-        bob.dispatch_and_wait(AppAction::SubmitInvitePin {
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
             pending_room_id: room_id.clone(),
-            pin: invite.pin,
         })
         .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -12010,9 +12025,8 @@ mod tests {
             })
             .unwrap();
         tablet
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin: invite.pin,
             })
             .unwrap();
         alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
@@ -12230,19 +12244,18 @@ mod tests {
         assert_eq!(after.toast.as_deref(), Some("Invite could not be created"));
         assert!(runtime_outbox(&app).is_empty());
 
-        let after_pin = app
-            .dispatch_and_wait(AppAction::SubmitInvitePin {
+        let after_join = app
+            .dispatch_and_wait(AppAction::SubmitInviteJoin {
                 pending_room_id: room_id.clone(),
-                pin: "123456".to_owned(),
             })
             .unwrap();
-        let room = app_room(&after_pin, &room_id);
+        let room = app_room(&after_join, &room_id);
         assert_eq!(room.state, AppRoomState::UnavailableOnDevice);
         assert_eq!(room.status, LOCAL_ROOM_UNAVAILABLE_STATUS);
-        assert_eq!(after_pin.active_invite, None);
-        assert_eq!(after_pin.status, "invite unavailable");
+        assert_eq!(after_join.active_invite, None);
+        assert_eq!(after_join.status, "invite unavailable");
         assert_eq!(
-            after_pin.toast.as_deref(),
+            after_join.toast.as_deref(),
             Some("Join request could not be sent")
         );
         assert!(runtime_outbox(&app).is_empty());

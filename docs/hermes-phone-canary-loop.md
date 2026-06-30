@@ -8,8 +8,8 @@ Hermes tests.
 The core quality loop is:
 
 > Paul asks for a fresh Hermes-backed Finite Chat agent, receives an invite URL
-> and current PIN, opens the production iOS app on his physical phone, joins the
-> room, and has a real multi-turn conversation with Hermes.
+> opens the production iOS app on his physical phone, joins the room, and has a
+> real multi-turn conversation with Hermes.
 
 This must be a named product gate, not an improvised operator sequence. Local,
 remote Docker, and Tinfoil should use the same promotion rule: do not hand a
@@ -24,10 +24,14 @@ admission and runtime readiness with machine-readable evidence.
 - `scripts/hermes-real-gateway-demo.sh` is a low-level manual runner, not a
   product canary. It can expose an invite before the sidecar and Hermes gateway
   have proven that they can admit a join.
+- We let a server compatibility failure turn into a new test shape. The product
+  canary server is `https://chat.finite.computer` for local phone, remote
+  Docker, and Tinfoil. If production is behind the app/server contract, deploy
+  the server; do not replace the release gate with a Mac LAN server.
 - Physical-phone reachability was not modeled as a first-class constraint.
   `127.0.0.1` is useful for a simulator and impossible for the phone because
-  it points at the phone itself. A phone canary must use the hosted server, a
-  Mac LAN URL, or an explicit tunnel URL.
+  it points at the phone itself. A phone product canary must use the hosted
+  server. Mac LAN URLs, loopback, and tunnels are lower-level diagnostics only.
 - Script discovery depended on relative worktree layout and whichever Hermes
   checkout/profile happened to be found. A canary must record the Hermes
   package/version, plugin path, plugin hash, finitechat commit, and dirty flag.
@@ -35,13 +39,12 @@ admission and runtime readiness with machine-readable evidence.
   sidecar contract is `/healthz`, `/readyz`, `/v1/hermes/inbound`, and
   `/v1/hermes/{action}`. A run that talks to any other bridge route is a
   provenance/version failure, not a flaky chat failure.
-- Invite/PIN delivery was optimized for the first terminal start. That is the
-  wrong UX. The running agent should expose the stable invite and current
-  rotating PIN after launch, so the dashboard or operator can fetch it whenever
-  the human is ready.
+- Invite delivery was optimized for the first terminal start. That is the wrong
+  UX. The running agent should expose the stable invite after launch, so the
+  dashboard or operator can fetch it whenever the human is ready.
 - We used logs and screenshots as the main oracle. They are useful for
   debugging, but every gate should write JSON with the inputs, versions,
-  process ids, URLs, room id, invite id, current PIN, and pass/fail reason.
+  process ids, URLs, room id, invite id, and pass/fail reason.
 - We let active product state and fresh canary state blur together. A fresh
   canary must use a new agent state root or a deliberate restored state root,
   and must say which one happened.
@@ -54,7 +57,9 @@ admission and runtime readiness with machine-readable evidence.
 - No echo handler counts as real Hermes.
 - No CLI join counts as the physical-phone product proof. CLI join is only an
   owner-side admission preflight.
-- No phone canary may use a loopback configured server URL.
+- No phone, remote Docker, or Tinfoil product canary may replace
+  `https://chat.finite.computer` with a local, LAN, loopback, or tunnel server.
+  Local servers are lower-level diagnostics, not product acceptance.
 - No human invite is handed out before the sidecar is ready, the gateway is
   alive, the current plugin provenance is recorded, and a throwaway admission
   probe has passed.
@@ -104,9 +109,7 @@ are null for that layer:
   "invite": {
     "room_id": "room-...",
     "invite_id": "invite-...",
-    "url": "finite://join?...",
-    "pin": "123456",
-    "pin_generated_at_unix": 0
+    "url": "finite://join?..."
   },
   "admission_probe": {
     "state": "joined",
@@ -144,21 +147,20 @@ Recommended defaults:
 Required preflight:
 
 1. `git status --short --branch` is recorded in the report.
-2. `cargo build -p finitechat-cli -p finitechat-server -p finitechat-rmp`
+2. `cargo build -p finitechat-cli -p finitechat-rmp`
    succeeds, or the report records `--skip-build` with binary provenance.
-3. The phone server URL is not loopback.
+3. The phone server URL is `https://chat.finite.computer`.
 4. The app installs on the target phone.
 5. The sidecar answers `/healthz` and `/readyz`.
 6. The Hermes gateway process is still alive after loading the plugin.
 7. The gateway log records the current `finite-platform` plugin, not a stale
    or built-in bridge.
-8. A throwaway CLI admission probe joins with the current invite/PIN.
+8. A throwaway CLI admission probe joins with the current invite.
 
 Only after those preflights pass should the harness print the human handoff:
 
 ```text
 Invite URL: finite://join?...
-PIN: 123456
 Report: target/hermes-phone-canary/local/<run-id>/report.json
 ```
 
@@ -190,10 +192,10 @@ scripts/hermes-phone-canary.py --install-phone-app --keep-running
 ```
 
 On success it writes `target/hermes-phone-canary/local/<run-id>/report.json`,
-prints the invite URL and current PIN, and leaves a `stop.sh` script in the
-same run directory. It must fail before printing a human invite if the hosted
-server, app install, sidecar, gateway, throwaway admission probe, or real
-Hermes model-response smoke fails.
+prints the invite URL, and leaves a `stop.sh` script in the same run directory.
+It must fail before printing a human invite if the hosted server, app install,
+sidecar, gateway, throwaway admission probe, or real Hermes model-response
+smoke fails.
 
 `scripts/hermes-real-gateway-admission-smoke.py` is the closest existing local
 preflight because it starts `finitechat hermes serve`, runs
@@ -231,11 +233,11 @@ scripts/hermes-remote-docker-canary.py --keep-running
 
 By default this uses `ssh://finite-lat-2`, builds the real runtime image on
 that remote Docker daemon, starts the container against
-`https://chat.finite.computer`, proves invite/PIN admission and a real Hermes
+`https://chat.finite.computer`, proves invite admission and a real Hermes
 model reply, stops the container so the entrypoint writes a restic backup,
 wipes the agent volume, restores into a fresh volume, proves the same user can
 still chat, proves a fresh user can still join, and only then prints a human
-invite/PIN. The restored container is left running only with
+invite URL. The restored container is left running only with
 `--keep-running`; otherwise the script cleans up the remote container and
 volumes after writing the report.
 
@@ -276,7 +278,7 @@ Tinfoil acceptance:
 - Restore latest restic snapshot by tag, or initialize fresh state if this is
   the first run.
 - Runtime exposes health with the expected npub.
-- Runtime exposes stable invite URL and current rotating PIN after launch.
+- Runtime exposes stable invite URL after launch.
 - Tinfoil owner-side admission probe passes before human testing.
 - Paul joins or resumes from the phone app and receives a real Hermes reply.
 - Clean stop writes a new encrypted backup.
@@ -288,8 +290,7 @@ Tinfoil acceptance:
 ## Invite API Requirement
 
 The runtime should expose a small local/admin API that returns the stable invite
-and current PIN after launch. Hitting it twice should keep the same invite and
-room but return a fresh PIN when the PIN window rotates.
+after launch. Hitting it twice should keep the same invite and room.
 
 Minimum response:
 
@@ -298,8 +299,6 @@ Minimum response:
   "room_id": "room-...",
   "invite_id": "invite-...",
   "url": "finite://join?...",
-  "pin": "123456",
-  "pin_window_seconds": 300,
   "agent_npub": "npub..."
 }
 ```
@@ -338,7 +337,7 @@ scripts/hermes-branch-publication-readiness.py \
    as a manual local runner so it is not reused as the phone product gate.
 3. Add the runtime invite API to the local runner and Docker/Tinfoil runtime.
 4. Add a remote Docker wrapper that can run the real image on finite-lat-2,
-   fetch the invite/PIN after the admission probe, and write the same report
+   fetch the invite after the admission probe, and write the same report
    schema.
 5. Teach the hardening audit to require the local-phone and remote-Docker
    reports before accepting a Tinfoil canary handoff.

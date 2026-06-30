@@ -6,7 +6,7 @@ This is intentionally stronger than the adapter echo tests:
   finitechat-server
   -> finitechat hermes serve
   -> hermes-agent 0.17 `gateway run --replace`
-  -> throwaway finitechat client joins via invite URL + PIN
+  -> throwaway finitechat client joins via invite URL
 
 The pass condition is that Hermes admits the pending join through the
 finite-platform plugin. No direct adapter import or test echo handler is used.
@@ -280,7 +280,6 @@ def main() -> int:
             "room_id": invite.get("room_id"),
             "invite_id": invite.get("invite_id"),
             "npub": invite.get("npub"),
-            "pin_window_seconds": invite.get("pin_window_seconds"),
         }
         step("invite.created", room_id=invite.get("room_id"))
 
@@ -359,10 +358,6 @@ def main() -> int:
                 "join",
                 "--url",
                 str(invite["url"]),
-                "--pin",
-                str(invite["pin"]),
-                "--name",
-                "Gateway Admission Smoke User",
                 "--timeout-ms",
                 str(args.timeout_ms),
             ],
@@ -388,7 +383,6 @@ def main() -> int:
                         "invite_url": invite.get("url"),
                         "invite_id": invite.get("invite_id"),
                         "room_id": invite.get("room_id"),
-                        "pin": invite.get("pin"),
                         "hold_seconds": args.hold_seconds,
                     },
                     sort_keys=True,

@@ -4549,6 +4549,8 @@ async fn sqlite_nostr_profile_cache_survives_restart_and_reports_stale_reads() {
         display_name: Some("Alice Finite".to_owned()),
         about: Some("FiniteChat test profile".to_owned()),
         picture: Some("https://example.invalid/alice.png".to_owned()),
+        bot: None,
+        finite_role: None,
         fetched_at_ms: 1_000,
         expires_at_ms: 2_000,
     };
@@ -4618,6 +4620,8 @@ async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects
                 display_name: None,
                 about: None,
                 picture: None,
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: 1_000,
                 expires_at_ms: 2_000,
             },
@@ -4638,6 +4642,8 @@ async fn sqlite_nostr_profile_cache_rejects_invalid_records_without_side_effects
                 display_name: None,
                 about: None,
                 picture: Some("file:///tmp/alice.png".to_owned()),
+                bot: None,
+                finite_role: None,
                 fetched_at_ms: 1_000,
                 expires_at_ms: 2_000,
             },
@@ -7590,7 +7596,7 @@ fn welcome_message(message_id: &str, recipient: MemberId, payload: &[u8]) -> Tra
     }
 }
 
-fn invite_pin_proof_stub(label: &str) -> String {
+fn invite_join_proof_stub(label: &str) -> String {
     // Server-side tests only need a structurally valid proof (64 hex chars);
     // proof verification is inviter-side by design (ADR 0006).
     let mut proof = String::with_capacity(64);
@@ -7646,7 +7652,7 @@ async fn sqlite_invite_session_lifecycle_survives_restart_over_http() {
         request_id: "join-bob".to_owned(),
         joiner: bob.clone(),
         key_package: b"opaque-mls-key-package-bytes".to_vec(),
-        pin_proof: invite_pin_proof_stub("bob"),
+        join_proof: invite_join_proof_stub("bob"),
         display_name: Some("Bob".to_owned()),
         submitted_at_ms: 1_000_000,
     };
@@ -7878,14 +7884,14 @@ async fn sqlite_invite_join_validation_and_expiry_reject_before_persisting() {
         request_id: "join-validation".to_owned(),
         joiner: bob.clone(),
         key_package: b"kp".to_vec(),
-        pin_proof: invite_pin_proof_stub("bob"),
+        join_proof: invite_join_proof_stub("bob"),
         display_name: None,
         submitted_at_ms: 500,
     };
 
-    // pin_proof must be 64 hex chars.
+    // join_proof must be 64 hex chars.
     let mut bad_proof = valid_join.clone();
-    bad_proof.pin_proof = "not-hex".to_owned();
+    bad_proof.join_proof = "not-hex".to_owned();
     let response = post_json(app.clone(), "/invites/join", &bad_proof).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
@@ -8082,7 +8088,7 @@ async fn sqlite_sync_wait_wakes_on_publish_and_invite_changes() {
             request_id: "join-wait".to_owned(),
             joiner: DeviceRef::new("carol", "carol-phone"),
             key_package: b"kp".to_vec(),
-            pin_proof: invite_pin_proof_stub("carol"),
+            join_proof: invite_join_proof_stub("carol"),
             display_name: None,
             submitted_at_ms: 1,
         },
@@ -8278,7 +8284,7 @@ async fn sqlite_sync_stream_emits_coalesced_high_watermark_hints() {
             request_id: "join-stream".to_owned(),
             joiner: DeviceRef::new("bob", "bob-phone"),
             key_package: b"kp".to_vec(),
-            pin_proof: invite_pin_proof_stub("bob"),
+            join_proof: invite_join_proof_stub("bob"),
             display_name: None,
             submitted_at_ms: 1,
         },

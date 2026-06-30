@@ -416,7 +416,7 @@ fn invite_join_request(
     let account_id = required_option(&mut args, "--account-id")?;
     let device_id = required_option(&mut args, "--device-id")?;
     let key_package_hex = required_option(&mut args, "--key-package-hex")?;
-    let pin_proof = required_option(&mut args, "--pin-proof")?;
+    let join_proof = required_option(&mut args, "--join-proof")?;
     let display_name = take_option(&mut args, "--display-name")?;
     let submitted_at_ms = required_option(&mut args, "--submitted-at-ms")?;
     reject_extra_args(&args)?;
@@ -429,7 +429,7 @@ fn invite_join_request(
             device_id,
         },
         key_package: parse_hex("--key-package-hex", &key_package_hex)?,
-        pin_proof,
+        join_proof: join_proof,
         display_name,
         submitted_at_ms: parse_u64("--submitted-at-ms", &submitted_at_ms)?,
     };
@@ -903,7 +903,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --pin-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat http [--server URL] invite-requests --invite-id ID\n  finitechat http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat http [--server URL] invite-expire --invite-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
+    "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --join-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat http [--server URL] invite-requests --invite-id ID\n  finitechat http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat http [--server URL] invite-expire --invite-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 #[cfg(test)]
@@ -1696,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn app_cli_invite_pin_and_message_flow_uses_runtime() {
+    fn app_cli_invite_join_and_message_flow_uses_runtime() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_cli_server(&dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice").display().to_string();
@@ -1734,7 +1734,6 @@ mod tests {
             &room_id,
         ]);
         let invite_url = invite["invite_url"].as_str().unwrap().to_owned();
-        let pin = invite["pin"].as_str().unwrap().to_owned();
 
         let scanned = run_cli_json([
             "app",
@@ -1751,25 +1750,7 @@ mod tests {
             &invite_url,
         ]);
         assert_eq!(scanned["selected_room_id"], room_id);
-        assert_eq!(scanned["status"], "invite scanned");
-
-        let requested = run_cli_json([
-            "app",
-            "--data-dir",
-            &bob_dir,
-            "--server",
-            &server_url,
-            "--device-id",
-            "bob-cli",
-            "--now",
-            "1000",
-            "submit-pin",
-            "--room-id",
-            &room_id,
-            "--pin",
-            &pin,
-        ]);
-        assert_eq!(requested["status"], "join requested");
+        assert_eq!(scanned["status"], "join requested");
 
         run_cli_json([
             "app",

@@ -132,7 +132,7 @@ def main() -> int:
             "start with empty local disk",
             "entrypoint restores latest restore.restore_tag snapshot from restore.repository",
             "restore with temporary canary restic password secret",
-            "print invite URL/PIN",
+            "print invite URL",
             "chat once from Finite Chat",
             "stop cleanly so entrypoint snapshots agent state",
             "restart container from empty local disk",

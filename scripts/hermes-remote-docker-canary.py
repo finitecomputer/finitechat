@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--server-url",
         default=os.environ.get("FINITECHAT_REMOTE_DOCKER_SERVER_URL", DEFAULT_SERVER_URL),
-        help="Finite Chat server URL. Remote Docker canaries should use the hosted server.",
+        help="Finite Chat server URL. Product remote Docker canaries must use https://chat.finite.computer.",
     )
     parser.add_argument(
         "--state-root",
@@ -201,11 +201,22 @@ def docker_json(
         ) from exc
 
 
-def reject_loopback(server_url: str) -> None:
+def enforce_product_server_url(server_url: str) -> None:
     parsed = urllib.parse.urlparse(server_url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in {"http", "https"} or not host:
         raise CanaryFailure(f"server URL must be an http(s) origin, got {server_url!r}")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise CanaryFailure(f"server URL must be an origin, got {server_url!r}")
+    normalized = f"{parsed.scheme}://{host}"
+    if parsed.port is not None:
+        normalized = f"{normalized}:{parsed.port}"
+    if normalized.rstrip("/") != DEFAULT_SERVER_URL:
+        raise CanaryFailure(
+            "product remote Docker canary must use "
+            f"{DEFAULT_SERVER_URL}; got {server_url!r}. Use lower-level Docker smoke "
+            "tests for local delivery-server experiments."
+        )
     if host in {"localhost", "127.0.0.1", "::1"} or host.startswith("127."):
         raise CanaryFailure(
             f"remote Docker canary must not use loopback server URL: {server_url!r}"
@@ -397,12 +408,12 @@ def wait_fresh_invite(
             opts, container, "/invite", timeout=15, name="container invite"
         )
         last = invite
-        if int(invite.get("seconds_remaining") or 0) >= 18:
+        if invite.get("url") and invite.get("room_id") and invite.get("invite_id"):
             return invite
         time.sleep(1)
     if last:
         return last
-    raise CanaryFailure("container invite endpoint did not return a PIN")
+    raise CanaryFailure("container invite endpoint did not return an invite URL")
 
 
 def docker_image_metadata(opts: argparse.Namespace, image: str) -> dict[str, Any]:
@@ -611,7 +622,7 @@ def admit_user(
         opts,
         image=image,
         volume=user_volume,
-        args=["init", "--server", server_url, "--device-id", "probe"],
+        args=["init", "--server", server_url, "--device-id", "probe", "--skip-agent-profile"],
         env=env,
         timeout=120,
     )
@@ -624,10 +635,6 @@ def admit_user(
             "join",
             "--url",
             str(invite["url"]),
-            "--pin",
-            str(invite["pin"]),
-            "--name",
-            display_name,
             "--timeout-ms",
             "120000",
         ],
@@ -746,7 +753,7 @@ def stop_for_backup(opts: argparse.Namespace, container: str) -> None:
 
 def main() -> int:
     opts = parse_args()
-    reject_loopback(opts.server_url)
+    enforce_product_server_url(opts.server_url)
     run_id = timestamp_id()
     slug = slug_from_run_id(run_id)
     state_root = (
@@ -1051,8 +1058,6 @@ def main() -> int:
                     "room_id": final_invite.get("room_id"),
                     "invite_id": final_invite.get("invite_id"),
                     "invite_url": final_invite.get("url"),
-                    "pin": final_invite.get("pin"),
-                    "seconds_remaining": final_invite.get("seconds_remaining"),
                     "report": str(report_path),
                     "stop_script": str(stop_script),
                     "kept_running": opts.keep_running,

@@ -55,7 +55,7 @@ use finitechat_proto::{
     staged_welcomes_by_id, validate_activity_expiry,
 };
 use finitechat_proto::{
-    DeviceRef, INVITE_PIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
+    DeviceRef, INVITE_JOIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
     MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_INVITE_DISPLAY_NAME_BYTES, MAX_INVITE_JOIN_REQUESTS_PER_SESSION, MAX_INVITE_MAX_JOINS,
     MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
@@ -1139,7 +1139,7 @@ impl HttpServerState {
     ) -> Result<HttpInviteJoinRequestRecord, ServerHttpError> {
         validate_invite_id(&request.invite_id)?;
         validate_invite_request_id(&request.request_id)?;
-        validate_invite_pin_proof(&request.pin_proof)?;
+        validate_invite_join_proof(&request.join_proof)?;
         validate_invite_key_package(&request.key_package)?;
         validate_invite_display_name(request.display_name.as_deref())?;
 
@@ -1167,7 +1167,7 @@ impl HttpServerState {
             // request_id with different content is a conflict.
             if existing.joiner == request.joiner
                 && existing.key_package == request.key_package
-                && existing.pin_proof == request.pin_proof
+                && existing.join_proof == request.join_proof
             {
                 return Ok(existing.clone());
             }
@@ -1191,7 +1191,7 @@ impl HttpServerState {
             request_id: request.request_id,
             joiner: request.joiner,
             key_package: request.key_package,
-            pin_proof: request.pin_proof,
+            join_proof: request.join_proof,
             display_name: request.display_name,
             submitted_at_ms: request.submitted_at_ms,
             state: HttpInviteJoinState::Pending,
@@ -5885,6 +5885,11 @@ fn validate_nostr_profile_record(record: &NostrProfileRecord) -> Result<(), Serv
         record.picture.as_deref(),
         MAX_NOSTR_PROFILE_PICTURE_BYTES,
     )?;
+    validate_optional_profile_text(
+        "profile.finite_role",
+        record.finite_role.as_deref(),
+        MAX_NOSTR_PROFILE_NAME_BYTES,
+    )?;
     if let Some(picture) = &record.picture
         && !picture.starts_with("http://")
         && !picture.starts_with("https://")
@@ -6321,13 +6326,13 @@ fn validate_invite_room_id(room_id: &str) -> Result<(), ServerHttpError> {
     })
 }
 
-fn validate_invite_pin_proof(pin_proof: &str) -> Result<(), ServerHttpError> {
-    if pin_proof.len() != INVITE_PIN_PROOF_HEX_BYTES as usize
-        || !pin_proof.bytes().all(|b| b.is_ascii_hexdigit())
+fn validate_invite_join_proof(join_proof: &str) -> Result<(), ServerHttpError> {
+    if join_proof.len() != INVITE_JOIN_PROOF_HEX_BYTES as usize
+        || !join_proof.bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(ServerHttpError::InvalidInviteRequest {
             reason: format!(
-                "pin_proof must be exactly {INVITE_PIN_PROOF_HEX_BYTES} hex characters"
+                "join_proof must be exactly {INVITE_JOIN_PROOF_HEX_BYTES} hex characters"
             ),
         });
     }

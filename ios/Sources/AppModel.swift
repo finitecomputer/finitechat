@@ -253,11 +253,6 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
 typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProtocol
 
 extension AppRoomSummary {
-    var requiresInvitePinEntry: Bool {
-        state == .waitingForApproval
-            && !isWaitingForInviteApproval
-    }
-
     var isWaitingForInviteApproval: Bool {
         state == .waitingForApproval
             && status.localizedCaseInsensitiveContains("waiting for room admission")
@@ -435,7 +430,6 @@ final class AppModel: ObservableObject, AppReconciler {
     @Published var errorText: String?
     @Published var roomDraft: String = ""
     @Published var scanDraft: String = ""
-    @Published var pinDraft: String = ""
     @Published var outboundText: String = ""
     @Published private(set) var runtimeStorePath: String?
     @Published private(set) var developerDiagnostics: [DeveloperDiagnosticEntry] = []
@@ -599,8 +593,8 @@ final class AppModel: ObservableObject, AppReconciler {
         userNoticeText ?? developerErrorText
     }
 
-    var invitePinSubmissionRoomID: String? {
-        state?.flow.invitePinSubmissionRoomId
+    var inviteJoinSubmissionRoomID: String? {
+        state?.flow.inviteJoinSubmissionRoomId
     }
 
     var scanInFlight: Bool {
@@ -1141,71 +1135,10 @@ final class AppModel: ObservableObject, AppReconciler {
         case .room:
             guard let room = selectedRoom else { return .unavailable }
             scanDraft = ""
-            if room.state == .waitingForApproval {
-                pinDraft = ""
-            }
             return .room(room)
         case .unavailable, .none:
             return .unavailable
         }
-    }
-
-    @discardableResult
-    func submitPin(for room: AppRoomSummary) -> Bool {
-        guard room.requiresInvitePinEntry else { return false }
-        guard invitePinSubmissionRoomID != room.roomId else { return false }
-        let pin = pinDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pin.isEmpty else { return false }
-        let action = AppAction.submitInvitePin(pendingRoomId: room.roomId, pin: pin)
-        let diagnostic = diagnosticAction(action)
-        appendDiagnostic(
-            category: diagnostic.category,
-            event: "\(diagnostic.name).requested",
-            details: diagnostic.details
-        )
-        let runtime: any FiniteChatRuntimeProtocol
-        let runtimeKey: String
-        do {
-            runtime = try currentRuntime()
-            runtimeKey = openKey
-        } catch {
-            appendDiagnostic(
-                category: diagnostic.category,
-                event: "\(diagnostic.name).failed",
-                details: diagnosticErrorDetails(error)
-            )
-            errorText = String(describing: error)
-            return false
-        }
-
-        enqueueRuntimeDispatch(
-            action,
-            runtime: runtime,
-            runtimeKey: runtimeKey,
-            priority: .userInitiated,
-            onSuccess: { [weak self] nextState in
-                guard let self else { return }
-                self.applyRuntimeSnapshot(nextState)
-                self.errorText = nil
-                self.appendDiagnostic(
-                    category: diagnostic.category,
-                    event: "\(diagnostic.name).succeeded",
-                    details: diagnostic.details
-                )
-                self.pinDraft = ""
-                self.restartUpdateLoopIfEnabled()
-            },
-            onFailure: { [weak self] error in
-                guard let self else { return }
-                self.errorText = String(describing: error)
-                self.appendDiagnostic(
-                    category: diagnostic.category,
-                    event: "\(diagnostic.name).failed",
-                    details: self.diagnosticErrorDetails(error)
-                )
-            }
-        )
-        return true
     }
 
     @discardableResult
@@ -2126,10 +2059,10 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "scan_target",
                 details: [:]
             )
-        case .submitInvitePin(let pendingRoomId, _):
+        case .submitInviteJoin(let pendingRoomId):
             return DiagnosticActionSummary(
                 category: "transport",
-                name: "submit_invite_pin",
+                name: "submit_invite_join",
                 details: ["room": pendingRoomId]
             )
         case .sendMessage(let roomId, _):
@@ -2363,7 +2296,6 @@ final class AppModel: ObservableObject, AppReconciler {
         }
 
         didRunLaunchAutomation = true
-        pinDraft = Self.argumentValue("--finitechat-pin", in: args) ?? pinDraft
         deviceID = Self.argumentValue("--finitechat-device", in: args) ?? deviceID
         serverURL = Self.argumentValue("--finitechat-server", in: args) ?? serverURL
         let requestedRoomID = Self.argumentValue("--finitechat-room", in: args)
@@ -2377,10 +2309,6 @@ final class AppModel: ObservableObject, AppReconciler {
             }
             if let inviteURL {
                 _ = await self.scanLaunchAutomationInvite(inviteURL)
-                let roomID = requestedRoomID ?? self.state?.selectedRoomId
-                if let room = self.launchAutomationRoom(roomID: roomID) {
-                    self.submitPin(for: room)
-                }
             }
             if let profileChatNpub,
                !profileChatNpub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2445,7 +2373,8 @@ final class AppModel: ObservableObject, AppReconciler {
                 displayName: shortenedDisplayNpub(npub),
                 about: nil,
                 picture: nil,
-                stale: true
+                stale: true,
+                isAgent: false
             )
             _ = startProfileChat(for: profile)
         } catch {
