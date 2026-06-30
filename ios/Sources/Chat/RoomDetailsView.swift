@@ -328,6 +328,7 @@ private struct RoomMetadataEditor: View {
                     .disabled(saveInFlight)
             }
 
+            // Borderless keeps each control independent inside this List row.
             HStack(spacing: 12) {
                 Button {
                     onChooseImage()
@@ -338,6 +339,7 @@ private struct RoomMetadataEditor: View {
                         Label("Choose Image", systemImage: "photo")
                     }
                 }
+                .buttonStyle(.borderless)
                 .disabled(imageUploadInFlight || saveInFlight)
 
                 if normalizedDraftPictureURL != nil {
@@ -346,6 +348,7 @@ private struct RoomMetadataEditor: View {
                     } label: {
                         Label("Remove Image", systemImage: "trash")
                     }
+                    .buttonStyle(.borderless)
                     .disabled(imageUploadInFlight || saveInFlight)
                 }
             }
@@ -359,6 +362,7 @@ private struct RoomMetadataEditor: View {
                     Label("Save Room", systemImage: "checkmark.circle")
                 }
             }
+            .buttonStyle(.borderless)
             .disabled(!canSave)
             .accessibilityIdentifier("RoomDetailsSaveMetadataButton")
 

@@ -152,6 +152,17 @@ async fn public_image_blob_upload_rejects_mismatched_image_content() {
 }
 
 #[tokio::test]
+async fn public_image_blob_upload_rejects_oversized_image_content() {
+    let temp = TempDir::new().expect("tempdir");
+    let app = persistent_app(&temp.path().join("delivery.sqlite3"));
+    let mut png = vec![0; 8 * 1024 * 1024 + 1];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+
+    let response = put_blob_with_content_type(app, &png, "image/png").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn blob_download_rejects_bad_or_missing_hash() {
     let app = http_router(HttpServerState::default());
 

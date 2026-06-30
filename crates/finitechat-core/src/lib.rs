@@ -72,7 +72,7 @@ const DEFAULT_PROFILE_CACHE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_PROFILE_DISPLAY_NAME_BYTES: u32 = 128;
 const MAX_PROFILE_ABOUT_BYTES: u32 = 4 * 1024;
 const MAX_PROFILE_PICTURE_BYTES: u32 = 2 * 1024;
-const MAX_PROFILE_IMAGE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PUBLIC_IMAGE_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MIN_APP_UPDATE_WAIT_MILLIS: u64 = 1_000;
 const MAX_APP_UPDATE_WAIT_MILLIS: u64 = 60_000;
 const MAX_ATTACHMENTS_PER_MESSAGE: u32 = 32;
@@ -4796,7 +4796,7 @@ fn normalize_image_upload_content_type(
         "image/gif" => Ok("image/gif"),
         "image/webp" => Ok("image/webp"),
         other => Err(FiniteChatCoreError::Client {
-            reason: format!("profile image content type is not supported: {other}"),
+            reason: format!("public image content type is not supported: {other}"),
         }),
     }
 }
@@ -4804,13 +4804,13 @@ fn normalize_image_upload_content_type(
 fn validate_image_upload(bytes: &[u8], content_type: &str) -> Result<(), FiniteChatCoreError> {
     if bytes.is_empty() {
         return Err(FiniteChatCoreError::Client {
-            reason: "profile image cannot be empty".to_owned(),
+            reason: "public image cannot be empty".to_owned(),
         });
     }
-    if bytes.len() > MAX_PROFILE_IMAGE_UPLOAD_BYTES {
+    if bytes.len() > MAX_PUBLIC_IMAGE_UPLOAD_BYTES {
         return Err(FiniteChatCoreError::Client {
             reason: format!(
-                "profile image is too large: {} bytes, max {MAX_PROFILE_IMAGE_UPLOAD_BYTES}",
+                "public image is too large: {} bytes, max {MAX_PUBLIC_IMAGE_UPLOAD_BYTES}",
                 bytes.len()
             ),
         });
@@ -9224,6 +9224,30 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("do not match image/png"));
+    }
+
+    #[test]
+    fn app_upload_image_rejects_oversized_public_image_before_http_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let app = FiniteChatRuntime::open(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        })
+        .unwrap();
+        let mut bytes = vec![0; MAX_PUBLIC_IMAGE_UPLOAD_BYTES + 1];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+
+        let error = app
+            .dispatch_and_wait(AppAction::UploadImage {
+                bytes,
+                content_type: "image/png".to_owned(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("public image is too large"));
     }
 
     #[test]

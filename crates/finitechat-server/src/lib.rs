@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -56,12 +56,13 @@ use finitechat_proto::{
 };
 use finitechat_proto::{
     DeviceRef, INVITE_JOIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
-    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
-    MAX_INVITE_DISPLAY_NAME_BYTES, MAX_INVITE_JOIN_REQUESTS_PER_SESSION, MAX_INVITE_MAX_JOINS,
-    MAX_KEY_PACKAGE_PAYLOAD_BYTES, MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT, MIN_SUPPORTED_PROTOCOL_VERSION,
-    MembershipAddV1, MembershipDeltaV1, PROTOCOL_VERSION_V1, RoomLogEntry, RoomProtocol,
-    RoomStatus, WelcomeState, validate_bytes_len, validate_bytes_non_empty, validate_string_bytes,
+    MAX_ATTACHMENT_CIPHERTEXT_BYTES, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
+    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_INVITE_DISPLAY_NAME_BYTES,
+    MAX_INVITE_JOIN_REQUESTS_PER_SESSION, MAX_INVITE_MAX_JOINS, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT, MIN_SUPPORTED_PROTOCOL_VERSION, MembershipAddV1,
+    MembershipDeltaV1, PROTOCOL_VERSION_V1, RoomLogEntry, RoomProtocol, RoomStatus, WelcomeState,
+    validate_bytes_len, validate_bytes_non_empty, validate_string_bytes,
 };
 use finitechat_transport::engine::KeyPackage;
 use finitechat_transport::transport::{
@@ -75,6 +76,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
+const MAX_HTTP_BLOB_UPLOAD_BODY_BYTES: usize = MAX_ATTACHMENT_CIPHERTEXT_BYTES as usize;
 const MAX_INVITE_AVAILABILITY_BATCH: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
 const MAX_NOSTR_PROFILE_BATCH: usize = 64;
 const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
@@ -3140,7 +3142,10 @@ pub fn http_router(state: HttpServerState) -> Router {
         )
         .route("/activities", post(append_ephemeral_activity))
         .route("/activities/get", post(get_ephemeral_activities))
-        .route("/upload", put(upload_blob_object))
+        .route(
+            "/upload",
+            put(upload_blob_object).layer(DefaultBodyLimit::max(MAX_HTTP_BLOB_UPLOAD_BODY_BYTES)),
+        )
         .route("/blobs/{sha256}", get(download_blob_object))
         .route("/commits", post(submit_commit))
         .route("/sync/group", post(sync_group))

@@ -4772,6 +4772,37 @@ final class StagedComposerAttachmentTests: XCTestCase {
     }
 }
 
+final class ImageUploadPayloadTests: XCTestCase {
+    func testUploadPayloadDownscalesAndReencodesImagesForProfileAndRoomMetadata() throws {
+        let sourceData = try makeSolidImageData(width: 2400, height: 1200)
+
+        let payload = try ImageUploadPayload(sourceData: sourceData)
+        let decoded = try XCTUnwrap(UIImage(data: payload.data))
+        let largestSide = max(decoded.size.width, decoded.size.height)
+
+        XCTAssertEqual(payload.mimeType, "image/jpeg")
+        XCTAssertLessThanOrEqual(largestSide, 1024)
+        XCTAssertLessThanOrEqual(payload.data.count, maxImageUploadBytes)
+    }
+
+    func testUploadPayloadRejectsUnreadableBytesBeforeUpload() {
+        XCTAssertThrowsError(try ImageUploadPayload(sourceData: Data("not an image".utf8))) { error in
+            guard case ImageUploadError.unreadableImage = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    private func makeSolidImageData(width: CGFloat, height: CGFloat) throws -> Data {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
+        let image = renderer.image { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return try XCTUnwrap(image.pngData())
+    }
+}
+
 final class VoiceMessageTests: XCTestCase {
     func testVoiceRecordingAttachmentUsesProtocolVoiceKind() throws {
         let bytes = Data([0x00, 0x01, 0x02])
