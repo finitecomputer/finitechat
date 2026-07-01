@@ -188,6 +188,13 @@ def wait_fresh_invite(container: str, *, timeout: float = 45) -> dict[str, Any]:
     while time.monotonic() < deadline:
         invite = wait_container_http_json(container, "/invite", timeout=10, name="container invite")
         last = invite
+        if (
+            invite.get("url")
+            and invite.get("room_id")
+            and invite.get("invite_id")
+            and not invite.get("pin")
+        ):
+            return invite
         if int(invite.get("seconds_remaining") or 0) >= 10:
             return invite
         time.sleep(1)
