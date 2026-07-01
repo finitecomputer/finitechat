@@ -3,8 +3,8 @@
 ## Problem Statement
 
 The Hermes runtime testing loop needs to prove the same image through Docker and
-Tinfoil without waiting on slow GitHub-hosted Docker builds or rebuilding the
-image inside each test layer.
+the current confidential runner lane without waiting on slow GitHub-hosted
+Docker builds or rebuilding the image inside each test layer.
 
 ## Acceptance Criteria
 
@@ -13,7 +13,10 @@ image inside each test layer.
 - The Docker smoke uses that prebuilt image instead of rebuilding inside the
   test.
 - The GHCR publish step pushes the same image ID proven by Docker smoke.
-- Tinfoil handoff artifacts are generated from the published image digest.
+- Phala durable-home publish uses the same image ID proven by the durable
+  `/home/node` smoke.
+- Tinfoil handoff artifacts are generated from the published image digest only
+  for explicit Tinfoil dispatches.
 
 ## Current Runner
 
@@ -35,11 +38,14 @@ not run the self-hosted Docker runtime smoke.
 1. `scripts/hermes-build-runtime-image.py` stages the Docker build context and
    builds `ghcr.io/<owner>/finite-chat-hermes-runtime:<sha>` locally on the
    self-hosted runner.
-2. `scripts/hermes-sidecar-docker-smoke.sh` runs with
+2. Pushes to `main` run `scripts/hermes-durable-home-docker-smoke.py` against
+   the prebuilt image. This is the default Phala-shaped `/home/node` gate.
+3. Explicit Tinfoil dispatches run `scripts/hermes-sidecar-docker-smoke.sh` with
    `FINITE_DOCKER_IMAGE=<that image>` and `FINITE_DOCKER_SKIP_IMAGE_BUILD=1`.
-3. `scripts/hermes-publish-proven-image.py` inspects the smoke report and pushes
-   the same local image ID to GHCR when `publish_runtime_image=true`.
-4. `scripts/hermes-tinfoil-handoff.py` and
+4. `scripts/hermes-publish-proven-image.py` inspects the selected smoke report
+   and pushes the same local image ID to GHCR when the matching publish input is
+   set.
+5. `scripts/hermes-tinfoil-handoff.py` and
    `scripts/hermes-tinfoil-canary-artifacts.py` consume the publish report.
 
 ## Dispatch
@@ -66,9 +72,19 @@ gh workflow run ci.yml \
   -f restic_prefix=agent-runtimes/<canary>/ci-smoke/restic
 ```
 
+Use the Phala durable-home gate when proving the current hosted-agent runtime:
+
+```sh
+gh workflow run ci.yml \
+  -R finitecomputer/finitechat \
+  --ref <branch> \
+  -f phala_durable_smoke=true \
+  -f publish_phala_runtime_image=true
+```
+
 ## Current Caveat
 
-This runner lane is ready, but the full backup/restore Docker smoke still
-depends on the persistence fix currently being worked separately. Use the
-stateless Tinfoil canary to isolate Tinfoil/runtime issues, then climb back down
-to the restore smoke before publishing persistence-enabled Tinfoil artifacts.
+The Tinfoil backup/restore Docker smoke is no longer the default `main` gate.
+It remains available for explicit Tinfoil dispatches only. The current
+hosted-agent lane is the Phala-shaped durable `/home/node` smoke, matching the
+runner contract proven in finitecomputer's Phala runtime spike.

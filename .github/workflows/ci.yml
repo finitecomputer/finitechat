@@ -189,9 +189,7 @@ jobs:
       - name: Docker runtime smoke
         if: >-
           ${{
-            (github.event_name == 'workflow_dispatch' && (inputs.docker_smoke || inputs.publish_runtime_image)) ||
-            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-            startsWith(github.ref, 'refs/tags/')
+            (github.event_name == 'workflow_dispatch' && (inputs.docker_smoke || inputs.publish_runtime_image))
           }}
         env:
           FINITE_DOCKER_SKIP_IMAGE_BUILD: "1"
@@ -211,7 +209,12 @@ jobs:
         run: scripts/hermes-sidecar-docker-smoke.sh
 
       - name: Durable home Docker smoke
-        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.phala_durable_smoke || inputs.publish_phala_runtime_image) }}
+        if: >-
+          ${{
+            (github.event_name == 'workflow_dispatch' && (inputs.phala_durable_smoke || inputs.publish_phala_runtime_image)) ||
+            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+            startsWith(github.ref, 'refs/tags/')
+          }}
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           FINITECHAT_HERMES_MODEL: ${{ vars.FINITECHAT_HERMES_MODEL || 'anthropic/claude-sonnet-4.6' }}
