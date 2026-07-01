@@ -73,12 +73,16 @@ def run(
     return proc
 
 
-def run_json(args: list[str], *, env: dict[str, str] | None = None, timeout: float = 60) -> dict[str, Any]:
+def run_json(
+    args: list[str], *, env: dict[str, str] | None = None, timeout: float = 60
+) -> dict[str, Any]:
     proc = run(args, env=env, timeout=timeout)
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise SmokeFailure(f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-3000:]}") from exc
+        raise SmokeFailure(
+            f"command did not emit JSON: {args!r}\nstdout={proc.stdout[-3000:]}"
+        ) from exc
 
 
 def reject_loopback(server_url: str) -> None:
@@ -160,7 +164,9 @@ def container_http_json(container: str, path: str) -> dict[str, Any]:
     return run_json(["docker", "exec", container, "python", "-c", code], timeout=20)
 
 
-def wait_container_http_json(container: str, path: str, *, timeout: float, name: str) -> dict[str, Any]:
+def wait_container_http_json(
+    container: str, path: str, *, timeout: float, name: str
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_error = ""
     while time.monotonic() < deadline:
@@ -427,7 +433,9 @@ def main() -> int:
     }
 
     def write_report() -> None:
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
     def step(step_name: str, **facts: Any) -> None:
         report["steps"].append(
@@ -491,15 +499,17 @@ def main() -> int:
 
         run(["docker", "restart", "--time", "60", name], timeout=120)
         step("agent.container_restarted")
-        restarted_health = wait_container_http_json(name, "/healthz", timeout=120, name="restarted health")
+        restarted_health = wait_container_http_json(
+            name, "/healthz", timeout=120, name="restarted health"
+        )
         restarted_invite = wait_fresh_invite(name)
         report["facts"]["agent_npub_after_restart"] = restarted_health.get("npub")
-        report["facts"]["same_agent_npub_after_restart"] = (
-            restarted_health.get("npub") == report["facts"].get("agent_npub")
-        )
-        report["facts"]["same_room_id_after_restart"] = (
-            restarted_invite.get("room_id") == report["facts"].get("room_id")
-        )
+        report["facts"]["same_agent_npub_after_restart"] = restarted_health.get("npub") == report[
+            "facts"
+        ].get("agent_npub")
+        report["facts"]["same_room_id_after_restart"] = restarted_invite.get("room_id") == report[
+            "facts"
+        ].get("room_id")
         if not report["facts"]["same_agent_npub_after_restart"]:
             raise SmokeFailure("agent npub changed after Docker restart")
         if not report["facts"]["same_room_id_after_restart"]:
