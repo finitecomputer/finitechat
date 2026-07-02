@@ -57,10 +57,15 @@ MODEL_ENV_NAMES = (
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "FINITE_DEFAULT_INFERENCE_PROFILE",
+    "FINITE_PRIVATE_MODEL",
+    "FINITE_PRIVATE_BASE_URL",
+    "FINITE_PRIVATE_API_KEY",
     "FINITECHAT_HERMES_MODEL",
     "FINITECHAT_HERMES_PROVIDER",
     "FINITECHAT_HERMES_BASE_URL",
     "FINITECHAT_HERMES_API_MODE",
+    "FINITECHAT_HERMES_API_KEY",
 )
 
 
@@ -181,6 +186,17 @@ class ResticRepositoryHelperTest(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(restic_env_value("AWS_ACCESS_KEY_ID"), "finite-access")
+
+
+class AgentRuntimeLauncherConfigTest(unittest.TestCase):
+    def test_gateway_launcher_does_not_persist_raw_finite_private_key(self) -> None:
+        script = (REPO_ROOT / "containers/agent/run_hermes_gateway.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("api_key: ${FINITE_PRIVATE_API_KEY}", script)
+        self.assertIn("api_key: ${FINITECHAT_HERMES_API_KEY}", script)
+        self.assertNotIn("api_key: ${api_key}", script)
 
 
 @unittest.skipUnless(

@@ -9,10 +9,25 @@ finitechat_bin="${FINITECHAT_BIN:-/usr/local/bin/finitechat}"
 plugin_name="${FINITECHAT_HERMES_PLUGIN_NAME:-finite-platform}"
 agent_name="${FINITECHAT_HERMES_AGENT_NAME:-${FINITE_AGENT_NAME:-${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}}}"
 agent_picture_url="${FINITECHAT_HERMES_AGENT_PICTURE_URL:-https://avatars.githubusercontent.com/u/274919006?v=4}"
-model="${FINITECHAT_HERMES_MODEL:-anthropic/claude-sonnet-4.6}"
-provider="${FINITECHAT_HERMES_PROVIDER:-openrouter}"
-base_url="${FINITECHAT_HERMES_BASE_URL:-https://openrouter.ai/api/v1}"
+if [[ "${FINITE_DEFAULT_INFERENCE_PROFILE:-}" == "finite-private" ]]; then
+    model="${FINITECHAT_HERMES_MODEL:-${FINITE_PRIVATE_MODEL:-kimi-k2-6}}"
+    provider="${FINITECHAT_HERMES_PROVIDER:-custom}"
+    base_url="${FINITECHAT_HERMES_BASE_URL:-${FINITE_PRIVATE_BASE_URL:-https://kimi-k2-6.finite.containers.tinfoil.dev/v1}}"
+else
+    model="${FINITECHAT_HERMES_MODEL:-anthropic/claude-sonnet-4.6}"
+    provider="${FINITECHAT_HERMES_PROVIDER:-openrouter}"
+    base_url="${FINITECHAT_HERMES_BASE_URL:-https://openrouter.ai/api/v1}"
+fi
 api_mode="${FINITECHAT_HERMES_API_MODE:-chat_completions}"
+api_key=""
+api_key_yaml=""
+if [[ -n "${FINITECHAT_HERMES_API_KEY:-}" ]]; then
+    api_key="${FINITECHAT_HERMES_API_KEY}"
+    api_key_yaml='  api_key: ${FINITECHAT_HERMES_API_KEY}'
+elif [[ -n "${FINITE_PRIVATE_API_KEY:-}" ]]; then
+    api_key="${FINITE_PRIVATE_API_KEY}"
+    api_key_yaml='  api_key: ${FINITE_PRIVATE_API_KEY}'
+fi
 service_addr="${FINITECHAT_HERMES_SERVICE_ADDR:-127.0.0.1:0}"
 poll_timeout_secs="${FINITECHAT_HERMES_POLL_TIMEOUT_SECS:-1}"
 poll_limit="${FINITECHAT_HERMES_POLL_LIMIT:-10}"
@@ -30,6 +45,11 @@ export FINITE_AGENT_ID="${FINITE_AGENT_ID:-agent_${device_id}}"
 export FINITE_AGENT_NAME="$agent_name"
 
 mkdir -p "$agent_home" "$hermes_home/plugins" "$workspace"
+
+if [[ "${FINITE_DEFAULT_INFERENCE_PROFILE:-}" == "finite-private" && -z "$api_key" ]]; then
+    echo "FINITE_DEFAULT_INFERENCE_PROFILE=finite-private requires FINITE_PRIVATE_API_KEY; refusing OpenRouter fallback." >&2
+    exit 64
+fi
 
 if [[ ! -f "${agent_home}/config.json" ]]; then
     if [[ -z "$server_url" ]]; then
@@ -69,6 +89,7 @@ model:
   provider: ${provider}
   base_url: ${base_url}
   api_mode: ${api_mode}
+${api_key_yaml}
 plugins:
   enabled:
     - finite-platform

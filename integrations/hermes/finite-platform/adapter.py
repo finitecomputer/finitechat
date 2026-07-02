@@ -138,7 +138,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         self._outbound_message_conversations: dict[str, str | None] = {}
         self._outbound_message_order: list[str] = []
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False, **_: Any) -> bool:
         if not self.home:
             logger.error("[finite] FINITECHAT_HOME is required (agent home directory)")
             return False
@@ -155,10 +155,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
         else:
             self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
-            "[finite] connected (home=%s%s%s)",
+            "[finite] connected (home=%s%s%s%s)",
             self.home,
             f", room filter={self.room_id}" if self.room_id else "",
             ", inbound stream=on" if self.inbound_stream and self.service_url else "",
+            ", reconnect" if is_reconnect else "",
         )
         return True
 

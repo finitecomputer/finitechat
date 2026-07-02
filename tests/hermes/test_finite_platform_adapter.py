@@ -168,6 +168,22 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             else:
                 os.environ["FINITECHAT_BIN"] = old_value
 
+    def test_connect_accepts_hermes_018_reconnect_keyword(self):
+        adapter = self.adapter()
+
+        async def noop():
+            return None
+
+        async def idle_loop():
+            return None
+
+        adapter._ensure_service = noop
+        adapter._recover_interrupted_turns = noop
+        adapter._surface_invite = noop
+        adapter._poll_loop = idle_loop
+
+        self.assertTrue(asyncio.run(adapter.connect(is_reconnect=True)))
+
     def test_local_env_file_supplies_defaults_without_overriding_process_env(self):
         old_home = os.environ.pop("FINITECHAT_HOME", None)
         old_bin = os.environ.get("FINITECHAT_BIN")
