@@ -11,11 +11,12 @@ Finite Chat owns:
 - the release-blocking verification that production is running the expected
   server commit.
 
-`../finitecomputer` owns the deployed host mechanics: host sync, backups,
-Nix/k3s/Traefik, systemd service installation, `finited`, and production runtime
-health. That split does not make server deployment optional for this repo. If an
-app change depends on server behavior, stop and loop Paul into
-`../finitecomputer` before distributing the app.
+`../finitecomputer-v2` owns the hosted SaaS deploy mechanics: current lat1
+systemd/k3s/Traefik rollout, future image/release artifacts, stack deploy
+coordination, and hosted runtime health gates. The legacy `../finitecomputer`
+repo remains for box1/TRF deployments only. This split does not make server
+deployment optional for this repo. If an app change depends on server behavior,
+stop and loop Paul into the v2 deploy lane before distributing the app.
 
 ## Required Production Check
 
@@ -47,9 +48,10 @@ The release is blocked when any of these are true:
 - the app requires a companion service change such as `push-drain`, blob
   storage policy, or Hermes bridge behavior that has not been deployed.
 
-## Handoff To finitecomputer
+## Handoff To finitecomputer-v2
 
-When production needs a server update, loop Paul into `../finitecomputer` with:
+When production needs a server update, loop Paul into `../finitecomputer-v2`
+with:
 
 - finite-chat branch and full commit SHA to deploy;
 - whether the deployment needs only `finitechat-server` or also a companion
@@ -58,16 +60,21 @@ When production needs a server update, loop Paul into `../finitecomputer` with:
 - any server data/backfill/rollback notes;
 - the expected post-deploy `/health` payload.
 
-The current finitecomputer deployment lane is documented in
-`../finitecomputer/docs/finite-stack-deployment.md` and currently sketches:
+The current v2 deployment lane is documented in
+`../finitecomputer-v2/docs/finite-stack-deployment.md` and currently uses:
 
 ```sh
-just chat-server-deploy workspaces/ovh-fc-1 <finitechat-commit>
+(
+  cd ../finitecomputer-v2
+  scripts/deploy_finitechat_server_lat1.sh \
+    deploy/finite-chat/lat1 \
+    <finitechat-commit>
+)
 ```
 
-Treat the exact finitecomputer command as owned by that repo. The required
-finite-chat acceptance criterion is that production `/health` reports the
-expected finite-chat commit and the app-facing smoke tests pass against
+Treat the exact deploy command as owned by v2. The required finite-chat
+acceptance criterion is that production `/health` reports the expected
+finite-chat commit and the app-facing smoke tests pass against
 `https://chat.finite.computer`.
 
 ## Post-Deploy Smoke

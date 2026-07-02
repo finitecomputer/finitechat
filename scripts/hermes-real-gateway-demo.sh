@@ -3,8 +3,9 @@
 #
 # This is not the hardened physical-phone canary gate. It may use loopback
 # server URLs and does not prove the full product flow on a phone. For the
-# local phone -> remote Docker -> Tinfoil promotion loop, see
-# docs/hermes-phone-canary-loop.md.
+# local phone and remote Docker canary gates, see
+# docs/hermes-phone-canary-loop.md. Provider promotion belongs to
+# ../finitecomputer-v2/docs/hermes-runtime-test-matrix.md.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,8 +23,8 @@ server_bin="${repo_root}/target/debug/finitechat-server"
 model="${FINITECHAT_HERMES_MODEL:-anthropic/claude-sonnet-4.6}"
 
 if [[ -z "${hermes_repo}" ]]; then
-  if [[ -d "${repo_root}/../finitecomputer/.state/chat-local/deps/hermes-agent" ]]; then
-    hermes_repo="${repo_root}/../finitecomputer/.state/chat-local/deps/hermes-agent"
+  if [[ -d "${repo_root}/../finitecomputer-v2/.state/hermes-runtime/deps/hermes-agent" ]]; then
+    hermes_repo="${repo_root}/../finitecomputer-v2/.state/hermes-runtime/deps/hermes-agent"
   elif [[ -d "${repo_root}/../hermes-agent" ]]; then
     hermes_repo="${repo_root}/../hermes-agent"
   else
@@ -34,7 +35,7 @@ fi
 
 if [[ ! -x "${hermes_repo}/.venv/bin/python" ]]; then
   echo "Hermes venv not found at ${hermes_repo}/.venv/bin/python." >&2
-  echo "Use the finitecomputer chat-local bootstrap or point FINITECHAT_HERMES_REPO at a prepared Hermes checkout." >&2
+  echo "Use the finitecomputer-v2 Hermes runtime matrix or point FINITECHAT_HERMES_REPO at a prepared Hermes checkout." >&2
   exit 1
 fi
 
@@ -98,8 +99,8 @@ if [[ -n "${FINITECHAT_HERMES_ENV_FILE:-}" ]]; then
 else
   env_files=(
     "${repo_root}/.env"
-    "${repo_root}/../finitecomputer/secrets/shared-provider-keys.env"
-    "${repo_root}/../finitecomputer/.state/chat-local/.env"
+    "${repo_root}/../finitecomputer-v2/secrets/shared-provider-keys.env"
+    "${repo_root}/../finitecomputer-v2/.state/hermes-runtime/.env"
   )
 fi
 

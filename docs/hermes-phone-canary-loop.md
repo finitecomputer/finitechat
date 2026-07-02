@@ -1,7 +1,8 @@
 # Fresh Hermes Phone Canary Loop
 
-Status: design runbook after the June 2026 repeated local, Docker, and Tinfoil
-Hermes tests.
+Status: Finite Chat local-phone and remote-Docker canary runbook. The hosted
+runtime provider ladder now lives in
+`../finitecomputer-v2/docs/hermes-runtime-test-matrix.md`.
 
 ## Problem Statement
 
@@ -11,10 +12,11 @@ The core quality loop is:
 > opens the production iOS app on his physical phone, joins the room, and has a
 > real multi-turn conversation with Hermes.
 
-This must be a named product gate, not an improvised operator sequence. Local,
-remote Docker, and Tinfoil should use the same promotion rule: do not hand a
-fresh invite to a human until the lower layer has already proven agent-side
-admission and runtime readiness with machine-readable evidence.
+This must be a named product gate, not an improvised operator sequence. Local
+phone, remote Docker, and hosted provider canaries should use the same
+promotion rule: do not hand a fresh invite to a human until the lower layer has
+already proven agent-side admission and runtime readiness with
+machine-readable evidence.
 
 ## What Went Wrong
 
@@ -26,8 +28,9 @@ admission and runtime readiness with machine-readable evidence.
   have proven that they can admit a join.
 - We let a server compatibility failure turn into a new test shape. The product
   canary server is `https://chat.finite.computer` for local phone, remote
-  Docker, and Tinfoil. If production is behind the app/server contract, deploy
-  the server; do not replace the release gate with a Mac LAN server.
+  Docker, and hosted provider canaries. If production is behind the app/server
+  contract, deploy the server; do not replace the release gate with a Mac LAN
+  server.
 - Physical-phone reachability was not modeled as a first-class constraint.
   `127.0.0.1` is useful for a simulator and impossible for the phone because
   it points at the phone itself. A phone product canary must use the hosted
@@ -48,7 +51,7 @@ admission and runtime readiness with machine-readable evidence.
 - We let active product state and fresh canary state blur together. A fresh
   canary must use a new agent state root or a deliberate restored state root,
   and must say which one happened.
-- Git hygiene got harder because runtime work, app work, docs, and Tinfoil
+- Git hygiene got harder because runtime work, app work, docs, and provider
   work were spread across worktrees. Experimental work should stay in a
   task-specific worktree and publish only source changes that passed the gate.
 
@@ -57,14 +60,16 @@ admission and runtime readiness with machine-readable evidence.
 - No echo handler counts as real Hermes.
 - No CLI join counts as the physical-phone product proof. CLI join is only an
   owner-side admission preflight.
-- No phone, remote Docker, or Tinfoil product canary may replace
+- No phone, remote Docker, or hosted provider product canary may replace
   `https://chat.finite.computer` with a local, LAN, loopback, or tunnel server.
   Local servers are lower-level diagnostics, not product acceptance.
 - No human invite is handed out before the sidecar is ready, the gateway is
   alive, the current plugin provenance is recorded, and a throwaway admission
   probe has passed.
-- No Tinfoil deployment starts until local phone and remote Docker evidence are
-  green for the same source/image lineage.
+- No hosted provider deployment starts until local phone and remote Docker
+  evidence are green for the same source/image lineage.
+- Phala/provider-specific acceptance belongs to
+  `../finitecomputer-v2/docs/hermes-runtime-test-matrix.md`.
 - No generated state, logs, secrets, SQLite files, or `target/` reports are
   committed.
 - No work happens in a dirty default checkout when a task-specific worktree is
@@ -78,7 +83,7 @@ are null for that layer:
 ```json
 {
   "status": "passed",
-  "layer": "local-phone | remote-docker | tinfoil",
+  "layer": "local-phone | remote-docker",
   "source": {
     "repo": "finitecomputer/finitechat",
     "branch": "codex/hermes-sidecar-hardening",
@@ -205,15 +210,15 @@ and local loopback server by default.
 
 ## Layer 2: Remote Docker Runtime
 
-Purpose: prove the real Linux runtime shape before Tinfoil. This should run on
-finite-lat-2 or another x86 Docker host, ideally through the self-hosted GitHub
-runner path so published packages are tied to the same proof.
+Purpose: prove the real Linux runtime shape before provider deployment. This
+should run on finite-lat-2 or another x86 Docker host, ideally through the
+self-hosted GitHub runner path so published packages are tied to the same proof.
 
 Required preflight:
 
 1. The local phone report for the source branch is green.
 2. The Docker image is built from `containers/agent/Dockerfile`.
-3. The image starts the same entrypoint intended for Tinfoil:
+3. The image starts the same entrypoint intended for hosted providers:
    `/opt/agent-entrypoint.sh` -> `/opt/run_hermes_gateway.sh`.
 4. The runtime reports `FINITE_AGENT_RUNTIME real_hermes_gateway=true`.
 5. The container health endpoint reports the agent npub.
@@ -256,36 +261,13 @@ same container has already passed the admission probe and the report includes
 the exact image id/digest. If the image is rebuilt after the probe, the probe
 must be rerun.
 
-## Layer 3: Tinfoil Canary
+## Layer 3: Hosted Runtime Provider
 
-Purpose: validate confidential-runtime constraints only. Tinfoil must not be
-the first place we learn that app join, Hermes admission, or Docker restore is
-broken.
-
-Required preflight:
-
-1. Local phone report is green.
-2. Remote Docker report is green for the image lineage that will be published.
-3. S3/Latitude restic smoke is green for an isolated per-agent prefix.
-4. CI publishes a digest-pinned image that is tied to the passing S3-backed
-   Docker smoke.
-5. `scripts/hermes-tinfoil-handoff.py` and
-   `scripts/hermes-tinfoil-canary-artifacts.py` produce ready handoff artifacts.
-
-Tinfoil acceptance:
-
-- Start from empty local disk.
-- Restore latest restic snapshot by tag, or initialize fresh state if this is
-  the first run.
-- Runtime exposes health with the expected npub.
-- Runtime exposes stable invite URL after launch.
-- Tinfoil owner-side admission probe passes before human testing.
-- Paul joins or resumes from the phone app and receives a real Hermes reply.
-- A fresh periodic or exit encrypted backup is observed before restart.
-- Full restart restores same npub and can chat again.
-- Any failure is classified as image pull, runtime state, object storage,
-  network, secrets/unlock, attestation, or Tinfoil control plane before
-  changing app/protocol code.
+Provider-specific runtime promotion belongs to
+`../finitecomputer-v2/docs/hermes-runtime-test-matrix.md`. That v2 matrix owns
+the local Docker, remote Docker, and Phala acceptance rules for the real hosted
+agent image. Finite Chat should feed that matrix a proven app/protocol/plugin
+commit, not maintain a separate provider ladder here.
 
 ## Invite API Requirement
 
@@ -311,7 +293,7 @@ restic passwords, or plaintext chat contents.
 
 - Work in this worktree for Finite Chat changes:
   `finite-chat-darkmatter-worktrees/hermes-sidecar-hardening`.
-- Use a separate `finitecomputer` worktree for Tinfoil runtime/deploy changes.
+- Use a separate `finitecomputer-v2` worktree for hosted runtime/deploy changes.
 - Keep `.state/`, `target/`, SQLite stores, app containers, and downloaded CI
   artifacts out of git.
 - Before starting a new experiment, record:
@@ -335,12 +317,12 @@ scripts/hermes-branch-publication-readiness.py \
    `finitechat-rmp`, that implements the Layer 1 preflight and evidence schema.
 2. Make `scripts/hermes-real-gateway-demo.sh` fail closed or clearly label it
    as a manual local runner so it is not reused as the phone product gate.
-3. Add the runtime invite API to the local runner and Docker/Tinfoil runtime.
+3. Add the runtime invite API to the local runner and Docker/provider runtime.
 4. Add a remote Docker wrapper that can run the real image on finite-lat-2,
    fetch the invite after the admission probe, and write the same report
    schema.
 5. Teach the hardening audit to require the local-phone and remote-Docker
-   reports before accepting a Tinfoil canary handoff.
+   reports before accepting a hosted provider canary handoff.
 6. Keep the app-side canary assertions in Rust/RMP as much as possible:
    optimistic send projection, working/thinking markers, room admission state,
    and multi-turn transcript projection should be tested through the same core

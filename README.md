@@ -65,15 +65,21 @@ FINITECHAT_SERVER_URL=http://127.0.0.1:18788 cargo run -p finitechat-rmp -- run 
 ```
 
 The Hermes runner needs a prepared Hermes checkout with a `.venv`; set
-`FINITECHAT_HERMES_REPO=/path/to/hermes-agent` if it is not in the default
-finitecomputer checkout location. It also needs the model provider key used by
-the Hermes profile. The runner loads `.env` when present, or set
+`FINITECHAT_HERMES_REPO=/path/to/hermes-agent` if it is not in a sibling
+checkout. It also needs the model provider key used by the Hermes profile. The
+runner loads `.env` when present, or set
 `FINITECHAT_HERMES_ENV_FILE=/path/to/provider.env`.
 
 For the hardened "fresh Hermes instance to Paul's phone" quality loop, use
-`docs/hermes-phone-canary-loop.md`. That runbook defines the local phone,
-remote Docker, and Tinfoil promotion gates and the evidence required before a
-human invite is handed out.
+`docs/hermes-phone-canary-loop.md`. That runbook defines Finite Chat's local
+phone and remote Docker gates and the evidence required before a human invite
+is handed out.
+
+The product-shaped hosted Hermes runtime ladder for local Docker, remote
+Docker, and Phala belongs to
+`../finitecomputer-v2/docs/hermes-runtime-test-matrix.md`. Finite Chat's local
+loop proves the app/protocol/plugin contract; v2 proves the hosted-agent
+runtime image and provider deploy shapes.
 
 For team testing, the normal Hermes phone canary is:
 
@@ -170,11 +176,13 @@ first.
 ## Deployment
 
 This repo owns the Finite Chat server source, HTTP contract, and release gate
-for `https://chat.finite.computer`. Production rollout mechanics belong in
-`../finitecomputer`, which owns host sync, backups, Nix/k3s deployment,
-`finited`, and runtime health checks. Do not ship a native app/TestFlight build
-that depends on server behavior until the deployed chat server has been
-verified against the finite-chat commit being shipped.
+for `https://chat.finite.computer`. Hosted Finite Computer SaaS rollout
+mechanics belong in `../finitecomputer-v2`, which owns the current chat-server
+deploy lane, stack deploy coordination, and hosted runtime matrix. The legacy
+`../finitecomputer` repo remains for box1/TRF users while they are unmigrated.
+Do not ship a native app/TestFlight build that depends on server behavior until
+the deployed chat server has been verified against the finite-chat commit being
+shipped.
 
 The production health endpoint must identify the deployed server build:
 
@@ -185,7 +193,7 @@ cargo run -q -p finitechat-cli -- http --server https://chat.finite.computer hea
 Expected production output includes `status: "ok"`, `server_version`,
 `source_commit`, and `source_dirty: false`. If `source_commit` is missing,
 the production server is an old build and the app release is blocked until
-`../finitecomputer` deploys a compatible finite-chat commit. See
+`../finitecomputer-v2` deploys a compatible finite-chat commit. See
 `docs/server-deployment-gate.md` for the required handoff and verification
 steps.
 
