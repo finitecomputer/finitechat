@@ -587,6 +587,106 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
     );
 }
 
+fn hermes_invite_status(url: &str) -> Value {
+    hermes(&["hermes", "invite-status", "--url", url, "--json"])
+}
+
+#[test]
+fn hermes_invite_status_tracks_open_consumed_and_expired_invites() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_url = spawn_live_http_server(&dir.path().join("server.sqlite3"));
+    let home = dir.path().join("agent-home");
+    let home_arg = home.display().to_string();
+
+    hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "init",
+        "--server",
+        &server_url,
+        "--device-id",
+        "agent",
+    ]);
+
+    // A fresh single-use invite is open and joinable.
+    let invite = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "invite",
+        "--room-name",
+        "Hosted Pairing",
+        "--max-joins",
+        "1",
+        "--ttl-ms",
+        "3600000",
+        "--json",
+    ]);
+    let url = invite["url"].as_str().unwrap().to_owned();
+    let code = InviteCodeV1::parse(&url).unwrap();
+    let status = hermes_invite_status(&url);
+    assert_eq!(status["invite_id"], code.invite_id.as_str());
+    assert_eq!(status["room_id"], code.room_id.as_str());
+    assert_eq!(status["state"], "open");
+    assert_eq!(status["max_joins"], 1);
+    assert_eq!(status["accepted_joins"], 0);
+    assert_eq!(status["consumed"], false);
+    assert_eq!(status["expired"], false);
+    assert_eq!(status["joinable"], true);
+    assert!(status["expires_at_ms"].as_u64().unwrap() > now_ms());
+
+    // A user pairs through the invite and the agent poll admits the join:
+    // the single-use invite is now consumed and closed.
+    let mut user = TestHermesUser::new(
+        &dir.path().join("user.sqlite3"),
+        &server_url,
+        USER_SECRET,
+        "user_phone",
+    );
+    user.submit_invite_join(&code, "Paul");
+    let admitted = hermes_poll(&home_arg, json!({ "timeout_millis": 0 }));
+    assert_eq!(admitted["joined"].as_array().unwrap().len(), 1);
+
+    let status = hermes_invite_status(&url);
+    assert_eq!(status["state"], "closed");
+    assert_eq!(status["accepted_joins"], 1);
+    assert_eq!(status["consumed"], true);
+    assert_eq!(status["expired"], false);
+    assert_eq!(status["joinable"], false);
+
+    // An unconsumed invite past its TTL reads expired (never consumed), so
+    // callers know a re-mint is safe.
+    let expired_invite = hermes(&[
+        "hermes",
+        "--home",
+        &home_arg,
+        "invite",
+        "--room-id",
+        &code.room_id,
+        "--max-joins",
+        "1",
+        "--ttl-ms",
+        "1",
+        "--json",
+    ]);
+    std::thread::sleep(Duration::from_millis(5));
+    let status = hermes_invite_status(expired_invite["url"].as_str().unwrap());
+    assert_eq!(status["consumed"], false);
+    assert_eq!(status["expired"], true);
+    assert_eq!(status["joinable"], false);
+
+    // An invite id the server has never seen reads not_found without
+    // claiming consumption or expiry.
+    let mut unknown = code.clone();
+    unknown.invite_id = "invite-0000000000000000".to_owned();
+    let status = hermes_invite_status(&unknown.encode().unwrap());
+    assert_eq!(status["state"], "not_found");
+    assert_eq!(status["consumed"], false);
+    assert_eq!(status["expired"], false);
+    assert_eq!(status["joinable"], false);
+}
+
 #[test]
 fn hermes_poll_recovers_messages_already_applied_by_runtime_sync() {
     let dir = tempfile::tempdir().unwrap();

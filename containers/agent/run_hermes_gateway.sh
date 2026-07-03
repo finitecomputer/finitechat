@@ -73,11 +73,17 @@ fi
     >/dev/null
 
 invite_file="${agent_home}/current-invite.json"
+# Hosted pairing is no-PIN, so the startup invite must be single-use and
+# short-lived. Keep this policy in sync with health_server.py, which owns
+# refresh/paired state for the same cache file.
+invite_ttl_ms="${FINITE_AGENT_INVITE_TTL_MS:-3600000}"
 if [[ -f "$invite_file" ]]; then
     cp "$invite_file" /tmp/finitechat-invite.json
 else
     "$finitechat_bin" hermes --home "$agent_home" invite \
         --room-name "$agent_name" \
+        --max-joins 1 \
+        --ttl-ms "$invite_ttl_ms" \
         --json \
         >"$invite_file"
     cp "$invite_file" /tmp/finitechat-invite.json
