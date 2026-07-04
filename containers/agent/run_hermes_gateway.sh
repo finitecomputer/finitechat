@@ -34,6 +34,8 @@ poll_limit="${FINITECHAT_HERMES_POLL_LIMIT:-10}"
 workspace="${FINITECHAT_WORKSPACE:-/workspace}"
 
 export FINITECHAT_HOME="$agent_home"
+# Shared Finite identity on the durable mount (identity/identity.json).
+export FINITE_HOME="${FINITE_HOME:-$agent_home}"
 export HERMES_HOME="$hermes_home"
 export FINITECHAT_BIN="$finitechat_bin"
 export FINITECHAT_HERMES_INBOUND_STREAM="${FINITECHAT_HERMES_INBOUND_STREAM:-1}"

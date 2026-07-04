@@ -21,6 +21,54 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USER_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [41; NOSTR_SECRET_KEY_BYTES];
 const USER2_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [42; NOSTR_SECRET_KEY_BYTES];
+const APP_USER_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [43; NOSTR_SECRET_KEY_BYTES];
+
+/// Point `FINITE_HOME` at a process-wide throwaway directory so in-process
+/// CLI calls never mint or read the developer's real shared identity. The
+/// agent under test shares this one identity across tests in this binary;
+/// simulated user devices pass explicit secrets or run as subprocesses with
+/// their own `FINITE_HOME`.
+fn ensure_test_finite_home() -> PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test FINITE_HOME tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        // SAFETY: set once before any identity resolution in this process;
+        // every entry point into the CLI in this file calls this helper.
+        unsafe { std::env::set_var("FINITE_HOME", &path) };
+        path
+    })
+    .clone()
+}
+
+/// The account secret of the process-wide shared test identity, read from
+/// the contract-v1 identity file the CLI minted.
+fn shared_identity_secret_hex() -> String {
+    let path = ensure_test_finite_home()
+        .join("identity")
+        .join("identity.json");
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    value["secret_hex"].as_str().unwrap().to_owned()
+}
+
+/// Run the real `finitechat` binary with its own `FINITE_HOME` (a distinct
+/// Finite identity), for flows that need a second account on the CLI surface.
+fn finitechat_bin_json(finite_home: &Path, args: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_finitechat"))
+        .env("FINITE_HOME", finite_home)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "finitechat {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("finitechat {args:?} produced invalid JSON: {error}"))
+}
 
 fn spawn_live_http_server(path: &std::path::Path) -> String {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -51,7 +99,16 @@ fn spawn_live_http_server(path: &std::path::Path) -> String {
     panic!("live HTTP server did not become healthy");
 }
 
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn cli_json(args: &[&str]) -> Value {
+    ensure_test_finite_home();
     let mut output = Vec::new();
     finitechat_cli::run(args.iter().map(|arg| arg.to_string()), &mut output)
         .unwrap_or_else(|error| panic!("finitechat {args:?} failed: {error}"));
@@ -271,30 +328,115 @@ impl SmokeReport {
 }
 
 #[test]
-fn hermes_init_reuses_existing_agent_identity() {
+fn hermes_init_reuses_imported_shared_identity() {
+    // Runs the real binary with a dedicated FINITE_HOME: `auth import`
+    // writes an existing secret into the shared identity location, and
+    // every later command (status, hermes init) finds the same account.
     let dir = tempfile::tempdir().unwrap();
+    let finite_home = dir.path().join("finite-home");
+    let home_arg = dir.path().join("agent-home").display().to_string();
+
+    let secret_file = dir.path().join("imported.nsec");
+    std::fs::write(&secret_file, format!("{}\n", "17".repeat(32))).unwrap();
+    let imported = finitechat_bin_json(
+        &finite_home,
+        &[
+            "auth",
+            "import",
+            "--file",
+            &secret_file.display().to_string(),
+        ],
+    );
+    assert_eq!(imported["imported"], true);
+    let identity_file = finite_home.join("identity").join("identity.json");
+    assert!(identity_file.is_file());
+    assert_eq!(
+        imported["identity_file"],
+        identity_file.display().to_string()
+    );
+
+    // Importing again refuses to overwrite the single storage location.
+    let rerun = Command::new(env!("CARGO_BIN_EXE_finitechat"))
+        .env("FINITE_HOME", &finite_home)
+        .args(["auth", "import", "--file"])
+        .arg(&secret_file)
+        .output()
+        .unwrap();
+    assert!(!rerun.status.success());
+    assert!(
+        String::from_utf8_lossy(&rerun.stderr).contains("refusing to overwrite"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+
+    let status = finitechat_bin_json(&finite_home, &["auth", "status"]);
+    assert_eq!(status["account_id"], imported["account_id"]);
+    assert_eq!(status["npub"], imported["npub"]);
+    assert!(
+        status["created_by"]
+            .as_str()
+            .unwrap()
+            .contains("auth import")
+    );
+
+    let hermes_init = finitechat_bin_json(
+        &finite_home,
+        &[
+            "hermes",
+            "--agent-home",
+            &home_arg,
+            "init",
+            "--server",
+            "http://127.0.0.1:1",
+            "--skip-agent-profile",
+        ],
+    );
+    assert_eq!(hermes_init["account_id"], imported["account_id"]);
+    assert_eq!(hermes_init["npub"], imported["npub"]);
+}
+
+#[test]
+fn hermes_init_mints_shared_identity_on_fresh_start() {
+    // Fresh FINITE_HOME, no identity: the first Finite tool to run mints
+    // the key at the shared location, and no key material lands in the
+    // agent home (hard cut of identity.env / agent.nsec).
+    let dir = tempfile::tempdir().unwrap();
+    let finite_home = dir.path().join("finite-home");
     let home = dir.path().join("agent-home");
     let home_arg = home.display().to_string();
 
-    let identity = cli_json(&["identity", "--agent-home", &home_arg, "init"]);
-    assert!(home.join("identity.env").exists());
-    assert!(home.join("agent.nsec").exists());
+    let init = finitechat_bin_json(
+        &finite_home,
+        &[
+            "hermes",
+            "--agent-home",
+            &home_arg,
+            "init",
+            "--server",
+            "http://127.0.0.1:1",
+            "--skip-agent-profile",
+        ],
+    );
+    let identity_file = finite_home.join("identity").join("identity.json");
+    assert!(identity_file.is_file());
+    let identity: Value =
+        serde_json::from_str(&std::fs::read_to_string(&identity_file).unwrap()).unwrap();
+    assert_eq!(identity["version"], 1);
+    assert_eq!(identity["kind"], "nostr-secp256k1");
+    assert_eq!(identity["public_key_hex"], init["account_id"]);
+    assert!(
+        identity["created_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("finitechat ")
+    );
+    assert!(!home.join("agent.nsec").exists());
+    assert!(!home.join("identity.env").exists());
+    assert!(!home.join("account-secret.hex").exists());
 
-    let hermes_init = hermes(&[
-        "hermes",
-        "--agent-home",
-        &home_arg,
-        "init",
-        "--server",
-        "http://127.0.0.1:1",
-        "--skip-agent-profile",
-    ]);
-    assert_eq!(hermes_init["account_id"], identity["account_id"]);
-    assert_eq!(hermes_init["npub"], identity["npub"]);
-
-    let shown = cli_json(&["identity", "--agent-home", &home_arg, "show"]);
-    assert_eq!(shown["account_id"], identity["account_id"]);
-    assert_eq!(shown["npub"], identity["npub"]);
+    let status = finitechat_bin_json(&finite_home, &["auth", "status"]);
+    assert_eq!(status["account_id"], init["account_id"]);
+    assert_eq!(status["npub"], init["npub"]);
 }
 
 #[test]
@@ -306,7 +448,15 @@ fn hermes_install_installs_plugin_into_temp_hermes_home() {
     let plugins_dir = hermes_home.join("plugins");
     let plugins_arg = plugins_dir.display().to_string();
 
-    cli_json(&["identity", "--agent-home", &home_arg, "init"]);
+    hermes(&[
+        "hermes",
+        "--agent-home",
+        &home_arg,
+        "init",
+        "--server",
+        "http://127.0.0.1:1",
+        "--skip-agent-profile",
+    ]);
     let installed = hermes(&[
         "hermes",
         "--agent-home",
@@ -338,7 +488,6 @@ fn hermes_serve_reports_process_health() {
     let ready_file = dir.path().join("serve-ready.json");
     let ready_arg = ready_file.display().to_string();
 
-    cli_json(&["identity", "--agent-home", &home_arg, "init"]);
     hermes(&[
         "hermes",
         "--agent-home",
@@ -523,7 +672,7 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
         data_dir: app_dir.to_string_lossy().into_owned(),
         server_url: server_url.clone(),
         device_id: "ios-smoke".to_owned(),
-        account_secret_hex: None,
+        account_secret_hex: Some(hex_lower(&APP_USER_SECRET)),
         now_unix_seconds: None,
     })
     .unwrap();
@@ -573,7 +722,7 @@ fn hermes_cli_app_syncs_second_message_after_read_receipt() {
         data_dir: app_dir.to_string_lossy().into_owned(),
         server_url,
         device_id: "ios-smoke".to_owned(),
-        account_secret_hex: None,
+        account_secret_hex: Some(hex_lower(&APP_USER_SECRET)),
         now_unix_seconds: None,
     })
     .unwrap();
@@ -754,12 +903,12 @@ fn hermes_poll_recovers_messages_already_applied_by_runtime_sync() {
         "Paul",
     );
 
-    let agent_secret_hex = std::fs::read_to_string(home.join("agent.nsec")).unwrap();
+    let agent_secret_hex = shared_identity_secret_hex();
     let agent_app_runtime = FiniteChatRuntime::open(OpenOptions {
         data_dir: home_arg.clone(),
         server_url: server_url.clone(),
         device_id: "agent".to_owned(),
-        account_secret_hex: Some(agent_secret_hex.trim().to_owned()),
+        account_secret_hex: Some(agent_secret_hex.clone()),
         now_unix_seconds: None,
     })
     .unwrap();
@@ -843,7 +992,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let home = dir.path().join("agent-home");
     let home_arg = home.display().to_string();
 
-    // init: fresh nostr identity, encrypted store, 0600 secrets.
+    // init: shared Finite identity (0600 at the contract location), encrypted store.
     let init = smoke.time("agent_init", || {
         hermes(&[
             "hermes",
@@ -867,15 +1016,21 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     assert_eq!(init["profile"]["saved"], true);
     smoke.fact("agent_account_id", json!(agent_account.clone()));
     smoke.fact("agent_npub", init["npub"].clone());
+    let identity_file = ensure_test_finite_home()
+        .join("identity")
+        .join("identity.json");
+    assert!(identity_file.is_file());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(home.join("agent.nsec"))
+        let mode = std::fs::metadata(&identity_file)
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+    assert!(!home.join("agent.nsec").exists());
+    assert!(!home.join("identity.env").exists());
 
     // invite: creates the room, prints URL + QR.
     let invite = smoke.time("invite_create", || {
@@ -1161,12 +1316,12 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     user_delivery
         .append_event(&request, DurableAppEventKind::ChatMessage.delivery_policy())
         .unwrap();
-    let agent_secret_hex = std::fs::read_to_string(home.join("agent.nsec")).unwrap();
+    let agent_secret_hex = shared_identity_secret_hex();
     let agent_app_runtime = FiniteChatRuntime::open(OpenOptions {
         data_dir: home_arg.clone(),
         server_url: server_url.clone(),
         device_id: "agent".to_owned(),
-        account_secret_hex: Some(agent_secret_hex.trim().to_owned()),
+        account_secret_hex: Some(agent_secret_hex.clone()),
         now_unix_seconds: None,
     })
     .unwrap();
@@ -1695,7 +1850,7 @@ fn hermes_cli_round_trips_media_blob_references_with_app_runtime() {
         data_dir: dir.path().join("ios-user").to_string_lossy().into_owned(),
         server_url: server_url.clone(),
         device_id: "ios-media".to_owned(),
-        account_secret_hex: None,
+        account_secret_hex: Some(hex_lower(&APP_USER_SECRET)),
         now_unix_seconds: Some(now_ms() / 1000),
     })
     .unwrap();
@@ -1823,6 +1978,9 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
     let server_url = spawn_live_http_server(&server_db);
     let agent_home = dir.path().join("agent").display().to_string();
     let user_home = dir.path().join("user").display().to_string();
+    // The joining agent is a second Finite account: it runs as the real
+    // binary with its own FINITE_HOME (one shared identity per environment).
+    let user_finite_home = dir.path().join("user-finite-home");
 
     hermes(&[
         "hermes",
@@ -1832,41 +1990,38 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
         "--server",
         &server_url,
     ]);
-    let user_init = hermes(&[
-        "hermes",
-        "--home",
-        &user_home,
-        "init",
-        "--server",
-        &server_url,
-    ]);
+    let user_init = finitechat_bin_json(
+        &user_finite_home,
+        &[
+            "hermes",
+            "--home",
+            &user_home,
+            "init",
+            "--server",
+            &server_url,
+        ],
+    );
     let invite = hermes(&["hermes", "--home", &agent_home, "invite", "--json"]);
     let url = invite["url"].as_str().unwrap().to_owned();
 
     // The joiner's request sits pending until the agent polls; run the
-    // join in a thread while the agent admits it.
-    let join_url = url.clone();
-    let join_home = user_home.clone();
-    let join_thread = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        finitechat_cli::run(
-            [
-                "hermes",
-                "--home",
-                &join_home,
-                "join",
-                "--url",
-                &join_url,
-                "--timeout-ms",
-                "30000",
-            ]
-            .iter()
-            .map(|arg| arg.to_string()),
-            &mut output,
-        )
-        .expect("join succeeds");
-        serde_json::from_slice::<Value>(&output).unwrap()
-    });
+    // join as a subprocess while the agent admits it.
+    let join_child = Command::new(env!("CARGO_BIN_EXE_finitechat"))
+        .env("FINITE_HOME", &user_finite_home)
+        .args([
+            "hermes",
+            "--home",
+            &user_home,
+            "join",
+            "--url",
+            &url,
+            "--timeout-ms",
+            "30000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(300));
     let poll = hermes(&[
@@ -1879,28 +2034,37 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
     ]);
     assert_eq!(poll["joined"].as_array().unwrap().len(), 1);
 
-    let joined = join_thread.join().unwrap();
+    let join_output = join_child.wait_with_output().unwrap();
+    assert!(
+        join_output.status.success(),
+        "join failed: {}",
+        String::from_utf8_lossy(&join_output.stderr)
+    );
+    let joined: Value = serde_json::from_slice(&join_output.stdout).unwrap();
     assert_eq!(joined["state"], "joined");
     assert_eq!(joined["room_id"], invite["room_id"]);
 
     // Round trip purely over the CLI surface, both directions.
     let room_id = invite["room_id"].as_str().unwrap();
-    hermes(&[
-        "hermes",
-        "--home",
-        &user_home,
-        "send",
-        "--request-json",
-        &json!({
-            "room_id": room_id,
-            "conversation_id": null,
-            "text": "hello from the cli user",
-            "kind": "message",
-            "status": "complete",
-            "reply_to_message_id": null,
-        })
-        .to_string(),
-    ]);
+    finitechat_bin_json(
+        &user_finite_home,
+        &[
+            "hermes",
+            "--home",
+            &user_home,
+            "send",
+            "--request-json",
+            &json!({
+                "room_id": room_id,
+                "conversation_id": null,
+                "text": "hello from the cli user",
+                "kind": "message",
+                "status": "complete",
+                "reply_to_message_id": null,
+            })
+            .to_string(),
+        ],
+    );
     let agent_poll = hermes(&[
         "hermes",
         "--home",
@@ -1954,14 +2118,17 @@ fn hermes_cli_join_command_pairs_two_agent_homes_end_to_end() {
         })
         .to_string(),
     ]);
-    let user_poll = hermes(&[
-        "hermes",
-        "--home",
-        &user_home,
-        "poll",
-        "--request-json",
-        r#"{"timeout_millis":10000}"#,
-    ]);
+    let user_poll = finitechat_bin_json(
+        &user_finite_home,
+        &[
+            "hermes",
+            "--home",
+            &user_home,
+            "poll",
+            "--request-json",
+            r#"{"timeout_millis":10000}"#,
+        ],
+    );
     let events = user_poll["events"].as_array().unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["text"], "hello back");

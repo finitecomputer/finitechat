@@ -38,6 +38,10 @@ sha2 = "0.10"
 hkdf = "0.12"
 hex = "0.4"
 hypernote-mdx = { git = "https://github.com/futurepaul/hypernote-mdx", rev = "db23b3d72e81389247716c5a59174cc4f4d55a34", version = "0.3.0" }
+# Shared on-disk Nostr identity (Finite Identity Contract v1): one account key
+# per user at $FINITE_HOME/identity/ (or ~/.finite/identity/), minted by
+# whichever Finite tool runs first.
+finite-identity = { git = "https://github.com/finitecomputer/finite-identity", rev = "fa718d071fe289db95121781a52afaa6c0fbb926" }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "local-offset", "parsing"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }

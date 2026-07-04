@@ -2,8 +2,11 @@
 //! the Hermes platform plugin shells to (ADR 0002), plus agent onboarding
 //! (ADR 0006: init → invite URL/QR → chat).
 //!
-//! The agent's durable home lives under `--home` / `$FINITECHAT_HOME`:
-//! `agent.nsec` (0600), `config.json`, `invites.json` (0600, each line is a
+//! The agent's account key is the shared Finite identity at
+//! `$FINITE_HOME/identity/identity.json` (else `~/.finite/identity/`),
+//! minted by whichever Finite tool runs first and never copied into the
+//! agent home. The agent's durable home lives under `--home` /
+//! `$FINITECHAT_HOME`: `config.json`, `invites.json` (0600, each line is a
 //! full invite URL — the URL carries the invite token), and the encrypted
 //! client store `client.sqlite3`.
 
@@ -22,6 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use finite_identity::{FiniteIdentity, IdentityPaths};
 use finitechat_blob::{
     BlossomDownloadHttpResponse, finish_blossom_download_http_response,
     prepare_blossom_download_http_request, sha256_hex,
@@ -29,7 +33,7 @@ use finitechat_blob::{
 use finitechat_client::{
     FiniteChatDevice, FiniteChatDeviceConfig, HttpRuntimeDelivery, HttpRuntimeDeliveryError,
     ReqwestHttpRuntimeTransport, ReqwestHttpRuntimeTransportError, RuntimeDelivery,
-    SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent, generate_account_secret,
+    SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent,
 };
 use finitechat_core::{
     AppAction, AppBridgeActivityInput, AppRoomState, AppSentMessage, FiniteChatCoreError,
@@ -43,7 +47,7 @@ use finitechat_http::{
     HttpInviteSessionState, HttpInviteSessionSummary, NostrProfileRecord, SyncWaitInvite,
     SyncWaitRequest, SyncWaitRoom,
 };
-use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
+use finitechat_mls::NostrSecretKey;
 use finitechat_proto::{
     AttachmentBlobReferenceV1, DecryptedApplicationEventV1, DurableAppEventKind,
     EphemeralActivityActionV1, InviteCodeV1, npub_encode,
@@ -54,7 +58,6 @@ use serde_json::{Value, json};
 use crate::CliError;
 
 const CONFIG_FILE: &str = "config.json";
-const NSEC_FILE: &str = "agent.nsec";
 const INVITES_FILE: &str = "invites.json";
 const HERMES_INBOX_FILE: &str = "hermes-inbox.json";
 const HERMES_RUNNING_FILE: &str = "hermes-running.json";
@@ -164,9 +167,9 @@ fn cmd_install<W: Write>(
             "pass either --plugin-dir or --plugins-dir, not both".to_owned(),
         ));
     }
-    if !crate::identity::agent_identity_exists(home_dir) {
+    if !home_dir.join(CONFIG_FILE).exists() {
         return Err(CliError::Hermes(format!(
-            "agent home {} is missing an Agent Principal Key (run finitechat identity init or finitechat hermes init first)",
+            "agent home {} is not initialized (run finitechat hermes init first)",
             home_dir.display()
         )));
     }
@@ -837,11 +840,10 @@ fn cmd_init<W: Write>(
     }
     fs::create_dir_all(home_dir).map_err(|error| CliError::Hermes(error.to_string()))?;
 
-    let secret = if crate::identity::agent_identity_exists(home_dir) {
-        crate::identity::load_agent_secret(home_dir)?
-    } else {
-        generate_account_secret().map_err(|error| CliError::Hermes(error.to_string()))?
-    };
+    // Account-key acquisition per the Finite Identity Contract v1: load the
+    // shared identity, minting it if this is the first Finite tool to run.
+    // The secret stays in memory; nothing key-shaped is written to the home.
+    let secret = load_or_generate_agent_secret()?;
     let runtime = FiniteChatRuntime::open(OpenOptions {
         data_dir: home_dir.to_string_lossy().into_owned(),
         server_url: server_url.clone(),
@@ -857,7 +859,6 @@ fn cmd_init<W: Write>(
         device_id,
         account_id: state.identity.account_id,
     };
-    crate::identity::persist_agent_identity(home_dir, &secret)?;
     write_private(
         home_dir.join(CONFIG_FILE),
         &serde_json::to_string_pretty(&config).map_err(CliError::Serialize)?,
@@ -1970,8 +1971,38 @@ fn cmd_activity<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Re
 
 // --- agent home plumbing ---
 
+/// Resolve the agent home (durable agent state — never the identity, whose
+/// location is fixed by the Finite Identity Contract).
 fn resolve_home(args: &mut Vec<String>) -> Result<PathBuf, CliError> {
-    crate::identity::resolve_agent_home(args).map(|resolved| resolved.path)
+    resolve_home_with(
+        args,
+        |name| std::env::var_os(name).map(PathBuf::from),
+        || std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn resolve_home_with(
+    args: &mut Vec<String>,
+    env_path: impl Fn(&str) -> Option<PathBuf>,
+    home_dir: impl Fn() -> Option<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    if let Some(path) = crate::take_option(args, "--agent-home")? {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = crate::take_option(args, "--home")? {
+        return Ok(PathBuf::from(path));
+    }
+    for name in ["FINITE_AGENT_HOME", "FINITECHAT_HOME"] {
+        if let Some(path) = env_path(name) {
+            return Ok(path);
+        }
+    }
+    let Some(home) = home_dir() else {
+        return Err(CliError::Usage(
+            "pass --agent-home DIR, set FINITE_AGENT_HOME, or set HOME".to_owned(),
+        ));
+    };
+    Ok(home.join(".finite").join("agent"))
 }
 
 fn default_hermes_plugins_dir() -> Result<PathBuf, CliError> {
@@ -2012,6 +2043,15 @@ fn hermes_plugin_env_contents(
     let home = env_file_value("FINITECHAT_HOME", home_dir)?;
     let bin = env_file_value("FINITECHAT_BIN", finitechat_bin)?;
     let mut contents = format!("FINITECHAT_HOME={home}\nFINITECHAT_BIN={bin}\n");
+    // Hosted runtimes pin the shared identity location with FINITE_HOME
+    // (e.g. the durable /data/agent mount); propagate it so the plugin
+    // shells finitechat against the same identity.
+    if let Some(finite_home) = std::env::var_os("FINITE_HOME") {
+        let finite_home = env_file_value("FINITE_HOME", Path::new(&finite_home))?;
+        if !finite_home.trim().is_empty() {
+            contents.push_str(&format!("FINITE_HOME={finite_home}\n"));
+        }
+    }
     if let Some(service_url) = service_url {
         let service_url = env_string_value("FINITECHAT_HERMES_SERVICE_URL", service_url)?;
         if !service_url.trim().is_empty() {
@@ -2092,19 +2132,46 @@ fn load_home(dir: &Path) -> Result<AgentHome, CliError> {
             ))
         })?)
         .map_err(CliError::Json)?;
-    let nsec_hex = fs::read_to_string(dir.join(NSEC_FILE))
+    // Bridge commands never mint: the shared identity must already exist and
+    // must be the account this agent home was initialized with.
+    let paths = identity_paths()?;
+    let identity = FiniteIdentity::load(&paths).map_err(|error| {
+        CliError::Hermes(format!(
+            "shared Finite identity unavailable at {}: {error}",
+            paths.identity_file().display()
+        ))
+    })?;
+    if identity.public_key_hex() != config.account_id {
+        return Err(CliError::Hermes(format!(
+            "shared Finite identity at {} is account {}, but agent home {} was initialized with account {}",
+            paths.identity_file().display(),
+            identity.public_key_hex(),
+            dir.display(),
+            config.account_id
+        )));
+    }
+    let secret = NostrSecretKey::from_bytes(identity.expose_secret_bytes())
         .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let bytes = crate::parse_hex("agent.nsec", nsec_hex.trim())?;
-    let bytes: [u8; NOSTR_SECRET_KEY_BYTES] = bytes
-        .try_into()
-        .map_err(|_| CliError::Hermes("agent.nsec must be 32 bytes of hex".to_owned()))?;
-    let secret =
-        NostrSecretKey::from_bytes(bytes).map_err(|error| CliError::Hermes(error.to_string()))?;
     Ok(AgentHome {
         dir: dir.to_path_buf(),
         config,
         secret,
     })
+}
+
+fn identity_paths() -> Result<IdentityPaths, CliError> {
+    IdentityPaths::resolve().map_err(|error| CliError::Hermes(error.to_string()))
+}
+
+/// `finitechat hermes init` acquisition: load the shared Finite identity,
+/// minting under the contract's exclusive lock when absent.
+fn load_or_generate_agent_secret() -> Result<NostrSecretKey, CliError> {
+    let paths = identity_paths()?;
+    let identity =
+        FiniteIdentity::load_or_generate(&paths, concat!("finitechat ", env!("CARGO_PKG_VERSION")))
+            .map_err(|error| CliError::Hermes(error.to_string()))?;
+    NostrSecretKey::from_bytes(identity.expose_secret_bytes())
+        .map_err(|error| CliError::Hermes(error.to_string()))
 }
 
 type AgentDelivery = HttpRuntimeDelivery<ReqwestHttpRuntimeTransport>;
@@ -2254,7 +2321,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID] [--agent-name NAME] [--agent-about TEXT] [--agent-picture-url URL] [--skip-agent-profile]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes invite-status --url INVITE_URL [--json]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, FINITE_HOME, or ~/.finite/agent may replace --agent-home; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID] [--agent-name NAME] [--agent-about TEXT] [--agent-picture-url URL] [--skip-agent-profile]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes invite-status --url INVITE_URL [--json]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, or ~/.finite/agent may replace --agent-home; the account key is the shared Finite identity under $FINITE_HOME/identity or ~/.finite/identity — see finitechat auth; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]
@@ -2262,13 +2329,23 @@ mod tests {
     use super::*;
     use finitechat_hermes::HermesMessageTypeV1;
 
+    /// `hermes install` requires an initialized agent home; plant the
+    /// config marker without running init (install only checks existence).
+    fn write_test_agent_config(home: &Path) {
+        fs::create_dir_all(home).unwrap();
+        fs::write(
+            home.join(CONFIG_FILE),
+            r#"{"server_url":"http://127.0.0.1:1","device_id":"agent","account_id":"00"}"#,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn install_writes_embedded_plugin_and_local_env_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("agent-home");
         let plugin_dir = dir.path().join("hermes").join("plugins").join("finite");
-        let secret = generate_account_secret().unwrap();
-        crate::identity::persist_agent_identity(&home, &secret).unwrap();
+        write_test_agent_config(&home);
 
         let mut output = Vec::new();
         cmd_install(
@@ -2319,8 +2396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("agent-home");
         let plugin_dir = dir.path().join("finite-plugin");
-        let secret = generate_account_secret().unwrap();
-        crate::identity::persist_agent_identity(&home, &secret).unwrap();
+        write_test_agent_config(&home);
         let args = vec![
             "--plugin-dir".to_owned(),
             plugin_dir.display().to_string(),
@@ -2346,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn install_fails_when_agent_home_has_no_identity() {
+    fn install_fails_when_agent_home_is_not_initialized() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("agent-home");
         let plugin_dir = dir.path().join("finite-plugin");
@@ -2363,13 +2439,14 @@ mod tests {
             true,
             &mut output,
         )
-        .expect_err("missing identity fails");
-        assert!(error.to_string().contains("Agent Principal Key"));
+        .expect_err("uninitialized agent home fails");
+        assert!(error.to_string().contains("not initialized"));
         assert!(!plugin_dir.exists());
     }
 
     #[test]
     fn home_channel_rejects_room_not_available_to_agent() {
+        crate::ensure_test_finite_home();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("agent-home");
         let mut output = Vec::new();

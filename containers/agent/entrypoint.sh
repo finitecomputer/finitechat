@@ -9,6 +9,10 @@ truthy() {
 }
 
 agent_home="${FINITECHAT_HOME:-/data/agent}"
+# The shared Finite identity (identity/identity.json) must live on the same
+# durable mount as the rest of the agent state so restore/backup and
+# restarts keep the account key.
+export FINITE_HOME="${FINITE_HOME:-$agent_home}"
 
 restic_repository() {
     printf '%s' "${FINITE_AGENT_RESTIC_REPOSITORY:-${FINITE_DOCKER_RESTIC_REPOSITORY:-}}"

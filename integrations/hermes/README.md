@@ -17,8 +17,11 @@ to end-to-end-encrypted Finite Chat rooms. The dream flow (ADR 0006):
 # 1. The binary (one drop-in binary owns all crypto and state)
 cargo install --path crates/finitechat-cli   # installs `finitechat`
 
-# 2. The agent identity
-finitechat identity --agent-home ~/.finite-agent init
+# 2. Initialize the agent home. The account key is the shared Finite
+#    identity at ~/.finite/identity/identity.json ($FINITE_HOME/identity in
+#    hosted runtimes) — minted here if no Finite tool has run yet, reused if
+#    one has. Inspect it with `finitechat auth status`; bring an existing
+#    nsec with `finitechat auth import` (stdin or --file).
 finitechat hermes --agent-home ~/.finite-agent init --server http://your-server:8787
 
 # 3. The plugin (Hermes ≥ 0.16 plugin layout)

@@ -192,9 +192,7 @@ def pull_phone_store(device: str, store_path: Path) -> None:
     copied_store = pull_parent / "FiniteChatStore"
     if copied_store.is_dir():
         source = copied_store
-    elif (pull_parent / "account-secret.hex").is_file() and (
-        pull_parent / "client.sqlite3"
-    ).is_file():
+    elif (pull_parent / "client.sqlite3").is_file():
         source = pull_parent
     else:
         raise AssertionError(f"devicectl copy did not produce FiniteChatStore under {pull_parent}")

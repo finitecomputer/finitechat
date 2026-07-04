@@ -845,6 +845,25 @@ mod tests {
     }
 
     #[test]
+    fn nostr_secret_derivation_matches_pinned_vector() {
+        // Pinned HKDF vector: the account secret now arrives via the shared
+        // Finite identity file, and existing device stores keyed off the
+        // same secret must keep working — the derivation math for a given
+        // secret must never change.
+        let derived = account_secret()
+            .derive_secret_32(b"finitechat.test.local-key.v1", b"phone")
+            .unwrap();
+        let mut derived_hex = String::with_capacity(64);
+        for byte in derived {
+            derived_hex.push_str(&format!("{byte:02x}"));
+        }
+        assert_eq!(
+            derived_hex,
+            "822a09dcf2789f0a6107d94acef335792f856d3f7b8cd40f755c06c4ca05a5e4"
+        );
+    }
+
+    #[test]
     fn nostr_secret_derivation_is_stable_and_domain_separated() {
         let secret = account_secret();
         let first = secret

@@ -190,9 +190,7 @@ class ResticRepositoryHelperTest(unittest.TestCase):
 
 class AgentRuntimeLauncherConfigTest(unittest.TestCase):
     def test_gateway_launcher_does_not_persist_raw_finite_private_key(self) -> None:
-        script = (REPO_ROOT / "containers/agent/run_hermes_gateway.sh").read_text(
-            encoding="utf-8"
-        )
+        script = (REPO_ROOT / "containers/agent/run_hermes_gateway.sh").read_text(encoding="utf-8")
 
         self.assertIn("api_key: ${FINITE_PRIVATE_API_KEY}", script)
         self.assertIn("api_key: ${FINITECHAT_HERMES_API_KEY}", script)
@@ -361,10 +359,8 @@ class AgentDockerE2ETest(unittest.TestCase):
                     "exec",
                     CONTAINER,
                     "finitechat",
-                    "identity",
-                    "--agent-home",
-                    "/data/agent",
-                    "show",
+                    "auth",
+                    "status",
                 ],
                 timeout=60,
             ).stdout

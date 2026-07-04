@@ -9263,6 +9263,25 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     #[test]
+    fn client_store_encryption_key_matches_pinned_vector() {
+        // Pinned HKDF vector for the client-store key derivation domain
+        // (`finitechat.client-store-key.v1`). The account secret now arrives
+        // via the shared Finite identity file; existing encrypted stores
+        // keyed off the same secret must keep opening, so this derivation
+        // must never change for a given secret.
+        let secret = NostrSecretKey::from_bytes([7; NOSTR_SECRET_KEY_BYTES]).unwrap();
+        let key = ClientStoreEncryptionKey::from_nostr_secret(&secret, "phone").unwrap();
+        let mut key_hex = String::with_capacity(64);
+        for byte in key.as_bytes() {
+            key_hex.push_str(&format!("{byte:02x}"));
+        }
+        assert_eq!(
+            key_hex,
+            "cb0a531322f96b78a76cec704b201c2ccc4695855f78022a024e50e8349bb656"
+        );
+    }
+
+    #[test]
     fn refreshed_device_clock_accepts_key_packages_created_after_runtime_open() {
         let alice_secret = NostrSecretKey::from_bytes([1; NOSTR_SECRET_KEY_BYTES]).unwrap();
         let bob_secret = NostrSecretKey::from_bytes([2; NOSTR_SECRET_KEY_BYTES]).unwrap();

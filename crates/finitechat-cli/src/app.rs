@@ -16,7 +16,6 @@ pub(crate) fn run<W: Write>(mut args: Vec<String>, output: &mut W) -> Result<(),
         take_option(&mut args, "--server")?.unwrap_or_else(|| DEFAULT_SERVER_URL.to_owned());
     let device_id =
         take_option(&mut args, "--device-id")?.unwrap_or_else(|| DEFAULT_DEVICE_ID.into());
-    let account_secret_hex = take_option(&mut args, "--account-secret-hex")?;
     let now_unix_seconds = take_option(&mut args, "--now")?
         .map(|value| parse_u64("--now", &value))
         .transpose()?;
@@ -24,11 +23,14 @@ pub(crate) fn run<W: Write>(mut args: Vec<String>, output: &mut W) -> Result<(),
         return Err(CliError::Usage(usage()));
     };
 
+    // The account key always comes from the shared Finite identity
+    // ($FINITE_HOME/identity/, else ~/.finite/identity/), minted on first
+    // run; there is no per-invocation secret flag (see `finitechat auth`).
     let runtime = FiniteChatRuntime::open(OpenOptions {
         data_dir,
         server_url: server,
         device_id,
-        account_secret_hex,
+        account_secret_hex: None,
         now_unix_seconds,
     })
     .map_err(map_core_error)?;
@@ -176,7 +178,7 @@ pub(crate) fn run<W: Write>(mut args: Vec<String>, output: &mut W) -> Result<(),
 }
 
 pub(crate) fn usage() -> String {
-    "app commands:\n  finitechat app [--data-dir DIR] [--server URL] [--device-id ID] [--account-secret-hex HEX] [--now SECONDS] identity\n  finitechat app [options] state [--start-runtime] [--wait-update-ms MS] [--room-id ID]\n  finitechat app [options] start\n  finitechat app [options] wait [--timeout-ms MS]\n  finitechat app [options] stop\n  finitechat app [options] open-room --room-id ID\n  finitechat app [options] create-room [--display-name NAME]\n  finitechat app [options] create-invite --room-id ID\n  finitechat app [options] scan --value INVITE_OR_PROFILE\n  finitechat app [options] submit-join --room-id ID\n  finitechat app [options] send --room-id ID --text TEXT\n  finitechat app [options] mark-read --room-id ID\n  finitechat app [options] refresh-devices".to_owned()
+    "app commands:\n  finitechat app [--data-dir DIR] [--server URL] [--device-id ID] [--now SECONDS] identity\n  finitechat app [options] state [--start-runtime] [--wait-update-ms MS] [--room-id ID]\n  finitechat app [options] start\n  finitechat app [options] wait [--timeout-ms MS]\n  finitechat app [options] stop\n  finitechat app [options] open-room --room-id ID\n  finitechat app [options] create-room [--display-name NAME]\n  finitechat app [options] create-invite --room-id ID\n  finitechat app [options] scan --value INVITE_OR_PROFILE\n  finitechat app [options] submit-join --room-id ID\n  finitechat app [options] send --room-id ID --text TEXT\n  finitechat app [options] mark-read --room-id ID\n  finitechat app [options] refresh-devices".to_owned()
 }
 
 fn write_state<W: Write>(output: &mut W, state: AppState) -> Result<(), CliError> {

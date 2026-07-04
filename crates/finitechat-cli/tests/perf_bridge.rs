@@ -106,8 +106,12 @@ fn bridge_path_latency_breakdown() {
 
     // --- Pair an agent (CLI home) with an in-process user device. ---
     let agent_home = dir.path().join("agent").display().to_string();
+    // The agent's shared Finite identity lives in a benchmark-local
+    // FINITE_HOME, never the developer's real ~/.finite.
+    let finite_home = dir.path().join("finite-home");
     let cli = |args: &[&str]| -> Value {
         let output = std::process::Command::new(bin)
+            .env("FINITE_HOME", &finite_home)
             .args(["hermes", "--home", &agent_home])
             .args(args)
             .output()

@@ -19,6 +19,10 @@ COPY finitechat/containers/agent/health_server.py /opt/health_server.py
 COPY finitechat/containers/agent/run_hermes_gateway.sh /opt/run_hermes_gateway.sh
 RUN chmod +x /opt/agent-entrypoint.sh /opt/health_server.py /opt/run_hermes_gateway.sh
 ENV FINITECHAT_HOME=/data/agent
+# Shared Finite identity root (Finite Identity Contract v1): the account key
+# lands at $FINITE_HOME/identity/identity.json on the durable mount, alongside
+# the rest of the agent state.
+ENV FINITE_HOME=/data/agent
 ENV HERMES_HOME=/data/agent/hermes-home
 EXPOSE 8080
 # FINITE_SERVER_URL is provided at `container run` time (the host's vmnet

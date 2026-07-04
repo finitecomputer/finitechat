@@ -14,8 +14,13 @@ finitechat hermes --agent-home DIR install
 
 The command installs the embedded `finite-platform` Hermes plugin and writes a
 colocated `finitechat.env` with `FINITECHAT_HOME` and `FINITECHAT_BIN`
-defaults. It refuses to install from an Agent Home that does not already have
-an Agent Principal Key. `--service-url URL` also writes
+defaults (plus `FINITE_HOME` when set at install time, so hosted runtimes pin
+the shared Finite identity location). It refuses to install from an Agent
+Home that has not been initialized with `finitechat hermes init`. The agent's
+account key is the shared Finite identity at
+`$FINITE_HOME/identity/identity.json` (else `~/.finite/identity/`) — see
+`finitechat auth status` / `finitechat auth import`; no key material lives in
+the Agent Home. `--service-url URL` also writes
 `FINITECHAT_HERMES_SERVICE_URL` for a supervisor-managed service.
 
 The supervised service entrypoint is:

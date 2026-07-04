@@ -39,7 +39,7 @@ def next_response(name: str) -> object:
     return responses[min(index, len(responses) - 1)]
 
 
-if "identity" in args:
+if "auth" in args and "status" in args:
     print(json.dumps({"npub": "npub1agent", "account_id": "a" * 64}))
     sys.exit(0)
 if "invite-status" in args:

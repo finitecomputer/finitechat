@@ -1,8 +1,8 @@
 use std::io::Write;
 
 mod app;
+mod auth;
 mod hermes;
-mod identity;
 
 use finitechat_delivery::{HttpKeyPackageId, HttpKeyPackagePublication};
 use finitechat_http::{
@@ -100,7 +100,7 @@ where
             .map_err(CliError::Output)
         }
         Some("app") => app::run(args.into_iter().skip(1).collect(), output),
-        Some("identity") => identity::run(args.into_iter().skip(1).collect(), output),
+        Some("auth") => auth::run(args.into_iter().skip(1).collect(), output),
         Some("hermes") => hermes::run(args.into_iter().skip(1).collect(), output),
         Some("http") => {
             let request = prepare_http_request(args.into_iter().skip(1))?;
@@ -895,8 +895,8 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat <http-smoke|http|identity|hermes|app>\n\n{}\n\n{}\n\n{}",
-        identity::usage(),
+        "usage: finitechat <http-smoke|http|auth|hermes|app>\n\n{}\n\n{}\n\n{}",
+        auth::usage(),
         app::usage(),
         http_usage()
     )
@@ -904,6 +904,26 @@ fn usage() -> String {
 
 fn http_usage() -> String {
     "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --join-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat http [--server URL] invite-requests --invite-id ID\n  finitechat http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat http [--server URL] invite-expire --invite-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
+}
+
+/// Point `FINITE_HOME` at a process-wide throwaway directory so tests never
+/// mint or read the developer's real shared identity. Set once per process;
+/// every in-process test that can reach identity resolution calls this first.
+#[cfg(test)]
+pub(crate) fn ensure_test_finite_home() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("test FINITE_HOME tempdir");
+        let path = dir.path().to_path_buf();
+        // Keep the directory alive for the whole test process.
+        std::mem::forget(dir);
+        // SAFETY: set exactly once, before any identity resolution in this
+        // process; tests that resolve identity call this helper first.
+        unsafe { std::env::set_var("FINITE_HOME", &path) };
+        path
+    })
+    .clone()
 }
 
 #[cfg(test)]
@@ -1661,6 +1681,7 @@ mod tests {
 
     #[test]
     fn app_identity_and_state_use_runtime() {
+        crate::ensure_test_finite_home();
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("app").display().to_string();
 
@@ -1697,10 +1718,26 @@ mod tests {
 
     #[test]
     fn app_cli_invite_join_and_message_flow_uses_runtime() {
+        crate::ensure_test_finite_home();
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_cli_server(&dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice").display().to_string();
         let bob_dir = dir.path().join("bob").display().to_string();
+        // Alice drives the CLI (shared test identity). Bob must be a distinct
+        // account: the CLI has no secret flag (the shared identity is the only
+        // CLI acquisition path), so bob runs through the core runtime with an
+        // explicit in-memory secret, like a second user's device would.
+        let bob_secret_hex = "42".repeat(32);
+        let open_bob = || {
+            finitechat_core::FiniteChatRuntime::open(finitechat_core::OpenOptions {
+                data_dir: bob_dir.clone(),
+                server_url: server_url.clone(),
+                device_id: "bob-cli".to_owned(),
+                account_secret_hex: Some(bob_secret_hex.clone()),
+                now_unix_seconds: Some(1000),
+            })
+            .expect("bob runtime opens")
+        };
 
         let created = run_cli_json([
             "app",
@@ -1735,22 +1772,13 @@ mod tests {
         ]);
         let invite_url = invite["invite_url"].as_str().unwrap().to_owned();
 
-        let scanned = run_cli_json([
-            "app",
-            "--data-dir",
-            &bob_dir,
-            "--server",
-            &server_url,
-            "--device-id",
-            "bob-cli",
-            "--now",
-            "1000",
-            "scan",
-            "--value",
-            &invite_url,
-        ]);
-        assert_eq!(scanned["selected_room_id"], room_id);
-        assert_eq!(scanned["status"], "join requested");
+        let scanned = open_bob()
+            .dispatch_and_wait(finitechat_core::AppAction::ScanTarget {
+                value: invite_url.clone(),
+            })
+            .expect("bob scans invite");
+        assert_eq!(scanned.selected_room_id.as_deref(), Some(room_id.as_str()));
+        assert_eq!(scanned.status, "join requested");
 
         run_cli_json([
             "app",
@@ -1764,42 +1792,22 @@ mod tests {
             "1000",
             "start",
         ]);
-        let joined = run_cli_json([
-            "app",
-            "--data-dir",
-            &bob_dir,
-            "--server",
-            &server_url,
-            "--device-id",
-            "bob-cli",
-            "--now",
-            "1000",
-            "start",
-        ]);
-        let bob_room = joined["rooms"]
-            .as_array()
-            .unwrap()
+        let joined = open_bob()
+            .dispatch_and_wait(finitechat_core::AppAction::StartRuntime)
+            .expect("bob syncs");
+        let bob_room = joined
+            .rooms
             .iter()
-            .find(|room| room["room_id"] == room_id)
+            .find(|room| room.room_id == room_id)
             .expect("bob room projects");
-        assert_eq!(bob_room["state"], "Connected");
+        assert_eq!(format!("{:?}", bob_room.state), "Connected");
 
-        run_cli_json([
-            "app",
-            "--data-dir",
-            &bob_dir,
-            "--server",
-            &server_url,
-            "--device-id",
-            "bob-cli",
-            "--now",
-            "1000",
-            "send",
-            "--room-id",
-            &room_id,
-            "--text",
-            "hello from app cli",
-        ]);
+        open_bob()
+            .dispatch_and_wait(finitechat_core::AppAction::SendMessage {
+                room_id: room_id.clone(),
+                text: "hello from app cli".to_owned(),
+            })
+            .expect("bob sends");
         let synced = run_cli_json([
             "app",
             "--data-dir",

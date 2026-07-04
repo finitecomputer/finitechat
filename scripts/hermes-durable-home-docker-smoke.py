@@ -223,6 +223,10 @@ def start_agent_container(
         "--env",
         "FINITECHAT_HOME=/home/node/.finitechat/agent",
         "--env",
+        # Shared Finite identity on the same durable volume as the agent home
+        # (overrides the image default of /data/agent).
+        "FINITE_HOME=/home/node/.finitechat/agent",
+        "--env",
         "HERMES_HOME=/home/node/.hermes",
         "--env",
         "FINITECHAT_WORKSPACE=/home/node/workspace",

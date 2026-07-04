@@ -50,7 +50,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset};
 
-const ACCOUNT_SECRET_FILE: &str = "account-secret.hex";
 const CLIENT_STORE_FILE: &str = "client.sqlite3";
 const ATTACHMENT_CACHE_DIR: &str = "attachments";
 const LOCAL_ROOM_CONNECTED_TEXT: &str = "Connected";
@@ -131,6 +130,10 @@ pub struct OpenOptions {
     pub data_dir: String,
     pub server_url: String,
     pub device_id: String,
+    /// Explicit account secret (lowercase hex), for platforms that hold key
+    /// material themselves (e.g. the iOS keychain identity). `None` resolves
+    /// the shared Finite identity at `$FINITE_HOME/identity/identity.json`
+    /// (or `~/.finite/identity/identity.json`), minting it if absent.
     pub account_secret_hex: Option<String>,
     pub now_unix_seconds: Option<u64>,
 }
@@ -4985,8 +4988,7 @@ impl CoreState {
             reason: format!("failed to create {}: {error}", data_dir.display()),
         })?;
 
-        let account_secret =
-            load_or_create_account_secret(&data_dir, options.account_secret_hex.as_deref())?;
+        let account_secret = resolve_account_secret(options.account_secret_hex.as_deref())?;
         let fixed_now_unix_seconds = options.now_unix_seconds;
         let now = fixed_now_unix_seconds.unwrap_or_else(current_unix_seconds);
         let mut config = FiniteChatDeviceConfig {
@@ -7571,45 +7573,34 @@ fn chat_media_gallery_item_id(message: &ChatMessage, attachment: &ChatMediaAttac
     )
 }
 
-fn load_or_create_account_secret(
-    data_dir: &Path,
-    provided: Option<&str>,
-) -> Result<NostrSecretKey, FiniteChatCoreError> {
-    let secret_path = data_dir.join(ACCOUNT_SECRET_FILE);
+/// Recorded as `created_by` in `identity.json` when this build mints the
+/// shared Finite identity.
+const FINITE_IDENTITY_CREATED_BY: &str = concat!("finitechat ", env!("CARGO_PKG_VERSION"));
+
+/// Resolve the account secret per the Finite Identity Contract v1.
+///
+/// Callers that already hold key material (iOS keychain identities, tests)
+/// pass it explicitly; it is held in memory only and never written to the
+/// data dir. Otherwise the shared identity at `$FINITE_HOME/identity/`
+/// (or `~/.finite/identity/`) is loaded, minting under the contract's
+/// exclusive lock if this is the first Finite tool to run. Legacy per-store
+/// `account-secret.hex` files are deliberately never read (hard cut).
+fn resolve_account_secret(provided: Option<&str>) -> Result<NostrSecretKey, FiniteChatCoreError> {
     if let Some(secret) = provided {
-        let parsed = parse_account_secret_hex(secret)?;
-        write_account_secret(&secret_path, &parsed)?;
-        return Ok(parsed);
+        return parse_account_secret_hex(secret);
     }
-    if secret_path.is_file() {
-        let secret =
-            fs::read_to_string(&secret_path).map_err(|error| FiniteChatCoreError::Filesystem {
-                reason: format!("failed to read {}: {error}", secret_path.display()),
-            })?;
-        return parse_account_secret_hex(secret.trim());
-    }
-    let secret = generate_account_secret().map_err(client_error)?;
-    write_account_secret(&secret_path, &secret)?;
-    Ok(secret)
+    let paths = finite_identity::IdentityPaths::resolve().map_err(finite_identity_error)?;
+    let identity =
+        finite_identity::FiniteIdentity::load_or_generate(&paths, FINITE_IDENTITY_CREATED_BY)
+            .map_err(finite_identity_error)?;
+    NostrSecretKey::from_bytes(identity.expose_secret_bytes())
+        .map_err(|_| FiniteChatCoreError::InvalidAccountSecret)
 }
 
-fn write_account_secret(path: &Path, secret: &NostrSecretKey) -> Result<(), FiniteChatCoreError> {
-    fs::write(path, format!("{}\n", hex::encode(secret.as_bytes()))).map_err(|error| {
-        FiniteChatCoreError::Filesystem {
-            reason: format!("failed to write {}: {error}", path.display()),
-        }
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions).map_err(|error| {
-            FiniteChatCoreError::Filesystem {
-                reason: format!("failed to chmod {}: {error}", path.display()),
-            }
-        })?;
+fn finite_identity_error(error: finite_identity::Error) -> FiniteChatCoreError {
+    FiniteChatCoreError::Filesystem {
+        reason: format!("finite identity: {error}"),
     }
-    Ok(())
 }
 
 fn parse_account_secret_hex(secret: &str) -> Result<NostrSecretKey, FiniteChatCoreError> {
@@ -7894,6 +7885,48 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
+    /// Tests always pass an explicit account secret so they never touch the
+    /// shared Finite identity in the developer's real `$HOME`/`$FINITE_HOME`.
+    /// The secret is derived deterministically from the data dir so a store
+    /// reopened at the same path recovers the same account, while separate
+    /// stores (alice/bob) get distinct accounts.
+    fn with_test_secret(mut options: OpenOptions) -> OpenOptions {
+        if options.account_secret_hex.is_none() {
+            options.account_secret_hex = Some(test_account_secret_hex(&options.data_dir));
+        }
+        options
+    }
+
+    /// For tests that must exercise the shared-identity (`None`) acquisition
+    /// path itself — e.g. stored-device recovery, which only runs when no
+    /// explicit secret is passed. Points FINITE_HOME at a process-wide
+    /// throwaway directory, never the developer's real ~/.finite.
+    fn ensure_test_finite_home() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = tempfile::tempdir().expect("test FINITE_HOME tempdir");
+            let path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            // SAFETY: set once; no other unit test in this binary reads
+            // FINITE_HOME (they all pass explicit secrets).
+            unsafe { std::env::set_var("FINITE_HOME", &path) };
+        });
+    }
+
+    fn test_account_secret_hex(seed: &str) -> String {
+        for counter in 0u32.. {
+            let mut hasher = Sha256::new();
+            hasher.update(b"finitechat.test.account-secret.v1");
+            hasher.update(seed.as_bytes());
+            hasher.update(counter.to_le_bytes());
+            let bytes: [u8; NOSTR_SECRET_KEY_BYTES] = hasher.finalize().into();
+            if NostrSecretKey::from_bytes(bytes).is_ok() {
+                return hex::encode(bytes);
+            }
+        }
+        unreachable!("some hash counter yields a valid secp256k1 secret key")
+    }
+
     #[test]
     fn nostr_identity_helpers_round_trip_nsec_material() {
         let created = create_nostr_identity().unwrap();
@@ -8017,13 +8050,13 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let runtime = FiniteChatRuntime::open(OpenOptions {
+        let runtime = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("app").to_string_lossy().into_owned(),
             server_url: "http://127.0.0.1:1".to_owned(),
             device_id: "listener-device".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -8050,21 +8083,21 @@ mod tests {
     fn app_runtime_sessions_message_each_other_over_live_http() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-cli".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -8133,13 +8166,13 @@ mod tests {
         let alice_secret_hex = hex::encode([1_u8; 32]);
         let bob_secret_hex = hex::encode([2_u8; 32]);
 
-        let stale_bob = CoreState::open(OpenOptions {
+        let stale_bob = CoreState::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("stale-bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: Some(bob_secret_hex.clone()),
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let stale_upload = stale_bob
             .device
@@ -8149,21 +8182,21 @@ mod tests {
         stale_delivery.upload_key_package(stale_upload).unwrap();
         drop(stale_bob);
 
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-cli".to_owned(),
             account_secret_hex: Some(alice_secret_hex),
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: Some(bob_secret_hex),
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -8205,13 +8238,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let created = app
@@ -8227,13 +8260,13 @@ mod tests {
         .unwrap();
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
         assert_eq!(
@@ -8704,13 +8737,13 @@ mod tests {
     #[test]
     fn app_create_room_requires_durable_server_success() {
         let dir = tempfile::tempdir().unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: "http://127.0.0.1:1".to_owned(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let error = app
@@ -8730,13 +8763,13 @@ mod tests {
     #[test]
     fn app_create_room_rejects_oversized_display_name_before_side_effects() {
         let dir = tempfile::tempdir().unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let error = app
@@ -8752,13 +8785,13 @@ mod tests {
     fn app_push_token_actions_register_remove_and_surface_server_rejection() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let registered = app
@@ -8787,13 +8820,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let created = app
@@ -8843,13 +8876,13 @@ mod tests {
         assert!(!app_room(&loaded, &room_id).can_load_older);
 
         drop(app);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert_eq!(reopened_state.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
@@ -8863,13 +8896,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let created = app
@@ -8885,13 +8918,13 @@ mod tests {
         .unwrap();
         drop(app);
 
-        let relaunched = FiniteChatRuntime::open(OpenOptions {
+        let relaunched = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let cached = relaunched.state().unwrap();
         assert_eq!(cached.rooms.len(), 1);
@@ -8938,13 +8971,13 @@ mod tests {
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
         );
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -8968,13 +9001,13 @@ mod tests {
         assert!(!state.profiles[0].stale);
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let cached = reopened.state().unwrap();
         assert_eq!(cached.profiles.len(), 1);
@@ -8999,13 +9032,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let account_id = app.state().unwrap().identity.account_id;
         let npub = npub_encode(&account_id).unwrap();
@@ -9048,13 +9081,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let account_id = app.state().unwrap().identity.account_id;
 
@@ -9088,13 +9121,13 @@ mod tests {
         );
 
         drop(app);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let cached = reopened.state().unwrap();
         let profile = cached
@@ -9113,13 +9146,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let account_id = app.state().unwrap().identity.account_id;
         let png = b"\x89PNG\r\n\x1a\nprofile image bytes".to_vec();
@@ -9190,13 +9223,13 @@ mod tests {
         assert_eq!(details.picture.as_deref(), Some(picture_url.as_str()));
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let room = app_room(&reopened_state, &room_id);
@@ -9208,13 +9241,13 @@ mod tests {
     fn app_upload_image_rejects_mismatched_content_type() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let error = app
@@ -9230,13 +9263,13 @@ mod tests {
     fn app_upload_image_rejects_oversized_public_image_before_http_upload() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let mut bytes = vec![0; MAX_PUBLIC_IMAGE_UPLOAD_BYTES + 1];
         bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
@@ -9274,13 +9307,13 @@ mod tests {
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
         );
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9308,13 +9341,13 @@ mod tests {
         let account_id =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned();
         let npub = npub_encode(&account_id).unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9337,13 +9370,13 @@ mod tests {
         assert!(state.profiles[0].stale);
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let cached = reopened.state().unwrap();
         assert_eq!(cached.profiles.len(), 1);
@@ -9374,13 +9407,13 @@ mod tests {
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
         );
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9422,13 +9455,13 @@ mod tests {
                 expires_at_ms: NOW.saturating_mul(1000).saturating_add(60_000),
             },
         );
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9453,13 +9486,13 @@ mod tests {
         let account_id =
             "3333333333333333333333333333333333333333333333333333333333333333".to_owned();
         let npub = npub_encode(&account_id).unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9496,13 +9529,13 @@ mod tests {
             npub_encode("4444444444444444444444444444444444444444444444444444444444444444")
                 .unwrap();
         let invite_url = format!("{}&npub={profile_npub}", invite_code.encode().unwrap());
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let scanned = app
@@ -9522,13 +9555,13 @@ mod tests {
         let inviter_npub =
             npub_encode("5555555555555555555555555555555555555555555555555555555555555555")
                 .unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let error = app
@@ -9553,13 +9586,13 @@ mod tests {
         let account_id =
             "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_owned();
         let npub = npub_encode(&account_id).unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let state = app
@@ -9584,13 +9617,13 @@ mod tests {
         assert!(runtime_outbox(&app).is_empty());
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert_eq!(reopened_state.active_profile_id, None);
@@ -9614,13 +9647,13 @@ mod tests {
         };
         let invite_url = invite_code.encode().unwrap();
         let data_dir = dir.path().join("bob");
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let scanned = app
@@ -9647,13 +9680,13 @@ mod tests {
         assert!(runtime_outbox(&app).is_empty());
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let pending = app_room(&reopened_state, &room_id);
@@ -9687,13 +9720,13 @@ mod tests {
             display_name: Some("Flow Join".to_owned()),
         };
         let invite_url = invite_code.encode().unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -9740,21 +9773,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -9820,13 +9853,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert!(
@@ -9846,21 +9879,21 @@ mod tests {
     fn app_profile_chat_claims_key_package_and_sends_welcome_without_invite_qr() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
@@ -9917,13 +9950,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened_alice = FiniteChatRuntime::open(OpenOptions {
+        let reopened_alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let disk_reopened_state = reopened_alice
             .dispatch_and_wait(AppAction::StartProfileChat {
@@ -9968,13 +10001,13 @@ mod tests {
     fn app_profile_chat_without_available_key_package_does_not_create_room() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let account_id =
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned();
@@ -9996,13 +10029,13 @@ mod tests {
         assert!(profile.stale);
         drop(alice);
 
-        let reopened_alice = FiniteChatRuntime::open(OpenOptions {
+        let reopened_alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened_alice.state().unwrap();
         let reopened_profile = app_profile(&reopened_state, &account_id);
@@ -10014,29 +10047,29 @@ mod tests {
     fn app_group_chat_claims_key_packages_and_sends_welcomes_without_invite_qr() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let carol = FiniteChatRuntime::open(OpenOptions {
+        let carol = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("carol").to_string_lossy().into_owned(),
             server_url,
             device_id: "carol-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
@@ -10154,21 +10187,21 @@ mod tests {
     fn app_group_chat_with_missing_key_package_does_not_create_room() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
@@ -10199,29 +10232,29 @@ mod tests {
     fn app_add_room_members_claims_key_package_and_sends_welcome_without_invite_qr() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let carol = FiniteChatRuntime::open(OpenOptions {
+        let carol = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("carol").to_string_lossy().into_owned(),
             server_url,
             device_id: "carol-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let bob_account_id = bob.state().unwrap().identity.account_id;
@@ -10311,13 +10344,13 @@ mod tests {
     fn app_add_room_members_with_missing_key_package_keeps_existing_room() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10351,21 +10384,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let bob_account_id = bob.state().unwrap().identity.account_id;
         let bob_npub = npub_encode(&bob_account_id).unwrap();
@@ -10436,13 +10469,13 @@ mod tests {
         );
 
         drop(alice);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert!(
             reopened.state().unwrap().typing_members.is_empty(),
@@ -10455,13 +10488,13 @@ mod tests {
             text: "done typing".to_owned(),
         })
         .unwrap();
-        let alice_online = FiniteChatRuntime::open(OpenOptions {
+        let alice_online = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice_online
             .dispatch_and_wait(AppAction::StartRuntime)
@@ -10482,21 +10515,21 @@ mod tests {
     fn app_runtime_projects_hermes_working_as_live_indicator_state() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let hermes = FiniteChatRuntime::open(OpenOptions {
+        let hermes = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("hermes").to_string_lossy().into_owned(),
             server_url,
             device_id: "hermes-agent".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10558,13 +10591,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10581,13 +10614,13 @@ mod tests {
             .unwrap();
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let local_snapshot = reopened.state().unwrap();
@@ -10632,13 +10665,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10649,13 +10682,13 @@ mod tests {
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         drop(alice);
 
-        let offline = FiniteChatRuntime::open(OpenOptions {
+        let offline = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let failed = offline
             .dispatch_and_wait(AppAction::SendMessage {
@@ -10674,13 +10707,13 @@ mod tests {
         let local_message_id = failed_message.message_id.clone();
         drop(offline);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
         let reopened_message = local_snapshot
@@ -10719,13 +10752,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10736,13 +10769,13 @@ mod tests {
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         drop(alice);
 
-        let offline = FiniteChatRuntime::open(OpenOptions {
+        let offline = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let failed = offline
             .dispatch_and_wait(AppAction::SendMessage {
@@ -10763,13 +10796,13 @@ mod tests {
             .expect("offline send should persist the outbox row");
         drop(offline);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let before_retry = reopened.state().unwrap();
         let before_message = before_retry
@@ -10803,13 +10836,13 @@ mod tests {
         );
         drop(reopened);
 
-        let persisted_runtime = FiniteChatRuntime::open(OpenOptions {
+        let persisted_runtime = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let persisted = persisted_runtime.state().unwrap();
         let persisted_message = persisted
@@ -10831,13 +10864,13 @@ mod tests {
         let original_server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let empty_server_url = spawn_live_http_server(dir.path().join("empty-server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: original_server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10848,13 +10881,13 @@ mod tests {
         let room_id = alice_state.rooms.first().unwrap().room_id.clone();
         drop(alice);
 
-        let rejected_runtime = FiniteChatRuntime::open(OpenOptions {
+        let rejected_runtime = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: empty_server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let rejected = rejected_runtime
             .dispatch_and_wait(AppAction::SendMessage {
@@ -10893,13 +10926,13 @@ mod tests {
         );
         drop(rejected_runtime);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: original_server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let before_retry = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let still_failed = before_retry
@@ -10950,13 +10983,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -10969,13 +11002,13 @@ mod tests {
 
         let caption = "offline media should not send";
         let plaintext = b"offline media must not create an outbox row".to_vec();
-        let offline = FiniteChatRuntime::open(OpenOptions {
+        let offline = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let failed = offline
             .dispatch_and_wait(AppAction::SendAttachment {
@@ -11009,13 +11042,13 @@ mod tests {
         );
         drop(offline);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
         assert_eq!(
@@ -11041,13 +11074,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alpha = alice
@@ -11078,13 +11111,13 @@ mod tests {
             .unwrap();
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
 
@@ -11105,6 +11138,9 @@ mod tests {
 
     #[test]
     fn app_reopens_unique_local_device_when_requested_device_id_is_stale() {
+        // Stored-device recovery only runs on the shared-identity (`None`)
+        // acquisition path: an explicit secret keeps the requested device id.
+        ensure_test_finite_home();
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let data_dir = dir.path().join("stable-app-store");
@@ -11170,21 +11206,21 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -11225,13 +11261,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
         assert_eq!(
@@ -11266,13 +11302,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let created = app
@@ -11371,13 +11407,13 @@ mod tests {
         );
 
         drop(app);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let reopened_reply = reopened_state
@@ -11405,13 +11441,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -11471,13 +11507,13 @@ mod tests {
         assert_eq!(downloaded.plaintext, plaintext);
 
         drop(alice);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let reopened_message = reopened_state
@@ -11507,13 +11543,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -11572,13 +11608,13 @@ mod tests {
         );
 
         drop(alice);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let reopened_message = reopened_state
@@ -11600,13 +11636,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -11656,13 +11692,13 @@ mod tests {
         assert_eq!(blob.metadata.mime_type, "audio/mp4");
 
         drop(alice);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let reopened_message = reopened_state
@@ -11680,21 +11716,21 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -11749,13 +11785,13 @@ mod tests {
         let attachment_id = attachment.attachment_id.clone();
 
         drop(bob);
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_before_download = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         let cache_miss_message = reopened_before_download
@@ -11809,13 +11845,13 @@ mod tests {
         assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
 
         drop(bob);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         let reopened_message = reopened_state
@@ -11835,21 +11871,21 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -11956,13 +11992,13 @@ mod tests {
         assert_eq!(std::fs::read(local_path).unwrap(), plaintext);
 
         drop(alice);
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert_eq!(reopened_state.messages.len(), DEFAULT_TRANSCRIPT_WINDOW);
@@ -11996,13 +12032,13 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -12019,26 +12055,26 @@ mod tests {
             .unwrap();
         drop(alice);
 
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert_eq!(
             app_room(&alice.state().unwrap(), &room_id).state,
             AppRoomState::Connected
         );
 
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let scanned = bob
             .dispatch_and_wait(AppAction::ScanTarget {
@@ -12055,13 +12091,13 @@ mod tests {
         );
         drop(bob);
 
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let recovered = bob.state().unwrap();
         assert_eq!(
@@ -12087,13 +12123,13 @@ mod tests {
         );
         drop(bob);
 
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let waiting = bob.state().unwrap();
         assert_eq!(
@@ -12123,21 +12159,21 @@ mod tests {
     fn app_runtime_wait_for_update_uses_sse_hints_for_admission_and_messages() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12197,21 +12233,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12255,13 +12291,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let local_snapshot = reopened.state().unwrap();
         assert_eq!(
@@ -12298,21 +12334,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12402,13 +12438,13 @@ mod tests {
         );
         drop(bob);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert_poll(
             &reopened.state().unwrap(),
@@ -12426,21 +12462,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12504,13 +12540,13 @@ mod tests {
         assert_reaction(&bob_state, &target_message_id, "👍", 1, false);
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert_reaction(
             &reopened.state().unwrap(),
@@ -12526,21 +12562,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12597,13 +12633,13 @@ mod tests {
         assert_read_receipt(&bob_state, &target_message_id, 1, 1, "Read by 1");
         drop(bob);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert_read_receipt(
             &reopened.state().unwrap(),
@@ -12620,21 +12656,21 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let room_id = "room-hermes-receipt-followup".to_owned();
         let app_dir = dir.path().join("app");
-        let mut agent = CoreState::open(OpenOptions {
+        let mut agent = CoreState::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("agent").to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "agent".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: app_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "ios-smoke".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         agent
@@ -12687,13 +12723,13 @@ mod tests {
         );
         drop(app);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: app_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "ios-smoke".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let final_state = reopened.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert!(
@@ -12711,21 +12747,21 @@ mod tests {
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice");
         let bob_dir = dir.path().join("bob");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
-        let bob = FiniteChatRuntime::open(OpenOptions {
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: bob_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "bob-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12780,13 +12816,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let offline_state = reopened.state().unwrap();
         assert_eq!(app_room(&offline_state, &room_id).unread_count, 1);
@@ -12799,13 +12835,13 @@ mod tests {
         assert_eq!(app_room(&cleared, &room_id).unread_count, 0);
         drop(reopened);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         assert_eq!(
             app_room(&reopened.state().unwrap(), &room_id).unread_count,
@@ -12818,16 +12854,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
         let alice_dir = dir.path().join("alice-phone");
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: server_url.clone(),
             device_id: "alice-phone".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_identity = alice.state().unwrap().identity;
-        let tablet = FiniteChatRuntime::open(OpenOptions {
+        let tablet = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir
                 .path()
                 .join("alice-tablet")
@@ -12837,7 +12873,7 @@ mod tests {
             device_id: "alice-tablet".to_owned(),
             account_secret_hex: Some(alice_identity.account_secret_hex.clone()),
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let alice_state = alice
@@ -12897,13 +12933,13 @@ mod tests {
         );
         drop(alice);
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url,
             device_id: "alice-phone".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let devices = reopened
             .dispatch_and_wait(AppAction::RefreshDevices)
@@ -12924,13 +12960,13 @@ mod tests {
     #[test]
     fn app_device_actions_offline_are_transient_only() {
         let dir = tempfile::tempdir().unwrap();
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-phone".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let refreshed = app.dispatch_and_wait(AppAction::RefreshDevices).unwrap();
@@ -12966,13 +13002,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let alice_dir = dir.path().join("alice");
         let first_server_url = spawn_live_http_server(dir.path().join("server-one.sqlite3"));
-        let alice = FiniteChatRuntime::open(OpenOptions {
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: first_server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -12983,13 +13019,13 @@ mod tests {
         drop(alice);
 
         let empty_server_url = spawn_live_http_server(dir.path().join("server-two.sqlite3"));
-        let stale = FiniteChatRuntime::open(OpenOptions {
+        let stale = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: empty_server_url,
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
 
         let stale_state = stale
@@ -13007,13 +13043,13 @@ mod tests {
             Some("Invite could not be created")
         );
 
-        let reopened = FiniteChatRuntime::open(OpenOptions {
+        let reopened = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: alice_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let reopened_state = reopened.state().unwrap();
         assert_eq!(
@@ -13027,13 +13063,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("alice");
         let room_id = "room-missing-local-mls".to_owned();
-        let seeded = FiniteChatRuntime::open(OpenOptions {
+        let seeded = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         seeded
             .test_seed_room_state(
@@ -13052,13 +13088,13 @@ mod tests {
             .unwrap();
         drop(seeded);
 
-        let app = FiniteChatRuntime::open(OpenOptions {
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
             data_dir: data_dir.to_string_lossy().into_owned(),
             server_url: unavailable_http_server_url(),
             device_id: "alice-ios".to_owned(),
             account_secret_hex: None,
             now_unix_seconds: Some(NOW),
-        })
+        }))
         .unwrap();
         let initial = app.state().unwrap();
         let initial_room = app_room(&initial, &room_id);

@@ -186,6 +186,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
     def test_local_env_file_supplies_defaults_without_overriding_process_env(self):
         old_home = os.environ.pop("FINITECHAT_HOME", None)
+        old_finite_home = os.environ.pop("FINITE_HOME", None)
         old_bin = os.environ.get("FINITECHAT_BIN")
         os.environ["FINITECHAT_BIN"] = "/env/bin/finitechat"
         try:
@@ -194,6 +195,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 env_path.write_text(
                     "FINITECHAT_HOME=/agent/home\n"
                     "FINITECHAT_BIN=/installed/bin/finitechat\n"
+                    "FINITE_HOME=/agent/home\n"
                     "OTHER_SECRET=ignored\n",
                     encoding="utf-8",
                 )
@@ -201,12 +203,17 @@ class FinitePlatformAdapterTests(unittest.TestCase):
 
             self.assertEqual(os.environ["FINITECHAT_HOME"], "/agent/home")
             self.assertEqual(os.environ["FINITECHAT_BIN"], "/env/bin/finitechat")
+            self.assertEqual(os.environ["FINITE_HOME"], "/agent/home")
             self.assertIsNone(os.environ.get("OTHER_SECRET"))
         finally:
             if old_home is None:
                 os.environ.pop("FINITECHAT_HOME", None)
             else:
                 os.environ["FINITECHAT_HOME"] = old_home
+            if old_finite_home is None:
+                os.environ.pop("FINITE_HOME", None)
+            else:
+                os.environ["FINITE_HOME"] = old_finite_home
             if old_bin is None:
                 os.environ.pop("FINITECHAT_BIN", None)
             else:

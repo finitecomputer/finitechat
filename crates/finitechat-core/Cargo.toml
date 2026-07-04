@@ -10,6 +10,7 @@ rust-version.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+finite-identity.workspace = true
 finitechat-blob = { path = "../finitechat-blob" }
 finitechat-client = { path = "../finitechat-client" }
 finitechat-hermes = { path = "../finitechat-hermes" }
@@ -29,6 +30,8 @@ uniffi.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+finite-identity.workspace = true
 finitechat-server = { path = "../finitechat-server" }
+hex.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

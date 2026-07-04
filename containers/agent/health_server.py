@@ -36,10 +36,8 @@ def identity() -> dict[str, Any]:
         proc = subprocess.run(
             [
                 FINITECHAT_BIN,
-                "identity",
-                "--agent-home",
-                str(AGENT_HOME),
-                "show",
+                "auth",
+                "status",
             ],
             capture_output=True,
             check=True,

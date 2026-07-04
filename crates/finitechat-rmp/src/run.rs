@@ -615,7 +615,9 @@ fn pulled_ios_device_store_source(pull_parent: &Path) -> Result<PathBuf, CliErro
 }
 
 fn is_ios_device_store_root(path: &Path) -> bool {
-    path.join("account-secret.hex").is_file() && path.join("client.sqlite3").is_file()
+    // Stores no longer contain account-secret.hex (the account key moved to
+    // the shared Finite identity); the encrypted client store is the marker.
+    path.join("client.sqlite3").is_file()
 }
 
 pub(crate) fn terminate_ios_simulator_app(
@@ -2043,7 +2045,6 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let pull_parent = temp.path().join("pull");
         std::fs::create_dir_all(&pull_parent).expect("pull dir");
-        std::fs::write(pull_parent.join("account-secret.hex"), "secret").expect("secret");
         std::fs::write(pull_parent.join("client.sqlite3"), "").expect("sqlite");
 
         assert_eq!(

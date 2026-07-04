@@ -62,6 +62,24 @@ client), `finitechat-transport` (shared transport value types), and
   self-update commit — ADR 0003 §7). Clients verify these credentials at
   every KeyPackage parse, commit merge, and Welcome activation; **the server
   is never an identity authority** (ADR 0001).
+- The account key is the **shared Finite identity** (Finite Identity
+  Contract v1, the `finite-identity` crate): one key per user/agent at
+  `$FINITE_HOME/identity/identity.json` (hosted runtimes pin
+  `FINITE_HOME=/data/agent`), else `~/.finite/identity/identity.json`,
+  minted under an exclusive lock by whichever Finite tool runs first and
+  found by all others (fsite, fbrain, hosted runtimes). CLI/agent flows load
+  it once into memory at open (`FiniteChatRuntime::open` with no explicit
+  secret; `finitechat auth status`/`auth import` are the CLI surface); the
+  secret is never copied into finitechat's own stores — the legacy
+  `account-secret.hex` / `identity.env` / `agent.nsec` locations are
+  hard-cut and never read. iOS keeps its keychain identity and passes the
+  secret explicitly (the shared file does not apply inside an app sandbox).
+- Everything the client needs at rest is **derived** from that account
+  secret at runtime via HKDF domain separation
+  (`NostrSecretKey::derive_secret_32`), e.g. the client-store encryption key
+  under `finitechat.client-store-key.v1` per device id. Derivation domains
+  and downstream state formats are pinned by test vectors and do not change
+  when the secret arrives via the shared file.
 - A **Room** is one OpenMLS group plus one server-ordered delivery log.
   Group key agreement is plain OpenMLS driven directly by the client: commits
   rotate epochs, Welcomes carry group secrets to new devices, application

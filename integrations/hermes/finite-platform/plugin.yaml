@@ -12,9 +12,14 @@ requires_env:
   - name: FINITECHAT_HOME
     description: >
       Agent home directory created by `finitechat hermes init
-      --server URL` (holds the agent's Nostr identity, encrypted client
-      store, and stored invites).
+      --server URL` (holds the encrypted client store and stored invites;
+      the account key is the shared Finite identity, see FINITE_HOME).
 optional_env:
+  - name: FINITE_HOME
+    description: >
+      Shared Finite identity root override: the account key lives at
+      $FINITE_HOME/identity/identity.json (default ~/.finite/identity/).
+      Hosted runtimes pin this to the durable mount.
   - name: FINITECHAT_BIN
     description: "Path to the finitechat binary (default: found on PATH)."
   - name: FINITECHAT_ROOM_ID

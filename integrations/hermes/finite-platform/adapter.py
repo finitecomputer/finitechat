@@ -56,7 +56,9 @@ def _load_local_env_defaults(path: Path | None = None) -> None:
             continue
         key, value = stripped.split("=", 1)
         key = key.strip()
-        if not key.startswith("FINITECHAT_"):
+        # FINITE_HOME pins the shared Finite identity location (hosted
+        # runtimes); everything else must be finitechat-namespaced.
+        if not key.startswith("FINITECHAT_") and key != "FINITE_HOME":
             continue
         os.environ.setdefault(key, value.strip())
 
