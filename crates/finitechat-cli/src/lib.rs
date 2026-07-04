@@ -89,6 +89,12 @@ where
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
+        // Success paths so `finitechat --version` works as an install check
+        // and `finitechat --help` self-describes for agents (exit 0, stdout).
+        Some("--version" | "-V" | "version") => {
+            writeln!(output, "finitechat {}", env!("CARGO_PKG_VERSION")).map_err(CliError::Output)
+        }
+        Some("--help" | "-h" | "help") => writeln!(output, "{}", usage()).map_err(CliError::Output),
         Some("http-smoke") => {
             let ids = finitechat_delivery::prove_http_delivery_core_orders_commit_then_message()
                 .expect("HTTP delivery core smoke passes");
@@ -895,8 +901,9 @@ pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: finitechat <http-smoke|http|auth|hermes|app>\n\n{}\n\n{}\n\n{}",
+        "usage: finitechat <http-smoke|http|auth|hermes|app>\n\n{}\n\n{}\n\n{}\n\n{}",
         auth::usage(),
+        hermes::hermes_usage(),
         app::usage(),
         http_usage()
     )
