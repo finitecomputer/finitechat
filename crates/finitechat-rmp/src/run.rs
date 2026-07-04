@@ -77,6 +77,21 @@ fn run_ios(
     args: crate::cli::RunIosArgs,
     release: bool,
 ) -> Result<(), CliError> {
+    // When an explicit --udid is supplied, decide whether it names a simulator or
+    // an attached physical device and route accordingly. Without --udid we keep the
+    // historical behavior of provisioning/booting a default simulator.
+    if let Some(requested) = args.udid.clone() {
+        let dev_dir = discover_xcode_dev_dir()?;
+        let simulator_udids = collect_simulator_udids(&dev_dir).unwrap_or_default();
+        if classify_ios_udid(&requested, &simulator_udids) == IosTargetKind::PhysicalDevice {
+            human_log(
+                verbose,
+                format!("routing --udid {requested} to physical iOS device install"),
+            );
+            return run_ios_device(root, json, verbose, args, release);
+        }
+    }
+
     let installed = build_install_ios_simulator(root, verbose, args, release)?;
 
     // Optional local runtime config for simulator runs.
@@ -110,6 +125,107 @@ fn run_ios(
         eprintln!("ok: ios app launched (simulator)");
     }
     Ok(())
+}
+
+fn run_ios_device(
+    root: &Path,
+    json: bool,
+    verbose: bool,
+    args: crate::cli::RunIosArgs,
+    release: bool,
+) -> Result<(), CliError> {
+    // Build the Rust core + xcframework, xcodebuild for iphoneos with managed
+    // signing, and devicectl-install onto the attached device. reset_app=false so a
+    // routine "push a new build" preserves the app's on-device data.
+    let installed = build_install_ios_device(root, verbose, args, release, false)?;
+
+    let _pid = launch_ios_device_app(
+        &installed.dev_dir,
+        &installed.udid,
+        &installed.bundle_id,
+        &[],
+        verbose,
+    )?;
+
+    if json {
+        json_print(&JsonOk {
+            ok: true,
+            data: serde_json::json!({"platform":"ios","kind":"device","udid":installed.udid,"bundle_id":installed.bundle_id}),
+        });
+    } else {
+        eprintln!("ok: ios app launched (device)");
+    }
+    Ok(())
+}
+
+/// Whether an explicitly requested iOS `--udid` names a booted-or-bootable
+/// simulator or an attached physical device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IosTargetKind {
+    Simulator,
+    PhysicalDevice,
+}
+
+/// Classify an explicitly requested iOS `--udid`.
+///
+/// `simulator_udids` should be the set of UDIDs reported by `simctl list
+/// devices`. When that query succeeds the set is authoritative for simulators.
+/// When it is empty (query failed) we fall back to a shape heuristic: simulator
+/// UDIDs are standard 8-4-4-4-12 UUIDs (four dashes) while modern hardware UDIDs
+/// look like `XXXXXXXX-XXXXXXXXXXXXXXXX` (a single dash), so anything that is not
+/// simulator-shaped is treated as a physical device.
+pub(crate) fn classify_ios_udid(
+    udid: &str,
+    simulator_udids: &std::collections::HashSet<String>,
+) -> IosTargetKind {
+    if simulator_udids.contains(udid) {
+        return IosTargetKind::Simulator;
+    }
+    if is_simulator_shaped_udid(udid) {
+        IosTargetKind::Simulator
+    } else {
+        IosTargetKind::PhysicalDevice
+    }
+}
+
+fn is_simulator_shaped_udid(udid: &str) -> bool {
+    let groups: Vec<&str> = udid.split('-').collect();
+    let expected = [8usize, 4, 4, 4, 12];
+    groups.len() == expected.len()
+        && groups
+            .iter()
+            .zip(expected)
+            .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn collect_simulator_udids(dev_dir: &Path) -> Result<std::collections::HashSet<String>, CliError> {
+    let mut cmd = Command::new("/usr/bin/xcrun");
+    cmd.env("DEVELOPER_DIR", dev_dir)
+        .arg("simctl")
+        .arg("list")
+        .arg("-j")
+        .arg("devices");
+    let out = run_capture(cmd)?;
+    if !out.status.success() {
+        return Err(CliError::operational("failed to list simulators"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::operational(format!("failed to parse simulator JSON: {e}")))?;
+    Ok(simulator_udids_from_value(&value))
+}
+
+fn simulator_udids_from_value(value: &serde_json::Value) -> std::collections::HashSet<String> {
+    let mut udids = std::collections::HashSet::new();
+    if let Some(runtimes) = value.get("devices").and_then(|v| v.as_object()) {
+        for devices in runtimes.values() {
+            for dev in devices.as_array().into_iter().flatten() {
+                if let Some(udid) = dev.get("udid").and_then(|v| v.as_str()) {
+                    udids.insert(udid.to_string());
+                }
+            }
+        }
+    }
+    udids
 }
 
 pub(crate) struct IosInstalledApp {
@@ -1963,6 +2079,56 @@ mod tests {
                 .contains("requires --ios-development-team"),
             "unexpected error: {missing}"
         );
+    }
+
+    #[test]
+    fn classify_ios_udid_routes_simulator_and_device() {
+        use std::collections::HashSet;
+
+        let mut sims = HashSet::new();
+        sims.insert("8C10824B-840E-5717-BC9C-55B537D33060".to_string());
+
+        // A UDID present in the queried simulator set is a simulator.
+        assert_eq!(
+            classify_ios_udid("8C10824B-840E-5717-BC9C-55B537D33060", &sims),
+            IosTargetKind::Simulator
+        );
+        // Paulphone Air's hardware UDID (single dash, not in the set) is a device.
+        assert_eq!(
+            classify_ios_udid("00008150-0010149A26F0401C", &sims),
+            IosTargetKind::PhysicalDevice
+        );
+
+        // Fallback heuristic when the simctl query failed (empty set): a
+        // UUID-shaped id is still treated as a simulator, a hardware-shaped id as
+        // a device.
+        let empty = HashSet::new();
+        assert_eq!(
+            classify_ios_udid("8C10824B-840E-5717-BC9C-55B537D33060", &empty),
+            IosTargetKind::Simulator
+        );
+        assert_eq!(
+            classify_ios_udid("00008150-0010149A26F0401C", &empty),
+            IosTargetKind::PhysicalDevice
+        );
+    }
+
+    #[test]
+    fn simulator_udids_are_collected_across_runtimes() {
+        let value = serde_json::json!({
+            "devices": {
+                "com.apple.CoreSimulator.SimRuntime.iOS-18-6": [
+                    {"udid": "8C10824B-840E-5717-BC9C-55B537D33060", "name": "iPhone 15"}
+                ],
+                "com.apple.CoreSimulator.SimRuntime.iOS-17-5": [
+                    {"udid": "11111111-2222-3333-4444-555555555555", "name": "iPhone 14"}
+                ]
+            }
+        });
+        let udids = simulator_udids_from_value(&value);
+        assert!(udids.contains("8C10824B-840E-5717-BC9C-55B537D33060"));
+        assert!(udids.contains("11111111-2222-3333-4444-555555555555"));
+        assert!(!udids.contains("00008150-0010149A26F0401C"));
     }
 
     #[test]
