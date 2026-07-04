@@ -13,19 +13,30 @@ to end-to-end-encrypted Finite Chat rooms. The dream flow (ADR 0006):
 
 ## Install
 
+The default way to get the binary is the released build: run the install
+block at the top of [the repo README](../../README.md), which downloads the
+`finitechat` release asset for your platform, verifies its sha256, and
+installs it to `~/.local/bin`. Building from source is the alternative for
+development checkouts:
+
 ```bash
-# 1. The binary (one drop-in binary owns all crypto and state)
 cargo install --path crates/finitechat-cli   # installs `finitechat`
+```
 
-# 2. Initialize the agent home. The account key is the shared Finite
-#    identity at ~/.finite/identity/identity.json ($FINITE_HOME/identity in
-#    hosted runtimes) — minted here if no Finite tool has run yet, reused if
-#    one has. Inspect it with `finitechat auth status`; bring an existing
-#    nsec with `finitechat auth import` (stdin or --file).
-finitechat hermes --agent-home ~/.finite-agent init --server http://your-server:8787
+Then onboard (one drop-in binary owns all crypto and state):
 
-# 3. The plugin (Hermes ≥ 0.16 plugin layout)
-finitechat hermes --agent-home ~/.finite-agent install
+```bash
+# 1. Initialize the agent home (defaults to ~/.finite/agent; override with
+#    --agent-home DIR). The account key is the shared Finite identity at
+#    ~/.finite/identity/identity.json ($FINITE_HOME/identity in hosted
+#    runtimes) — minted here if no Finite tool has run yet, reused if one
+#    has. Inspect it with `finitechat auth status`; bring an existing nsec
+#    with `finitechat auth import` (stdin or --file). Use
+#    --server http://127.0.0.1:8787 for a local development server.
+finitechat hermes init --server https://chat.finite.computer
+
+# 2. The plugin (Hermes ≥ 0.16 plugin layout)
+finitechat hermes install
 ```
 
 Enable it in `~/.hermes/config.yaml`:

@@ -1,8 +1,172 @@
 # Finite Chat
 
-Finite Chat is the native encrypted chat stack for Finite Computer. Rust owns
-protocol state, persistence, networking, and product policy; SwiftUI renders the
-Rust-owned app state and dispatches typed actions.
+Finite Chat is end-to-end-encrypted chat for people and agents. If you are an
+agent (Hermes or otherwise) asked to get yourself or a human onto Finite Chat,
+use the `finitechat` CLI: one binary owns identity, MLS encryption, invites,
+and durable message state.
+
+- Nostr keys provide portable account identity and profile discovery.
+- OpenMLS protects room contents and membership truth.
+- The server only orders opaque encrypted payloads; it never reads contents.
+
+The production server is `https://chat.finite.computer`. Use it unless you are
+intentionally targeting a local development server.
+
+## Install `finitechat`
+
+Install the latest release binary:
+
+```sh
+set -eu
+
+repo="finitecomputer/finitechat"
+tmp="$(mktemp -d)"
+os="$(uname -s)"
+arch="$(uname -m)"
+
+case "$os:$arch" in
+  Darwin:arm64) asset="finitechat-macos-aarch64" ;;
+  Darwin:x86_64) asset="finitechat-macos-x86_64" ;;
+  Linux:x86_64) asset="finitechat-linux-x86_64" ;;
+  *) echo "unsupported platform: $os $arch" >&2; exit 1 ;;
+esac
+
+base="https://github.com/$repo/releases/latest/download"
+curl -fsSL "$base/$asset.tar.gz" -o "$tmp/$asset.tar.gz"
+curl -fsSL "$base/$asset.tar.gz.sha256" -o "$tmp/$asset.tar.gz.sha256"
+
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$tmp" && shasum -a 256 -c "$asset.tar.gz.sha256")
+else
+  (cd "$tmp" && sha256sum -c "$asset.tar.gz.sha256")
+fi
+
+tar -xzf "$tmp/$asset.tar.gz" -C "$tmp"
+mkdir -p "$HOME/.local/bin"
+install -m 0755 "$tmp/finitechat" "$HOME/.local/bin/finitechat"
+"$HOME/.local/bin/finitechat" --version
+```
+
+Make sure `$HOME/.local/bin` is on `PATH` before continuing. To build from
+source instead, see [Development](#development).
+
+## Discover The CLI
+
+Start by asking `finitechat` what it can do:
+
+```sh
+finitechat --help
+```
+
+The `auth` family manages the shared identity, the `hermes` family owns agent
+onboarding and the message bridge, and the `http` family exposes raw server
+routes for debugging.
+
+## Your Finite Identity
+
+`finitechat` uses the shared Finite identity: one Nostr key per user, stored
+at `~/.finite/identity/identity.json` (or
+`$FINITE_HOME/identity/identity.json` when `FINITE_HOME` is set, e.g. in
+hosted runtimes). Whichever Finite tool runs first mints the key; every other
+Finite tool finds it. The on-disk format and concurrency rules are the
+[Finite Identity Contract](https://github.com/finitecomputer/finite-identity),
+shared with `fsite` and the rest of the Finite tools. `finitechat` never
+copies the secret into its own stores.
+
+```sh
+finitechat auth status
+```
+
+If no identity exists yet, `finitechat hermes init` mints one. To keep an
+existing npub, import its secret first:
+
+```sh
+finitechat auth import --file /path/to/secret
+# or pipe it: printf '%s' "$SECRET" | finitechat auth import
+```
+
+`auth import` reads an `nsec1...` or 64-char hex secret from stdin or from a
+`--file` whose content is just the secret. The secret is never accepted as a
+flag value (argv leaks into `ps` and shell history). Import refuses to
+overwrite an existing `identity.json` (another Finite tool may already be
+using it).
+
+## Onboard A Hermes Agent
+
+Initialize the agent home against the production server. This mints or reuses
+the shared Finite identity, registers the agent's device state, and publishes
+an agent profile (skippable with `--skip-agent-profile`):
+
+```sh
+finitechat hermes init --server https://chat.finite.computer \
+  --agent-name "My Agent"
+```
+
+The agent home defaults to `~/.finite/agent`; override it with
+`--agent-home DIR` (or `FINITE_AGENT_HOME`). For local development, run a
+local delivery server and point init at it instead:
+
+```sh
+cargo run -p finitechat-server -- serve 127.0.0.1:8787 --sqlite .state/finitechat.sqlite3
+finitechat hermes --agent-home .state/agent init --server http://127.0.0.1:8787
+```
+
+Then install the Finite platform plugin into the Hermes agent (Hermes >= 0.16
+plugin layout):
+
+```sh
+finitechat hermes install
+```
+
+`install` writes the embedded `finite-platform` plugin into
+`$HERMES_PLUGINS_DIR/finite`, `$HERMES_HOME/plugins/finite`, or
+`~/.hermes/plugins/finite`, plus a local `finitechat.env` recording the agent
+home and binary path (defaults only; explicit Hermes config and process
+environment win). Flags: `--plugins-dir DIR` or `--plugin-dir DIR` to place
+it elsewhere, `--plugin-name NAME`, `--finitechat-bin PATH`,
+`--service-url URL` to point the plugin at a supervisor-managed
+`finitechat hermes serve` process, `--force` to overwrite, `--json` for
+parseable output.
+
+Enable the plugin in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - finite
+
+gateway:
+  platforms:
+    finite:
+      enabled: true
+```
+
+Then `hermes gateway start` brings the agent onto Finite Chat.
+
+## Invite A Human (Or Join A Room)
+
+When the Hermes gateway starts with the Finite plugin, it prints a QR code, a
+`finite://join?...` URL, and a rotating 6-digit PIN. A human scans or pastes
+that into the Finite Chat app and types the PIN; the agent verifies the PIN
+proof before admitting them to the encrypted room. You can also drive invites
+directly:
+
+```sh
+finitechat hermes invite --room-name "Ops" --json   # create an invite (URL + PIN)
+finitechat hermes invite-status --url INVITE_URL --json
+finitechat hermes join --url INVITE_URL             # join someone else's invite
+```
+
+For the full agent integration surface (message polling, sending, the
+supervised `hermes serve` bridge, smoke tests, and hardening evidence), see
+[`integrations/hermes/README.md`](integrations/hermes/README.md).
+
+## Development
+
+Everything below is for understanding, running, or modifying Finite Chat
+itself. Rust owns protocol state, persistence, networking, and product
+policy; SwiftUI renders the Rust-owned app state and dispatches typed
+actions.
 
 The v1 product shape is a phone chat app for people and agents:
 
@@ -14,20 +178,21 @@ The v1 product shape is a phone chat app for people and agents:
   attachment upload stays online-only.
 - Hermes integration uses the same chat surface as human conversations.
 
-## Repository Map
+### Repository Map
 
 - `crates/finitechat-core` - Rust app/runtime facade used by CLI and iOS.
 - `crates/finitechat-client` - device state machine and encrypted local store.
 - `crates/finitechat-server` - Axum HTTP delivery server with SQLite durability.
 - `crates/finitechat-proto` / `finitechat-http` - wire DTOs and route contracts.
 - `crates/finitechat-mls` - OpenMLS helpers and finite device credentials.
-- `crates/finitechat-cli` - local smoke, server calls, and Hermes bridge tools.
+- `crates/finitechat-cli` - the `finitechat` binary: auth, Hermes bridge, and
+  server calls.
 - `crates/finitechat-rmp` - UniFFI, XCFramework, Xcode, and simulator helper.
 - `ios` - SwiftUI app shell for `computer.finite.finitechat`.
 - `integrations/hermes/finite-platform` - Hermes platform plugin adapter.
 - `docs/adr` and `docs/protocol-v1.md` - current product/protocol decisions.
 
-## Local Loop
+### Local Loop
 
 The production/default app server is `https://chat.finite.computer`. Local
 server URLs are explicit development and test overrides only.
@@ -121,7 +286,7 @@ The normal app flow is:
 3. Chat from the room surface. Rust owns send state, retry state, delivery
    projection, and attachment download decisions.
 
-## Checks
+### Checks
 
 Fast Rust/server checks:
 
@@ -157,7 +322,15 @@ uvx --no-config --with hermes-agent basedpyright
 python3 -m unittest discover -s tests -p '*test*.py'
 ```
 
-## Publish Safety
+### Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the
+`finitechat` binary for linux-x86_64, macos-aarch64, and macos-x86_64 and
+attaches `finitechat-<platform>.tar.gz` plus `.sha256` checksums to the
+GitHub release. The install block at the top of this README consumes those
+assets.
+
+### Publish Safety
 
 The repo is intended to publish as `finitecomputer/finitechat`.
 
@@ -173,7 +346,7 @@ Before pushing, verify the GitHub target is the new repo. If
 push or force-push; create or restore the new `finitecomputer/finitechat` repo
 first.
 
-## Deployment
+### Deployment
 
 This repo owns the Finite Chat server source, HTTP contract, and release gate
 for `https://chat.finite.computer`. Hosted Finite Computer SaaS rollout
