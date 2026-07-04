@@ -459,29 +459,61 @@ pub(crate) fn build_install_ios_device(
         )));
     }
 
-    human_log(verbose, format!("devicectl install app (udid={udid})"));
-    let status = Command::new("/usr/bin/xcrun")
-        .env("DEVELOPER_DIR", &dev_dir)
-        .arg("devicectl")
-        .arg("device")
-        .arg("install")
-        .arg("app")
-        .arg("--device")
-        .arg(&udid)
-        .arg(&app_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| CliError::operational(format!("failed to run devicectl install: {e}")))?;
-    if !status.success() {
-        return Err(CliError::operational("devicectl install app failed"));
-    }
+    devicectl_install_app_with_retry(&dev_dir, &udid, &app_path, verbose)?;
 
     Ok(IosDeviceInstalledApp {
         dev_dir,
         udid,
         bundle_id,
     })
+}
+
+/// Run `devicectl device install app`, retrying a few times.
+///
+/// The first install after the device has been idle frequently fails while
+/// CoreDevice mounts the developer disk image (e.g. error 4000, "the device
+/// disconnected immediately after connecting"); a plain retry then succeeds. We
+/// stream output so the operator still sees progress, and only surface a failure
+/// after all attempts are exhausted.
+fn devicectl_install_app_with_retry(
+    dev_dir: &Path,
+    udid: &str,
+    app_path: &Path,
+    verbose: bool,
+) -> Result<(), CliError> {
+    const MAX_ATTEMPTS: usize = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        human_log(
+            verbose,
+            format!("devicectl install app (udid={udid}, attempt {attempt}/{MAX_ATTEMPTS})"),
+        );
+        let status = Command::new("/usr/bin/xcrun")
+            .env("DEVELOPER_DIR", dev_dir)
+            .arg("devicectl")
+            .arg("device")
+            .arg("install")
+            .arg("app")
+            .arg("--device")
+            .arg(udid)
+            .arg(app_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| CliError::operational(format!("failed to run devicectl install: {e}")))?;
+        if status.success() {
+            return Ok(());
+        }
+        if attempt < MAX_ATTEMPTS {
+            human_log(
+                verbose,
+                "devicectl install app failed (often a transient CoreDevice disconnect); retrying",
+            );
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
+    Err(CliError::operational(format!(
+        "devicectl install app failed after {MAX_ATTEMPTS} attempts"
+    )))
 }
 
 pub(crate) fn launch_ios_simulator_app(
