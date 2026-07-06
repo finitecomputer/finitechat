@@ -111,16 +111,16 @@ cargo run -p finitechat-server -- serve 127.0.0.1:8787 --sqlite .state/finitecha
 finitechat hermes --agent-home .state/agent init --server http://127.0.0.1:8787
 ```
 
-Then install the Finite platform plugin into the Hermes agent (Hermes >= 0.16
+Then install the Finite Chat plugin into the Hermes agent (Hermes >= 0.16
 plugin layout):
 
 ```sh
 finitechat hermes install
 ```
 
-`install` writes the embedded `finite-platform` plugin into
-`$HERMES_PLUGINS_DIR/finite`, `$HERMES_HOME/plugins/finite`, or
-`~/.hermes/plugins/finite`, plus a local `finitechat.env` recording the agent
+`install` writes the embedded `finitechat` plugin into
+`$HERMES_PLUGINS_DIR/finitechat`, `$HERMES_HOME/plugins/finitechat`, or
+`~/.hermes/plugins/finitechat`, plus a local `finitechat.env` recording the agent
 home and binary path (defaults only; explicit Hermes config and process
 environment win). Flags: `--plugins-dir DIR` or `--plugin-dir DIR` to place
 it elsewhere, `--plugin-name NAME`, `--finitechat-bin PATH`,
@@ -133,11 +133,11 @@ Enable the plugin in `~/.hermes/config.yaml`:
 ```yaml
 plugins:
   enabled:
-    - finite
+    - finitechat
 
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
 ```
 
@@ -189,7 +189,7 @@ The v1 product shape is a phone chat app for people and agents:
   server calls.
 - `crates/finitechat-rmp` - UniFFI, XCFramework, Xcode, and simulator helper.
 - `ios` - SwiftUI app shell for `computer.finite.finitechat`.
-- `integrations/hermes/finite-platform` - Hermes platform plugin adapter.
+- `integrations/hermes/finitechat` - Hermes platform plugin adapter.
 - `docs/adr` and `docs/protocol-v1.md` - current product/protocol decisions.
 
 ### Local Loop
@@ -261,7 +261,7 @@ scripts/hermes-phone-canary.py \
 
 The script uses `https://chat.finite.computer`, builds the current
 `finitechat` binary, installs the current iOS app on the paired phone, starts
-real Hermes 0.17 with the `finite-platform` plugin, proves invite admission
+real Hermes 0.17 with the `finitechat` plugin, proves invite admission
 with a throwaway client, requires a real model reply, then prints the human
 invite URL, report path, and `stop.sh`. Do not hand an invite to a
 human from lower-level scripts that have not produced a passed report.

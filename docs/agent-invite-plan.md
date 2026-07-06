@@ -5,7 +5,7 @@ Companion to ADR 0006. Status ledger lives at the bottom; commit per phase.
 ## Goal
 
 `hermes-agent` (latest upstream) + the `finitechat` binary +
-the `finite-platform` plugin = drop-in agent you can start chatting with
+the `finitechat` plugin = drop-in agent you can start chatting with
 from the Finite Chat app by scanning a QR and typing a PIN. Proven by an
 end-to-end test where Hermes runs in a Linux container (Apple `container`)
 and the user side runs on the host. Then a perf pass so the flow and the
@@ -14,7 +14,7 @@ story.
 
 ## Current gaps (audited 2026-06-12)
 
-- The Python plugin (`integrations/hermes/finite-platform/adapter.py`)
+- The Python plugin (`integrations/hermes/finitechat/adapter.py`)
   shells to `finitechat hermes <action> --json` — **those subcommands do
   not exist**; they died with the deleted engine. The CLI today is a thin
   per-route HTTP client with no MLS device.

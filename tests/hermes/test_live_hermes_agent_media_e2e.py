@@ -17,7 +17,7 @@ from typing import Any
 from urllib.request import urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ADAPTER_PATH = REPO_ROOT / "integrations" / "hermes" / "finite-platform" / "adapter.py"
+ADAPTER_PATH = REPO_ROOT / "integrations" / "hermes" / "finitechat" / "adapter.py"
 FINITECHAT_BIN = Path(os.environ.get("FINITECHAT_BIN", REPO_ROOT / "target/debug/finitechat"))
 FINITECHAT_SERVER_BIN = Path(
     os.environ.get("FINITECHAT_SERVER_BIN", REPO_ROOT / "target/debug/finitechat-server")

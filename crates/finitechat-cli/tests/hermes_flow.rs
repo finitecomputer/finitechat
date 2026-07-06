@@ -12,7 +12,9 @@ use finitechat_core::{AppAction, AppRoomState, ChatMediaKind, FiniteChatRuntime,
 use finitechat_hermes::{HermesMessagePayloadV1, HermesMessageStatusV1, HermesSendKindV1};
 use finitechat_http::GetEphemeralActivitiesRequest;
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
-use finitechat_proto::{DecryptedEphemeralActivityV1, DurableAppEventKind, InviteCodeV1};
+use finitechat_proto::{
+    DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DurableAppEventKind, InviteCodeV1,
+};
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -41,6 +43,27 @@ fn ensure_test_finite_home() -> PathBuf {
         path
     })
     .clone()
+}
+
+fn decode_wrapped_hermes_payload(plaintext: &[u8]) -> HermesMessagePayloadV1 {
+    let event: DecryptedApplicationEventV1 =
+        serde_json::from_slice(plaintext).expect("typed chat app event");
+    assert_eq!(event.kind, DurableAppEventKind::ChatMessage);
+    HermesMessagePayloadV1::decode(&event.payload)
+        .expect("valid Hermes payload")
+        .expect("Hermes message payload")
+}
+
+fn wrapped_hermes_payload_text_is(plaintext: &[u8], expected: &str) -> bool {
+    serde_json::from_slice::<DecryptedApplicationEventV1>(plaintext)
+        .ok()
+        .filter(|event| event.kind == DurableAppEventKind::ChatMessage)
+        .and_then(|event| {
+            HermesMessagePayloadV1::decode(&event.payload)
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|payload| payload.text == expected)
 }
 
 /// The account secret of the process-wide shared test identity, read from
@@ -469,12 +492,21 @@ fn hermes_install_installs_plugin_into_temp_hermes_home() {
         "--json",
     ]);
 
-    let plugin_dir = plugins_dir.join("finite");
-    assert_eq!(installed["plugin_name"], "finite");
+    let plugin_dir = plugins_dir.join("finitechat");
+    assert_eq!(installed["plugin_name"], "finitechat");
+    assert_eq!(installed["platform_name"], "finitechat");
     assert_eq!(installed["plugin_dir"], plugin_dir.display().to_string());
     assert!(plugin_dir.join("__init__.py").exists());
     assert!(plugin_dir.join("adapter.py").exists());
     assert!(plugin_dir.join("plugin.yaml").exists());
+    let plugin_yaml = std::fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
+    assert!(plugin_yaml.lines().any(|line| line == "name: finitechat"));
+    assert!(
+        installed["recommended_config"]
+            .as_str()
+            .unwrap()
+            .contains("platforms:\n    finitechat:")
+    );
     let env = std::fs::read_to_string(plugin_dir.join("finitechat.env")).unwrap();
     assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
     assert!(env.contains("FINITECHAT_BIN=/bin/finitechat"));
@@ -1159,7 +1191,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         panic!("expected application entry");
     };
     assert_eq!(sender.account_id, agent_account);
-    let payload = HermesMessagePayloadV1::decode(plaintext).unwrap().unwrap();
+    let payload = decode_wrapped_hermes_payload(plaintext);
     assert_eq!(payload.text, "hello from your agent");
 
     // A running Hermes message is tracked locally and recovered after a
@@ -1212,7 +1244,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .iter()
         .find_map(|entry| match &entry.entry {
             AppliedLogEntry::Application { plaintext, .. } => {
-                let payload = HermesMessagePayloadV1::decode(plaintext).unwrap()?;
+                let payload = decode_wrapped_hermes_payload(plaintext);
                 (payload.edit_of.as_deref() == Some(running_message_id.as_str())).then_some(payload)
             }
             _ => None,
@@ -1455,7 +1487,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .iter()
         .find_map(|entry| match &entry.entry {
             AppliedLogEntry::Application { plaintext, .. } => {
-                HermesMessagePayloadV1::decode(plaintext).unwrap()
+                Some(decode_wrapped_hermes_payload(plaintext))
             }
             _ => None,
         })
@@ -1493,7 +1525,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         .iter()
         .find_map(|entry| match &entry.entry {
             AppliedLogEntry::Application { plaintext, .. } => {
-                HermesMessagePayloadV1::decode(plaintext).unwrap()
+                Some(decode_wrapped_hermes_payload(plaintext))
             }
             _ => None,
         })
@@ -1776,10 +1808,7 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
             AppliedLogEntry::Application { plaintext, sender }
                 if sender.account_id == agent_account =>
             {
-                HermesMessagePayloadV1::decode(plaintext)
-                    .unwrap()
-                    .map(|payload| payload.text == "hello group from the agent")
-                    .unwrap_or(false)
+                wrapped_hermes_payload_text_is(plaintext, "hello group from the agent")
             }
             _ => false,
         });
@@ -1803,10 +1832,7 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
             AppliedLogEntry::Application { plaintext, sender }
                 if sender.account_id == agent_account =>
             {
-                HermesMessagePayloadV1::decode(plaintext)
-                    .unwrap()
-                    .map(|payload| payload.text == "hello group from the agent")
-                    .unwrap_or(false)
+                wrapped_hermes_payload_text_is(plaintext, "hello group from the agent")
             }
             _ => false,
         });

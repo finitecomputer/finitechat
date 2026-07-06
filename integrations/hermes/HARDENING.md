@@ -53,9 +53,9 @@ Facts established:
 - The live canary `finite-agent-tinfoil-user-canary-v022` was running Tinfoil
   package tag `v0.1.10` even though the container name suggested a later v022
   run.
-- A local Hermes 0.17 gateway using the current `finite-platform` plugin,
+- A local Hermes 0.17 gateway using the current `finitechat` plugin,
   `finitechat hermes serve`, and the same Tinfoil-shaped plugin install path
-  (`plugins/finite` with `plugins.enabled: finite-platform`) admitted a
+  (`plugins/finitechat` with `plugins.enabled: finitechat`) admitted a
   throwaway client in 3.7s via
   `scripts/hermes-real-gateway-admission-smoke.py`.
 - The previous "Hermes media" and Docker smokes did not prove the exact
@@ -118,7 +118,7 @@ the join. It would have caught this failure without involving the iOS app.
 
 Goal: prove the whole product surface locally before another Tinfoil attempt:
 visible iOS Simulator UI, hosted Finite Chat server, a real Hermes 0.17 gateway
-running on the Mac, the real `finite-platform` plugin, a real invite/PIN join,
+running on the Mac, the real `finitechat` plugin, a real invite/PIN join,
 and multiple model-backed AI response turns. CLI state reads are allowed for
 diagnostics only; they are not the UI oracle because they can open the same
 store and perform sync work.
@@ -330,7 +330,7 @@ The smoke commands write `target/hermes-adapter-regressions/report.json`,
 `scripts/hermes-real-gateway-admission-smoke.py` writes
 `target/hermes-real-gateway-admission-smoke/report.json`; its pass condition is
 that Hermes 0.17 `gateway run --replace` admits a normal invite/PIN join through
-the installed `finite-platform` plugin with no direct adapter import and no echo
+the installed `finitechat` plugin with no direct adapter import and no echo
 handler.
 The iOS Simulator script writes
 `target/ios-hermes-agent-media-e2e/report.json`; it requires a booted

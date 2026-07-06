@@ -135,7 +135,7 @@ class SmokeReport:
                         "docker image build",
                         "hermes-agent 0.17 runtime",
                         "finitechat binary in image",
-                        "finite-platform plugin in image",
+                        "finitechat plugin in image",
                         "finitechat-server on host",
                         "agent container with persistent state volume",
                         "user finitechat CLI in Docker",

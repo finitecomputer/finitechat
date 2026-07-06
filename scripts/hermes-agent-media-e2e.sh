@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local Hermes adapter media end-to-end:
-#   real pip hermes-agent package + finite-platform plugin + finitechat binaries
+#   real pip hermes-agent package + finitechat plugin + finitechat binaries
 #   finitechat user joins via invite URL, sends image media, then receives
 #   agent text and image media replies.
 # This test installs an echo set_message_handler callback. It proves adapter

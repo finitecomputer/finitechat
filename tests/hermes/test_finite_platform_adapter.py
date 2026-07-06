@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ADAPTER_PATH = REPO_ROOT / "integrations" / "hermes" / "finite-platform" / "adapter.py"
+ADAPTER_PATH = REPO_ROOT / "integrations" / "hermes" / "finitechat" / "adapter.py"
 
 
 class Platform(Enum):
-    FINITE = "finite"
+    FINITECHAT = "finitechat"
+    LOCAL = "local"
 
 
 @dataclass
@@ -142,13 +143,13 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             extra["room_id"] = room_id
         return self.module.FiniteChatAdapter(PlatformConfig(extra=extra))
 
-    def test_register_exposes_finite_platform_contract(self):
+    def test_register_exposes_finitechat_platform_contract(self):
         ctx = MockPluginContext()
         self.module.register(ctx)
 
         self.assertEqual(len(ctx.registered), 1)
         entry = ctx.registered[0]
-        self.assertEqual(entry["name"], "finite")
+        self.assertEqual(entry["name"], "finitechat")
         self.assertEqual(entry["label"], "Finite Chat")
         self.assertEqual(entry["required_env"], ["FINITECHAT_HOME"])
         self.assertEqual(entry["allowed_users_env"], "FINITECHAT_ALLOWED_USERS")
@@ -156,6 +157,9 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             entry["max_message_length"], self.module.FiniteChatAdapter.MAX_MESSAGE_LENGTH
         )
         self.assertTrue(callable(entry["adapter_factory"]))
+
+    def test_adapter_disables_edit_streaming_for_ios_rendering_compatibility(self):
+        self.assertFalse(self.module.FiniteChatAdapter.SUPPORTS_MESSAGE_EDITING)
 
     def test_check_requirements_uses_finitechat_bin_not_finitecomputer(self):
         old_value = os.environ.get("FINITECHAT_BIN")
@@ -329,7 +333,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             "text": "please build",
             "message_type": "text",
             "source": {
-                "platform": "finite",
+                "platform": "finitechat",
                 "chat_id": "room-agent-1",
                 "chat_type": "dm",
                 "user_id": "alice",
@@ -380,7 +384,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             "conversation_id": "topic-chat",
             "text": "hello group",
             "source": {
-                "platform": "finite",
+                "platform": "finitechat",
                 "chat_id": "room-group-1",
                 "chat_name": "Agent Camp",
                 "chat_type": "group",

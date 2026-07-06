@@ -91,7 +91,7 @@ Relevant files:
 - `crates/finite-core/src/relay.rs`
 - `crates/finited/src/main.rs`
 - `crates/fc/src/main.rs`
-- `integrations/hermes/finite-platform/adapter.py`
+- `integrations/hermes/finitechat/adapter.py`
 - `apps/dashboard/src/lib/finite-relay-client.ts`
 - `apps/dashboard/src/lib/chat-proxy.ts`
 

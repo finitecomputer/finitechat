@@ -12,7 +12,7 @@ The supported plugin distribution path is:
 finitechat hermes --agent-home DIR install
 ```
 
-The command installs the embedded `finite-platform` Hermes plugin and writes a
+The command installs the embedded `finitechat` Hermes plugin and writes a
 colocated `finitechat.env` with `FINITECHAT_HOME` and `FINITECHAT_BIN`
 defaults (plus `FINITE_HOME` when set at install time, so hosted runtimes pin
 the shared Finite identity location). It refuses to install from an Agent
@@ -147,7 +147,7 @@ CI runs both sides of the boundary:
   of Mac loopback.
 - `scripts/hermes-real-gateway-demo.sh` is the repo-local real Hermes runner:
   it starts a local Finite Chat server, initializes a Hermes agent home, loads
-  the finite-platform plugin into a prepared Hermes checkout, and runs
+  the finitechat plugin into a prepared Hermes checkout, and runs
   `hermes gateway run` without a test echo callback.
 
 That runner is a low-level local debugging aid. It is not the physical-phone

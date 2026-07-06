@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Real iPhone + real pip hermes-agent package + finite-platform plugin.
+# Real iPhone + real pip hermes-agent package + finitechat plugin.
 # This test installs an echo set_message_handler callback. It proves adapter
 # transport/media wiring through a phone, not real Hermes gateway/model behavior.
 #

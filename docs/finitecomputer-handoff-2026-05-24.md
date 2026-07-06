@@ -122,7 +122,7 @@ docs/adr/
 Important implementation areas:
 
 ```text
-integrations/hermes/finite-platform/
+integrations/hermes/finitechat/
 crates/finitechat-hermes/
 crates/finitechat-proto/
 crates/finitechat-client/
@@ -155,7 +155,7 @@ Notable finitecomputer changes:
 github:finitecomputer/finitechat?ref=codex/blob-store-spike
 ```
 
-- The old local plugin under `integrations/hermes/finite-platform` was removed.
+- The old local plugin under `integrations/hermes/finitechat` was removed.
 - Runtime profiles now copy the finitechat-owned Hermes plugin from the finitechat flake input.
 - Local dev/bootstrap scripts copy the finitechat plugin into the Hermes environment.
 - Runtime scripts set the finitechat plugin environment, including `FINITECHAT_ROOM_ID` and `FINITECHAT_BIN`.

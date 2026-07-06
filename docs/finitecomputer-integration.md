@@ -296,7 +296,7 @@ same Rust core when the local true-E2EE clients are ready.
 - Once stable, route existing `finitec gateway` through encrypted chat for
   canary Projects.
 
-`integrations/hermes/finite-platform/adapter.py`
+`integrations/hermes/finitechat/adapter.py`
 
 - Keep the adapter CLI-only.
 - It should not import finitechat internals or start a local HTTP service.

@@ -13,7 +13,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "hermes-agent==${HERMES_AGENT_VERSION}"
 COPY --from=builder /build/finitechat/target/release/finitechat /usr/local/bin/finitechat
-COPY finitechat/integrations/hermes/finite-platform /root/.hermes/plugins/finite-platform
+COPY finitechat/integrations/hermes/finitechat /root/.hermes/plugins/finitechat
 COPY finitechat/containers/agent/entrypoint.sh /opt/agent-entrypoint.sh
 COPY finitechat/containers/agent/health_server.py /opt/health_server.py
 COPY finitechat/containers/agent/run_hermes_gateway.sh /opt/run_hermes_gateway.sh
