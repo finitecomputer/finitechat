@@ -91,6 +91,24 @@ else
     cp "$invite_file" /tmp/finitechat-invite.json
 fi
 
+# The hosted runtime starts with one user-facing room. Make that room the
+# default Hermes home channel unless the agent already has one. Without this,
+# first contact can get stuck behind a repeated "type /sethome" onboarding
+# prompt even though the gateway is otherwise healthy.
+if "$finitechat_bin" hermes --home "$agent_home" home-channel show \
+    | python -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("home_channel") else 1)' \
+    >/dev/null 2>&1; then
+    :
+else
+    invite_room_id="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("room_id") or "")' "$invite_file")"
+    if [[ -n "$invite_room_id" ]]; then
+        "$finitechat_bin" hermes --home "$agent_home" home-channel set \
+            --room-id "$invite_room_id" \
+            >/dev/null \
+            || echo "FINITE_AGENT_HOME_CHANNEL_WARN failed_to_set room_id=$invite_room_id" >&2
+    fi
+fi
+
 cat >"${hermes_home}/config.yaml" <<EOF
 model:
   default: ${model}

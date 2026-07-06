@@ -196,6 +196,14 @@ class AgentRuntimeLauncherConfigTest(unittest.TestCase):
         self.assertIn("api_key: ${FINITECHAT_HERMES_API_KEY}", script)
         self.assertNotIn("api_key: ${api_key}", script)
 
+    def test_gateway_launcher_defaults_startup_invite_room_to_home_channel(self) -> None:
+        script = (REPO_ROOT / "containers/agent/run_hermes_gateway.sh").read_text(encoding="utf-8")
+
+        self.assertIn("home-channel show", script)
+        self.assertIn("home-channel set", script)
+        self.assertIn("invite_room_id", script)
+        self.assertIn("FINITE_AGENT_HOME_CHANNEL_WARN", script)
+
 
 @unittest.skipUnless(
     os.environ.get("FINITE_DOCKER_E2E") == "1",
