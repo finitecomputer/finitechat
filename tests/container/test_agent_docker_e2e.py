@@ -202,6 +202,10 @@ class AgentRuntimeLauncherConfigTest(unittest.TestCase):
         self.assertIn("home-channel show", script)
         self.assertIn("home-channel set", script)
         self.assertIn("invite_room_id", script)
+        self.assertIn("export FINITECHAT_HOME_CHANNEL", script)
+        self.assertIn("gateway_home_channel_yaml", script)
+        self.assertIn("home_channel:", script)
+        self.assertIn("chat_id: ${FINITECHAT_HOME_CHANNEL}", script)
         self.assertIn("FINITE_AGENT_HOME_CHANNEL_WARN", script)
 
 
