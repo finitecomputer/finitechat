@@ -22,7 +22,7 @@ reasoning, tool use, or media understanding.
 A real Hermes proof must satisfy all of these:
 
 - run Hermes with `gateway run`;
-- load `integrations/hermes/finite-platform` as a Hermes plugin;
+- load `integrations/hermes/finitechat` as a Hermes plugin;
 - use `finitechat hermes poll/send/edit/activity` through the plugin;
 - use a normal Hermes model provider config and provider key;
 - avoid `adapter.set_message_handler(...)` or any custom echo callback;
@@ -36,7 +36,7 @@ scripts/hermes-real-gateway-demo.sh
 ```
 
 It starts a local Finite Chat server, initializes a dedicated Hermes agent home,
-copies the current finite-platform plugin into Hermes, sources local provider
+copies the current finitechat plugin into Hermes, sources local provider
 secrets without printing them, and runs the real Hermes gateway loop.
 It is not the physical-phone product canary because it may use loopback URLs
 and does not gate human handoff on a preflight admission probe. The product

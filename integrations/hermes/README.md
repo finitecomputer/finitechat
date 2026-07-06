@@ -1,6 +1,6 @@
 # Hermes ⇄ Finite Chat
 
-The `finite-platform` plugin connects a [Hermes agent](https://github.com/NousResearch/hermes-agent)
+The `finitechat` plugin connects a [Hermes agent](https://github.com/NousResearch/hermes-agent)
 to end-to-end-encrypted Finite Chat rooms. The dream flow (ADR 0006):
 
 1. The agent prints a QR code, a `finite://join?...` URL, and a rotating
@@ -44,20 +44,20 @@ Enable it in `~/.hermes/config.yaml`:
 ```yaml
 plugins:
   enabled:
-    - finite
+    - finitechat
 
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
 ```
 
 Then `hermes gateway start` prints the invite QR/URL/PIN and the agent is
 reachable from the Finite Chat app.
 
-`finitechat hermes install` writes the embedded `finite-platform` plugin into
-`$HERMES_PLUGINS_DIR/finite`, `$HERMES_HOME/plugins/finite`, or
-`~/.hermes/plugins/finite`. It also writes a local `finitechat.env` file with
+`finitechat hermes install` writes the embedded `finitechat` plugin into
+`$HERMES_PLUGINS_DIR/finitechat`, `$HERMES_HOME/plugins/finitechat`, or
+`~/.hermes/plugins/finitechat`. It also writes a local `finitechat.env` file with
 the Agent Home and binary path. The plugin treats that file as defaults only:
 explicit Hermes config and process environment still win.
 Pass `--service-url URL` to also write `FINITECHAT_HERMES_SERVICE_URL` for a
@@ -105,7 +105,7 @@ It installs an echo callback, so it is adapter transport coverage, not a real
 Hermes model or gateway acceptance gate.
 The real gateway admission smoke writes
 `target/hermes-real-gateway-admission-smoke/report.json` and proves Hermes 0.17
-`gateway run --replace` loads the installed `finite-platform` plugin and admits
+`gateway run --replace` loads the installed `finitechat` plugin and admits
 a normal invite/PIN join without a test callback.
 The iOS Simulator E2E writes
 `target/ios-hermes-agent-media-e2e/report.json`, drives the native app through

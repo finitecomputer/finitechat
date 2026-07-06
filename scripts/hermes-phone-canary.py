@@ -325,10 +325,10 @@ def write_hermes_config(
   api_mode: {api_mode}
 plugins:
   enabled:
-    - finite-platform
+    - finitechat
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
       extra:
         home: "{agent_home}"
@@ -638,7 +638,7 @@ def main() -> int:
     )
 
     source = git_source()
-    plugin_dir = REPO_ROOT / "integrations/hermes/finite-platform"
+    plugin_dir = REPO_ROOT / "integrations/hermes/finitechat"
     report: dict[str, Any] = {
         "status": "running",
         "layer": "local-phone",
@@ -647,7 +647,7 @@ def main() -> int:
         "runtime": {
             "finitechat_bin": str(finitechat_bin),
             "hermes_agent_version_expected": args.hermes_package,
-            "plugin_name": "finite-platform",
+            "plugin_name": "finitechat",
             "plugin_hash": sha256_tree(plugin_dir),
             "image_ref": None,
             "image_digest": None,
@@ -764,7 +764,7 @@ def main() -> int:
                 "--plugins-dir",
                 str(hermes_home / "plugins"),
                 "--plugin-name",
-                "finite-platform",
+                "finitechat",
                 "--finitechat-bin",
                 str(finitechat_bin),
                 "--service-url",

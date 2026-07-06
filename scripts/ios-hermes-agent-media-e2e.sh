@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Real iOS Simulator + real pip hermes-agent package + finite-platform plugin.
+# Real iOS Simulator + real pip hermes-agent package + finitechat plugin.
 # The app joins the agent invite, sends an image attachment with a caption,
 # then receives agent text and image replies.
 # This test installs an echo set_message_handler callback. It proves adapter

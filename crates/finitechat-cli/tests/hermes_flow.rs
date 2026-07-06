@@ -469,12 +469,21 @@ fn hermes_install_installs_plugin_into_temp_hermes_home() {
         "--json",
     ]);
 
-    let plugin_dir = plugins_dir.join("finite");
-    assert_eq!(installed["plugin_name"], "finite");
+    let plugin_dir = plugins_dir.join("finitechat");
+    assert_eq!(installed["plugin_name"], "finitechat");
+    assert_eq!(installed["platform_name"], "finitechat");
     assert_eq!(installed["plugin_dir"], plugin_dir.display().to_string());
     assert!(plugin_dir.join("__init__.py").exists());
     assert!(plugin_dir.join("adapter.py").exists());
     assert!(plugin_dir.join("plugin.yaml").exists());
+    let plugin_yaml = std::fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
+    assert!(plugin_yaml.lines().any(|line| line == "name: finitechat"));
+    assert!(
+        installed["recommended_config"]
+            .as_str()
+            .unwrap()
+            .contains("platforms:\n    finitechat:")
+    );
     let env = std::fs::read_to_string(plugin_dir.join("finitechat.env")).unwrap();
     assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
     assert!(env.contains("FINITECHAT_BIN=/bin/finitechat"));

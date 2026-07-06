@@ -45,9 +45,9 @@ cargo build -q -p finitechat-cli -p finitechat-server
 write_hermes_profile() {
   local target_home="$1"
   mkdir -p "${target_home}/plugins"
-  rm -rf "${target_home}/plugins/finite-platform"
-  cp -R "${repo_root}/integrations/hermes/finite-platform" "${target_home}/plugins/finite-platform"
-  find "${target_home}/plugins/finite-platform" -name __pycache__ -type d -prune -exec rm -rf {} +
+  rm -rf "${target_home}/plugins/finitechat"
+  cp -R "${repo_root}/integrations/hermes/finitechat" "${target_home}/plugins/finitechat"
+  find "${target_home}/plugins/finitechat" -name __pycache__ -type d -prune -exec rm -rf {} +
 
   cat >"${target_home}/config.yaml" <<EOF
 model:
@@ -57,10 +57,10 @@ model:
   api_mode: chat_completions
 plugins:
   enabled:
-    - finite-platform
+    - finitechat
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
       extra:
         home: ${agent_home}

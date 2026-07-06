@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const FINITECHAT_HERMES_PLATFORM_NAME: &str = "finite";
+pub const FINITECHAT_HERMES_PLATFORM_NAME: &str = "finitechat";
 pub const HERMES_METADATA_THREAD_ID: &str = "thread_id";
 pub const HERMES_METADATA_CONVERSATION_ID: &str = "conversation_id";
 pub const HERMES_METADATA_ATTACHMENTS: &str = "attachments";

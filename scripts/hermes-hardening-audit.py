@@ -14,7 +14,7 @@ REQUIRED_DOCKER_PROOF_LAYERS = {
     "docker image build",
     "hermes-agent 0.17 runtime",
     "finitechat binary in image",
-    "finite-platform plugin in image",
+    "finitechat plugin in image",
     "real Hermes gateway process",
     "gateway invite admission before restore",
     "entrypoint restic encrypted agent state snapshot on shutdown",

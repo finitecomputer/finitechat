@@ -233,7 +233,7 @@ def start_agent_container(
         "--env",
         "FINITECHAT_HERMES_INBOUND_STREAM=1",
         "--env",
-        "FINITECHAT_HERMES_PLUGIN_NAME=finite-platform",
+        "FINITECHAT_HERMES_PLUGIN_NAME=finitechat",
         "--env",
         "FINITECHAT_HERMES_ROOM_NAME=Phala Durable Docker Smoke",
         "--env",

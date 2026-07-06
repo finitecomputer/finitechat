@@ -6,7 +6,7 @@ hermes_home="${HERMES_HOME:-${agent_home}/hermes-home}"
 server_url="${FINITE_SERVER_URL:-${FINITECHAT_SERVER_URL:-}}"
 device_id="${FINITECHAT_HERMES_AGENT_DEVICE_ID:-agent}"
 finitechat_bin="${FINITECHAT_BIN:-/usr/local/bin/finitechat}"
-plugin_name="${FINITECHAT_HERMES_PLUGIN_NAME:-finite-platform}"
+plugin_name="${FINITECHAT_HERMES_PLUGIN_NAME:-finitechat}"
 agent_name="${FINITECHAT_HERMES_AGENT_NAME:-${FINITE_AGENT_NAME:-${FINITECHAT_HERMES_ROOM_NAME:-Finite Agent}}}"
 agent_picture_url="${FINITECHAT_HERMES_AGENT_PICTURE_URL:-https://avatars.githubusercontent.com/u/274919006?v=4}"
 if [[ "${FINITE_DEFAULT_INFERENCE_PROFILE:-}" == "finite-private" ]]; then
@@ -100,10 +100,10 @@ model:
 ${api_key_yaml}
 plugins:
   enabled:
-    - finite-platform
+    - ${plugin_name}
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
       extra:
         home: ${agent_home}

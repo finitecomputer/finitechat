@@ -65,13 +65,16 @@ const HERMES_HOME_CHANNEL_FILE: &str = "hermes-home-channel.json";
 const BACKUP_ACTIVITY_FILE: &str = ".finitechat-backup-active";
 const STORE_FILE: &str = "client.sqlite3";
 const ATTACHMENT_CACHE_DIR: &str = "attachments";
-const HERMES_PLUGIN_INSTALL_NAME: &str = "finite";
+const HERMES_PLUGIN_INSTALL_NAME: &str = "finitechat";
+const LEGACY_HERMES_PLUGIN_NAME: &str = "finite-platform";
+const AMBIGUOUS_HERMES_PLUGIN_NAME: &str = "finite";
+const HERMES_PLATFORM_NAME: &str = "finitechat";
 const HERMES_PLUGIN_INIT: &str =
-    include_str!("../../../integrations/hermes/finite-platform/__init__.py");
+    include_str!("../../../integrations/hermes/finitechat/__init__.py");
 const HERMES_PLUGIN_ADAPTER: &str =
-    include_str!("../../../integrations/hermes/finite-platform/adapter.py");
+    include_str!("../../../integrations/hermes/finitechat/adapter.py");
 const HERMES_PLUGIN_YAML: &str =
-    include_str!("../../../integrations/hermes/finite-platform/plugin.yaml");
+    include_str!("../../../integrations/hermes/finitechat/plugin.yaml");
 const HERMES_PLUGIN_ENV_FILE: &str = "finitechat.env";
 const DEFAULT_HERMES_SERVICE_ADDR: &str = "127.0.0.1:0";
 const DEFAULT_DEVICE_ID: &str = "agent";
@@ -140,10 +143,29 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
 #[derive(Debug, Serialize)]
 struct HermesInstallSummary {
     plugin_name: String,
+    platform_name: String,
     plugin_dir: String,
     agent_home: String,
     finitechat_bin: String,
     files: Vec<String>,
+    recommended_config: String,
+    warnings: Vec<String>,
+    legacy_plugin_conflicts: Vec<HermesInstallLegacyPluginConflict>,
+    legacy_config_conflicts: Vec<HermesInstallLegacyConfigConflict>,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesInstallLegacyPluginConflict {
+    plugin_name: String,
+    plugin_dir: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HermesInstallLegacyConfigConflict {
+    config_path: String,
+    enabled_plugin: String,
+    replacement_plugin: String,
 }
 
 fn cmd_install<W: Write>(
@@ -174,14 +196,22 @@ fn cmd_install<W: Write>(
         )));
     }
 
-    let plugin_dir = match plugin_dir_arg {
-        Some(path) => PathBuf::from(path),
+    let (plugin_dir, plugins_dir_for_audit) = match plugin_dir_arg {
+        Some(path) => {
+            let plugin_dir = PathBuf::from(path);
+            let plugins_dir = plugin_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            (plugin_dir, plugins_dir)
+        }
         None => {
             let plugins_dir = plugins_dir_arg
                 .map(PathBuf::from)
                 .map(Ok)
                 .unwrap_or_else(default_hermes_plugins_dir)?;
-            plugins_dir.join(&plugin_name)
+            let plugin_dir = plugins_dir.join(&plugin_name);
+            (plugin_dir, plugins_dir)
         }
     };
     let finitechat_bin = match finitechat_bin_arg {
@@ -205,9 +235,10 @@ fn cmd_install<W: Write>(
         force,
         &mut installed,
     )?;
+    let plugin_yaml = hermes_plugin_yaml_for_install(&plugin_name);
     write_managed_plugin_file(
         &plugin_dir.join("plugin.yaml"),
-        HERMES_PLUGIN_YAML,
+        &plugin_yaml,
         force,
         &mut installed,
     )?;
@@ -220,12 +251,35 @@ fn cmd_install<W: Write>(
         &mut installed,
     )?;
 
+    let legacy_plugin_conflicts =
+        detect_legacy_plugin_conflicts(&plugins_dir_for_audit, &plugin_dir, &plugin_name);
+    let legacy_config_conflicts =
+        detect_legacy_config_conflicts(&plugins_dir_for_audit, &plugin_name);
+    let mut warnings = Vec::new();
+    for conflict in &legacy_plugin_conflicts {
+        warnings.push(format!(
+            "found legacy Hermes plugin '{}' at {}; {}",
+            conflict.plugin_name, conflict.plugin_dir, conflict.reason
+        ));
+    }
+    for conflict in &legacy_config_conflicts {
+        warnings.push(format!(
+            "{} enables legacy plugin '{}'; change plugins.enabled to '{}'",
+            conflict.config_path, conflict.enabled_plugin, conflict.replacement_plugin
+        ));
+    }
+
     let summary = HermesInstallSummary {
-        plugin_name,
+        plugin_name: plugin_name.clone(),
+        platform_name: HERMES_PLATFORM_NAME.to_owned(),
         plugin_dir: plugin_dir.display().to_string(),
         agent_home: home_dir.display().to_string(),
         finitechat_bin: finitechat_bin.display().to_string(),
         files: installed,
+        recommended_config: hermes_recommended_config(&plugin_name, home_dir),
+        warnings,
+        legacy_plugin_conflicts,
+        legacy_config_conflicts,
     };
     if json_mode {
         crate::write_pretty_json(output, &summary)
@@ -237,7 +291,14 @@ fn cmd_install<W: Write>(
         )
         .map_err(CliError::Output)?;
         writeln!(output, "Agent home: {}", summary.agent_home).map_err(CliError::Output)?;
-        writeln!(output, "finitechat binary: {}", summary.finitechat_bin).map_err(CliError::Output)
+        writeln!(output, "finitechat binary: {}", summary.finitechat_bin)
+            .map_err(CliError::Output)?;
+        writeln!(output, "Enable with:\n{}", summary.recommended_config)
+            .map_err(CliError::Output)?;
+        for warning in &summary.warnings {
+            writeln!(output, "WARNING: {warning}").map_err(CliError::Output)?;
+        }
+        Ok(())
     }
 }
 
@@ -2027,12 +2088,137 @@ fn validate_plugin_name(name: &str) -> Result<(), CliError> {
         || trimmed == ".."
         || trimmed.contains('/')
         || trimmed.contains('\\')
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(CliError::Usage(format!(
-            "--plugin-name must be a single directory name, got {name:?}"
+            "--plugin-name must be a single YAML-safe directory name, got {name:?}"
         )));
     }
     Ok(())
+}
+
+fn hermes_plugin_yaml_for_install(plugin_name: &str) -> String {
+    HERMES_PLUGIN_YAML.replacen("name: finitechat", &format!("name: {plugin_name}"), 1)
+}
+
+fn hermes_recommended_config(plugin_name: &str, home_dir: &Path) -> String {
+    format!(
+        "plugins:\n  enabled:\n    - {plugin_name}\ngateway:\n  platforms:\n    {platform_name}:\n      enabled: true\n      extra:\n        home: {home}\n",
+        platform_name = HERMES_PLATFORM_NAME,
+        home = home_dir.display()
+    )
+}
+
+fn detect_legacy_plugin_conflicts(
+    plugins_dir: &Path,
+    installed_plugin_dir: &Path,
+    plugin_name: &str,
+) -> Vec<HermesInstallLegacyPluginConflict> {
+    let mut conflicts = Vec::new();
+    for (candidate_name, reason) in [
+        (
+            LEGACY_HERMES_PLUGIN_NAME,
+            "this is the legacy plaintext bridge",
+        ),
+        (
+            AMBIGUOUS_HERMES_PLUGIN_NAME,
+            "this is the old generic Finite plugin name",
+        ),
+    ] {
+        let candidate_dir = plugins_dir.join(candidate_name);
+        if same_path(&candidate_dir, installed_plugin_dir) {
+            continue;
+        }
+        let yaml = candidate_dir.join("plugin.yaml");
+        if !yaml.exists() {
+            continue;
+        }
+        let yaml_name = plugin_yaml_name(&yaml);
+        if yaml_name.as_deref() == Some(candidate_name)
+            || yaml_name.as_deref() == Some(LEGACY_HERMES_PLUGIN_NAME)
+        {
+            conflicts.push(HermesInstallLegacyPluginConflict {
+                plugin_name: candidate_name.to_owned(),
+                plugin_dir: candidate_dir.display().to_string(),
+                reason: format!("{reason}; enable '{plugin_name}' for Finite Chat"),
+            });
+        }
+    }
+    conflicts
+}
+
+fn detect_legacy_config_conflicts(
+    plugins_dir: &Path,
+    plugin_name: &str,
+) -> Vec<HermesInstallLegacyConfigConflict> {
+    let mut configs = Vec::new();
+    if let Some(hermes_home) = plugins_dir.parent() {
+        configs.push(hermes_home.join("config.yaml"));
+        configs.push(hermes_home.join("config.yml"));
+    }
+    if let Some(home) = std::env::var_os("HERMES_HOME") {
+        let home = PathBuf::from(home);
+        configs.push(home.join("config.yaml"));
+        configs.push(home.join("config.yml"));
+    }
+    configs.sort();
+    configs.dedup();
+
+    configs
+        .into_iter()
+        .flat_map(|path| {
+            config_enabled_conflicting_plugins(&path)
+                .into_iter()
+                .map(move |enabled_plugin| HermesInstallLegacyConfigConflict {
+                    config_path: path.display().to_string(),
+                    enabled_plugin,
+                    replacement_plugin: plugin_name.to_owned(),
+                })
+        })
+        .collect()
+}
+
+fn config_enabled_conflicting_plugins(path: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for candidate in [LEGACY_HERMES_PLUGIN_NAME, AMBIGUOUS_HERMES_PLUGIN_NAME] {
+        if contents
+            .lines()
+            .any(|line| yaml_line_is_value(line, candidate))
+        {
+            found.push(candidate.to_owned());
+        }
+    }
+    found
+}
+
+fn yaml_line_is_value(line: &str, value: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == format!("- {value}")
+        || trimmed == value
+        || trimmed == format!("\"{value}\"")
+        || trimmed == format!("'{value}'")
+}
+
+fn plugin_yaml_name(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("name:")?.trim();
+        Some(value.trim_matches('"').trim_matches('\'').trim().to_owned())
+    })
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || match (fs::canonicalize(left), fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
 }
 
 fn hermes_plugin_env_contents(
@@ -2344,7 +2530,7 @@ mod tests {
     fn install_writes_embedded_plugin_and_local_env_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("agent-home");
-        let plugin_dir = dir.path().join("hermes").join("plugins").join("finite");
+        let plugin_dir = dir.path().join("hermes").join("plugins").join("finitechat");
         write_test_agent_config(&home);
 
         let mut output = Vec::new();
@@ -2364,17 +2550,108 @@ mod tests {
         .expect("install succeeds");
 
         let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(summary["plugin_name"], "finite");
+        assert_eq!(summary["plugin_name"], "finitechat");
+        assert_eq!(summary["platform_name"], "finitechat");
         assert_eq!(summary["plugin_dir"], plugin_dir.display().to_string());
+        assert_eq!(summary["warnings"].as_array().unwrap().len(), 0);
         assert!(plugin_dir.join("__init__.py").exists());
         assert!(plugin_dir.join("adapter.py").exists());
         assert!(plugin_dir.join("plugin.yaml").exists());
         assert!(plugin_dir.join(HERMES_PLUGIN_ENV_FILE).exists());
 
+        let plugin_yaml = fs::read_to_string(plugin_dir.join("plugin.yaml")).unwrap();
+        assert!(plugin_yaml.lines().any(|line| line == "name: finitechat"));
+        assert!(
+            summary["recommended_config"]
+                .as_str()
+                .unwrap()
+                .contains("gateway:\n  platforms:\n    finitechat:")
+        );
         let env = fs::read_to_string(plugin_dir.join(HERMES_PLUGIN_ENV_FILE)).unwrap();
         assert!(env.contains(&format!("FINITECHAT_HOME={}", home.display())));
         assert!(env.contains("FINITECHAT_BIN=/usr/local/bin/finitechat"));
         assert!(env.contains("FINITECHAT_HERMES_SERVICE_URL=http://127.0.0.1:4321"));
+    }
+
+    #[test]
+    fn install_reports_legacy_plaintext_plugin_and_config_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("agent-home");
+        let hermes_home = dir.path().join("hermes");
+        let plugins_dir = hermes_home.join("plugins");
+        let legacy_dir = plugins_dir.join(LEGACY_HERMES_PLUGIN_NAME);
+        let ambiguous_dir = plugins_dir.join(AMBIGUOUS_HERMES_PLUGIN_NAME);
+        write_test_agent_config(&home);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join("plugin.yaml"),
+            "name: finite-platform\nkind: platform\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&ambiguous_dir).unwrap();
+        fs::write(
+            ambiguous_dir.join("plugin.yaml"),
+            "name: finite-platform\nkind: platform\nversion: 0.2.0\n",
+        )
+        .unwrap();
+        fs::write(
+            hermes_home.join("config.yaml"),
+            "plugins:\n  enabled:\n    - finite-platform\n    - finite\ngateway:\n  platforms:\n    finite:\n      enabled: true\n",
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        cmd_install(
+            &home,
+            vec![
+                "--plugins-dir".to_owned(),
+                plugins_dir.display().to_string(),
+                "--finitechat-bin".to_owned(),
+                "/usr/local/bin/finitechat".to_owned(),
+            ],
+            true,
+            &mut output,
+        )
+        .expect("install succeeds with warnings");
+
+        let summary: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(summary["plugin_name"], "finitechat");
+        assert_eq!(
+            summary["plugin_dir"],
+            plugins_dir.join("finitechat").display().to_string()
+        );
+        let legacy_plugins = summary["legacy_plugin_conflicts"].as_array().unwrap();
+        assert_eq!(legacy_plugins.len(), 2);
+        assert_eq!(legacy_plugins[0]["plugin_name"], "finite-platform");
+        assert!(
+            legacy_plugins[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("legacy plaintext bridge")
+        );
+        assert_eq!(legacy_plugins[1]["plugin_name"], "finite");
+        assert!(
+            legacy_plugins[1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("old generic Finite plugin name")
+        );
+        let legacy_configs = summary["legacy_config_conflicts"].as_array().unwrap();
+        assert_eq!(legacy_configs.len(), 2);
+        assert_eq!(legacy_configs[0]["enabled_plugin"], "finite-platform");
+        assert_eq!(legacy_configs[0]["replacement_plugin"], "finitechat");
+        assert_eq!(legacy_configs[1]["enabled_plugin"], "finite");
+        assert_eq!(legacy_configs[1]["replacement_plugin"], "finitechat");
+        assert!(
+            summary["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .unwrap()
+                    .contains("change plugins.enabled to 'finitechat'"))
+        );
     }
 
     #[test]

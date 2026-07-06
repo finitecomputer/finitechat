@@ -93,7 +93,7 @@ are null for that layer:
   "runtime": {
     "finitechat_version": "...",
     "hermes_agent_version": "0.17.0",
-    "plugin_name": "finite-platform",
+    "plugin_name": "finitechat",
     "plugin_hash": "...",
     "image_ref": null,
     "image_digest": null
@@ -158,7 +158,7 @@ Required preflight:
 4. The app installs on the target phone.
 5. The sidecar answers `/healthz` and `/readyz`.
 6. The Hermes gateway process is still alive after loading the plugin.
-7. The gateway log records the current `finite-platform` plugin, not a stale
+7. The gateway log records the current `finitechat` plugin, not a stale
    or built-in bridge.
 8. A throwaway CLI admission probe joins with the current invite.
 

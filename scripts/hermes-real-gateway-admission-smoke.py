@@ -9,7 +9,7 @@ This is intentionally stronger than the adapter echo tests:
   -> throwaway finitechat client joins via invite URL
 
 The pass condition is that Hermes admits the pending join through the
-finite-platform plugin. No direct adapter import or test echo handler is used.
+finitechat plugin. No direct adapter import or test echo handler is used.
 """
 
 from __future__ import annotations
@@ -159,10 +159,10 @@ def write_hermes_config(
   api_mode: chat_completions
 plugins:
   enabled:
-    - finite-platform
+    - finitechat
 gateway:
   platforms:
-    finite:
+    finitechat:
       enabled: true
       extra:
         home: "{agent_home}"

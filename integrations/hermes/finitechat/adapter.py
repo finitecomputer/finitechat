@@ -25,7 +25,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 logger = logging.getLogger(__name__)
 
-FINITE_PLATFORM_NAME = "finite"
+FINITE_PLATFORM_NAME = "finitechat"
 LOCAL_ENV_FILE = "finitechat.env"
 DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
@@ -47,7 +47,7 @@ def _load_local_env_defaults(path: Path | None = None) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        logger.warning("[finite] could not read %s: %s", env_path, exc)
+        logger.warning("[finitechat] could not read %s: %s", env_path, exc)
         return
 
     for line in raw.splitlines():
@@ -142,10 +142,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def connect(self, is_reconnect: bool = False, **_: Any) -> bool:
         if not self.home:
-            logger.error("[finite] FINITECHAT_HOME is required (agent home directory)")
+            logger.error("[finitechat] FINITECHAT_HOME is required (agent home directory)")
             return False
         if not self._finitechat_cmd:
-            logger.error("[finite] finitechat CLI is not configured")
+            logger.error("[finitechat] finitechat CLI is not configured")
             return False
 
         await self._ensure_service()
@@ -157,7 +157,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         else:
             self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
-            "[finite] connected (home=%s%s%s%s)",
+            "[finitechat] connected (home=%s%s%s%s)",
             self.home,
             f", room filter={self.room_id}" if self.room_id else "",
             ", inbound stream=on" if self.inbound_stream and self.service_url else "",
@@ -172,7 +172,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         if not url:
             result = await self._finitechat_json("invite", {}, timeout=60)
             if not result.ok:
-                logger.warning("[finite] could not prepare an invite: %s", result.error)
+                logger.warning("[finitechat] could not prepare an invite: %s", result.error)
                 return
             qr = result.data.get("qr") or ""
             url = result.data.get("url") or ""
@@ -188,15 +188,15 @@ class FiniteChatAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             return ""
         except OSError as exc:
-            logger.warning("[finite] could not read stored invites from %s: %s", invites_path, exc)
+            logger.warning("[finitechat] could not read stored invites from %s: %s", invites_path, exc)
             return ""
         try:
             values = json.loads(raw)
         except json.JSONDecodeError as exc:
-            logger.warning("[finite] stored invites file is not valid JSON: %s", exc)
+            logger.warning("[finitechat] stored invites file is not valid JSON: %s", exc)
             return ""
         if not isinstance(values, list):
-            logger.warning("[finite] stored invites file is not a JSON array")
+            logger.warning("[finitechat] stored invites file is not a JSON array")
             return ""
         for value in reversed(values):
             if isinstance(value, str) and value.startswith("finite://join?"):
@@ -206,11 +206,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
     async def _recover_interrupted_turns(self) -> None:
         result = await self._finitechat_json("recover", {}, timeout=60)
         if not result.ok:
-            logger.warning("[finite] could not recover interrupted turns: %s", result.error)
+            logger.warning("[finitechat] could not recover interrupted turns: %s", result.error)
             return
         recovered = result.data.get("recovered") or 0
         if recovered:
-            logger.info("[finite] recovered %s interrupted Hermes turn(s)", recovered)
+            logger.info("[finitechat] recovered %s interrupted Hermes turn(s)", recovered)
 
     async def disconnect(self) -> None:
         if self._poll_task:
@@ -221,7 +221,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         await self._stop_service()
         await self.cancel_background_tasks()
         self._mark_disconnected()
-        logger.info("[finite] disconnected")
+        logger.info("[finitechat] disconnected")
 
     async def send(
         self,
@@ -419,7 +419,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             timeout=self.poll_timeout_secs + 15,
         )
         if not result.ok:
-            logger.warning("[finite] poll failed: %s", result.error)
+            logger.warning("[finitechat] poll failed: %s", result.error)
             return False
         await self._process_poll_payload(result.data)
         return True
@@ -439,7 +439,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             if result.ok:
                 await self._process_inbound_records(result.data.get("records") or [])
                 continue
-            logger.warning("[finite] inbound stream failed: %s", result.error)
+            logger.warning("[finitechat] inbound stream failed: %s", result.error)
             if result.transport_error:
                 self.service_url = ""
             await asyncio.sleep(STREAM_RECONNECT_BACKOFF_SECS)
@@ -458,7 +458,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
 
     async def _process_poll_payload(self, data: dict[str, Any]) -> None:
         for account in data.get("joined") or []:
-            logger.info("[finite] verified joiner admitted: %s", account)
+            logger.info("[finitechat] verified joiner admitted: %s", account)
         for raw_event in data.get("events") or []:
             await self._dispatch_raw_event(raw_event)
 
@@ -468,12 +468,12 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 continue
             record_type = str(raw_record.get("type") or "")
             if record_type == "joined":
-                logger.info("[finite] verified joiner admitted: %s", raw_record.get("account_id"))
+                logger.info("[finitechat] verified joiner admitted: %s", raw_record.get("account_id"))
                 continue
             if record_type == "event":
                 raw_event = raw_record.get("event")
             elif record_type:
-                logger.debug("[finite] ignored non-message inbound record type %s", record_type)
+                logger.debug("[finitechat] ignored non-message inbound record type %s", record_type)
                 continue
             else:
                 raw_event = raw_record
@@ -483,19 +483,19 @@ class FiniteChatAdapter(BasePlatformAdapter):
         try:
             await self._handle_finitechat_event(raw_event)
         except Exception as exc:
-            logger.error("[finite] failed to dispatch event: %s", exc, exc_info=True)
+            logger.error("[finitechat] failed to dispatch event: %s", exc, exc_info=True)
 
     async def _handle_finitechat_event(self, raw_event: dict[str, Any]) -> None:
         if not isinstance(raw_event, dict):
             return
         room_id = str(raw_event.get("room_id") or self.room_id)
         if self.room_id and room_id != self.room_id:
-            logger.warning("[finite] ignored event for filtered room %s", room_id)
+            logger.warning("[finitechat] ignored event for filtered room %s", room_id)
             return
         seq = raw_event.get("seq")
         message_id = str(raw_event.get("message_id") or "")
         if not message_id:
-            logger.warning("[finite] ignored event without message_id")
+            logger.warning("[finitechat] ignored event without message_id")
             return
         event_key = _adapter_event_key(room_id, seq, message_id)
         if event_key and event_key in self._delivered_event_keys:
@@ -549,7 +549,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             timeout=15,
         )
         if not ack.ok:
-            logger.warning("[finite] failed to ack %s/%s: %s", room_id, seq, ack.error)
+            logger.warning("[finitechat] failed to ack %s/%s: %s", room_id, seq, ack.error)
 
     def _remember_delivered_event(self, event_key: str) -> None:
         if event_key in self._delivered_event_keys:
@@ -692,7 +692,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
             if action == "activity" and isinstance(payload.get("action"), str):
                 action_detail = f"/{payload['action']}"
             logger.warning(
-                "[finite] Hermes service unavailable during %s%s (%s); "
+                "[finitechat] Hermes service unavailable during %s%s (%s); "
                 "falling back to finitechat CLI",
                 action,
                 action_detail,
@@ -761,7 +761,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
                     healthy = await asyncio.to_thread(_finitechat_service_health, candidate_url, 2)
                     if healthy:
                         self.service_url = candidate_url
-                        logger.info("[finite] Hermes service ready at %s", self.service_url)
+                        logger.info("[finitechat] Hermes service ready at %s", self.service_url)
                         return True
             return bool(self.service_url)
         if not self.home or not self._finitechat_cmd:
@@ -791,14 +791,14 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 stderr=asyncio.subprocess.DEVNULL,
             )
         except Exception as exc:
-            logger.warning("[finite] could not start Hermes service: %s", exc)
+            logger.warning("[finitechat] could not start Hermes service: %s", exc)
             return False
 
         deadline = asyncio.get_running_loop().time() + SERVICE_START_TIMEOUT_SECS
         while asyncio.get_running_loop().time() < deadline:
             if self._service_proc.returncode is not None:
                 logger.warning(
-                    "[finite] Hermes service exited during startup (%s)",
+                    "[finitechat] Hermes service exited during startup (%s)",
                     self._service_proc.returncode,
                 )
                 self._service_proc = None
@@ -810,11 +810,11 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 healthy = await asyncio.to_thread(_finitechat_service_health, candidate_url, 2)
                 if healthy:
                     self.service_url = candidate_url
-                    logger.info("[finite] Hermes service ready at %s", self.service_url)
+                    logger.info("[finitechat] Hermes service ready at %s", self.service_url)
                     return True
             await asyncio.sleep(0.05)
 
-        logger.warning("[finite] Hermes service did not become ready; using CLI bridge")
+        logger.warning("[finitechat] Hermes service did not become ready; using CLI bridge")
         return False
 
     async def _stop_service(self) -> None:
@@ -989,7 +989,7 @@ def _read_service_ready_file(path: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except OSError as exc:
-        logger.warning("[finite] could not read Hermes service ready file %s: %s", path, exc)
+        logger.warning("[finitechat] could not read Hermes service ready file %s: %s", path, exc)
         return {}
     try:
         data = json.loads(raw)

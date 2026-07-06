@@ -519,7 +519,7 @@ def start_agent_container(
         "--env",
         "FINITECHAT_HERMES_INBOUND_STREAM=1",
         "--env",
-        "FINITECHAT_HERMES_PLUGIN_NAME=finite-platform",
+        "FINITECHAT_HERMES_PLUGIN_NAME=finitechat",
         "--env",
         f"FINITECHAT_HERMES_ROOM_NAME={opts.room_name}",
         "--env",
@@ -778,7 +778,7 @@ def main() -> int:
 
     env, env_files_loaded = load_canary_env(opts)
     local_report = load_required_local_report(opts)
-    plugin_dir = REPO_ROOT / "integrations/hermes/finite-platform"
+    plugin_dir = REPO_ROOT / "integrations/hermes/finitechat"
     started = time.monotonic()
     report: dict[str, Any] = {
         "status": "running",
@@ -801,7 +801,7 @@ def main() -> int:
         },
         "runtime": {
             "hermes_agent_version_expected": opts.hermes_agent_version,
-            "plugin_name": "finite-platform",
+            "plugin_name": "finitechat",
             "plugin_hash": sha256_tree(plugin_dir),
             "image_ref": image,
             "image_id": None,
