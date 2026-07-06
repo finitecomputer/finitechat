@@ -188,7 +188,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
         except FileNotFoundError:
             return ""
         except OSError as exc:
-            logger.warning("[finitechat] could not read stored invites from %s: %s", invites_path, exc)
+            logger.warning(
+                "[finitechat] could not read stored invites from %s: %s", invites_path, exc
+            )
             return ""
         try:
             values = json.loads(raw)
@@ -468,7 +470,9 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 continue
             record_type = str(raw_record.get("type") or "")
             if record_type == "joined":
-                logger.info("[finitechat] verified joiner admitted: %s", raw_record.get("account_id"))
+                logger.info(
+                    "[finitechat] verified joiner admitted: %s", raw_record.get("account_id")
+                )
                 continue
             if record_type == "event":
                 raw_event = raw_record.get("event")
