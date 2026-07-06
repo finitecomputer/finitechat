@@ -9876,6 +9876,65 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_agent_bridge_poll_admits_native_app_invite_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let agent = FiniteChatRuntime::open(with_test_secret(OpenOptions {
+            data_dir: dir.path().join("agent").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "agent".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        }))
+        .unwrap();
+        let app = FiniteChatRuntime::open(with_test_secret(OpenOptions {
+            data_dir: dir.path().join("ios-app").to_string_lossy().into_owned(),
+            server_url,
+            device_id: "ios-hermes-media-sim".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        }))
+        .unwrap();
+
+        let agent_state = agent
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "Hermes Bridge Invite".to_owned(),
+            })
+            .unwrap();
+        let room_id = agent_state.rooms.first().unwrap().room_id.clone();
+        let invite = agent
+            .create_invite_with_options_and_wait(
+                room_id.clone(),
+                Some("Hermes Bridge Invite".to_owned()),
+                DEFAULT_INVITE_MAX_JOINS,
+                DEFAULT_INVITE_TTL_MS,
+            )
+            .unwrap()
+            .active_invite
+            .unwrap();
+
+        app.dispatch_and_wait(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        app.dispatch_and_wait(AppAction::SubmitInviteJoin {
+            pending_room_id: room_id.clone(),
+        })
+        .unwrap();
+
+        let bridge = agent
+            .agent_bridge_poll_once(vec![invite.invite_url.clone()])
+            .unwrap();
+        assert_eq!(bridge.joined_account_ids.len(), 1);
+
+        let app_state = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&app_state, &room_id).state,
+            AppRoomState::Connected
+        );
+    }
+
+    #[test]
     fn app_profile_chat_claims_key_package_and_sends_welcome_without_invite_qr() {
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));

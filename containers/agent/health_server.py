@@ -109,14 +109,17 @@ def invite_base_payload(
     }
 
 
-def paired_payload(
+def consumed_pending_admission_payload(
     identity_payload: dict[str, Any], invite_payload: dict[str, Any]
 ) -> dict[str, Any]:
-    # No url: the dashboard treats a missing url as not-serving-an-invite,
-    # and paired tells it why.
+    # A closed single-use invite only proves the rendezvous session can no
+    # longer admit another join request. It does not prove the joiner claimed
+    # and activated its Welcome or that the agent has observed a usable MLS
+    # member. Do not tell the dashboard the agent is paired until finitechat can
+    # prove room admission from member state.
     payload = invite_base_payload(identity_payload, invite_payload)
-    payload["paired"] = True
-    payload["invite_state"] = "consumed"
+    payload["paired"] = False
+    payload["invite_state"] = "consumed_pending_admission"
     return payload
 
 
@@ -148,8 +151,10 @@ def invite() -> dict[str, Any]:
         if invite_payload is None:
             invite_payload = mint_invite(room_id=None)
             write_cached_invite(invite_payload)
+        if invite_payload.get("invite_state") == "consumed_pending_admission":
+            return consumed_pending_admission_payload(identity_payload, invite_payload)
         if invite_payload.get("paired"):
-            return paired_payload(identity_payload, invite_payload)
+            return consumed_pending_admission_payload(identity_payload, invite_payload)
         try:
             status = invite_status(invite_payload["url"])
         except Exception:
@@ -160,11 +165,13 @@ def invite() -> dict[str, Any]:
                 identity_payload, invite_payload, invite_state="unknown", expires_at_ms=None
             )
         if status.get("consumed"):
-            # Someone paired. Persist that verdict so /invite never re-mints
-            # for this room, even if the server later forgets the session.
-            invite_payload["paired"] = True
+            # The single-use rendezvous is closed, so do not re-mint
+            # automatically. But invite consumption is not pairing: a stale or
+            # incompatible client can burn the session before it has usable MLS
+            # room state. Persist only that the invite is spent.
+            invite_payload["invite_state"] = "consumed_pending_admission"
             write_cached_invite(invite_payload)
-            return paired_payload(identity_payload, invite_payload)
+            return consumed_pending_admission_payload(identity_payload, invite_payload)
         if status.get("expired"):
             # Nobody paired in time: mint a fresh invite for the same room.
             invite_payload = mint_invite(room_id=invite_payload.get("room_id"))

@@ -2525,7 +2525,9 @@ final class AppModel: ObservableObject, AppReconciler {
                 self.createRoom()
             }
             if let inviteURL {
-                _ = await self.scanLaunchAutomationInvite(inviteURL)
+                if case .room(let room) = await self.scanLaunchAutomationInvite(inviteURL) {
+                    await self.submitLaunchAutomationInviteJoin(roomID: room.roomId)
+                }
             }
             if let profileChatNpub,
                !profileChatNpub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2560,6 +2562,54 @@ final class AppModel: ObservableObject, AppReconciler {
                     mimeType: attachmentMimeType,
                     caption: attachmentCaption ?? ""
                 )
+            }
+        }
+    }
+
+    private func submitLaunchAutomationInviteJoin(roomID: String) async {
+        await withCheckedContinuation { continuation in
+            let action = AppAction.submitInviteJoin(pendingRoomId: roomID)
+            let diagnostic = diagnosticAction(action)
+            do {
+                let runtime = try currentRuntime()
+                let runtimeKey = openKey
+                enqueueRuntimeDispatch(
+                    action,
+                    runtime: runtime,
+                    runtimeKey: runtimeKey,
+                    priority: .userInitiated,
+                    onSuccess: { [weak self] nextState in
+                        guard let self else {
+                            continuation.resume()
+                            return
+                        }
+                        self.applyRuntimeSnapshot(nextState)
+                        self.errorText = nil
+                        self.appendDiagnostic(
+                            category: diagnostic.category,
+                            event: "\(diagnostic.name).succeeded",
+                            details: diagnostic.details
+                        )
+                        self.restartUpdateLoopIfEnabled()
+                        continuation.resume()
+                    },
+                    onFailure: { [weak self] error in
+                        guard let self else {
+                            continuation.resume()
+                            return
+                        }
+                        self.appendDiagnostic(
+                            category: diagnostic.category,
+                            event: "\(diagnostic.name).failed",
+                            details: self.diagnosticErrorDetails(error)
+                        )
+                        self.errorText = String(describing: error)
+                        continuation.resume()
+                    }
+                )
+            } catch {
+                errorText = String(describing: error)
+                continuation.resume()
             }
         }
     }
