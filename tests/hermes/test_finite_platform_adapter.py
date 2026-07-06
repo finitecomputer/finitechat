@@ -158,6 +158,9 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         )
         self.assertTrue(callable(entry["adapter_factory"]))
 
+    def test_adapter_disables_edit_streaming_for_ios_rendering_compatibility(self):
+        self.assertFalse(self.module.FiniteChatAdapter.SUPPORTS_MESSAGE_EDITING)
+
     def test_check_requirements_uses_finitechat_bin_not_finitecomputer(self):
         old_value = os.environ.get("FINITECHAT_BIN")
         os.environ["FINITECHAT_BIN"] = "/bin/echo"

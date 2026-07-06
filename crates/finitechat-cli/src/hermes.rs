@@ -1842,22 +1842,58 @@ fn payload_is_typed_json(payload: &[u8]) -> bool {
         .is_some()
 }
 
+fn encode_application_event(
+    kind: DurableAppEventKind,
+    conversation_id: Option<String>,
+    payload: &[u8],
+) -> Result<Vec<u8>, CliError> {
+    let event = DecryptedApplicationEventV1 {
+        kind,
+        conversation_id,
+        payload: payload.to_vec(),
+    };
+    event
+        .validate_limits()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    serde_json::to_vec(&event).map_err(CliError::Serialize)
+}
+
 fn cmd_send<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
     let request: HermesSendRequestV1 = serde_json::from_value(request).map_err(CliError::Json)?;
-    let payload = HermesMessagePayloadV1::from_send(&request)
+    let hermes_payload = HermesMessagePayloadV1::from_send(&request)
         .encode()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let sent = append_payload_to_room(home_dir, &request.room_id, payload, request.text.clone())?;
+    let app_payload = encode_application_event(
+        DurableAppEventKind::ChatMessage,
+        request.conversation_id.clone(),
+        &hermes_payload,
+    )?;
+    let sent = append_payload_to_room(
+        home_dir,
+        &request.room_id,
+        app_payload,
+        request.text.clone(),
+    )?;
     update_running_after_send(home_dir, &request, &sent.message_id)?;
     write_sent_message(output, &sent)
 }
 
 fn cmd_edit<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
     let request: HermesEditRequestV1 = serde_json::from_value(request).map_err(CliError::Json)?;
-    let payload = HermesMessagePayloadV1::from_edit(&request)
+    let hermes_payload = HermesMessagePayloadV1::from_edit(&request)
         .encode()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let sent = append_payload_to_room(home_dir, &request.room_id, payload, request.text.clone())?;
+    let app_payload = encode_application_event(
+        DurableAppEventKind::ChatMessage,
+        request.conversation_id.clone(),
+        &hermes_payload,
+    )?;
+    let sent = append_payload_to_room(
+        home_dir,
+        &request.room_id,
+        app_payload,
+        request.text.clone(),
+    )?;
     update_running_after_edit(home_dir, &request)?;
     write_sent_message(output, &sent)
 }
@@ -1875,10 +1911,20 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
             finalize: true,
             metadata: BTreeMap::new(),
         };
-        let payload = HermesMessagePayloadV1::from_edit(&recovery)
+        let hermes_payload = HermesMessagePayloadV1::from_edit(&recovery)
             .encode()
             .map_err(|error| CliError::Hermes(error.to_string()))?;
-        append_payload_to_room(home_dir, &recovery.room_id, payload, recovery.text.clone())?;
+        let app_payload = encode_application_event(
+            DurableAppEventKind::ChatMessage,
+            recovery.conversation_id.clone(),
+            &hermes_payload,
+        )?;
+        append_payload_to_room(
+            home_dir,
+            &recovery.room_id,
+            app_payload,
+            recovery.text.clone(),
+        )?;
         recovered += 1;
     }
     if recovered > 0 {

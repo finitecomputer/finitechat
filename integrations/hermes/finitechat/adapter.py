@@ -83,7 +83,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
     """Poll Finite Chat for inbound messages and deliver Hermes replies."""
 
     MAX_MESSAGE_LENGTH = 12000
-    SUPPORTS_MESSAGE_EDITING = True
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, _finite_platform())
