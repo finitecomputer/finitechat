@@ -319,7 +319,7 @@ fn publish_key_package_request(
 
     let request = HttpKeyPackagePublication {
         key_package_id: HttpKeyPackageId::new(key_package_id.into_bytes()),
-        owner: MemberId::new(owner.into_bytes()),
+        owner: raw_delivery_owner_from_cli(owner)?,
         key_package: KeyPackage::new(bytes.into_bytes()),
     };
     post_json_request(server, "/key-packages", &request)
@@ -333,7 +333,7 @@ fn claim_key_package_request(
     reject_extra_args(&args)?;
 
     let request = ClaimKeyPackageRequest {
-        owner: MemberId::new(owner.into_bytes()),
+        owner: raw_delivery_owner_from_cli(owner)?,
     };
     post_json_request(server, "/key-packages/claim", &request)
 }
@@ -346,7 +346,7 @@ fn key_package_inventory_request(
     reject_extra_args(&args)?;
 
     let request = KeyPackageInventoryRequest {
-        owner: MemberId::new(owner.into_bytes()),
+        owner: raw_delivery_owner_from_cli(owner)?,
     };
     post_json_request(server, "/key-packages/inventory", &request)
 }
@@ -368,11 +368,20 @@ fn claim_key_packages_request(
     let request = ClaimKeyPackagesRequest {
         owners: owners
             .into_iter()
-            .map(|owner| MemberId::new(owner.into_bytes()))
-            .collect(),
+            .map(raw_delivery_owner_from_cli)
+            .collect::<Result<Vec<_>, _>>()?,
         idempotency_key,
     };
     post_json_request(server, "/key-packages/claims", &request)
+}
+
+fn raw_delivery_owner_from_cli(owner: String) -> Result<MemberId, CliError> {
+    if serde_json::from_str::<DeviceRef>(&owner).is_ok() {
+        return Err(CliError::Usage(
+            "--owner is a raw delivery MemberId, not DeviceRef JSON; use finitechat-client runtime delivery for Finite device KeyPackages".to_owned(),
+        ));
+    }
+    Ok(MemberId::new(owner.into_bytes()))
 }
 
 fn expire_key_package_lease_request(
@@ -936,24 +945,25 @@ pub(crate) fn ensure_test_finite_home() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use finitechat_client::{
+        FiniteChatDevice, FiniteChatDeviceConfig, HttpRuntimeDelivery, ReqwestHttpRuntimeTransport,
+        RuntimeDelivery,
+    };
     use finitechat_delivery::HttpSyncPage;
     use finitechat_http::{
         AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
         BootstrapAccountRoomRequest, ClaimKeyPackagesRequest, ClaimLinkPayloadRequest,
         ClaimWelcomesRequest, CreateLinkSessionRequest, ExpireKeyPackageLeaseRequest,
         ExpireLinkSessionRequest, GetDeviceLivenessRequest, GetLinkSessionRequest,
-        GroupSyncRequest, HttpClaimedWelcome, HttpKeyPackageClaim, KeyPackageInventoryRequest,
+        GroupSyncRequest, HttpKeyPackageClaim, KeyPackageInventoryRequest,
         ListAccountRoomDirectoryRequest, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
         ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
         SaveAccountRoomRequest, UploadLinkPayloadRequest,
     };
-    use finitechat_proto::{
-        CommitAccepted, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
-    };
-    use finitechat_proto::{
-        FiniteEnvelope, LogEntryKind, MembershipAddV1, MembershipDeltaV1, StagedWelcomeV1,
-        WelcomeState,
-    };
+    use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
+    use finitechat_proto::{CommitAccepted, WelcomeState};
+
+    const CLI_LIVE_ALICE_SECRET: [u8; NOSTR_SECRET_KEY_BYTES] = [71; NOSTR_SECRET_KEY_BYTES];
 
     #[test]
     fn sync_group_command_defaults_cursor_and_limit() {
@@ -1406,6 +1416,23 @@ mod tests {
     }
 
     #[test]
+    fn raw_key_package_owner_rejects_device_ref_json() {
+        let device_json = serde_json::to_string(&DeviceRef::new("alice", "alice-phone"))
+            .expect("device ref json");
+        let error = prepare_http_request([
+            "publish-key-package",
+            "--owner",
+            &device_json,
+            "--key-package-id",
+            "alice-phone-1",
+            "--bytes",
+            "package",
+        ])
+        .expect_err("DeviceRef JSON is not a raw delivery owner");
+        assert!(error.to_string().contains("raw delivery MemberId"));
+    }
+
+    #[test]
     fn ack_welcome_command_builds_ack_request() {
         let request =
             prepare_http_request(["ack-welcome", "--message-id", "welcome-bob"]).expect("request");
@@ -1418,24 +1445,18 @@ mod tests {
     }
 
     #[test]
-    fn live_cli_submit_commit_claim_and_ack_welcome_over_http_server() {
+    fn live_client_submit_commit_claim_and_ack_welcome_over_http_server() {
         let dir = tempfile::tempdir().expect("tempdir");
         let server_db = dir.path().join("cli-live-submit.sqlite3");
         let server_url = spawn_live_cli_server(&server_db);
-        let creator = DeviceRef::new("alice", "alice-laptop");
-        let phone = DeviceRef::new("alice", "alice-phone");
+        let mut creator = test_finitechat_device(CLI_LIVE_ALICE_SECRET, "alice-laptop");
+        let phone = test_finitechat_device(CLI_LIVE_ALICE_SECRET, "alice-phone");
         let room_id = "room-cli-live-submit";
         let mls_group_id = "mls-cli-live-submit";
         let welcome_id = "welcome-cli-live-phone";
-        let submit = submit_add_device_request(
-            room_id,
-            mls_group_id,
-            &creator,
-            &phone,
-            welcome_id,
-            "commit-cli-live-idempotency",
-        );
-        let submit_json = serde_json::to_string(&submit).expect("submit json");
+        creator
+            .create_group_state(room_id, mls_group_id)
+            .expect("creator group state");
 
         let bootstrap = run_cli_json([
             "http",
@@ -1447,62 +1468,47 @@ mod tests {
             "--mls-group-id",
             mls_group_id,
             "--account-id",
-            &creator.account_id,
+            &creator.device_ref().account_id,
             "--device-id",
-            &creator.device_id,
+            &creator.device_ref().device_id,
         ]);
         assert_eq!(bootstrap["bootstrapped"], true);
 
-        let add = &submit.membership_delta.adds[0];
-        let upload = UploadKeyPackageRequest {
-            key_package_id: add.key_package_id.clone(),
-            owner: phone.clone(),
-            key_package_ref: add.key_package_ref.clone(),
-            key_package_hash: add.key_package_hash.clone(),
-            key_package_payload: b"cli-live-submit-key-package".to_vec(),
-        };
-        let owner = serde_json::to_string(&phone).expect("owner json");
-        let upload_json = serde_json::to_string(&upload).expect("upload json");
-        let published: PublishKeyPackageResponse = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "publish-key-package",
-            "--owner",
-            &owner,
-            "--key-package-id",
-            &upload.key_package_id,
-            "--bytes",
-            &upload_json,
-        ]))
-        .expect("publish commit KeyPackage");
-        assert!(published.published);
-        let claimed: Option<finitechat_delivery::HttpClaimedKeyPackage> =
-            serde_json::from_value(run_cli_json([
-                "http",
-                "--server",
-                &server_url,
-                "claim-key-package",
-                "--owner",
-                &owner,
-            ]))
-            .expect("claim commit KeyPackage");
-        assert!(claimed.is_some());
+        let mut delivery =
+            HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url.clone()));
+        let upload = phone
+            .upload_key_package_request("key-package-add-device")
+            .expect("phone upload KeyPackage request");
+        delivery
+            .upload_key_package(upload.clone())
+            .expect("publish commit KeyPackage through product delivery");
+        let claimed = delivery
+            .claim_key_package_for_device(phone.device_ref())
+            .expect("claim commit KeyPackage through product delivery")
+            .expect("uploaded package can be claimed");
+        assert_eq!(claimed.owner, *phone.device_ref());
+        assert_eq!(claimed.key_package_id, upload.key_package_id);
+        assert_eq!(claimed.key_package_ref, upload.key_package_ref);
+        assert_eq!(claimed.key_package_hash, upload.key_package_hash);
 
-        let accepted: CommitAccepted = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "submit-commit",
-            "--request-json",
-            &submit_json,
-        ]))
-        .expect("commit accepted");
-        let expected_message_id = submit.envelope.message_id().expect("submit message id");
+        let prepared = creator
+            .prepare_add_members_commit(
+                room_id,
+                &[claimed],
+                &[welcome_id.to_owned()],
+                "commit-cli-live-idempotency",
+            )
+            .expect("prepare add-device commit");
+        let expected_message_id = prepared.message_id.clone();
+        let submit_request = prepared.request.clone();
+        let accepted = delivery
+            .submit_commit(prepared.request)
+            .expect("commit accepted through product delivery");
         assert_eq!(accepted.seq, 1);
         assert_eq!(accepted.message_id, expected_message_id);
         assert_eq!(accepted.released_welcomes, vec![welcome_id.to_owned()]);
 
+        let submit_json = serde_json::to_string(&submit_request).expect("submit json");
         let replayed: CommitAccepted = serde_json::from_value(run_cli_json([
             "http",
             "--server",
@@ -1532,60 +1538,27 @@ mod tests {
             accepted.message_id.as_bytes()
         );
 
-        let recipient = member_for_device(&phone);
-        let claimed: Vec<HttpClaimedWelcome> = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "claim-welcomes",
-            "--recipient",
-            std::str::from_utf8(recipient.as_slice()).expect("recipient json"),
-            "--limit",
-            "10",
-        ]))
-        .expect("claimed welcomes");
+        let claimed = delivery
+            .claim_welcomes(phone.device_ref())
+            .expect("claim welcomes through product delivery");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].seq, 1);
-        assert_eq!(claimed[0].message.id.as_slice(), welcome_id.as_bytes());
-        let welcome: WelcomeRecord =
-            serde_json::from_slice(&claimed[0].message.payload).expect("welcome record");
+        let welcome = &claimed[0];
         assert_eq!(welcome.welcome_id, welcome_id);
         assert_eq!(welcome.commit_seq, accepted.seq);
-        assert_eq!(welcome.recipient, phone);
-        assert_eq!(welcome.state, WelcomeState::Released);
+        assert_eq!(welcome.recipient, *phone.device_ref());
+        assert_eq!(welcome.state, WelcomeState::Claimed);
 
-        let duplicate_claim: Vec<HttpClaimedWelcome> = serde_json::from_value(run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "claim-welcomes",
-            "--recipient",
-            std::str::from_utf8(recipient.as_slice()).expect("recipient json"),
-            "--limit",
-            "10",
-        ]))
-        .expect("duplicate claim");
+        let duplicate_claim = delivery
+            .claim_welcomes(phone.device_ref())
+            .expect("duplicate claim through product delivery");
         assert!(duplicate_claim.is_empty());
 
-        let acked = run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "ack-welcome",
-            "--message-id",
-            welcome_id,
-        ]);
-        assert_eq!(acked["acked"], true);
-
-        let acked_again = run_cli_json([
-            "http",
-            "--server",
-            &server_url,
-            "ack-welcome",
-            "--message-id",
-            welcome_id,
-        ]);
-        assert_eq!(acked_again["acked"], true);
+        delivery
+            .ack_welcome(welcome_id)
+            .expect("ack welcome through product delivery");
+        delivery
+            .ack_welcome(welcome_id)
+            .expect("idempotent ack through product delivery");
 
         let listed = run_cli_json([
             "http",
@@ -1593,10 +1566,11 @@ mod tests {
             &server_url,
             "account-rooms-list",
             "--account-id",
-            "alice",
+            &creator.device_ref().account_id,
             "--limit",
             "10",
         ]);
+        assert_eq!(listed["rooms"][0]["devices"][0]["active"], true);
         assert_eq!(listed["rooms"][0]["devices"][1]["active"], true);
     }
 
@@ -1878,8 +1852,18 @@ mod tests {
         panic!("live CLI test server did not become healthy at {health_url}");
     }
 
-    fn member_for_device(device: &DeviceRef) -> MemberId {
-        MemberId::new(finitechat_proto::delivery_member_id_for_device(device))
+    fn test_finitechat_device(
+        account_secret_bytes: [u8; NOSTR_SECRET_KEY_BYTES],
+        device_id: &str,
+    ) -> FiniteChatDevice {
+        let config = FiniteChatDeviceConfig {
+            account_secret_key: NostrSecretKey::from_bytes(account_secret_bytes).unwrap(),
+            device_id: device_id.to_owned(),
+            now_unix_seconds: 1000,
+            credential_not_before_unix_seconds: 0,
+            credential_not_after_unix_seconds: 86_400,
+        };
+        FiniteChatDevice::new(config).expect("test finitechat device")
     }
 
     fn assert_claimed_package(claim: &HttpKeyPackageClaim, owner: &str, key_package_id: &str) {
@@ -1887,49 +1871,5 @@ mod tests {
         let claimed = claim.claimed.as_ref().expect("claimed package");
         assert_eq!(claimed.owner.as_slice(), owner.as_bytes());
         assert_eq!(claimed.key_package_id.as_slice(), key_package_id.as_bytes());
-    }
-
-    fn submit_add_device_request(
-        room_id: &str,
-        mls_group_id: &str,
-        sender: &DeviceRef,
-        added: &DeviceRef,
-        welcome_id: &str,
-        idempotency_key: &str,
-    ) -> SubmitCommitRequest {
-        let envelope = FiniteEnvelope {
-            room_id: room_id.to_owned(),
-            mls_group_id: mls_group_id.to_owned(),
-            epoch: 0,
-            sender: sender.clone(),
-            kind: LogEntryKind::Commit,
-            payload: b"commit-add-device".to_vec(),
-        };
-        let commit_message_id = envelope.message_id().expect("commit message id");
-        SubmitCommitRequest {
-            room_id: room_id.to_owned(),
-            sender: sender.clone(),
-            expected_epoch: 0,
-            envelope,
-            membership_delta: MembershipDeltaV1 {
-                base_epoch: 0,
-                post_commit_epoch: 1,
-                commit_message_id,
-                adds: vec![MembershipAddV1 {
-                    device: added.clone(),
-                    key_package_id: "key-package-add-device".to_owned(),
-                    key_package_ref: "key-package-ref-add-device".to_owned(),
-                    key_package_hash: "key-package-hash-add-device".to_owned(),
-                    welcome_id: welcome_id.to_owned(),
-                }],
-                removes: Vec::new(),
-            },
-            staged_welcomes: vec![StagedWelcomeV1 {
-                welcome_id: welcome_id.to_owned(),
-                welcome_payload: b"welcome-add-device".to_vec(),
-                ratchet_tree_payload: b"ratchet-tree-add-device".to_vec(),
-            }],
-            idempotency_key: idempotency_key.to_owned(),
-        }
     }
 }
