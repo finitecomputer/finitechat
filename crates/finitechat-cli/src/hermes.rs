@@ -11,15 +11,17 @@
 //! client store `client.sqlite3`.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -52,6 +54,7 @@ use finitechat_proto::{
     AttachmentBlobReferenceV1, DecryptedApplicationEventV1, DurableAppEventKind,
     EphemeralActivityActionV1, InviteCodeV1, npub_encode,
 };
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -86,6 +89,7 @@ const DEFAULT_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CREDENTIAL_VALIDITY_SECONDS: u64 = 90 * 24 * 60 * 60;
 const POLL_SLEEP_MS: u64 = 300;
 const HERMES_STORED_EVENT_RECOVERY_LIMIT: u32 = 5_000;
+const HERMES_SERVICE_HEARTBEAT_MILLIS: u64 = 250;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentConfig {
@@ -316,13 +320,15 @@ struct HermesServiceStarted {
     pid: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct HermesServiceState {
     agent_home: PathBuf,
     account_id: String,
     device_id: String,
     server_url: String,
-    bridge_lock: Arc<tokio::sync::Mutex<()>>,
+    runtime: Arc<FiniteChatRuntime>,
+    inbox_lock: Arc<Mutex<()>>,
+    running_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -344,6 +350,18 @@ struct HermesInboundQuery {
     limit: Option<u32>,
     #[serde(default)]
     timeout_millis: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HermesServiceInviteRequest {
+    #[serde(default)]
+    room_id: Option<String>,
+    #[serde(default)]
+    room_name: Option<String>,
+    #[serde(default)]
+    max_joins: Option<u32>,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
 }
 
 struct PreparedHermesService {
@@ -400,12 +418,15 @@ async fn prepare_hermes_service(
         .local_addr()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
     let url = format!("http://{bound_addr}");
+    let runtime = open_agent_runtime(home)?;
     let state = HermesServiceState {
         agent_home: home_dir.to_path_buf(),
         account_id: home.config.account_id.clone(),
         device_id: home.config.device_id.clone(),
         server_url: home.config.server_url.clone(),
-        bridge_lock: Arc::new(tokio::sync::Mutex::new(())),
+        runtime,
+        inbox_lock: Arc::new(Mutex::new(())),
+        running_lock: Arc::new(Mutex::new(())),
     };
     let started = HermesServiceStarted {
         service: "finitechat-hermes",
@@ -469,22 +490,20 @@ async fn hermes_service_healthz(
 async fn hermes_service_readyz(
     State(state): State<HermesServiceState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let home_dir = state.agent_home.clone();
-    let _guard = state.bridge_lock.lock().await;
     let result = tokio::task::spawn_blocking(move || {
-        let home = load_home(&home_dir)?;
-        let (_store, device, _delivery) = open_agent(&home)?;
-        let device_ref = device.device_ref();
+        let app = state.runtime.state().map_err(map_core_hermes_error)?;
         Ok(json!({
             "status": "ready",
             "service": "finitechat-hermes",
             "version": env!("CARGO_PKG_VERSION"),
-            "agent_home": home.dir.display().to_string(),
-            "account_id": device_ref.account_id.clone(),
-            "device_id": device_ref.device_id.clone(),
-            "server_url": home.config.server_url,
+            "agent_home": state.agent_home.display().to_string(),
+            "account_id": state.account_id,
+            "device_id": state.device_id,
+            "server_url": state.server_url,
             "store": "ok",
-            "store_file": home.dir.join(STORE_FILE).display().to_string(),
+            "store_file": state.agent_home.join(STORE_FILE).display().to_string(),
+            "rooms": app.rooms.len(),
+            "messages": app.messages.len(),
         }))
     })
     .await
@@ -497,13 +516,10 @@ async fn hermes_service_action(
     AxumPath(action): AxumPath<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let home_dir = state.agent_home.clone();
-    let _guard = state.bridge_lock.lock().await;
-    let result = tokio::task::spawn_blocking(move || {
-        handle_hermes_bridge_action(&home_dir, &action, payload)
-    })
-    .await
-    .map_err(|error| service_internal_error(error.to_string()))?;
+    let result =
+        tokio::task::spawn_blocking(move || handle_hermes_service_action(&state, &action, payload))
+            .await
+            .map_err(|error| service_internal_error(error.to_string()))?;
     result.map(Json).map_err(service_cli_error)
 }
 
@@ -511,105 +527,356 @@ async fn hermes_service_inbound(
     State(state): State<HermesServiceState>,
     Query(query): Query<HermesInboundQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    let home_dir = state.agent_home.clone();
-    let _guard = state.bridge_lock.lock().await;
-    let result =
-        tokio::task::spawn_blocking(move || handle_hermes_inbound_stream(&home_dir, query))
-            .await
-            .map_err(|error| service_internal_error(error.to_string()))?;
-    result
-        .map(|body| {
-            (
-                [
-                    (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                body,
-            )
-                .into_response()
-        })
-        .map_err(service_cli_error)
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+    std::thread::spawn(move || {
+        if let Err(error) = run_hermes_inbound_stream(state, query, tx.clone()) {
+            let record = json!({
+                "type": "error",
+                "error": error.to_string(),
+            });
+            if let Ok(line) = serde_json::to_string(&record) {
+                let _ = tx.blocking_send(Ok(Bytes::from(format!("{line}\n"))));
+            }
+        }
+    });
+
+    let body_stream = stream::unfold(
+        (
+            rx,
+            tokio::time::interval(Duration::from_millis(HERMES_SERVICE_HEARTBEAT_MILLIS)),
+        ),
+        |(mut rx, mut heartbeat)| async move {
+            tokio::select! {
+                item = rx.recv() => item.map(|bytes| (bytes, (rx, heartbeat))),
+                _ = heartbeat.tick() => Some((Ok(Bytes::from_static(b"\n")), (rx, heartbeat))),
+            }
+        },
+    );
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(body_stream),
+    )
+        .into_response())
 }
 
-fn handle_hermes_bridge_action(
-    home_dir: &Path,
+fn handle_hermes_service_action(
+    state: &HermesServiceState,
     action: &str,
     payload: Value,
 ) -> Result<Value, CliError> {
-    with_backup_activity(home_dir, action, || {
-        handle_hermes_bridge_action_inner(home_dir, action, payload)
-    })
-}
-
-fn handle_hermes_bridge_action_inner(
-    home_dir: &Path,
-    action: &str,
-    payload: Value,
-) -> Result<Value, CliError> {
-    let mut output = Vec::new();
     match action {
-        "invite" => cmd_invite(home_dir, Vec::new(), true, &mut output)?,
-        "poll" => cmd_poll(home_dir, payload, &mut output)?,
-        "ack" => cmd_ack(home_dir, payload, &mut output)?,
-        "send" => cmd_send(home_dir, payload, &mut output)?,
-        "edit" => cmd_edit(home_dir, payload, &mut output)?,
-        "recover" => cmd_recover(home_dir, payload, &mut output)?,
-        "activity" => cmd_activity(home_dir, payload, &mut output)?,
-        "home-channel-show" => write_home_channel_show(home_dir, &mut output)?,
+        "invite" => handle_hermes_service_invite(state, payload),
+        "poll" => handle_hermes_service_poll(state, payload),
+        "ack" => {
+            let _guard = lock_service_mutex(&state.inbox_lock)?;
+            output_json_value(|output| cmd_ack(&state.agent_home, payload, output))
+        }
+        "send" => {
+            let request: HermesSendRequestV1 =
+                serde_json::from_value(payload).map_err(CliError::Json)?;
+            let _guard = lock_service_mutex(&state.running_lock)?;
+            let sent = send_hermes_request_with_runtime(&state.runtime, &request)?;
+            update_running_after_send(&state.agent_home, &request, &sent.message_id)?;
+            Ok(sent_message_value(&sent))
+        }
+        "edit" => {
+            let request: HermesEditRequestV1 =
+                serde_json::from_value(payload).map_err(CliError::Json)?;
+            let _guard = lock_service_mutex(&state.running_lock)?;
+            let sent = edit_hermes_request_with_runtime(&state.runtime, &request)?;
+            update_running_after_edit(&state.agent_home, &request)?;
+            Ok(sent_message_value(&sent))
+        }
+        "recover" => handle_hermes_service_recover(state),
+        "activity" => handle_hermes_service_activity(state, payload),
+        "home-channel-show" => {
+            output_json_value(|output| write_home_channel_show(&state.agent_home, output))
+        }
         "home-channel-set" => {
             let request: HermesHomeChannelSetRequest =
                 serde_json::from_value(payload).map_err(CliError::Json)?;
-            set_home_channel(
-                home_dir,
-                request.room_id,
-                request.conversation_id,
-                &mut output,
-            )?;
+            output_json_value(|output| {
+                set_home_channel(
+                    &state.agent_home,
+                    request.room_id,
+                    request.conversation_id,
+                    output,
+                )
+            })
         }
         "home-channel-clear" => {
-            clear_home_channel(home_dir)?;
-            crate::write_pretty_json(
-                &mut output,
-                &json!({ "cleared": true, "home_channel": null }),
-            )?;
+            clear_home_channel(&state.agent_home)?;
+            Ok(json!({ "cleared": true, "home_channel": null }))
         }
-        _ => {
-            return Err(CliError::Usage(format!(
-                "unknown Hermes service action {action:?}"
-            )));
-        }
+        _ => Err(CliError::Usage(format!(
+            "unknown Hermes service action {action:?}"
+        ))),
     }
+}
+
+fn output_json_value(
+    f: impl FnOnce(&mut Vec<u8>) -> Result<(), CliError>,
+) -> Result<Value, CliError> {
+    let mut output = Vec::new();
+    f(&mut output)?;
     serde_json::from_slice(&output).map_err(CliError::Json)
 }
 
-fn handle_hermes_inbound_stream(
-    home_dir: &Path,
-    query: HermesInboundQuery,
-) -> Result<String, CliError> {
-    with_backup_activity(home_dir, "inbound", || {
-        handle_hermes_inbound_stream_inner(home_dir, query)
-    })
+fn handle_hermes_service_invite(
+    state: &HermesServiceState,
+    payload: Value,
+) -> Result<Value, CliError> {
+    let request: HermesServiceInviteRequest =
+        serde_json::from_value(payload).map_err(CliError::Json)?;
+    let max_joins = request.max_joins.unwrap_or(DEFAULT_MAX_JOINS);
+    let ttl_ms = request.ttl_ms.unwrap_or(DEFAULT_INVITE_TTL_MS);
+    let room_id = match request.room_id {
+        Some(room_id) => {
+            state
+                .runtime
+                .dispatch_and_wait(AppAction::StartRuntime)
+                .map_err(map_core_hermes_error)?;
+            room_id
+        }
+        None => {
+            let app = state
+                .runtime
+                .dispatch_and_wait(AppAction::CreateRoom {
+                    display_name: request.room_name.clone().unwrap_or_default(),
+                })
+                .map_err(map_core_hermes_error)?;
+            app.selected_room_id
+                .ok_or_else(|| CliError::Hermes("created room was not selected".to_owned()))?
+        }
+    };
+    let app = state
+        .runtime
+        .create_invite_with_options_and_wait(room_id.clone(), request.room_name, max_joins, ttl_ms)
+        .map_err(map_core_hermes_error)?;
+    let invite = app
+        .active_invite
+        .ok_or_else(|| CliError::Hermes(format!("could not create invite for room {room_id}")))?;
+    let url = invite.invite_url;
+    append_invite(&state.agent_home, &url)?;
+    let code = InviteCodeV1::parse(&url).map_err(|error| CliError::Hermes(error.to_string()))?;
+    let npub = npub_encode(&code.inviter_account_id)
+        .map_err(|error| CliError::Hermes(format!("npub encoding failed: {error}")))?;
+    let qr = render_qr(&url)?;
+    Ok(json!({
+        "url": url,
+        "qr": qr,
+        "invite_id": code.invite_id,
+        "room_id": room_id,
+        "npub": npub,
+    }))
 }
 
-fn handle_hermes_inbound_stream_inner(
-    home_dir: &Path,
+fn handle_hermes_service_poll(
+    state: &HermesServiceState,
+    payload: Value,
+) -> Result<Value, CliError> {
+    let request: PollRequest = serde_json::from_value(payload).map_err(CliError::Json)?;
+    let timeout = normalized_hermes_poll_timeout(&request);
+    let started = Instant::now();
+    let home = load_home(&state.agent_home)?;
+    let invite_urls = load_invite_urls(&state.agent_home)?;
+
+    loop {
+        let payload = collect_hermes_service_inbound_payload(state, &home, &request, None)?;
+        if hermes_inbound_payload_has_records(&payload) || started.elapsed() >= timeout {
+            return Ok(payload);
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed()).as_millis() as u64;
+        let bridge = state
+            .runtime
+            .agent_bridge_wait_for_update(invite_urls.clone(), remaining)
+            .map_err(map_core_hermes_error)?;
+        let payload = collect_hermes_service_inbound_payload(state, &home, &request, Some(bridge))?;
+        if hermes_inbound_payload_has_records(&payload) || started.elapsed() >= timeout {
+            return Ok(payload);
+        }
+    }
+}
+
+fn handle_hermes_service_recover(state: &HermesServiceState) -> Result<Value, CliError> {
+    let _guard = lock_service_mutex(&state.running_lock)?;
+    let running = load_hermes_running(&state.agent_home)?;
+    let mut recovered = 0usize;
+    for message in &running.messages {
+        let recovery = HermesEditRequestV1 {
+            room_id: message.room_id.clone(),
+            conversation_id: message.conversation_id.clone(),
+            message_id: message.message_id.clone(),
+            text: "Hermes gateway restarted before this turn completed.".to_owned(),
+            status: HermesMessageStatusV1::Complete,
+            finalize: true,
+            metadata: BTreeMap::new(),
+        };
+        edit_hermes_request_with_runtime(&state.runtime, &recovery)?;
+        recovered += 1;
+    }
+    if recovered > 0 {
+        save_hermes_running(&state.agent_home, &HermesRunningState::default())?;
+    }
+    Ok(json!({ "recovered": recovered }))
+}
+
+fn handle_hermes_service_activity(
+    state: &HermesServiceState,
+    payload: Value,
+) -> Result<Value, CliError> {
+    let request: HermesActivityRequestV1 =
+        serde_json::from_value(payload).map_err(CliError::Json)?;
+    let activity_payload = if matches!(request.action, EphemeralActivityActionV1::Set) {
+        serde_json::to_vec(&request.payload).map_err(CliError::Serialize)?
+    } else {
+        Vec::new()
+    };
+    let accepted = state
+        .runtime
+        .append_ephemeral_activity_and_wait(AppBridgeActivityInput {
+            room_id: request.room_id,
+            conversation_id: request.conversation_id,
+            activity_kind: request.activity_kind,
+            activity_id: request.activity_id,
+            action: request.action,
+            payload: activity_payload,
+            expires_in_millis: request.expires_in_millis,
+        })
+        .map_err(map_core_hermes_error)?;
+    Ok(json!({ "accepted": true, "result": accepted }))
+}
+
+fn run_hermes_inbound_stream(
+    state: HermesServiceState,
     query: HermesInboundQuery,
-) -> Result<String, CliError> {
-    let mut request = serde_json::Map::new();
-    if let Some(room_id) = query.room_id {
-        request.insert("room_id".to_owned(), Value::String(room_id));
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+) -> Result<(), CliError> {
+    let home = load_home(&state.agent_home)?;
+    let request = PollRequest {
+        room_id: query.room_id,
+        limit: query.limit,
+        timeout_millis: query.timeout_millis,
+    };
+    let timeout_millis = normalized_hermes_poll_timeout(&request).as_millis() as u64;
+    let invite_urls = load_invite_urls(&state.agent_home)?;
+
+    loop {
+        let payload = collect_hermes_service_inbound_payload(&state, &home, &request, None)?;
+        if !send_hermes_inbound_payload(&tx, &payload)? {
+            return Ok(());
+        }
+        if hermes_inbound_payload_has_records(&payload) {
+            continue;
+        }
+
+        let bridge = state
+            .runtime
+            .agent_bridge_wait_for_update(invite_urls.clone(), timeout_millis)
+            .map_err(map_core_hermes_error)?;
+        let payload =
+            collect_hermes_service_inbound_payload(&state, &home, &request, Some(bridge))?;
+        if !send_hermes_inbound_payload(&tx, &payload)? {
+            return Ok(());
+        }
     }
-    if let Some(limit) = query.limit {
-        request.insert("limit".to_owned(), json!(limit));
-    }
-    if let Some(timeout_millis) = query.timeout_millis {
-        request.insert("timeout_millis".to_owned(), json!(timeout_millis));
+}
+
+fn collect_hermes_service_inbound_payload(
+    state: &HermesServiceState,
+    home: &AgentHome,
+    request: &PollRequest,
+    bridge: Option<finitechat_core::AppBridgeSync>,
+) -> Result<Value, CliError> {
+    let limit = normalized_hermes_poll_limit(request);
+    let _guard = lock_service_mutex(&state.inbox_lock)?;
+    let mut inbox = load_hermes_inbox(&state.agent_home)?;
+    initialize_hermes_inbox_cursors(&state.agent_home, home, &mut inbox)?;
+    let mut joined = Vec::<String>::new();
+
+    if let Some(bridge) = bridge {
+        joined = bridge.joined_account_ids;
+        for applied in &bridge.events {
+            if let Some(room_filter) = &request.room_id
+                && room_filter != &applied.room_id
+            {
+                continue;
+            }
+            if applied.sender_account_id == state.account_id {
+                continue;
+            }
+            let context = HermesPollEventContext {
+                home_dir: &state.agent_home,
+                room_id: &applied.room_id,
+                seq: applied.seq,
+                message_id: &applied.message_id,
+                sender_account_id: &applied.sender_account_id,
+                sender_device_id: &applied.sender_device_id,
+                conversation_id: None,
+            };
+            if let Some(event) =
+                hermes_poll_event_from_application_plaintext(context, &applied.plaintext)?
+            {
+                enqueue_hermes_inbox_event(&state.agent_home, &mut inbox, event)?;
+            }
+        }
     }
 
-    let mut output = Vec::new();
-    cmd_poll(home_dir, Value::Object(request), &mut output)?;
-    let payload: Value = serde_json::from_slice(&output).map_err(CliError::Json)?;
-    hermes_inbound_ndjson(&payload)
+    recover_stored_hermes_events(
+        &state.agent_home,
+        home,
+        &state.account_id,
+        request.room_id.as_deref(),
+        &mut inbox,
+    )?;
+    let events = pending_hermes_inbox_events(&inbox, request.room_id.as_deref(), limit);
+    Ok(json!({ "events": events, "joined": joined }))
+}
+
+fn send_hermes_inbound_payload(
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes, Infallible>>,
+    payload: &Value,
+) -> Result<bool, CliError> {
+    let body = hermes_inbound_ndjson(payload)?;
+    if body.is_empty() {
+        return Ok(true);
+    }
+    Ok(tx.blocking_send(Ok(Bytes::from(body))).is_ok())
+}
+
+fn hermes_inbound_payload_has_records(payload: &Value) -> bool {
+    payload
+        .get("joined")
+        .and_then(Value::as_array)
+        .is_some_and(|joined| !joined.is_empty())
+        || payload
+            .get("events")
+            .and_then(Value::as_array)
+            .is_some_and(|events| !events.is_empty())
+}
+
+fn normalized_hermes_poll_limit(request: &PollRequest) -> usize {
+    request.limit.unwrap_or(10).clamp(1, 32) as usize
+}
+
+fn normalized_hermes_poll_timeout(request: &PollRequest) -> Duration {
+    Duration::from_millis(
+        request
+            .timeout_millis
+            .unwrap_or(0)
+            .min(MAX_HERMES_POLL_TIMEOUT_MILLIS),
+    )
+}
+
+fn lock_service_mutex(mutex: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, CliError> {
+    mutex
+        .lock()
+        .map_err(|_| CliError::Hermes("Hermes service state lock poisoned".to_owned()))
 }
 
 struct BackupActivityGuard {
@@ -1979,40 +2246,24 @@ fn encode_application_event(
 
 fn cmd_send<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
     let request: HermesSendRequestV1 = serde_json::from_value(request).map_err(CliError::Json)?;
-    let hermes_payload = HermesMessagePayloadV1::from_send(&request)
-        .encode()
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let app_payload = encode_application_event(
-        DurableAppEventKind::ChatMessage,
-        request.conversation_id.clone(),
-        &hermes_payload,
-    )?;
-    let sent = append_payload_to_room(
-        home_dir,
-        &request.room_id,
-        app_payload,
-        request.text.clone(),
-    )?;
+    let home = load_home(home_dir)?;
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    let sent = send_hermes_request_with_runtime(&runtime, &request)?;
     update_running_after_send(home_dir, &request, &sent.message_id)?;
     write_sent_message(output, &sent)
 }
 
 fn cmd_edit<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result<(), CliError> {
     let request: HermesEditRequestV1 = serde_json::from_value(request).map_err(CliError::Json)?;
-    let hermes_payload = HermesMessagePayloadV1::from_edit(&request)
-        .encode()
-        .map_err(|error| CliError::Hermes(error.to_string()))?;
-    let app_payload = encode_application_event(
-        DurableAppEventKind::ChatMessage,
-        request.conversation_id.clone(),
-        &hermes_payload,
-    )?;
-    let sent = append_payload_to_room(
-        home_dir,
-        &request.room_id,
-        app_payload,
-        request.text.clone(),
-    )?;
+    let home = load_home(home_dir)?;
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    let sent = edit_hermes_request_with_runtime(&runtime, &request)?;
     update_running_after_edit(home_dir, &request)?;
     write_sent_message(output, &sent)
 }
@@ -2038,8 +2289,13 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
             recovery.conversation_id.clone(),
             &hermes_payload,
         )?;
-        append_payload_to_room(
-            home_dir,
+        let home = load_home(home_dir)?;
+        let runtime = open_agent_runtime(&home)?;
+        runtime
+            .dispatch_and_wait(AppAction::StartRuntime)
+            .map_err(map_core_hermes_error)?;
+        append_payload_to_room_with_runtime(
+            &runtime,
             &recovery.room_id,
             app_payload,
             recovery.text.clone(),
@@ -2052,27 +2308,63 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
     crate::write_pretty_json(output, &json!({ "recovered": recovered }))
 }
 
-fn append_payload_to_room(
-    home_dir: &Path,
+fn send_hermes_request_with_runtime(
+    runtime: &FiniteChatRuntime,
+    request: &HermesSendRequestV1,
+) -> Result<AppSentMessage, CliError> {
+    let hermes_payload = HermesMessagePayloadV1::from_send(request)
+        .encode()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let app_payload = encode_application_event(
+        DurableAppEventKind::ChatMessage,
+        request.conversation_id.clone(),
+        &hermes_payload,
+    )?;
+    append_payload_to_room_with_runtime(
+        runtime,
+        &request.room_id,
+        app_payload,
+        request.text.clone(),
+    )
+}
+
+fn edit_hermes_request_with_runtime(
+    runtime: &FiniteChatRuntime,
+    request: &HermesEditRequestV1,
+) -> Result<AppSentMessage, CliError> {
+    let hermes_payload = HermesMessagePayloadV1::from_edit(request)
+        .encode()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    let app_payload = encode_application_event(
+        DurableAppEventKind::ChatMessage,
+        request.conversation_id.clone(),
+        &hermes_payload,
+    )?;
+    append_payload_to_room_with_runtime(
+        runtime,
+        &request.room_id,
+        app_payload,
+        request.text.clone(),
+    )
+}
+
+fn append_payload_to_room_with_runtime(
+    runtime: &FiniteChatRuntime,
     room_id: &str,
     payload: Vec<u8>,
     preview: String,
 ) -> Result<AppSentMessage, CliError> {
-    let home = load_home(home_dir)?;
-    let runtime = open_agent_runtime(&home)?;
-    runtime
-        .dispatch_and_wait(AppAction::StartRuntime)
-        .map_err(map_core_hermes_error)?;
     runtime
         .send_encoded_chat_message_and_wait(room_id.to_owned(), payload, preview)
         .map_err(map_core_hermes_error)
 }
 
 fn write_sent_message<W: Write>(output: &mut W, sent: &AppSentMessage) -> Result<(), CliError> {
-    crate::write_pretty_json(
-        output,
-        &json!({ "message_id": &sent.message_id, "seq": sent.seq }),
-    )
+    crate::write_pretty_json(output, &sent_message_value(sent))
+}
+
+fn sent_message_value(sent: &AppSentMessage) -> Value {
+    json!({ "message_id": &sent.message_id, "seq": sent.seq })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

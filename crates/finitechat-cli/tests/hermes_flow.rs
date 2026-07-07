@@ -17,6 +17,7 @@ use finitechat_proto::{
 };
 use finitechat_server::{HttpServerState, http_router};
 use serde_json::{Value, json};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -644,14 +645,21 @@ fn hermes_serve_reports_process_health() {
     assert_eq!(home_channel["home_channel"], Value::Null);
     let (inbound_status, inbound_body) =
         inbound_result.expect("Hermes service handled inbound stream action");
-    assert_eq!(inbound_status, 409);
-    let inbound_error: Value = serde_json::from_str(&inbound_body).unwrap();
-    assert_eq!(inbound_error["ok"], false);
-    assert_eq!(inbound_error["status"], "error");
-    assert_eq!(inbound_error["service"], "finitechat-hermes");
-    assert_eq!(inbound_error["http_status"], 409);
-    assert_eq!(inbound_error["error_kind"], "hermes");
-    assert_eq!(inbound_error["retryable"], false);
+    assert_eq!(inbound_status, 200);
+    let inbound_error: Value = serde_json::from_str(
+        inbound_body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("inbound stream error record"),
+    )
+    .unwrap();
+    assert_eq!(inbound_error["type"], "error");
+    assert!(
+        inbound_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP runtime request failed")
+    );
     assert!(!inbound_error["error"].as_str().unwrap().is_empty());
     let (unknown_status, unknown_error) =
         unknown_action_result.expect("Hermes service returned structured action error");
@@ -1419,8 +1427,12 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         wait_for_ready_file(&stream_ready_file).expect("stream ready file")
     });
     smoke.fact("sidecar_url", stream_started["url"].clone());
-    let stream_body = smoke.time("sidecar_inbound_plain_ios_message", || {
-        let stream_response = reqwest::blocking::Client::new()
+    let stream_client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let events = smoke.time("sidecar_inbound_plain_ios_message", || {
+        let stream_response = stream_client
             .get(format!(
                 "{}/v1/hermes/inbound",
                 stream_started["url"].as_str().unwrap()
@@ -1433,19 +1445,25 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
             .send()
             .expect("inbound stream response");
         assert_eq!(stream_response.status().as_u16(), 200);
-        stream_response.text().expect("inbound stream body")
+        let mut reader = std::io::BufReader::new(stream_response);
+        let mut events = Vec::new();
+        while events.is_empty() {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("read inbound stream");
+            assert!(read > 0, "inbound stream ended before an event");
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record = serde_json::from_str::<Value>(line).unwrap();
+            if record.get("type").and_then(Value::as_str) == Some("event")
+                && let Some(event) = record.get("event").cloned()
+            {
+                events.push(event);
+            }
+        }
+        events
     });
-    let _ = stream_child.kill();
-    stream_child.wait().expect("wait inbound stream service");
-    let events = stream_body
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter_map(|record| {
-            (record.get("type").and_then(Value::as_str) == Some("event"))
-                .then(|| record.get("event").cloned())
-                .flatten()
-        })
-        .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["text"], "plain hello from iOS");
     assert_eq!(
@@ -1470,6 +1488,54 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
         ])
     });
     assert_eq!(drained["events"].as_array().unwrap().len(), 0);
+
+    smoke.time("sidecar_idle_stream_does_not_block_activity", || {
+        let idle_response = stream_client
+            .get(format!(
+                "{}/v1/hermes/inbound",
+                stream_started["url"].as_str().unwrap()
+            ))
+            .query(&[
+                ("room_id", code.room_id.as_str()),
+                ("timeout_millis", "30000"),
+                ("limit", "10"),
+            ])
+            .send()
+            .expect("idle inbound stream response");
+        assert_eq!(idle_response.status().as_u16(), 200);
+        std::thread::sleep(Duration::from_millis(150));
+
+        let activity_started = Instant::now();
+        let activity = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .post(format!(
+                "{}/v1/hermes/activity",
+                stream_started["url"].as_str().unwrap()
+            ))
+            .json(&json!({
+                "room_id": code.room_id.as_str(),
+                "conversation_id": null,
+                "activity_kind": "working",
+                "activity_id": "sidecar-latency-test",
+                "action": "set",
+                "payload": null,
+                "expires_in_millis": 1,
+            }))
+            .send()
+            .expect("activity while inbound stream is open");
+        assert_eq!(activity.status().as_u16(), 200);
+        assert!(
+            activity_started.elapsed() < Duration::from_secs(2),
+            "activity was blocked by an open inbound stream"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        drop(idle_response);
+    });
+
+    let _ = stream_child.kill();
+    stream_child.wait().expect("wait inbound stream service");
 
     let report = smoke.time("agent_reply_after_stream", || {
         hermes_send_text(&home_arg, &room_id, "reply after inbound poll");

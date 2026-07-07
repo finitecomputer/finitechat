@@ -765,6 +765,11 @@ enum AppRuntimeCommand {
         invite_urls: Vec<String>,
         response: mpsc::SyncSender<Result<AppBridgeSync, FiniteChatCoreError>>,
     },
+    AgentBridgeApplySyncHint {
+        invite_urls: Vec<String>,
+        event: SyncHintEvent,
+        response: mpsc::SyncSender<Result<AppBridgeSync, FiniteChatCoreError>>,
+    },
     SendEncodedChatMessage {
         room_id: String,
         app_event_plaintext: Vec<u8>,
@@ -1230,6 +1235,36 @@ impl FiniteChatRuntime {
             })?
     }
 
+    pub fn agent_bridge_wait_for_update(
+        &self,
+        invite_urls: Vec<String>,
+        timeout_millis: u64,
+    ) -> Result<AppBridgeSync, FiniteChatCoreError> {
+        let plan = self.wait_plan(timeout_millis)?;
+
+        let event = {
+            let mut delivery = delivery_for(&plan.server_url);
+            let mut stream = delivery.sync_stream(&plan.request).map_err(runtime_error)?;
+            stream.next_hint().map_err(runtime_error)?
+        };
+
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(AppRuntimeCommand::AgentBridgeApplySyncHint {
+                invite_urls,
+                event,
+                response: response_tx,
+            })
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor is stopped".to_owned(),
+            })?;
+        response_rx
+            .recv()
+            .map_err(|_| FiniteChatCoreError::Client {
+                reason: "runtime actor stopped before bridge update".to_owned(),
+            })?
+    }
+
     pub fn send_encoded_chat_message_and_wait(
         &self,
         room_id: String,
@@ -1437,6 +1472,9 @@ fn spawn_app_runtime_worker(
                 }
                 AppRuntimeCommand::ApplySyncHint { event, response } => {
                     let result = (|| {
+                        if matches!(event, SyncHintEvent::Heartbeat) {
+                            return Ok(state.app.clone());
+                        }
                         state.apply_sync_hint(event);
                         state.runtime_tick()?;
                         state.bump_rev();
@@ -1444,6 +1482,21 @@ fn spawn_app_runtime_worker(
                         publish_app_update(&snapshot, &shared_state, &reconciler);
                         Ok(snapshot)
                     })();
+                    let _ = response.send(result);
+                }
+                AppRuntimeCommand::AgentBridgeApplySyncHint {
+                    invite_urls,
+                    event,
+                    response,
+                } => {
+                    let result = (|| state.agent_bridge_apply_sync_hint(invite_urls, event))();
+                    if result.as_ref().is_ok_and(|bridge| {
+                        !bridge.joined_account_ids.is_empty() || !bridge.events.is_empty()
+                    }) {
+                        state.bump_rev();
+                        let snapshot = state.app.clone();
+                        publish_app_update(&snapshot, &shared_state, &reconciler);
+                    }
                     let _ = response.send(result);
                 }
                 AppRuntimeCommand::CreateInviteWithOptions {
@@ -2075,13 +2128,37 @@ impl AppRuntimeState {
         &mut self,
         invite_urls: Vec<String>,
     ) -> Result<AppBridgeSync, FiniteChatCoreError> {
-        for invite_url in &invite_urls {
+        self.register_owned_bridge_invites(&invite_urls);
+        self.agent_bridge_sync_after_change(invite_urls)
+    }
+
+    fn agent_bridge_apply_sync_hint(
+        &mut self,
+        invite_urls: Vec<String>,
+        event: SyncHintEvent,
+    ) -> Result<AppBridgeSync, FiniteChatCoreError> {
+        self.register_owned_bridge_invites(&invite_urls);
+        if matches!(event, SyncHintEvent::Heartbeat) {
+            return Ok(AppBridgeSync::default());
+        }
+        self.apply_sync_hint(event);
+        self.agent_bridge_sync_after_change(invite_urls)
+    }
+
+    fn register_owned_bridge_invites(&mut self, invite_urls: &[String]) {
+        for invite_url in invite_urls {
             if let Ok(code) = parse_invite(invite_url) {
                 self.owned_invites
                     .entry(code.room_id)
                     .or_insert_with(|| invite_url.clone());
             }
         }
+    }
+
+    fn agent_bridge_sync_after_change(
+        &mut self,
+        invite_urls: Vec<String>,
+    ) -> Result<AppBridgeSync, FiniteChatCoreError> {
         let (joined_account_ids, invite_counts) = self.accept_owned_invite_joins(invite_urls)?;
         if !joined_account_ids.is_empty() {
             self.app.toast = Some(format!("{} device(s) joined", joined_account_ids.len()));

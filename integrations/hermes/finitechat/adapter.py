@@ -14,6 +14,7 @@ import logging
 import os
 import shlex
 import shutil
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -435,18 +436,36 @@ class FiniteChatAdapter(BasePlatformAdapter):
                 if not await self._poll_once():
                     await asyncio.sleep(STREAM_RECONNECT_BACKOFF_SECS)
                 continue
-            result = await asyncio.to_thread(
-                _finitechat_service_inbound,
-                self.service_url,
-                self._inbound_request_payload(),
-                self.poll_timeout_secs + 15,
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[_FiniteChatResult] = asyncio.Queue()
+            stop_event = threading.Event()
+            service_url = self.service_url
+            worker = threading.Thread(
+                target=_finitechat_service_stream_worker,
+                args=(
+                    service_url,
+                    self._inbound_request_payload(),
+                    self.poll_timeout_secs + 15,
+                    loop,
+                    queue,
+                    stop_event,
+                ),
+                daemon=True,
             )
-            if result.ok:
-                await self._process_inbound_records(result.data.get("records") or [])
-                continue
-            logger.warning("[finitechat] inbound stream failed: %s", result.error)
-            if result.transport_error:
-                self.service_url = ""
+            worker.start()
+            try:
+                while self.is_connected and self.service_url == service_url:
+                    result = await queue.get()
+                    if result.ok:
+                        await self._process_inbound_records(result.data.get("records") or [])
+                        continue
+                    logger.warning("[finitechat] inbound stream failed: %s", result.error)
+                    if result.transport_error:
+                        self.service_url = ""
+                    break
+            finally:
+                stop_event.set()
+                await asyncio.to_thread(worker.join, 0.5)
             await asyncio.sleep(STREAM_RECONNECT_BACKOFF_SECS)
 
     def _inbound_request_payload(self) -> dict[str, Any]:
@@ -946,11 +965,14 @@ def _finitechat_service_json(
         )
 
 
-def _finitechat_service_inbound(
+def _finitechat_service_stream_worker(
     service_url: str,
     payload: dict[str, Any],
     timeout: int,
-) -> _FiniteChatResult:
+    loop: asyncio.AbstractEventLoop,
+    queue: asyncio.Queue,
+    stop_event: threading.Event,
+) -> None:
     query = urllib.parse.urlencode(
         {key: value for key, value in payload.items() if value is not None and value != ""}
     )
@@ -964,37 +986,66 @@ def _finitechat_service_inbound(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            while not stop_event.is_set():
+                raw_line = response.readline()
+                if not raw_line:
+                    _put_stream_result(
+                        loop,
+                        queue,
+                        _FiniteChatResult(
+                            False, {}, "finitechat inbound stream ended", True, True
+                        ),
+                    )
+                    return
+                stripped = raw_line.decode("utf-8", errors="replace").strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    _put_stream_result(
+                        loop,
+                        queue,
+                        _FiniteChatResult(
+                            False,
+                            {},
+                            f"finitechat inbound stream returned invalid JSON: {exc}",
+                            False,
+                            False,
+                        ),
+                    )
+                    return
+                _put_stream_result(
+                    loop,
+                    queue,
+                    _FiniteChatResult(True, {"records": [record]}, None, False, False),
+                )
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace").strip()
-        return _FiniteChatResult(
-            False,
-            {},
-            _service_error_body(body) or f"finitechat service returned HTTP {exc.code}",
-            _is_retryable_cli_error(body),
-            False,
-        )
-    except TimeoutError as exc:
-        return _FiniteChatResult(False, {}, str(exc), True, False)
-    except (urllib.error.URLError, OSError) as exc:
-        return _FiniteChatResult(False, {}, str(exc), True, True)
-
-    records: list[Any] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            return _FiniteChatResult(
+        _put_stream_result(
+            loop,
+            queue,
+            _FiniteChatResult(
                 False,
                 {},
-                f"finitechat inbound stream returned invalid JSON: {exc}",
+                _service_error_body(body) or f"finitechat service returned HTTP {exc.code}",
+                _is_retryable_cli_error(body),
                 False,
-            )
-        records.append(record)
-    return _FiniteChatResult(True, {"records": records}, None, False)
+            ),
+        )
+    except TimeoutError as exc:
+        _put_stream_result(loop, queue, _FiniteChatResult(False, {}, str(exc), True, False))
+    except (urllib.error.URLError, OSError) as exc:
+        _put_stream_result(loop, queue, _FiniteChatResult(False, {}, str(exc), True, True))
+
+
+def _put_stream_result(
+    loop: asyncio.AbstractEventLoop,
+    queue: asyncio.Queue,
+    result: _FiniteChatResult,
+) -> None:
+    with contextlib.suppress(RuntimeError):
+        loop.call_soon_threadsafe(queue.put_nowait, result)
 
 
 def _service_error_body(body: str) -> str | None:

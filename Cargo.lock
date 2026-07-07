@@ -743,6 +743,7 @@ dependencies = [
  "finitechat-proto",
  "finitechat-server",
  "finitechat-transport",
+ "futures-util",
  "qrcode",
  "reqwest",
  "serde",
