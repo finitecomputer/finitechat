@@ -97,6 +97,20 @@ def invite_status(url: str) -> dict[str, Any]:
     return finitechat_json(["hermes", "invite-status", "--url", url, "--json"])
 
 
+def room_status(room_id: str) -> dict[str, Any]:
+    return finitechat_json(
+        [
+            "hermes",
+            "--agent-home",
+            str(AGENT_HOME),
+            "room-status",
+            "--room-id",
+            room_id,
+            "--json",
+        ]
+    )
+
+
 def invite_base_payload(
     identity_payload: dict[str, Any], invite_payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -123,6 +137,15 @@ def consumed_pending_admission_payload(
     return payload
 
 
+def paired_payload(
+    identity_payload: dict[str, Any], invite_payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload = invite_base_payload(identity_payload, invite_payload)
+    payload["paired"] = True
+    payload["invite_state"] = "paired"
+    return payload
+
+
 def open_payload(
     identity_payload: dict[str, Any],
     invite_payload: dict[str, Any],
@@ -142,6 +165,24 @@ def open_payload(
     return payload
 
 
+def invite_room_is_paired(invite_payload: dict[str, Any]) -> bool:
+    room_id = invite_payload.get("room_id")
+    if not room_id:
+        return False
+    try:
+        status = room_status(str(room_id))
+    except Exception:
+        return bool(invite_payload.get("paired"))
+    return bool(status.get("paired"))
+
+
+def mark_invite_paired(invite_payload: dict[str, Any]) -> dict[str, Any]:
+    invite_payload["paired"] = True
+    invite_payload["invite_state"] = "paired"
+    write_cached_invite(invite_payload)
+    return invite_payload
+
+
 def invite() -> dict[str, Any]:
     identity_payload = identity()
     if not identity_payload.get("ready"):
@@ -151,10 +192,13 @@ def invite() -> dict[str, Any]:
         if invite_payload is None:
             invite_payload = mint_invite(room_id=None)
             write_cached_invite(invite_payload)
+        if invite_room_is_paired(invite_payload):
+            invite_payload = mark_invite_paired(invite_payload)
+            return paired_payload(identity_payload, invite_payload)
         if invite_payload.get("invite_state") == "consumed_pending_admission":
             return consumed_pending_admission_payload(identity_payload, invite_payload)
         if invite_payload.get("paired"):
-            return consumed_pending_admission_payload(identity_payload, invite_payload)
+            return paired_payload(identity_payload, invite_payload)
         try:
             status = invite_status(invite_payload["url"])
         except Exception:

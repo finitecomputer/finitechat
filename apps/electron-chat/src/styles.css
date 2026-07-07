@@ -427,7 +427,6 @@ svg {
 }
 
 .finite-chat__sidebar-create,
-.finite-chat__invite-form,
 .finite-chat__account-import {
   display: flex;
   min-width: 0;
@@ -435,14 +434,12 @@ svg {
   gap: 6px;
 }
 
-.finite-chat__sidebar-create,
-.finite-chat__invite-form {
+.finite-chat__sidebar-create {
   margin: 8px 0 0;
   padding: 0 6px;
 }
 
 .finite-chat__sidebar-create input,
-.finite-chat__invite-form input,
 .finite-chat__account-import input,
 .finite-chat__onboarding-import input {
   min-width: 0;
@@ -456,14 +453,12 @@ svg {
 }
 
 .finite-chat__sidebar-create input,
-.finite-chat__invite-form input,
 .finite-chat__account-import input {
   height: 32px;
   padding: 0 12px;
 }
 
 .finite-chat__sidebar-create input:focus,
-.finite-chat__invite-form input:focus,
 .finite-chat__account-import input:focus,
 .finite-chat__onboarding-import input:focus,
 .finite-chat__composer textarea:focus {
@@ -471,7 +466,6 @@ svg {
 }
 
 .finite-chat__sidebar-create input::placeholder,
-.finite-chat__invite-form input::placeholder,
 .finite-chat__account-import input::placeholder,
 .finite-chat__onboarding-import input::placeholder,
 .finite-chat__composer textarea::placeholder {
@@ -584,13 +578,30 @@ svg {
   font-weight: 700;
 }
 
-.finite-chat__account-id,
+.finite-chat__account-id {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.finite-chat__account-id strong,
+.finite-chat__account-id small,
 .finite-chat__account-warning {
   overflow: hidden;
-  color: var(--text-secondary);
-  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.finite-chat__account-id strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.finite-chat__account-id small,
+.finite-chat__account-warning {
+  color: var(--text-secondary);
+  font-size: 12px;
 }
 
 .finite-chat__account-warning {
@@ -931,9 +942,74 @@ svg {
   padding: 10px 16px;
 }
 
+.finite-chat__message--pending > div {
+  opacity: 0.76;
+}
+
+.finite-chat__message--pending.is-failed > div {
+  border: 1px solid var(--danger-border);
+  background: var(--danger-bg);
+}
+
 .finite-chat__message--user p {
   margin: 0;
   white-space: pre-wrap;
+}
+
+.finite-chat__message-attachments {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.finite-chat__message-attachment {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-subtle), var(--text-primary) 3%);
+  color: var(--text-primary);
+  padding: 7px 9px;
+}
+
+.finite-chat__message-attachment > svg,
+.finite-chat__message-attachment > img {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.finite-chat__message-attachment > svg {
+  padding: 7px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+}
+
+.finite-chat__message-attachment span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.finite-chat__message-attachment strong,
+.finite-chat__message-attachment small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finite-chat__message-attachment strong {
+  font-size: 12px;
+}
+
+.finite-chat__message-attachment small {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .finite-chat__message-time {
@@ -993,6 +1069,39 @@ svg {
 
 .finite-chat__message--agent .finite-chat__message-time {
   margin-top: 8px;
+}
+
+.finite-chat__live-activity {
+  display: inline-flex;
+  width: fit-content;
+  max-width: min(420px, 86%);
+  align-items: center;
+  gap: 9px;
+  margin: 8px 0 18px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.finite-chat__live-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.finite-chat__live-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+  animation: finiteChatLiveDot 1s ease-in-out infinite;
+}
+
+.finite-chat__live-dots i:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.finite-chat__live-dots i:nth-child(3) {
+  animation-delay: 240ms;
 }
 
 .finite-chat__empty {
@@ -1075,6 +1184,66 @@ svg {
   box-shadow:
     0 0 0 3px color-mix(in srgb, var(--primary), transparent 82%),
     var(--shadow-composer);
+}
+
+.finite-chat__file-input {
+  display: none;
+}
+
+.finite-chat__attachment-tray {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.finite-chat__attachment-chip {
+  display: inline-grid;
+  max-width: min(260px, 100%);
+  min-width: 0;
+  grid-template-columns: 24px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-subtle);
+  color: var(--text-primary);
+  padding: 7px 9px;
+  text-align: left;
+}
+
+.finite-chat__attachment-chip:hover {
+  border-color: var(--border-strong);
+}
+
+.finite-chat__attachment-chip > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.finite-chat__attachment-chip span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.finite-chat__attachment-chip strong,
+.finite-chat__attachment-chip small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finite-chat__attachment-chip strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.finite-chat__attachment-chip small {
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .finite-chat__composer textarea {
@@ -1285,6 +1454,19 @@ svg {
 @keyframes finiteChatSpin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes finiteChatLiveDot {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+
+  45% {
+    opacity: 1;
+    transform: translateY(-2px);
   }
 }
 

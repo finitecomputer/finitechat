@@ -366,9 +366,13 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.source.chat_topic, "Builds")
         self.assertEqual(event.media_urls, ["/tmp/screenshot.png"])
         self.assertEqual(event.reply_to_message_id, "msg-11")
-        self.assertEqual(calls[-1][0], "ack")
+        self.assertEqual([call[0] for call in calls], ["activity", "ack"])
+        self.assertEqual(calls[0][1]["action"], "set")
+        self.assertEqual(calls[0][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[0][1]["expires_in_millis"], self.module.PROCESSING_ACTIVITY_TTL_MILLIS)
+        ack_calls = [call for call in calls if call[0] == "ack"]
         self.assertEqual(
-            calls[-1][1],
+            ack_calls[0][1],
             {"room_id": "room-agent-1", "seq": 12, "message_id": "msg-12"},
         )
 
@@ -411,8 +415,9 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.source.chat_id_alt, "mls-group-id")
         self.assertFalse(event.source.is_bot)
         self.assertEqual(event.source.thread_id, "topic-chat")
-        self.assertEqual(calls[0][0], "ack")
-        self.assertEqual(calls[0][1]["message_id"], "msg-42")
+        self.assertEqual([call[0] for call in calls], ["activity", "ack"])
+        ack_calls = [call for call in calls if call[0] == "ack"]
+        self.assertEqual(ack_calls[0][1]["message_id"], "msg-42")
 
     def test_duplicate_redelivery_is_acked_without_second_dispatch(self):
         adapter = self.adapter()
@@ -434,15 +439,19 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         asyncio.run(adapter._handle_finitechat_event(raw_event))
 
         self.assertEqual(len(adapter.handled_messages), 1)
-        self.assertEqual([call[0] for call in calls], ["ack", "ack"])
+        self.assertEqual([call[0] for call in calls], ["activity", "ack", "ack"])
 
     def test_ack_failure_retries_without_dispatching_duplicate(self):
         adapter = self.adapter()
         calls = []
+        ack_attempts = 0
 
         async def fake_json(action, payload, *, timeout):
+            nonlocal ack_attempts
             calls.append((action, payload, timeout))
-            if len(calls) == 1:
+            if action == "ack":
+                ack_attempts += 1
+            if action == "ack" and ack_attempts == 1:
                 return self.module._FiniteChatResult(False, {}, "ack transport busy", True)
             return self.module._FiniteChatResult(True, {"acked": True}, None, False)
 
@@ -458,7 +467,30 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         asyncio.run(adapter._handle_finitechat_event(raw_event))
 
         self.assertEqual(len(adapter.handled_messages), 1)
-        self.assertEqual([call[0] for call in calls], ["ack", "ack"])
+        self.assertEqual([call[0] for call in calls], ["activity", "ack", "ack"])
+
+    def test_failed_handoff_clears_processing_activity(self):
+        adapter = self.adapter()
+        calls = []
+        adapter._finitechat_json = self._record_json(calls)
+
+        async def fail_handle(_event):
+            raise RuntimeError("handoff failed")
+
+        adapter.handle_message = fail_handle
+        raw_event = {
+            "room_id": "room-agent-1",
+            "seq": 12,
+            "message_id": "msg-12",
+            "text": "please build",
+        }
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(adapter._handle_finitechat_event(raw_event))
+
+        self.assertEqual([call[0] for call in calls], ["activity", "activity"])
+        self.assertEqual(calls[0][1]["action"], "set")
+        self.assertEqual(calls[1][1]["action"], "clear")
 
     def test_room_filter_drops_other_rooms_but_unfiltered_serves_all(self):
         filtered = self.adapter(room_id="room-agent-1")
@@ -482,9 +514,10 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(unfiltered.handled_messages), 1)
         self.assertEqual(unfiltered.handled_messages[0].source.chat_id, "any-room")
-        self.assertEqual(unfiltered_calls[0][0], "ack")
+        ack_calls = [call for call in unfiltered_calls if call[0] == "ack"]
+        self.assertEqual(len(ack_calls), 1)
         self.assertEqual(
-            unfiltered_calls[0][1],
+            ack_calls[0][1],
             {"room_id": "any-room", "seq": 2, "message_id": "msg-2"},
         )
 
@@ -903,8 +936,8 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(stream_calls[0][1]["room_id"], "room-agent-1")
         self.assertEqual(len(adapter.handled_messages), 1)
         self.assertEqual(adapter.handled_messages[0].text, "hello from stream")
-        self.assertEqual(ack_calls[0][0], "ack")
-        self.assertEqual(ack_calls[0][1]["message_id"], "msg-12")
+        message_acks = [call for call in ack_calls if call[0] == "ack"]
+        self.assertEqual(message_acks[0][1]["message_id"], "msg-12")
 
     def test_stream_loop_skips_typed_receipt_records_without_dispatch_or_ack(self):
         adapter = self.module.FiniteChatAdapter(

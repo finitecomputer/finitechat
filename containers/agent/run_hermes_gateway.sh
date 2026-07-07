@@ -31,6 +31,7 @@ fi
 service_addr="${FINITECHAT_HERMES_SERVICE_ADDR:-127.0.0.1:0}"
 poll_timeout_secs="${FINITECHAT_HERMES_POLL_TIMEOUT_SECS:-1}"
 poll_limit="${FINITECHAT_HERMES_POLL_LIMIT:-10}"
+title_generation_timeout_secs="${FINITECHAT_HERMES_TITLE_TIMEOUT_SECS:-2}"
 workspace="${FINITECHAT_WORKSPACE:-/workspace}"
 
 export FINITECHAT_HOME="$agent_home"
@@ -133,6 +134,9 @@ ${api_key_yaml}
 plugins:
   enabled:
     - ${plugin_name}
+auxiliary:
+  title_generation:
+    timeout: ${title_generation_timeout_secs}
 gateway:
   platforms:
     finitechat:

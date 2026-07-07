@@ -54,6 +54,32 @@ export type AppTopicSummary = {
   segments: { segment_id: string; started_seq: number }[];
 };
 
+export type ChatMediaKind = "Image" | "VoiceNote" | "Video" | "File";
+
+export type ChatMediaAttachment = {
+  attachment_id: string;
+  url?: string | null;
+  mime_type: string;
+  filename: string;
+  kind: ChatMediaKind;
+  width?: number | null;
+  height?: number | null;
+  local_path?: string | null;
+  upload_progress_per_mille?: number | null;
+  download_progress_per_mille?: number | null;
+};
+
+export type ChatReadReceiptSummary = {
+  delivered_count: number;
+  read_count: number;
+  display_text: string;
+};
+
+export type OutboundDelivery = {
+  local_send: "Sending" | "Sent";
+  server_delivery: "Undelivered" | "Delivered" | { Failed: { reason: string } };
+};
+
 export type ChatMessage = {
   room_id: string;
   seq: number;
@@ -66,9 +92,30 @@ export type ChatMessage = {
   text: string;
   display_content: string;
   rich_text_json: string;
+  reply_to_message_id?: string | null;
   is_mine: boolean;
+  outbound_delivery?: OutboundDelivery | null;
+  media: ChatMediaAttachment[];
+  read_receipt?: ChatReadReceiptSummary | null;
   timestamp_unix_seconds: number;
   display_timestamp: string;
+};
+
+export type AppTypingMember = {
+  room_id: string;
+  account_id: string;
+  device_id: string;
+  display_name: string;
+  picture?: string | null;
+  npub?: string | null;
+  activity_kind: "typing" | "thinking" | "working" | string;
+};
+
+export type OutboundAttachment = {
+  filename: string;
+  mime_type: string;
+  kind: ChatMediaKind;
+  bytes: number[];
 };
 
 export type AppState = {
@@ -85,7 +132,7 @@ export type AppState = {
   messages: ChatMessage[];
   profiles: unknown[];
   devices: unknown[];
-  typing_members: unknown[];
+  typing_members: AppTypingMember[];
   flow: {
     notice_text?: string | null;
     notice_busy: boolean;
@@ -109,8 +156,18 @@ export type AppAction =
   | { SubmitInviteJoin: { pending_room_id: string } }
   | { SendMessage: { room_id: string; text: string } }
   | { SendTopicMessage: { room_id: string; topic_id: string; text: string } }
+  | {
+      SendAttachments: {
+        room_id: string;
+        attachments: OutboundAttachment[];
+        caption: string;
+        reply_to_message_id?: string | null;
+      };
+    }
   | { LoadOlderMessages: { room_id: string; before_message_id: string; limit: number } }
   | { MarkRoomRead: { room_id: string } }
+  | { RetryMessage: { room_id: string; message_id: string } }
+  | { DownloadAttachment: { room_id: string; message_id: string; attachment_id: string } }
   | { SetTyping: { room_id: string; is_typing: boolean } };
 
 export async function resolveDaemonUrl() {

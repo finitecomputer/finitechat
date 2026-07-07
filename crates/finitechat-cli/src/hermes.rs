@@ -36,7 +36,7 @@ use finitechat_client::{
     SqliteClientStore, SqliteClientStoreOptions, StoredAppEvent,
 };
 use finitechat_core::{
-    AppAction, AppBridgeActivityInput, AppRoomState, AppSentMessage, FiniteChatCoreError,
+    AppAction, AppBridgeActivityInput, AppRoomState, AppSentMessage, AppState, FiniteChatCoreError,
     FiniteChatRuntime, OpenOptions,
 };
 use finitechat_hermes::{
@@ -117,6 +117,7 @@ pub(crate) fn run<W: Write>(args: Vec<String>, output: &mut W) -> Result<(), Cli
         "home-channel" => cmd_home_channel(&home_dir, rest, output),
         "invite" => cmd_invite(&home_dir, rest, json_mode, output),
         "invite-status" => cmd_invite_status(rest, json_mode, output),
+        "room-status" => cmd_room_status(&home_dir, rest, json_mode, output),
         "join" => cmd_join(&home_dir, rest, output),
         "poll" => with_backup_activity(&home_dir, "poll", || {
             cmd_poll(&home_dir, read_request(request_json)?, output)
@@ -1210,6 +1211,98 @@ fn invite_status_summary(
     })
 }
 
+#[derive(Debug, Serialize)]
+struct HermesRoomStatusSummary {
+    room_id: String,
+    state: String,
+    status: String,
+    connected: bool,
+    paired: bool,
+    member_count: u32,
+    other_member_count: u32,
+}
+
+fn cmd_room_status<W: Write>(
+    home_dir: &Path,
+    mut args: Vec<String>,
+    json_mode: bool,
+    output: &mut W,
+) -> Result<(), CliError> {
+    let room_id = crate::required_option(&mut args, "--room-id")?;
+    crate::reject_extra_args(&args)?;
+
+    let home = load_home(home_dir)?;
+    let runtime = open_agent_runtime(&home)?;
+    runtime
+        .dispatch_and_wait(AppAction::StartRuntime)
+        .map_err(map_core_hermes_error)?;
+    let state = runtime
+        .dispatch_and_wait(AppAction::OpenRoom {
+            room_id: room_id.clone(),
+        })
+        .map_err(map_core_hermes_error)?;
+    let summary = hermes_room_status_summary(&state, &room_id);
+
+    if json_mode {
+        crate::write_pretty_json(output, &summary)
+    } else {
+        writeln!(
+            output,
+            "Room {}: {} (connected: {}, paired: {}, members: {})",
+            summary.room_id,
+            summary.status,
+            summary.connected,
+            summary.paired,
+            summary.member_count,
+        )
+        .map_err(CliError::Output)
+    }
+}
+
+fn hermes_room_status_summary(state: &AppState, room_id: &str) -> HermesRoomStatusSummary {
+    let room = state.rooms.iter().find(|room| room.room_id == room_id);
+    let connected = room
+        .map(|room| room.state == AppRoomState::Connected)
+        .unwrap_or(false);
+    let details = state
+        .room_details
+        .as_ref()
+        .filter(|details| details.room_id == room_id);
+    let member_count = details.map(|details| details.members.len()).unwrap_or(0) as u32;
+    let other_member_count = details
+        .map(|details| {
+            details
+                .members
+                .iter()
+                .filter(|member| !member.current_device)
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    HermesRoomStatusSummary {
+        room_id: room_id.to_owned(),
+        state: room
+            .map(|room| app_room_state_label(&room.state).to_owned())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        status: room
+            .map(|room| room.status.clone())
+            .unwrap_or_else(|| "not_found".to_owned()),
+        connected,
+        paired: connected && other_member_count > 0,
+        member_count,
+        other_member_count,
+    }
+}
+
+fn app_room_state_label(state: &AppRoomState) -> &'static str {
+    match state {
+        AppRoomState::Connected => "connected",
+        AppRoomState::WaitingForApproval => "waiting_for_approval",
+        AppRoomState::Joining => "joining",
+        AppRoomState::UnavailableOnDevice => "unavailable_on_device",
+    }
+}
+
 /// User-side join: scan/paste the invite URL and land in the chat (ADR 0006).
 /// Submits the proof-bound join request, waits for the
 /// inviter's verdict, activates the Welcome from the room's server,
@@ -1325,7 +1418,7 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
     initialize_hermes_inbox_cursors(home_dir, &home, &mut inbox)?;
     let mut events = pending_hermes_inbox_events(&inbox, request.room_id.as_deref(), limit);
     let mut joined: Vec<String> = Vec::new();
-    let invite_counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let mut invite_counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
 
     while events.is_empty() {
         let bridge = runtime
@@ -1334,6 +1427,9 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
         joined.extend(bridge.joined_account_ids);
         joined.sort();
         joined.dedup();
+        for (invite_id, counts) in bridge.invite_counts {
+            invite_counts.insert(invite_id, (counts.total_requests, counts.resolved_requests));
+        }
 
         for applied in &bridge.events {
             if let Some(room_filter) = &request.room_id
@@ -1582,20 +1678,7 @@ fn wait_for_hermes_sync_hint(
             .into_iter()
             .map(|cursor| (cursor.room_id, cursor.after_seq, cursor.server_url)),
     );
-    let invite_waits: Vec<SyncWaitInvite> = invites
-        .iter()
-        .map(|code| {
-            let (seen_requests, seen_resolved) = invite_counts
-                .get(&code.invite_id)
-                .copied()
-                .unwrap_or((u32::MAX, u32::MAX));
-            SyncWaitInvite {
-                invite_id: code.invite_id.clone(),
-                seen_requests,
-                seen_resolved,
-            }
-        })
-        .collect();
+    let invite_waits = hermes_sync_wait_invites(invites, invite_counts);
     let wait_target_count =
         usize::from(!home_rooms.is_empty() || !invite_waits.is_empty()) + remote_rooms.len();
     if wait_target_count == 0 {
@@ -1632,6 +1715,26 @@ fn wait_for_hermes_sync_hint(
         };
         sync_wait_or_sleep(&mut room_delivery, &wait, target_wait_ms);
     }
+}
+
+fn hermes_sync_wait_invites(
+    invites: &[InviteCodeV1],
+    invite_counts: &BTreeMap<String, (u32, u32)>,
+) -> Vec<SyncWaitInvite> {
+    invites
+        .iter()
+        .map(|code| {
+            let (seen_requests, seen_resolved) = invite_counts
+                .get(&code.invite_id)
+                .copied()
+                .unwrap_or((0, 0));
+            SyncWaitInvite {
+                invite_id: code.invite_id.clone(),
+                seen_requests,
+                seen_resolved,
+            }
+        })
+        .collect()
 }
 
 fn bounded_remaining_wait_ms(wait_ms: u64, per_target_wait_ms: u64, started: Instant) -> u64 {
@@ -2569,7 +2672,7 @@ fn take_flag(args: &mut Vec<String>, name: &str) -> bool {
 }
 
 pub(crate) fn hermes_usage() -> String {
-    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID] [--agent-name NAME] [--agent-about TEXT] [--agent-picture-url URL] [--skip-agent-profile]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes invite-status --url INVITE_URL [--json]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, or ~/.finite/agent may replace --agent-home; the account key is the shared Finite identity under $FINITE_HOME/identity or ~/.finite/identity — see finitechat auth; --request-json JSON may replace stdin)".to_owned()
+    "hermes commands:\n  finitechat hermes [--agent-home DIR] init --server URL [--device-id ID] [--agent-name NAME] [--agent-about TEXT] [--agent-picture-url URL] [--skip-agent-profile]\n  finitechat hermes [--agent-home DIR] install [--plugins-dir DIR | --plugin-dir DIR] [--plugin-name NAME] [--finitechat-bin PATH] [--service-url URL] [--force] [--json]\n  finitechat hermes [--agent-home DIR] serve [--addr HOST:PORT] [--ready-file PATH] [--json]\n  finitechat hermes [--agent-home DIR] home-channel show|clear\n  finitechat hermes [--agent-home DIR] home-channel set --room-id ID [--conversation-id ID]\n  finitechat hermes [--agent-home DIR] invite [--room-id ID] [--room-name NAME] [--max-joins N] [--ttl-ms N] [--json]\n  finitechat hermes invite-status --url INVITE_URL [--json]\n  finitechat hermes [--agent-home DIR] room-status --room-id ID [--json]\n  finitechat hermes [--agent-home DIR] join --url INVITE_URL [--timeout-ms N]\n  finitechat hermes [--agent-home DIR] poll --json   (stdin: {room_id?, limit?, timeout_millis?})\n  finitechat hermes [--agent-home DIR] ack --json    (stdin: HermesAckRequestV1)\n  finitechat hermes [--agent-home DIR] send --json   (stdin: HermesSendRequestV1)\n  finitechat hermes [--agent-home DIR] edit --json   (stdin: HermesEditRequestV1)\n  finitechat hermes [--agent-home DIR] recover --json\n  finitechat hermes [--agent-home DIR] activity --json (stdin: HermesActivityRequestV1)\n  (--home is accepted as a compatibility alias; FINITE_AGENT_HOME, FINITECHAT_HOME, or ~/.finite/agent may replace --agent-home; the account key is the shared Finite identity under $FINITE_HOME/identity or ~/.finite/identity — see finitechat auth; --request-json JSON may replace stdin)".to_owned()
 }
 
 #[cfg(test)]
@@ -2586,6 +2689,100 @@ mod tests {
             r#"{"server_url":"http://127.0.0.1:1","device_id":"agent","account_id":"00"}"#,
         )
         .unwrap();
+    }
+
+    fn app_state_with_room_members(member_current_device_flags: Vec<bool>) -> AppState {
+        serde_json::from_value(json!({
+            "rev": 1,
+            "identity": {
+                "account_id": "agent-account",
+                "device_id": "agent-device",
+                "account_secret_hex": "00"
+            },
+            "rooms": [{
+                "room_id": "room-main",
+                "display_name": "Main",
+                "picture": null,
+                "state": "Connected",
+                "status": "connected",
+                "user_status_text": "Connected",
+                "last_message_preview": "",
+                "unread_count": 0,
+                "can_load_older": false,
+                "is_agent_chat": false
+            }],
+            "selected_room_id": "room-main",
+            "topics": [],
+            "selected_topic_id": null,
+            "active_invite": null,
+            "active_profile_id": null,
+            "status": "ready",
+            "toast": null,
+            "messages": [],
+            "media_gallery": null,
+            "room_details": {
+                "room_id": "room-main",
+                "display_name": "Main",
+                "picture": null,
+                "state": "Connected",
+                "status": "connected",
+                "user_status_text": "Connected",
+                "can_create_invite": true,
+                "media_item_count": 0,
+                "members": member_current_device_flags
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, current_device)| {
+                        json!({
+                            "account_id": format!("account-{index}"),
+                            "device_id": format!("device-{index}"),
+                            "npub": format!("npub-{index}"),
+                            "display_name": format!("Member {index}"),
+                            "picture": null,
+                            "current_device": current_device
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "devices": []
+            },
+            "profiles": [],
+            "devices": [],
+            "typing_members": [],
+            "flow": {
+                "notice_text": null,
+                "notice_busy": false,
+                "scan_in_flight": false,
+                "invite_join_submission_room_id": null,
+                "scan_result": "None",
+                "image_upload_url": null
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn room_status_summary_pairs_connected_room_with_other_member() {
+        let state = app_state_with_room_members(vec![true, false]);
+
+        let summary = hermes_room_status_summary(&state, "room-main");
+
+        assert!(summary.connected);
+        assert!(summary.paired);
+        assert_eq!(summary.member_count, 2);
+        assert_eq!(summary.other_member_count, 1);
+        assert_eq!(summary.state, "connected");
+    }
+
+    #[test]
+    fn room_status_summary_does_not_pair_without_other_member() {
+        let state = app_state_with_room_members(vec![true]);
+
+        let summary = hermes_room_status_summary(&state, "room-main");
+
+        assert!(summary.connected);
+        assert!(!summary.paired);
+        assert_eq!(summary.member_count, 1);
+        assert_eq!(summary.other_member_count, 0);
     }
 
     #[test]
@@ -3056,6 +3253,23 @@ mod tests {
         let error = invite_status_summary(&invite_status_code(), Some(&session), 0)
             .expect_err("room mismatch fails closed");
         assert!(error.to_string().contains("belongs to room"));
+    }
+
+    #[test]
+    fn hermes_sync_wait_invites_use_observed_counts_and_zero_for_unknown() {
+        let first = invite_status_code();
+        let mut second = invite_status_code();
+        second.invite_id = "invite-2".to_owned();
+        let counts = BTreeMap::from([(first.invite_id.clone(), (3, 2))]);
+
+        let waits = hermes_sync_wait_invites(&[first, second], &counts);
+
+        assert_eq!(waits[0].invite_id, "invite-1");
+        assert_eq!(waits[0].seen_requests, 3);
+        assert_eq!(waits[0].seen_resolved, 2);
+        assert_eq!(waits[1].invite_id, "invite-2");
+        assert_eq!(waits[1].seen_requests, 0);
+        assert_eq!(waits[1].seen_resolved, 0);
     }
 
     #[test]

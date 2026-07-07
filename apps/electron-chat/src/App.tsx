@@ -6,6 +6,8 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
+  FileIcon,
+  ImageIcon,
   KeyRoundIcon,
   LinkIcon,
   Loader2Icon,
@@ -26,7 +28,11 @@ import {
   AppRoomSummary,
   AppState,
   AppTopicSummary,
+  AppTypingMember,
+  ChatMediaAttachment,
+  ChatMediaKind,
   ChatMessage,
+  OutboundAttachment,
   dispatch,
   getState,
   resolveDaemonUrl,
@@ -41,6 +47,23 @@ type DesktopIdentityStatus = {
 
 type DesktopOnboardingStatus = {
   completed: boolean;
+};
+
+const MAX_COMPOSER_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+type ComposerAttachment = OutboundAttachment & {
+  id: string;
+  size: number;
+};
+
+type LocalPendingMessage = {
+  local_id: string;
+  room_id: string;
+  conversation_id: string | null;
+  text: string;
+  attachments: Pick<ComposerAttachment, "id" | "filename" | "mime_type" | "kind" | "size">[];
+  state: "sending" | "failed";
+  created_at: string;
 };
 
 export function App() {
@@ -58,8 +81,14 @@ export function App() {
   const [onboardingStatus, setOnboardingStatus] = useState<DesktopOnboardingStatus | null>(null);
   const [identitySecret, setIdentitySecret] = useState("");
   const [identityBusy, setIdentityBusy] = useState(false);
-  const inviteInputRef = useRef<HTMLInputElement | null>(null);
+  const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
+  const [localPendingMessages, setLocalPendingMessages] = useState<LocalPendingMessage[]>([]);
+  const [awaitingReplyRoomIds, setAwaitingReplyRoomIds] = useState<string[]>([]);
+  const joinInviteInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptRef = useRef<HTMLElement | null>(null);
+  const typingRoomRef = useRef<string | null>(null);
+  const typingStopTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,6 +167,40 @@ export function App() {
     [daemonUrl]
   );
 
+  const runQuiet = useCallback(
+    async (action: Parameters<typeof dispatch>[1]) => {
+      if (!daemonUrl) {
+        return null;
+      }
+      try {
+        const next = await dispatch(daemonUrl, action);
+        setState(next);
+        return next;
+      } catch {
+        return null;
+      }
+    },
+    [daemonUrl]
+  );
+
+  const runComposerAction = useCallback(
+    async (action: Parameters<typeof dispatch>[1]) => {
+      if (!daemonUrl) {
+        return null;
+      }
+      setError(null);
+      try {
+        const next = await dispatch(daemonUrl, action);
+        setState(next);
+        return next;
+      } catch (reason) {
+        setError(errorMessage(reason));
+        return null;
+      }
+    },
+    [daemonUrl]
+  );
+
   const loadDesktopState = useCallback(async () => {
     if (!window.finiteChatDesktop) {
       setOnboardingStatus({ completed: true });
@@ -196,6 +259,32 @@ export function App() {
   const statusText = state ? (error ?? state.flow.notice_text ?? state.toast ?? state.status) : "starting daemon";
   const shortAccount = state?.identity.account_id ? shortId(state.identity.account_id) : "not connected";
   const showOnboarding = window.finiteChatDesktop ? onboardingStatus?.completed === false : false;
+  const selectedLiveMembers = useMemo(
+    () => state?.typing_members.filter((member) => member.room_id === selectedRoom?.room_id) ?? [],
+    [selectedRoom?.room_id, state?.typing_members]
+  );
+  const visiblePendingMessages = useMemo(
+    () =>
+      localPendingMessages.filter(
+        (message) =>
+          message.room_id === selectedRoom?.room_id &&
+          (selectedTopic ? message.conversation_id === selectedTopic.topic_id : message.conversation_id === null)
+      ),
+    [localPendingMessages, selectedRoom?.room_id, selectedTopic]
+  );
+  const hasComposerContent = Boolean(composer.trim() || composerAttachments.length > 0);
+  const awaitingSelectedAgent =
+    Boolean(selectedRoom?.is_agent_chat) &&
+    Boolean(selectedRoom?.room_id && awaitingReplyRoomIds.includes(selectedRoom.room_id)) &&
+    selectedLiveMembers.length === 0;
+
+  const focusJoinInvite = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      const input = joinInviteInputRef.current;
+      input?.closest(".finite-chat__agent-panel")?.scrollIntoView({ block: "center", behavior: "smooth" });
+      input?.focus();
+    });
+  }, []);
 
   useEffect(() => {
     const transcript = transcriptRef.current;
@@ -203,17 +292,85 @@ export function App() {
       return;
     }
     transcript.scrollTo({ top: transcript.scrollHeight, behavior: "smooth" });
-  }, [selectedMessages.length, selectedRoom?.room_id, selectedTopic?.topic_id]);
+  }, [selectedMessages.length, visiblePendingMessages.length, selectedLiveMembers.length, selectedRoom?.room_id, selectedTopic?.topic_id]);
+
+  useEffect(() => {
+    if (!selectedRoom || selectedMessages.length === 0) {
+      return;
+    }
+    const last = selectedMessages[selectedMessages.length - 1];
+    if (!last?.is_mine) {
+      setAwaitingReplyRoomIds((roomIds) =>
+        roomIds.includes(selectedRoom.room_id) ? roomIds.filter((roomId) => roomId !== selectedRoom.room_id) : roomIds
+      );
+    }
+  }, [selectedMessages, selectedRoom?.room_id]);
+
+  useEffect(() => {
+    if (!selectedRoom || selectedRoom.state !== "Connected" || !selectedMessages.some((message) => !message.is_mine)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void runQuiet({ MarkRoomRead: { room_id: selectedRoom.room_id } });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [runQuiet, selectedMessages.length, selectedRoom?.room_id, selectedRoom?.state]);
+
+  useEffect(() => {
+    return () => {
+      if (typingStopTimerRef.current !== null) {
+        window.clearTimeout(typingStopTimerRef.current);
+      }
+      if (typingRoomRef.current) {
+        void runQuiet({ SetTyping: { room_id: typingRoomRef.current, is_typing: false } });
+      }
+    };
+  }, [runQuiet, selectedRoom?.room_id]);
+
+  function stopTyping(roomId = typingRoomRef.current) {
+    if (typingStopTimerRef.current !== null) {
+      window.clearTimeout(typingStopTimerRef.current);
+      typingStopTimerRef.current = null;
+    }
+    if (roomId) {
+      typingRoomRef.current = null;
+      void runQuiet({ SetTyping: { room_id: roomId, is_typing: false } });
+    }
+  }
+
+  function noteTyping(nextValue: string) {
+    if (!selectedRoom || !canSendToSelectedRoom) {
+      return;
+    }
+    if (!nextValue.trim()) {
+      stopTyping(selectedRoom.room_id);
+      return;
+    }
+    if (typingRoomRef.current !== selectedRoom.room_id) {
+      typingRoomRef.current = selectedRoom.room_id;
+      void runQuiet({ SetTyping: { room_id: selectedRoom.room_id, is_typing: true } });
+    }
+    if (typingStopTimerRef.current !== null) {
+      window.clearTimeout(typingStopTimerRef.current);
+    }
+    typingStopTimerRef.current = window.setTimeout(() => stopTyping(selectedRoom.room_id), 2200);
+  }
+
+  function handleComposerChange(value: string) {
+    setComposer(value);
+    noteTyping(value);
+  }
 
   async function submitComposer(event: FormEvent) {
     event.preventDefault();
     const text = composer.trim();
-    if (!text || !state) {
+    const attachments = composerAttachments;
+    if ((!text && attachments.length === 0) || !state) {
       return;
     }
     if (!selectedRoom) {
       setError(agentRooms.length > 0 ? "Select an agent chat before sending." : "Connect Hermes before sending.");
-      inviteInputRef.current?.focus();
+      focusJoinInvite();
       return;
     }
     if (!canSendToSelectedRoom) {
@@ -222,21 +379,89 @@ export function App() {
           ? "This chat has no other member. Connect Hermes before sending."
           : "This chat is not ready for messages yet."
       );
-      inviteInputRef.current?.focus();
+      focusJoinInvite();
       return;
     }
-    setComposer("");
-    if (selectedTopic) {
-      await run({
-        SendTopicMessage: {
-          room_id: selectedTopic.room_id,
-          topic_id: selectedTopic.topic_id,
-          text,
-        },
-      });
-    } else {
-      await run({ SendMessage: { room_id: selectedRoom.room_id, text } });
+    if (selectedTopic && attachments.length > 0) {
+      setError("Attachments are room-scoped in the current core. Open the room view to attach files.");
+      return;
     }
+    stopTyping(selectedRoom.room_id);
+    const pendingId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setComposer("");
+    setComposerAttachments([]);
+    setLocalPendingMessages((messages) => [
+      ...messages,
+      {
+        local_id: pendingId,
+        room_id: selectedRoom.room_id,
+        conversation_id: selectedTopic?.topic_id ?? null,
+        text,
+        attachments: attachments.map(({ id, filename, mime_type, kind, size }) => ({ id, filename, mime_type, kind, size })),
+        state: "sending",
+        created_at: "Sending",
+      },
+    ]);
+    if (selectedRoom.is_agent_chat) {
+      setAwaitingReplyRoomIds((roomIds) => (roomIds.includes(selectedRoom.room_id) ? roomIds : [...roomIds, selectedRoom.room_id]));
+    }
+    const next = attachments.length
+      ? await runComposerAction({
+          SendAttachments: {
+            room_id: selectedRoom.room_id,
+            attachments: attachments.map(({ filename, mime_type, kind, bytes }) => ({ filename, mime_type, kind, bytes })),
+            caption: text,
+            reply_to_message_id: null,
+          },
+        })
+      : selectedTopic
+        ? await runComposerAction({
+            SendTopicMessage: {
+              room_id: selectedTopic.room_id,
+              topic_id: selectedTopic.topic_id,
+              text,
+            },
+          })
+        : await runComposerAction({ SendMessage: { room_id: selectedRoom.room_id, text } });
+    if (next) {
+      setLocalPendingMessages((messages) => messages.filter((message) => message.local_id !== pendingId));
+    } else {
+      setLocalPendingMessages((messages) =>
+        messages.map((message) => (message.local_id === pendingId ? { ...message, state: "failed", created_at: "Not sent" } : message))
+      );
+    }
+  }
+
+  async function handleAttachmentFiles(files: FileList | null) {
+    if (!files || files.length === 0) {
+      return;
+    }
+    const next: ComposerAttachment[] = [];
+    for (const file of Array.from(files)) {
+      if (file.size > MAX_COMPOSER_ATTACHMENT_BYTES) {
+        setError(`${file.name} is larger than ${formatBytes(MAX_COMPOSER_ATTACHMENT_BYTES)}.`);
+        continue;
+      }
+      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+      next.push({
+        id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2)}`,
+        filename: file.name,
+        mime_type: file.type || "application/octet-stream",
+        kind: mediaKindForFile(file),
+        bytes,
+        size: file.size,
+      });
+    }
+    if (next.length > 0) {
+      setComposerAttachments((attachments) => [...attachments, ...next].slice(0, 8));
+    }
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function removeComposerAttachment(id: string) {
+    setComposerAttachments((attachments) => attachments.filter((attachment) => attachment.id !== id));
   }
 
   async function submitInvite(event: FormEvent) {
@@ -253,10 +478,10 @@ export function App() {
       setNewRoomOpen(false);
       setRoomTitle("");
       setError("Connect Hermes before starting a new chat.");
-      inviteInputRef.current?.focus();
+      focusJoinInvite();
       return;
     }
-    const displayName = roomTitle.trim() || "New chat";
+    const displayName = roomTitle.trim() || "New topic";
     setRoomTitle("");
     setNewRoomOpen(false);
     await run({ CreateTopic: { room_id: selectedAgentRoom.room_id, title: displayName } });
@@ -417,44 +642,36 @@ export function App() {
             </form>
           ) : null}
 
-          <form className="finite-chat__invite-form" onSubmit={submitInvite}>
-            <input
-              ref={inviteInputRef}
-              value={inviteUrl}
-              onChange={(event) => setInviteUrl(event.target.value)}
-              placeholder="finite://join..."
-            />
-            <button type="submit" className="ocean-icon-button" aria-label="Open invite" disabled={!inviteUrl.trim() || busy}>
-              <LinkIcon aria-hidden />
-            </button>
-          </form>
         </nav>
 
-        <button
-          type="button"
-          className="finite-chat__sidebar-new-chat-fab"
-          aria-label={selectedAgentRoom ? "New chat" : "Connect agent"}
-          disabled={busy}
-          onClick={() => {
-            if (selectedAgentRoom) {
-              setNewRoomOpen(true);
-            } else {
-              inviteInputRef.current?.focus();
-            }
-          }}
-        >
-          {selectedAgentRoom ? <PlusIcon aria-hidden /> : <LinkIcon aria-hidden />}
-          <span>{selectedAgentRoom ? "New chat" : "Connect agent"}</span>
-        </button>
+        {selectedAgentRoom ? (
+          <button
+            type="button"
+            className="finite-chat__sidebar-new-chat-fab"
+            aria-label="New topic"
+            disabled={busy}
+            onClick={() => setNewRoomOpen(true)}
+          >
+            <PlusIcon aria-hidden />
+            <span>New topic</span>
+          </button>
+        ) : null}
 
         <div className="finite-chat__sidebar-footer">
           {accountMenuOpen ? (
             <div className="finite-chat__account-menu">
               <div className="finite-chat__account-heading">
                 <KeyRoundIcon aria-hidden />
-                <span>{identityStatus?.hasStoredAccountSecret ? "Imported account" : "Local identity"}</span>
+                <span>Desktop identity</span>
               </div>
-              <div className="finite-chat__account-id">{shortAccount}</div>
+              <div className="finite-chat__account-id">
+                <strong>{shortAccount}</strong>
+                <small>
+                  {identityStatus?.hasStoredAccountSecret
+                    ? "Imported key in secure storage"
+                    : "Local key on this Mac"}
+                </small>
+              </div>
               <form className="finite-chat__account-import" onSubmit={submitAccountImport}>
                 <input
                   value={identitySecret}
@@ -564,6 +781,7 @@ export function App() {
           <AgentConnectionPanel
             busy={busy}
             inviteUrl={inviteUrl}
+            inputRef={joinInviteInputRef}
             pendingInviteRoomId={pendingInviteRoomId}
             selectedRoom={selectedRoom}
             hasAgentRoom={agentRooms.length > 0}
@@ -580,9 +798,14 @@ export function App() {
                 {selectedMessages.map((message) => (
                   <MessageRow key={`${message.room_id}:${message.message_id}`} message={message} />
                 ))}
+                {visiblePendingMessages.map((message) => (
+                  <PendingMessageRow key={message.local_id} message={message} />
+                ))}
+                {awaitingSelectedAgent ? <LiveActivityIndicator label="Waiting for Hermes" /> : null}
+                {selectedLiveMembers.length > 0 ? <LiveActivityIndicator members={selectedLiveMembers} /> : null}
                 {!state ? (
                   <EmptyState title="Starting daemon" busy />
-                ) : selectedMessages.length === 0 ? (
+                ) : selectedMessages.length === 0 && visiblePendingMessages.length === 0 ? (
                   <EmptyState title={selectedRoom ? selectedRoom.display_name : "Finite Chat"} />
                 ) : null}
               </div>
@@ -590,17 +813,52 @@ export function App() {
 
             <form className="finite-chat__composer-wrap" onSubmit={submitComposer}>
               <div className="finite-chat__composer">
+                <input
+                  ref={fileInputRef}
+                  className="finite-chat__file-input"
+                  type="file"
+                  multiple
+                  onChange={(event) => void handleAttachmentFiles(event.currentTarget.files)}
+                />
+                {composerAttachments.length > 0 ? (
+                  <div className="finite-chat__attachment-tray">
+                    {composerAttachments.map((attachment) => (
+                      <button
+                        key={attachment.id}
+                        type="button"
+                        className="finite-chat__attachment-chip"
+                        onClick={() => removeComposerAttachment(attachment.id)}
+                        title="Remove attachment"
+                      >
+                        {attachment.kind === "Image" ? <ImageIcon aria-hidden /> : <FileIcon aria-hidden />}
+                        <span>
+                          <strong>{attachment.filename}</strong>
+                          <small>{formatBytes(attachment.size)}</small>
+                        </span>
+                        <XIcon aria-hidden />
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
                 <textarea
                   value={composer}
-                  onChange={(event) => setComposer(event.target.value)}
+                  onChange={(event) => handleComposerChange(event.target.value)}
                   placeholder={composerPlaceholder(state, selectedRoom, selectedTopic, selectedRoomHasCounterparty)}
                   disabled={!state || busy || !canSendToSelectedRoom}
                   autoFocus
+                  onBlur={() => stopTyping()}
                   onKeyDown={handleComposerKeyDown}
                 />
                 <div className="finite-chat__composer-actions">
                   <div className="finite-chat__composer-left">
-                    <button type="button" className="finite-chat__tool-button" aria-label="Attach file" disabled>
+                    <button
+                      type="button"
+                      className="finite-chat__tool-button"
+                      aria-label="Attach file"
+                      disabled={!state || busy || !canSendToSelectedRoom || Boolean(selectedTopic)}
+                      title={selectedTopic ? "Attachments are available in the room view" : "Attach file"}
+                      onClick={() => fileInputRef.current?.click()}
+                    >
                       <PaperclipIcon aria-hidden />
                     </button>
                     <button type="button" className="finite-chat__command-button" disabled>
@@ -613,7 +871,7 @@ export function App() {
                       type="submit"
                       className="finite-chat__send-button"
                       aria-label="Send message"
-                      disabled={!state || !composer.trim() || busy || !canSendToSelectedRoom}
+                      disabled={!state || !hasComposerContent || busy || !canSendToSelectedRoom}
                     >
                       <SendIcon aria-hidden />
                     </button>
@@ -677,22 +935,23 @@ function DesktopOnboarding({
         <div className="finite-chat__onboarding-copy">
           <h1 id="finite-chat-onboarding-title">Finite Chat</h1>
           <p>
-            {identityStatus?.hasStoredAccountSecret
-              ? "Imported account ready."
-              : "Generate a new local key for this desktop."}
+            This desktop keeps a Finite identity locally. New installs create one automatically; import only when
+            this device should use an existing npub.
           </p>
         </div>
 
         <button type="button" className="finite-chat__onboarding-choice" onClick={onUseLocal} disabled={busy}>
           <ShieldCheckIcon aria-hidden />
           <span>
-            <strong>Generate local key</strong>
-            <small>{accountId}</small>
+            <strong>{identityStatus?.hasStoredAccountSecret ? "Continue with imported account" : "Continue with this device"}</strong>
+            <small>
+              {identityStatus?.hasStoredAccountSecret ? "Key stored in macOS secure storage" : `Local identity ${accountId}`}
+            </small>
           </span>
         </button>
 
         <form className="finite-chat__onboarding-import" onSubmit={submit}>
-          <label htmlFor="finite-chat-secret">Import account</label>
+          <label htmlFor="finite-chat-secret">Use an existing npub</label>
           <div>
             <input
               id="finite-chat-secret"
@@ -728,6 +987,7 @@ function DesktopOnboarding({
 function AgentConnectionPanel({
   busy,
   hasAgentRoom,
+  inputRef,
   inviteUrl,
   onInviteUrlChange,
   onSubmitInvite,
@@ -737,6 +997,7 @@ function AgentConnectionPanel({
 }: {
   busy: boolean;
   hasAgentRoom: boolean;
+  inputRef: { current: HTMLInputElement | null };
   inviteUrl: string;
   onInviteUrlChange: (value: string) => void;
   onSubmitInvite: (event: FormEvent) => void;
@@ -765,9 +1026,10 @@ function AgentConnectionPanel({
       ) : (
         <form className="finite-chat__agent-panel-form" onSubmit={onSubmitInvite}>
           <input
+            ref={inputRef}
             value={inviteUrl}
             onChange={(event) => onInviteUrlChange(event.target.value)}
-            placeholder="finite://join..."
+            placeholder="Paste finite:// join invite"
             disabled={busy}
           />
           <button type="submit" className="finite-chat__send-button" aria-label="Connect Hermes" disabled={!inviteUrl.trim() || busy}>
@@ -819,7 +1081,7 @@ function agentConnectionCopy(
   if (selectedRoom && !selectedRoom.is_agent_chat) {
     return {
       title: "No agent in this chat",
-      body: "This room does not contain Hermes. Paste a Finite Chat invite from a runtime to connect an agent chat.",
+      body: "This room does not contain Hermes. Join a runtime invite to start an agent chat.",
     };
   }
   if (hasAgentRoom) {
@@ -830,7 +1092,7 @@ function agentConnectionCopy(
   }
   return {
     title: "Connect Hermes",
-    body: "Paste a finite:// join invite from a local or hosted Hermes runtime. The desktop app will join that encrypted room as this device.",
+    body: "Paste the invite from your local or hosted Hermes runtime. Browser finite:// links are handled automatically.",
   };
 }
 
@@ -910,14 +1172,53 @@ function MembersPill({ members }: { members: AppRoomMemberSummary[] }) {
   );
 }
 
+function LiveActivityIndicator({ label, members = [] }: { label?: string; members?: AppTypingMember[] }) {
+  const displayLabel = label ?? liveActivityLabel(members);
+  return (
+    <div className="finite-chat__live-activity" aria-live="polite">
+      <span className="finite-chat__live-dots" aria-hidden>
+        <i />
+        <i />
+        <i />
+      </span>
+      <span>{displayLabel}</span>
+    </div>
+  );
+}
+
+function PendingMessageRow({ message }: { message: LocalPendingMessage }) {
+  return (
+    <article className={`finite-chat__message finite-chat__message--user finite-chat__message--pending ${message.state === "failed" ? "is-failed" : ""}`}>
+      <div>
+        {message.text ? <p>{message.text}</p> : null}
+        {message.attachments.length > 0 ? (
+          <div className="finite-chat__message-attachments">
+            {message.attachments.map((attachment) => (
+              <div key={attachment.id} className="finite-chat__message-attachment">
+                {attachment.kind === "Image" ? <ImageIcon aria-hidden /> : <FileIcon aria-hidden />}
+                <span>
+                  <strong>{attachment.filename}</strong>
+                  <small>{formatBytes(attachment.size)}</small>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <time className="finite-chat__message-time">{message.created_at}</time>
+      </div>
+    </article>
+  );
+}
+
 function MessageRow({ message }: { message: ChatMessage }) {
   const content = message.display_content || message.text;
   if (message.is_mine) {
     return (
       <article className="finite-chat__message finite-chat__message--user">
         <div>
-          <p>{content}</p>
-          <time className="finite-chat__message-time">{message.display_timestamp}</time>
+          {content ? <p>{content}</p> : null}
+          <MessageAttachments media={message.media} />
+          <time className="finite-chat__message-time">{deliveryText(message) ?? message.display_timestamp}</time>
         </div>
       </article>
     );
@@ -926,12 +1227,36 @@ function MessageRow({ message }: { message: ChatMessage }) {
   return (
     <article className="finite-chat__message finite-chat__message--agent">
       <div className="finite-chat__assistant-text">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        {content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown> : null}
+        <MessageAttachments media={message.media} />
       </div>
       <time className="finite-chat__message-time">
         {message.sender_display_name} · {message.display_timestamp}
       </time>
     </article>
+  );
+}
+
+function MessageAttachments({ media }: { media?: ChatMediaAttachment[] }) {
+  if (!media || media.length === 0) {
+    return null;
+  }
+  return (
+    <div className="finite-chat__message-attachments">
+      {media.map((attachment) => {
+        const previewUrl = attachment.local_path ? `file://${attachment.local_path}` : attachment.url || "";
+        const canPreviewImage = attachment.kind === "Image" && previewUrl;
+        return (
+          <div key={attachment.attachment_id} className="finite-chat__message-attachment">
+            {canPreviewImage ? <img src={previewUrl} alt="" /> : attachment.kind === "Image" ? <ImageIcon aria-hidden /> : <FileIcon aria-hidden />}
+            <span>
+              <strong>{attachment.filename}</strong>
+              <small>{attachmentLabel(attachment)}</small>
+            </span>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -947,6 +1272,68 @@ function EmptyState({ busy, title }: { busy?: boolean; title: string }) {
       </h1>
     </div>
   );
+}
+
+function mediaKindForFile(file: File): ChatMediaKind {
+  if (file.type.startsWith("image/")) {
+    return "Image";
+  }
+  if (file.type.startsWith("video/")) {
+    return "Video";
+  }
+  if (file.type.startsWith("audio/")) {
+    return "VoiceNote";
+  }
+  return "File";
+}
+
+function liveActivityLabel(members: AppTypingMember[]) {
+  const working = members.find((member) => member.activity_kind === "working");
+  const thinking = members.find((member) => member.activity_kind === "thinking");
+  const typing = members.find((member) => member.activity_kind === "typing");
+  const member = working ?? thinking ?? typing ?? members[0];
+  const name = member?.display_name || "Someone";
+  if (member?.activity_kind === "working") {
+    return `${name} is working`;
+  }
+  if (member?.activity_kind === "thinking") {
+    return `${name} is thinking`;
+  }
+  return `${name} is typing`;
+}
+
+function deliveryText(message: ChatMessage) {
+  const delivery = message.outbound_delivery;
+  if (!delivery) {
+    return message.read_receipt?.display_text || null;
+  }
+  if (typeof delivery.server_delivery === "object" && "Failed" in delivery.server_delivery) {
+    return `Not delivered: ${delivery.server_delivery.Failed.reason}`;
+  }
+  if (delivery.server_delivery === "Undelivered") {
+    return "Sending...";
+  }
+  return message.read_receipt?.display_text || "Delivered";
+}
+
+function attachmentLabel(attachment: ChatMediaAttachment) {
+  if (attachment.download_progress_per_mille !== null && attachment.download_progress_per_mille !== undefined) {
+    return "Downloading";
+  }
+  if (attachment.upload_progress_per_mille !== null && attachment.upload_progress_per_mille !== undefined) {
+    return "Uploading";
+  }
+  return attachment.mime_type || attachment.kind;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function initials(value: string) {

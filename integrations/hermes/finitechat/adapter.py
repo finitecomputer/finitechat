@@ -30,6 +30,7 @@ LOCAL_ENV_FILE = "finitechat.env"
 DEFAULT_POLL_LIMIT = 10
 DEFAULT_POLL_TIMEOUT_SECS = 20
 DEFAULT_ACTIVITY_REFRESH_SECS = 30.0
+DEFAULT_ACTIVITY_START_GRACE_SECS = 0.1
 ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 100
 DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
 SERVICE_READY_FILE = "hermes-service.json"
@@ -38,6 +39,8 @@ MAX_DELIVERED_EVENT_KEYS = 256
 MAX_OUTBOUND_MESSAGE_ROUTES = 256
 STREAM_RECONNECT_BACKOFF_SECS = 2.0
 SERVICE_TRANSPORT_RETRY_SECS = 0.1
+ACTIVITY_CONTROL_TIMEOUT_SECS = 1.5
+PROCESSING_ACTIVITY_TTL_MILLIS = 15 * 1000
 
 
 def _load_local_env_defaults(path: Path | None = None) -> None:
@@ -307,7 +310,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         metadata=None,
         stop_event: asyncio.Event | None = None,
     ) -> None:
-        grace_deadline = asyncio.get_running_loop().time() + 0.75
+        grace_deadline = asyncio.get_running_loop().time() + DEFAULT_ACTIVITY_START_GRACE_SECS
         while asyncio.get_running_loop().time() < grace_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
@@ -539,10 +542,49 @@ class FiniteChatAdapter(BasePlatformAdapter):
             channel_prompt=_string_or_none(raw_event.get("channel_prompt")),
             internal=bool(raw_event.get("internal") or False),
         )
-        await self.handle_message(event)
-        if event_key:
-            self._remember_delivered_event(event_key)
-        await self._ack_finitechat_event(room_id, seq, message_id)
+        activity_metadata = {"conversation_id": conversation_id} if conversation_id else None
+        activity_set = await self._set_processing_activity(room_id, activity_metadata)
+        try:
+            await self.handle_message(event)
+            if event_key:
+                self._remember_delivered_event(event_key)
+            await self._ack_finitechat_event(room_id, seq, message_id)
+        except Exception:
+            if activity_set:
+                await self._clear_processing_activity(room_id, activity_metadata)
+            raise
+
+    async def _set_processing_activity(
+        self,
+        room_id: str,
+        metadata: dict[str, Any] | None,
+    ) -> bool:
+        payload = self._activity_payload(room_id, metadata, action="set")
+        payload["expires_in_millis"] = PROCESSING_ACTIVITY_TTL_MILLIS
+        return await self._run_activity_control(
+            "set",
+            self._finitechat_json("activity", payload, timeout=15),
+        )
+
+    async def _clear_processing_activity(
+        self,
+        room_id: str,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        await self._run_activity_control(
+            "clear",
+            self.stop_typing(room_id, metadata=metadata),
+        )
+
+    async def _run_activity_control(self, action: str, operation: Any) -> bool:
+        try:
+            result = await asyncio.wait_for(operation, timeout=ACTIVITY_CONTROL_TIMEOUT_SECS)
+            return bool(getattr(result, "ok", True))
+        except TimeoutError:
+            logger.debug("[finitechat] timed out during activity %s", action)
+        except Exception as exc:
+            logger.debug("[finitechat] activity %s failed: %s", action, exc)
+        return False
 
     async def _ack_finitechat_event(self, room_id: str, seq: Any, message_id: str) -> None:
         if not isinstance(seq, int):

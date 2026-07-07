@@ -538,7 +538,15 @@ pub struct AppBridgeAppliedEvent {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppBridgeSync {
     pub joined_account_ids: Vec<String>,
+    #[serde(default)]
+    pub invite_counts: BTreeMap<String, AppBridgeInviteCounts>,
     pub events: Vec<AppBridgeAppliedEvent>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppBridgeInviteCounts {
+    pub total_requests: u32,
+    pub resolved_requests: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -2046,7 +2054,7 @@ impl AppRuntimeState {
     }
 
     fn runtime_tick(&mut self) -> Result<(), FiniteChatCoreError> {
-        let joined = self.accept_owned_invite_joins(Vec::new())?;
+        let (joined, _) = self.accept_owned_invite_joins(Vec::new())?;
         if !joined.is_empty() {
             self.app.toast = Some(format!("{} device(s) joined", joined.len()));
         }
@@ -2074,7 +2082,7 @@ impl AppRuntimeState {
                     .or_insert_with(|| invite_url.clone());
             }
         }
-        let joined_account_ids = self.accept_owned_invite_joins(invite_urls)?;
+        let (joined_account_ids, invite_counts) = self.accept_owned_invite_joins(invite_urls)?;
         if !joined_account_ids.is_empty() {
             self.app.toast = Some(format!("{} device(s) joined", joined_account_ids.len()));
         }
@@ -2095,6 +2103,7 @@ impl AppRuntimeState {
         self.app.status = "ready".to_owned();
         Ok(AppBridgeSync {
             joined_account_ids,
+            invite_counts,
             events,
         })
     }
@@ -2102,7 +2111,7 @@ impl AppRuntimeState {
     fn accept_owned_invite_joins<I>(
         &mut self,
         extra_invite_urls: I,
-    ) -> Result<Vec<String>, FiniteChatCoreError>
+    ) -> Result<(Vec<String>, BTreeMap<String, AppBridgeInviteCounts>), FiniteChatCoreError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -2112,8 +2121,17 @@ impl AppRuntimeState {
         invite_urls.dedup();
 
         let mut joined_account_ids = Vec::new();
+        let mut invite_counts = BTreeMap::new();
         for invite_url in invite_urls {
+            let code = parse_invite(&invite_url)?;
             let accepted = self.core.accept_invite_joins(&invite_url)?;
+            invite_counts.insert(
+                code.invite_id,
+                AppBridgeInviteCounts {
+                    total_requests: accepted.total_requests,
+                    resolved_requests: accepted.resolved_requests,
+                },
+            );
             joined_account_ids.extend(
                 accepted
                     .accepted
@@ -2123,7 +2141,7 @@ impl AppRuntimeState {
         }
         joined_account_ids.sort();
         joined_account_ids.dedup();
-        Ok(joined_account_ids)
+        Ok((joined_account_ids, invite_counts))
     }
 
     fn materialize_known_connected_rooms(&mut self) -> Result<(), FiniteChatCoreError> {
@@ -10790,6 +10808,15 @@ mod tests {
             .agent_bridge_poll_once(vec![invite.invite_url.clone()])
             .unwrap();
         assert_eq!(bridge.joined_account_ids.len(), 1);
+        let code = InviteCodeV1::parse(&invite.invite_url).unwrap();
+        assert_eq!(
+            bridge.invite_counts.get(&code.invite_id),
+            Some(&AppBridgeInviteCounts {
+                total_requests: 1,
+                resolved_requests: 1,
+            }),
+            "Hermes bridge must report invite counters for /sync/wait cursors"
+        );
 
         let app_state = app.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
