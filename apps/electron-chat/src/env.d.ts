@@ -1,0 +1,13 @@
+interface FiniteChatDesktopBridge {
+  daemonUrl(): Promise<string>;
+  identityStatus(): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
+  onboardingStatus(): Promise<{ completed: boolean }>;
+  completeOnboarding(): Promise<{ completed: boolean }>;
+  importAccountSecret(secret: string): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
+  clearAccountSecret(): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
+  onInviteUrl(callback: (url: string) => void): () => void;
+}
+
+interface Window {
+  finiteChatDesktop?: FiniteChatDesktopBridge;
+}

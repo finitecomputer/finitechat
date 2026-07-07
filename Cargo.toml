@@ -12,6 +12,7 @@ members = [
   "crates/finitechat-http",
   "crates/finitechat-server",
   "crates/finitechat-cli",
+  "crates/finitechat-daemon",
   "crates/finitechat-rmp",
   "uniffi-bindgen",
 ]

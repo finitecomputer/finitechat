@@ -1436,6 +1436,10 @@ impl ConversationProjection {
         self.entries.is_empty()
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = &ConversationProjectionEntry> {
+        self.entries.values()
+    }
+
     fn ensure_entry(
         &mut self,
         room_id: &str,

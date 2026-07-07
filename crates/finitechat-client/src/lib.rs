@@ -26,8 +26,8 @@ use finitechat_proto::{
     AccountRoomRecord, AppendApplicationEventRequest, AppendEventRequest,
     ApplicationDeliveryPolicy, ClaimKeyPackageResult, CommitAccepted, CreateRoomRequest,
     EngineError, EventAccepted, KeyPackageInventory, ListAccountRoomsPage, ListAccountRoomsRequest,
-    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord, envelope,
-    lease_token_for,
+    SubmitCommitRequest, SyncEventsPage, UploadKeyPackageRequest, WelcomeRecord,
+    delivery_member_id_for_device, envelope, lease_token_for,
 };
 use finitechat_proto::{
     AppendEphemeralActivityRequest, EphemeralActivityAccepted, InviteCodeV1, MAX_INVITE_TTL_MILLIS,
@@ -4703,9 +4703,7 @@ fn claimed_key_package_result_from_http<E>(
 fn http_member_id_for_device<E>(
     device: &DeviceRef,
 ) -> Result<HttpMemberId, HttpRuntimeDeliveryError<E>> {
-    serde_json::to_vec(device)
-        .map(HttpMemberId::new)
-        .map_err(|error| HttpRuntimeDeliveryError::Json(error.to_string()))
+    Ok(HttpMemberId::new(delivery_member_id_for_device(device)))
 }
 
 fn http_group_id_for_room(room_id: &str) -> HttpGroupId {

@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     fn member_for_device(device: &DeviceRef) -> MemberId {
-        MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+        MemberId::new(finitechat_proto::delivery_member_id_for_device(device))
     }
 
     fn assert_claimed_package(claim: &HttpKeyPackageClaim, owner: &str, key_package_id: &str) {

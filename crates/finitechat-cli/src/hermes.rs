@@ -1351,6 +1351,7 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
                 message_id: &applied.message_id,
                 sender_account_id: &applied.sender_account_id,
                 sender_device_id: &applied.sender_device_id,
+                conversation_id: None,
             };
             if let Some(event) =
                 hermes_poll_event_from_application_plaintext(context, &applied.plaintext)?
@@ -1507,6 +1508,7 @@ fn recover_stored_hermes_events(
             message_id: &stored.message_id,
             sender_account_id: &stored.sender.account_id,
             sender_device_id: &stored.sender.device_id,
+            conversation_id: None,
         };
         match hermes_poll_event_from_application_plaintext(context, &stored.plaintext)? {
             Some(event) => enqueue_hermes_inbox_event(home_dir, inbox, event)?,
@@ -1672,6 +1674,7 @@ struct HermesPollEventContext<'a> {
     message_id: &'a str,
     sender_account_id: &'a str,
     sender_device_id: &'a str,
+    conversation_id: Option<&'a str>,
 }
 
 fn hermes_poll_event_from_application_plaintext(
@@ -1684,6 +1687,10 @@ fn hermes_poll_event_from_application_plaintext(
         }
         return match event.kind {
             DurableAppEventKind::ChatMessage => {
+                let context = HermesPollEventContext {
+                    conversation_id: event.conversation_id.as_deref(),
+                    ..context
+                };
                 hermes_poll_event_from_chat_payload(context, &event.payload, true)
             }
             DurableAppEventKind::ConversationCreate
@@ -1721,6 +1728,10 @@ fn hermes_poll_event_from_chat_payload(
             context.sender_account_id.to_owned(),
             context.sender_device_id.to_owned(),
         );
+        if event.conversation_id.is_none() {
+            event.conversation_id = context.conversation_id.map(ToOwned::to_owned);
+            event.source.thread_id = event.conversation_id.clone();
+        }
         materialize_poll_event_attachments(context.home_dir, &mut event)?;
         return Ok(Some(event));
     }
@@ -1735,7 +1746,7 @@ fn hermes_poll_event_from_chat_payload(
     if text.trim().is_empty() {
         return Ok(None);
     }
-    HermesPollEventV1::finite_chat_text(
+    let mut event = HermesPollEventV1::finite_chat_text(
         context.room_id.to_owned(),
         context.seq,
         context.message_id.to_owned(),
@@ -1743,8 +1754,13 @@ fn hermes_poll_event_from_chat_payload(
         context.sender_device_id.to_owned(),
         text.to_owned(),
     )
-    .map(Some)
-    .map_err(|error| CliError::Hermes(error.to_string()))
+    .map_err(|error| CliError::Hermes(error.to_string()))?;
+    event.conversation_id = context.conversation_id.map(ToOwned::to_owned);
+    event.source.thread_id = event.conversation_id.clone();
+    event
+        .validate_limits()
+        .map_err(|error| CliError::Hermes(error.to_string()))?;
+    Ok(Some(event))
 }
 
 fn materialize_poll_event_attachments(
@@ -2812,6 +2828,7 @@ mod tests {
                 message_id: "message-1",
                 sender_account_id: "alice",
                 sender_device_id: "ios",
+                conversation_id: None,
             },
             &plaintext,
         )
@@ -2835,6 +2852,7 @@ mod tests {
                 message_id: "message-2",
                 sender_account_id: "alice",
                 sender_device_id: "ios",
+                conversation_id: None,
             },
             &plaintext,
         )
@@ -2842,6 +2860,48 @@ mod tests {
         .expect("typed plain-text chat is still bridge-visible");
         assert_eq!(event.text, "plain hello");
         assert_eq!(event.message_type, HermesMessageTypeV1::Text);
+    }
+
+    #[test]
+    fn wrapped_chat_event_conversation_id_reaches_poll_event() {
+        let home = tempfile::tempdir().unwrap();
+        let hermes_payload = HermesMessagePayloadV1 {
+            payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
+            conversation_id: None,
+            text: "topic hello".to_owned(),
+            kind: finitechat_hermes::HermesSendKindV1::Message,
+            status: HermesMessageStatusV1::Complete,
+            edit_of: None,
+            attachments: Vec::new(),
+            reply_to_message_id: None,
+            sender_name: None,
+            metadata: BTreeMap::new(),
+        }
+        .encode()
+        .unwrap();
+        let wrapped = DecryptedApplicationEventV1 {
+            kind: DurableAppEventKind::ChatMessage,
+            conversation_id: Some("topic-main".to_owned()),
+            payload: hermes_payload,
+        };
+        let plaintext = serde_json::to_vec(&wrapped).unwrap();
+        let event = hermes_poll_event_from_application_plaintext(
+            HermesPollEventContext {
+                home_dir: home.path(),
+                room_id: "room-main",
+                seq: 3,
+                message_id: "message-3",
+                sender_account_id: "alice",
+                sender_device_id: "electron",
+                conversation_id: None,
+            },
+            &plaintext,
+        )
+        .unwrap()
+        .expect("topic chat is bridge-visible");
+        assert_eq!(event.text, "topic hello");
+        assert_eq!(event.conversation_id.as_deref(), Some("topic-main"));
+        assert_eq!(event.source.thread_id.as_deref(), Some("topic-main"));
     }
 
     #[test]

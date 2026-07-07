@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -27,22 +27,23 @@ use finitechat_client::{
 };
 use finitechat_hermes::{HermesAttachmentKindV1, HermesAttachmentV1, HermesMessagePayloadV1};
 use finitechat_http::{
-    GetEphemeralActivitiesRequest, PushPlatform, SyncHintEvent, SyncStreamRequest, SyncWaitInvite,
-    SyncWaitRoom,
+    FINITECHAT_SERVER_CONTRACT_VERSION, GetEphemeralActivitiesRequest, HealthResponse,
+    PushPlatform, SyncHintEvent, SyncStreamRequest, SyncWaitInvite, SyncWaitRoom,
 };
 use finitechat_mls::{NOSTR_SECRET_KEY_BYTES, NostrSecretKey};
 use finitechat_proto::{
     AppendEphemeralActivityRequest, ApplicationDeliveryPolicy, AttachmentBlobMetadataV1,
     AttachmentBlobReferenceV1, ChatReactionV1, ChatReceiptStateV1, ChatReceiptV1,
-    ClaimKeyPackageResult, CreateRoomRequest, DecryptedApplicationEventV1,
-    DecryptedEphemeralActivityV1, DeviceRef, DurableAppEventKind, EphemeralActivityAccepted,
-    EphemeralActivityActionV1, EphemeralActivityIngressContext, EphemeralActivityProjection,
-    EphemeralActivityProjectionEntry, EventAccepted, FINITECHAT_ACTIVITY_KIND_THINKING,
-    FINITECHAT_ACTIVITY_KIND_TYPING, FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1,
-    INVITE_URL_PREFIX, InviteCodeV1, ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES,
-    MAX_OBJECT_ID_BYTES, MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1,
-    nprofile_decode, npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count,
-    validate_string_bytes,
+    ClaimKeyPackageResult, ConversationMetadataV1, ConversationProjection,
+    ConversationProjectionEntry, ConversationProjectionEventContext, ConversationSegmentStartV1,
+    CreateRoomRequest, DecryptedApplicationEventV1, DecryptedEphemeralActivityV1, DeviceRef,
+    DurableAppEventKind, EphemeralActivityAccepted, EphemeralActivityActionV1,
+    EphemeralActivityIngressContext, EphemeralActivityProjection, EphemeralActivityProjectionEntry,
+    EventAccepted, FINITECHAT_ACTIVITY_KIND_THINKING, FINITECHAT_ACTIVITY_KIND_TYPING,
+    FINITECHAT_ACTIVITY_KIND_WORKING, GenericActivityKindV1, INVITE_URL_PREFIX, InviteCodeV1,
+    ListAccountRoomsRequest, MAX_INVITE_DISPLAY_NAME_BYTES, MAX_OBJECT_ID_BYTES,
+    MAX_STAGED_WELCOMES_PER_COMMIT, RoomProtocol, RuntimeActivityClearV1, nprofile_decode,
+    npub_decode, npub_encode, nsec_decode, nsec_encode, validate_item_count, validate_string_bytes,
 };
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,7 @@ const DEFAULT_INVITE_TTL_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_INVITE_MAX_JOINS: u32 = 32;
 const DEFAULT_APP_UPDATE_WAIT_MILLIS: u64 = 30_000;
 const DEFAULT_EPHEMERAL_ACTIVITY_EXPIRY_MILLIS: u64 = 30_000;
+const SERVER_CONTRACT_HEALTH_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_PROFILE_CACHE_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_PROFILE_DISPLAY_NAME_BYTES: u32 = 128;
 const MAX_PROFILE_ABOUT_BYTES: u32 = 4 * 1024;
@@ -398,6 +400,28 @@ pub struct AppRoomSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppTopicSegmentSummary {
+    pub segment_id: String,
+    pub started_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
+pub struct AppTopicSummary {
+    pub room_id: String,
+    pub topic_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub last_message_preview: String,
+    pub unread_count: u32,
+    pub message_count: u32,
+    pub created_seq: u64,
+    pub updated_seq: u64,
+    pub archived: bool,
+    pub active_segment_id: Option<String>,
+    pub segments: Vec<AppTopicSegmentSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
 pub struct AppRoomDetailsState {
     pub room_id: String,
     pub display_name: String,
@@ -523,6 +547,8 @@ pub struct AppState {
     pub identity: Identity,
     pub rooms: Vec<AppRoomSummary>,
     pub selected_room_id: Option<String>,
+    pub topics: Vec<AppTopicSummary>,
+    pub selected_topic_id: Option<String>,
     pub active_invite: Option<AppInviteState>,
     pub active_profile_id: Option<String>,
     pub status: String,
@@ -543,8 +569,21 @@ pub enum AppAction {
     OpenRoom {
         room_id: String,
     },
+    OpenTopic {
+        room_id: String,
+        topic_id: String,
+    },
     CreateRoom {
         display_name: String,
+    },
+    CreateTopic {
+        room_id: String,
+        title: String,
+    },
+    StartTopicSegment {
+        room_id: String,
+        topic_id: String,
+        reason: Option<String>,
     },
     SaveProfile {
         display_name: String,
@@ -583,6 +622,11 @@ pub enum AppAction {
     },
     SendMessage {
         room_id: String,
+        text: String,
+    },
+    SendTopicMessage {
+        room_id: String,
+        topic_id: String,
         text: String,
     },
     SendReply {
@@ -809,6 +853,7 @@ struct CoreSyncProjection {
 #[derive(Clone, Debug, Default)]
 struct ChatProjectionState {
     messages: BTreeMap<(String, String), ChatMessage>,
+    conversations: ConversationProjection,
     reaction_senders: BTreeSet<(String, String, String, String)>,
     poll_votes: BTreeMap<(String, String, String), String>,
     delivered_through: BTreeMap<(String, String), u64>,
@@ -1639,6 +1684,8 @@ impl AppRuntimeState {
                 rev: 0,
                 identity,
                 selected_room_id,
+                topics: Vec::new(),
+                selected_topic_id: None,
                 rooms,
                 active_invite: None,
                 active_profile_id: None,
@@ -1665,7 +1712,7 @@ impl AppRuntimeState {
             revoked_devices,
             downloading_attachments: BTreeSet::new(),
         };
-        state.sync_selected_room_messages();
+        state.sync_chat_projection();
         for room_id in repaired_room_ids {
             state.persist_room_projection(&room_id)?;
         }
@@ -1748,7 +1795,14 @@ impl AppRuntimeState {
             AppAction::StartRuntime => self.start_runtime()?,
             AppAction::StopRuntime => self.app.status = "stopped".to_owned(),
             AppAction::OpenRoom { room_id } => self.open_room(room_id)?,
+            AppAction::OpenTopic { room_id, topic_id } => self.open_topic(room_id, topic_id)?,
             AppAction::CreateRoom { display_name } => self.create_room(display_name)?,
+            AppAction::CreateTopic { room_id, title } => self.create_topic(room_id, title)?,
+            AppAction::StartTopicSegment {
+                room_id,
+                topic_id,
+                reason,
+            } => self.start_topic_segment(room_id, topic_id, reason)?,
             AppAction::SaveProfile {
                 display_name,
                 about,
@@ -1785,6 +1839,11 @@ impl AppRuntimeState {
                 self.submit_invite_join(pending_room_id)?
             }
             AppAction::SendMessage { room_id, text } => self.send_message(room_id, text)?,
+            AppAction::SendTopicMessage {
+                room_id,
+                topic_id,
+                text,
+            } => self.send_topic_message(room_id, topic_id, text)?,
             AppAction::SendReply {
                 room_id,
                 text,
@@ -2054,11 +2113,7 @@ impl AppRuntimeState {
 
         let mut joined_account_ids = Vec::new();
         for invite_url in invite_urls {
-            let accepted = match self.core.accept_invite_joins(&invite_url) {
-                Ok(accepted) => accepted,
-                Err(FiniteChatCoreError::Delivery { .. }) => continue,
-                Err(error) => return Err(error),
-            };
+            let accepted = self.core.accept_invite_joins(&invite_url)?;
             joined_account_ids.extend(
                 accepted
                     .accepted
@@ -2105,6 +2160,7 @@ impl AppRuntimeState {
 
     fn open_room(&mut self, room_id: String) -> Result<(), FiniteChatCoreError> {
         self.app.selected_room_id = Some(room_id.clone());
+        self.app.selected_topic_id = None;
         self.loaded_message_counts
             .entry(room_id.clone())
             .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
@@ -2117,6 +2173,33 @@ impl AppRuntimeState {
                 LOCAL_ROOM_UNAVAILABLE_STATUS,
             );
         }
+        self.persist_app_state()?;
+        self.sync_selected_room_messages();
+        self.drain_undelivered_outbox(MAX_OUTBOX_DRAIN_PER_TICK)?;
+        Ok(())
+    }
+
+    fn open_topic(&mut self, room_id: String, topic_id: String) -> Result<(), FiniteChatCoreError> {
+        if self.room(&room_id).is_none() {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not available"),
+            });
+        }
+        if !self
+            .app
+            .topics
+            .iter()
+            .any(|topic| topic.room_id == room_id && topic.topic_id == topic_id)
+        {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("topic '{topic_id}' is not available in room '{room_id}'"),
+            });
+        }
+        self.app.selected_room_id = Some(room_id.clone());
+        self.app.selected_topic_id = Some(topic_id);
+        self.loaded_message_counts
+            .entry(room_id.clone())
+            .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
         self.persist_app_state()?;
         self.sync_selected_room_messages();
         self.drain_undelivered_outbox(MAX_OUTBOX_DRAIN_PER_TICK)?;
@@ -2149,9 +2232,81 @@ impl AppRuntimeState {
         );
         self.persist_room_projection(&room_id)?;
         self.app.selected_room_id = Some(room_id);
+        self.app.selected_topic_id = None;
         self.persist_app_state()?;
         self.sync_selected_room_messages();
         self.app.status = "room created".to_owned();
+        Ok(())
+    }
+
+    fn create_topic(&mut self, room_id: String, title: String) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to create topics"),
+            });
+        }
+        let topic_id = self.core.generate_object_id("topic")?;
+        let trimmed = title.trim();
+        let metadata = ConversationMetadataV1 {
+            title: (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+            description: None,
+            external_topic: None,
+            skill_binding: None,
+        };
+        metadata.validate_limits().map_err(client_error)?;
+        let payload = serde_json::to_vec(&metadata).map_err(client_error)?;
+        let event = self.core.send_application_event(
+            &room_id,
+            DurableAppEventKind::ConversationCreate,
+            Some(topic_id.clone()),
+            &payload,
+            "topic",
+        )?;
+        self.apply_projection_events(vec![event]);
+        self.app.selected_room_id = Some(room_id.clone());
+        self.app.selected_topic_id = Some(topic_id);
+        self.loaded_message_counts
+            .entry(room_id)
+            .or_insert(DEFAULT_TRANSCRIPT_WINDOW);
+        self.persist_app_state()?;
+        self.sync_selected_room_messages();
+        self.app.status = "topic created".to_owned();
+        Ok(())
+    }
+
+    fn start_topic_segment(
+        &mut self,
+        room_id: String,
+        topic_id: String,
+        reason: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to start topic segments"),
+            });
+        }
+        self.validate_topic(&room_id, &topic_id)?;
+        let reason = reason
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let segment = ConversationSegmentStartV1 {
+            segment_id: self.core.generate_object_id("segment")?,
+            reason,
+        };
+        segment.validate_limits().map_err(client_error)?;
+        let payload = serde_json::to_vec(&segment).map_err(client_error)?;
+        let event = self.core.send_application_event(
+            &room_id,
+            DurableAppEventKind::ConversationSegmentStart,
+            Some(topic_id.clone()),
+            &payload,
+            "segment",
+        )?;
+        self.apply_projection_events(vec![event]);
+        self.app.selected_room_id = Some(room_id);
+        self.app.selected_topic_id = Some(topic_id);
+        self.sync_selected_room_messages();
+        self.app.status = "topic segment started".to_owned();
         Ok(())
     }
 
@@ -2899,6 +3054,16 @@ impl AppRuntimeState {
         self.send_message_with_reply(room_id, text, None)
     }
 
+    fn send_topic_message(
+        &mut self,
+        room_id: String,
+        topic_id: String,
+        text: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        self.validate_topic(&room_id, &topic_id)?;
+        self.send_message_with_conversation(room_id, Some(topic_id), text, None)
+    }
+
     fn send_reply(
         &mut self,
         room_id: String,
@@ -2927,15 +3092,41 @@ impl AppRuntimeState {
         }
 
         let reply_to_message_id = self.normalize_reply_target(&room_id, reply_to_message_id)?;
+        self.send_message_with_conversation(room_id, None, trimmed.to_owned(), reply_to_message_id)
+    }
+
+    fn send_message_with_conversation(
+        &mut self,
+        room_id: String,
+        conversation_id: Option<String>,
+        text: String,
+        reply_to_message_id: Option<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to send"),
+            });
+        }
+
         let chat_payload = encode_text_message_payload(trimmed, reply_to_message_id.as_deref())?;
-        let app_event_plaintext =
-            encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
+        let app_event_plaintext = encode_application_event(
+            DurableAppEventKind::ChatMessage,
+            conversation_id.clone(),
+            &chat_payload,
+        )?;
         self.send_chat_message_with_local_outbox(
             room_id,
             app_event_plaintext,
             trimmed.to_owned(),
             "sent",
-        )
+        )?;
+        self.app.selected_topic_id = conversation_id;
+        self.sync_selected_room_messages();
+        Ok(())
     }
 
     fn send_encoded_chat_message(
@@ -3262,7 +3453,12 @@ impl AppRuntimeState {
 
         let page_size = normalized_transcript_page_size(limit);
         let current_count = self.loaded_message_count(&room_id);
-        let total_count = self.chat_projection.room_message_count(&room_id);
+        let total_count = self
+            .app
+            .selected_topic_id
+            .as_deref()
+            .map(|topic_id| self.chat_projection.topic_message_count(&room_id, topic_id))
+            .unwrap_or_else(|| self.chat_projection.room_message_count(&room_id));
         let next_count = current_count
             .saturating_add(page_size)
             .min(total_count)
@@ -3553,7 +3749,6 @@ impl AppRuntimeState {
             room.user_status_text = app_room_user_status_text(room);
         }
         self.persist_room_projection(room_id)?;
-        self.core.sync()?;
         self.core.finalize_invite(&pending.invite_url)?;
         self.pending_invites.remove(room_id);
         self.upsert_room(
@@ -3940,6 +4135,8 @@ impl AppRuntimeState {
     fn sync_chat_projection(&mut self) {
         let messages = self.chat_projection.messages();
         apply_room_message_projection(&mut self.app.rooms, &messages, &self.local_read_seq);
+        self.app.topics = self.chat_projection.topics(&self.local_read_seq);
+        self.repair_selected_topic();
         self.sync_selected_room_messages();
     }
 
@@ -4001,9 +4198,13 @@ impl AppRuntimeState {
             return;
         };
         let count = self.loaded_message_count(&room_id);
-        let mut messages = self
-            .chat_projection
-            .messages_for_room_window(&room_id, count);
+        let mut messages = if let Some(topic_id) = self.app.selected_topic_id.as_deref() {
+            self.chat_projection
+                .messages_for_topic_window(&room_id, topic_id, count)
+        } else {
+            self.chat_projection
+                .messages_for_room_window(&room_id, count)
+        };
         self.core.apply_attachment_cache_paths(&mut messages);
         self.apply_attachment_download_progress(&mut messages);
         self.app.messages = messages;
@@ -4013,7 +4214,12 @@ impl AppRuntimeState {
     }
 
     fn sync_selected_room_media_gallery(&mut self, room_id: &str) {
-        let mut messages = self.chat_projection.visual_media_messages_for_room(room_id);
+        let mut messages = if let Some(topic_id) = self.app.selected_topic_id.as_deref() {
+            self.chat_projection
+                .visual_media_messages_for_topic(room_id, topic_id)
+        } else {
+            self.chat_projection.visual_media_messages_for_room(room_id)
+        };
         self.core.apply_attachment_cache_paths(&mut messages);
         self.apply_attachment_download_progress(&mut messages);
         self.app.media_gallery = Some(ChatProjectionState::media_gallery_from_messages(
@@ -4086,12 +4292,34 @@ impl AppRuntimeState {
     fn sync_transcript_load_state(&mut self) {
         let selected_room_id = self.app.selected_room_id.clone();
         let selected_can_load_older = selected_room_id.as_ref().is_some_and(|room_id| {
-            self.chat_projection.room_message_count(room_id) > self.loaded_message_count(room_id)
+            let total_count = self
+                .app
+                .selected_topic_id
+                .as_deref()
+                .map(|topic_id| self.chat_projection.topic_message_count(room_id, topic_id))
+                .unwrap_or_else(|| self.chat_projection.room_message_count(room_id));
+            total_count > self.loaded_message_count(room_id)
         });
         for room in &mut self.app.rooms {
             room.can_load_older = selected_room_id.as_deref() == Some(room.room_id.as_str())
                 && selected_can_load_older;
         }
+    }
+
+    fn repair_selected_topic(&mut self) {
+        let Some(room_id) = self.app.selected_room_id.as_deref() else {
+            self.app.selected_topic_id = None;
+            return;
+        };
+        if self.app.selected_topic_id.as_ref().is_some_and(|topic_id| {
+            self.app
+                .topics
+                .iter()
+                .any(|topic| topic.room_id == room_id && topic.topic_id == *topic_id)
+        }) {
+            return;
+        }
+        self.app.selected_topic_id = None;
     }
 
     fn refresh_ephemeral_activity_for_connected_rooms(
@@ -4485,6 +4713,21 @@ impl AppRuntimeState {
             .rooms
             .iter_mut()
             .find(|room| room.room_id == room_id)
+    }
+
+    fn validate_topic(&self, room_id: &str, topic_id: &str) -> Result<(), FiniteChatCoreError> {
+        if self
+            .app
+            .topics
+            .iter()
+            .any(|topic| topic.room_id == room_id && topic.topic_id == topic_id && !topic.archived)
+        {
+            Ok(())
+        } else {
+            Err(FiniteChatCoreError::Client {
+                reason: format!("topic '{topic_id}' is not available in room '{room_id}'"),
+            })
+        }
     }
 
     fn normalize_reply_target(
@@ -5092,6 +5335,7 @@ impl CoreState {
         }
         let app_room = app_room_metadata(room_id, display_name.as_deref());
         let mls_group_id = self.generate_object_id("mls")?;
+        verify_server_contract(&self.server_url)?;
         let mut delivery = self.home_delivery();
         delivery
             .bootstrap_account_room(&CreateRoomRequest {
@@ -5120,6 +5364,7 @@ impl CoreState {
         max_joins: u32,
         ttl_ms: u64,
     ) -> Result<InviteResult, FiniteChatCoreError> {
+        verify_server_contract(&self.server_url)?;
         let mut delivery = self.home_delivery();
         let code = create_room_invite(
             &self.device,
@@ -5145,6 +5390,7 @@ impl CoreState {
         display_name: Option<String>,
     ) -> Result<JoinRequestResult, FiniteChatCoreError> {
         let code = parse_invite(invite_url)?;
+        verify_server_contract(&code.server_url)?;
         let now_ms = self.now_millis()?;
         let mut delivery = delivery_for(&code.server_url);
         let handle = submit_invite_join_request(
@@ -5167,6 +5413,7 @@ impl CoreState {
         invite_url: &str,
     ) -> Result<AcceptInvitesResult, FiniteChatCoreError> {
         let code = parse_invite(invite_url)?;
+        verify_server_contract(&code.server_url)?;
         let now_ms = self.now_millis()?;
         let mut delivery = delivery_for(&code.server_url);
         let report = accept_pending_invite_joins(
@@ -5203,6 +5450,7 @@ impl CoreState {
 
     fn finalize_invite(&mut self, invite_url: &str) -> Result<(), FiniteChatCoreError> {
         let code = parse_invite(invite_url)?;
+        verify_server_contract(&code.server_url)?;
         let options = RuntimeSyncOptions {
             key_package_target_available: DEFAULT_KEY_PACKAGE_TARGET_AVAILABLE,
             max_sync_pages_per_room: DEFAULT_MAX_SYNC_PAGES_PER_ROOM,
@@ -5719,6 +5967,61 @@ impl CoreState {
             .map_err(delivery_error)
     }
 
+    fn send_application_event(
+        &mut self,
+        room_id: &str,
+        kind: DurableAppEventKind,
+        conversation_id: Option<String>,
+        payload: &[u8],
+        idempotency_prefix: &str,
+    ) -> Result<StoredAppEvent, FiniteChatCoreError> {
+        let app_event_plaintext = encode_application_event(kind.clone(), conversation_id, payload)?;
+        let idempotency_key = self
+            .device
+            .generate_object_id(idempotency_prefix)
+            .map_err(client_error)?;
+        let timestamp_unix_seconds = self.now_unix_seconds()?;
+        let request = self
+            .device
+            .create_application_request_at(
+                room_id,
+                &app_event_plaintext,
+                idempotency_key,
+                timestamp_unix_seconds,
+            )
+            .map_err(|error| send_error(room_id, error))?;
+        let sender = request.sender.clone();
+        self.store
+            .save_device_state(&self.device)
+            .map_err(store_error)?;
+
+        let room_server_url = self
+            .device
+            .room_server_url(room_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.server_url.clone());
+        let mut delivery = delivery_for(&room_server_url);
+        let accepted = delivery
+            .append_event(&request, kind.delivery_policy())
+            .map_err(delivery_error)?;
+        let event = StoredAppEvent {
+            room_id: room_id.to_owned(),
+            seq: accepted.seq,
+            message_id: accepted.message_id,
+            sender,
+            plaintext: app_event_plaintext,
+            timestamp_unix_seconds: request.timestamp_unix_seconds,
+        };
+        self.store
+            .save_app_events(
+                self.device.device_ref(),
+                std::slice::from_ref(&event),
+                MAX_APP_MESSAGES_U32,
+            )
+            .map_err(store_error)?;
+        Ok(event)
+    }
+
     fn send_reaction(
         &mut self,
         room_id: &str,
@@ -5919,16 +6222,20 @@ impl CoreState {
         };
         let mut projection = CoreSyncProjection::default();
 
+        let owner = self.device.device_ref().clone();
+        let mut first_error = None;
         let mut home_delivery = self.home_delivery();
-        let home_report = run_runtime_sync_tick(
+        match run_runtime_sync_tick(
             &mut self.store,
             &mut self.device,
             &mut home_delivery,
             &options,
-        )
-        .map_err(runtime_error)?;
-        let owner = self.device.device_ref().clone();
-        projection.merge_report(home_report, &owner);
+        ) {
+            Ok(report) => projection.merge_report(report, &owner),
+            Err(error) => {
+                first_error.get_or_insert_with(|| runtime_error(error));
+            }
+        };
 
         let room_servers = self
             .device
@@ -5938,15 +6245,24 @@ impl CoreState {
             .collect::<BTreeSet<_>>();
         for server_url in room_servers {
             let mut delivery = delivery_for(&server_url);
-            let report = run_room_server_sync_tick(
+            match run_room_server_sync_tick(
                 &mut self.store,
                 &mut self.device,
                 &mut delivery,
                 &options,
                 &server_url,
-            )
-            .map_err(runtime_error)?;
-            projection.merge_report(report, &owner);
+            ) {
+                Ok(report) => projection.merge_report(report, &owner),
+                Err(error) => {
+                    first_error.get_or_insert_with(|| runtime_error(error));
+                }
+            }
+        }
+
+        if let Some(error) = first_error
+            && !projection.has_progress()
+        {
+            return Err(error);
         }
 
         Ok(projection)
@@ -5980,6 +6296,15 @@ impl CoreState {
 }
 
 impl CoreSyncProjection {
+    fn has_progress(&self) -> bool {
+        self.result.uploaded_key_packages > 0
+            || self.result.claimed_welcomes > 0
+            || self.result.activated_welcome_acks_sent > 0
+            || self.result.sync_pages > 0
+            || !self.result.messages.is_empty()
+            || !self.events.is_empty()
+    }
+
     fn merge_report(&mut self, report: finitechat_client::RuntimeSyncReport, owner: &DeviceRef) {
         self.result.uploaded_key_packages = self
             .result
@@ -6301,6 +6626,21 @@ fn decoded_typed_application_event(event: DecryptedApplicationEventV1) -> Decode
         | DurableAppEventKind::StreamStart
         | DurableAppEventKind::StreamFinish
         | DurableAppEventKind::Namespaced { .. } => DecodedAppEvent::Ignored,
+    }
+}
+
+fn conversation_id_from_decoded_event(event: &DecodedAppEvent) -> Option<String> {
+    match event {
+        DecodedAppEvent::ChatMessage {
+            conversation_id,
+            payload,
+        } => conversation_id
+            .clone()
+            .or_else(|| chat_projection_payload(payload).conversation_id),
+        DecodedAppEvent::ChatReaction(_)
+        | DecodedAppEvent::ChatReceipt(_)
+        | DecodedAppEvent::PollVote(_)
+        | DecodedAppEvent::Ignored => None,
     }
 }
 
@@ -6828,7 +7168,23 @@ impl ChatProjectionState {
     }
 
     fn apply_event(&mut self, event: StoredAppEvent, owner: &DeviceRef) {
-        match decode_application_event(&event.plaintext) {
+        let decoded = decode_application_event(&event.plaintext);
+        let decoded_conversation_id = conversation_id_from_decoded_event(&decoded);
+        if let Ok(app_event) =
+            serde_json::from_slice::<DecryptedApplicationEventV1>(&event.plaintext)
+        {
+            let conversation_id = app_event
+                .conversation_id
+                .as_deref()
+                .or(decoded_conversation_id.as_deref());
+            let context = ConversationProjectionEventContext {
+                room_id: &event.room_id,
+                accepted_seq: event.seq,
+                conversation_id,
+            };
+            let _ = self.conversations.apply_event(context, &app_event);
+        }
+        match decoded {
             DecodedAppEvent::ChatMessage { .. } => {
                 if let Some(message) = project_chat_message(
                     event.room_id,
@@ -6856,6 +7212,44 @@ impl ChatProjectionState {
         self.trim_to_limit();
     }
 
+    fn topics(&self, local_read_seq: &BTreeMap<String, u64>) -> Vec<AppTopicSummary> {
+        let mut messages_by_topic = BTreeMap::<(String, String), Vec<&ChatMessage>>::new();
+        for message in self.messages.values() {
+            let Some(topic_id) = message.conversation_id.as_ref() else {
+                continue;
+            };
+            messages_by_topic
+                .entry((message.room_id.clone(), topic_id.clone()))
+                .or_default()
+                .push(message);
+        }
+
+        let mut topics = self
+            .conversations
+            .entries()
+            .map(|entry| {
+                let key = (entry.room_id.clone(), entry.conversation_id.clone());
+                topic_summary_from_projection(
+                    entry,
+                    messages_by_topic.remove(&key).unwrap_or_default(),
+                    local_read_seq,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for ((room_id, topic_id), messages) in messages_by_topic {
+            topics.push(topic_summary_from_messages(
+                room_id,
+                topic_id,
+                messages,
+                local_read_seq,
+            ));
+        }
+
+        topics.sort_by(topic_sort);
+        topics
+    }
+
     fn messages(&self) -> Vec<ChatMessage> {
         let mut messages = self.messages.values().cloned().collect::<Vec<_>>();
         messages.sort_by(message_sort);
@@ -6876,11 +7270,48 @@ impl ChatProjectionState {
         messages
     }
 
+    fn messages_for_topic_window(
+        &self,
+        room_id: &str,
+        topic_id: &str,
+        limit: usize,
+    ) -> Vec<ChatMessage> {
+        let mut messages = self
+            .messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| message.conversation_id.as_deref() == Some(topic_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by(message_sort);
+        if messages.len() > limit {
+            messages.drain(0..messages.len() - limit);
+        }
+        messages
+    }
+
     fn visual_media_messages_for_room(&self, room_id: &str) -> Vec<ChatMessage> {
         let mut messages = self
             .messages
             .values()
             .filter(|message| message.room_id == room_id)
+            .filter(|message| {
+                message.media.iter().any(|attachment| {
+                    matches!(attachment.kind, ChatMediaKind::Image | ChatMediaKind::Video)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by(message_sort);
+        messages
+    }
+
+    fn visual_media_messages_for_topic(&self, room_id: &str, topic_id: &str) -> Vec<ChatMessage> {
+        let mut messages = self
+            .messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| message.conversation_id.as_deref() == Some(topic_id))
             .filter(|message| {
                 message.media.iter().any(|attachment| {
                     matches!(attachment.kind, ChatMediaKind::Image | ChatMediaKind::Video)
@@ -6929,6 +7360,14 @@ impl ChatProjectionState {
             .count()
     }
 
+    fn topic_message_count(&self, room_id: &str, topic_id: &str) -> usize {
+        self.messages
+            .values()
+            .filter(|message| message.room_id == room_id)
+            .filter(|message| message.conversation_id.as_deref() == Some(topic_id))
+            .count()
+    }
+
     fn message_exists(&self, room_id: &str, message_id: &str) -> bool {
         self.messages
             .contains_key(&(room_id.to_owned(), message_id.to_owned()))
@@ -6940,6 +7379,7 @@ impl ChatProjectionState {
     }
 
     fn insert_message(&mut self, mut message: ChatMessage, owner: &DeviceRef) {
+        self.apply_conversation_projection_from_message(&message);
         message.reactions = reaction_summaries_for_message(&message, &self.reaction_senders, owner);
         message.read_receipt =
             receipt_summary_for_message(&message, &self.delivered_through, &self.read_through);
@@ -6953,6 +7393,25 @@ impl ChatProjectionState {
             ));
         }
         self.messages.insert(message_key(&message), message);
+    }
+
+    fn apply_conversation_projection_from_message(&mut self, message: &ChatMessage) {
+        let Some(conversation_id) = message.conversation_id.as_deref() else {
+            return;
+        };
+        let Ok(app_event) = serde_json::from_slice::<DecryptedApplicationEventV1>(&message.payload)
+        else {
+            return;
+        };
+        let context = ConversationProjectionEventContext {
+            room_id: &message.room_id,
+            accepted_seq: message.seq,
+            conversation_id: app_event
+                .conversation_id
+                .as_deref()
+                .or(Some(conversation_id)),
+        };
+        let _ = self.conversations.apply_event(context, &app_event);
     }
 
     fn latest_peer_message_needing_read_receipt(
@@ -7547,6 +8006,126 @@ fn message_preview(message: &ChatMessage) -> String {
     }
 }
 
+fn topic_summary_from_projection(
+    entry: &ConversationProjectionEntry,
+    messages: Vec<&ChatMessage>,
+    local_read_seq: &BTreeMap<String, u64>,
+) -> AppTopicSummary {
+    let metadata = entry.metadata.as_ref();
+    let last_message_preview = latest_message_preview(&messages);
+    let title = metadata
+        .and_then(|metadata| metadata.title.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            metadata
+                .and_then(|metadata| metadata.external_topic.as_ref())
+                .and_then(|external| external.topic_name.as_deref())
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| topic_fallback_title(&entry.conversation_id, &last_message_preview));
+    let latest_seq = messages
+        .iter()
+        .map(|message| message.seq)
+        .max()
+        .unwrap_or(entry.updated_seq);
+    AppTopicSummary {
+        room_id: entry.room_id.clone(),
+        topic_id: entry.conversation_id.clone(),
+        title,
+        description: metadata.and_then(|metadata| metadata.description.clone()),
+        last_message_preview,
+        unread_count: topic_unread_count(&entry.room_id, &messages, local_read_seq),
+        message_count: messages.len().min(u32::MAX as usize) as u32,
+        created_seq: entry.created_seq,
+        updated_seq: entry.updated_seq.max(latest_seq),
+        archived: entry.archived,
+        active_segment_id: entry.active_segment_id.clone(),
+        segments: entry
+            .segments
+            .iter()
+            .map(|segment| AppTopicSegmentSummary {
+                segment_id: segment.segment_id.clone(),
+                started_seq: segment.started_seq,
+            })
+            .collect(),
+    }
+}
+
+fn topic_summary_from_messages(
+    room_id: String,
+    topic_id: String,
+    messages: Vec<&ChatMessage>,
+    local_read_seq: &BTreeMap<String, u64>,
+) -> AppTopicSummary {
+    let last_message_preview = latest_message_preview(&messages);
+    let created_seq = messages
+        .iter()
+        .map(|message| message.seq)
+        .min()
+        .unwrap_or_default();
+    let updated_seq = messages
+        .iter()
+        .map(|message| message.seq)
+        .max()
+        .unwrap_or_default();
+    AppTopicSummary {
+        room_id: room_id.clone(),
+        topic_id: topic_id.clone(),
+        title: topic_fallback_title(&topic_id, &last_message_preview),
+        description: None,
+        last_message_preview,
+        unread_count: topic_unread_count(&room_id, &messages, local_read_seq),
+        message_count: messages.len().min(u32::MAX as usize) as u32,
+        created_seq,
+        updated_seq,
+        archived: false,
+        active_segment_id: None,
+        segments: Vec::new(),
+    }
+}
+
+fn latest_message_preview(messages: &[&ChatMessage]) -> String {
+    messages
+        .iter()
+        .max_by(|left, right| message_sort(left, right))
+        .map(|message| message_preview(message))
+        .unwrap_or_default()
+}
+
+fn topic_fallback_title(topic_id: &str, last_message_preview: &str) -> String {
+    let preview = last_message_preview.trim();
+    if !preview.is_empty() {
+        return preview.chars().take(48).collect();
+    }
+    topic_id.to_owned()
+}
+
+fn topic_unread_count(
+    room_id: &str,
+    messages: &[&ChatMessage],
+    local_read_seq: &BTreeMap<String, u64>,
+) -> u32 {
+    let read_seq = local_read_seq.get(room_id).copied().unwrap_or_default();
+    messages
+        .iter()
+        .filter(|message| !message.is_mine && message.seq > read_seq)
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn topic_sort(left: &AppTopicSummary, right: &AppTopicSummary) -> std::cmp::Ordering {
+    right
+        .updated_seq
+        .cmp(&left.updated_seq)
+        .then_with(|| left.room_id.cmp(&right.room_id))
+        .then_with(|| left.title.cmp(&right.title))
+        .then_with(|| left.topic_id.cmp(&right.topic_id))
+}
+
 fn sort_app_rooms(rooms: &mut [AppRoomSummary]) {
     rooms.sort_by(|left, right| {
         left.display_name
@@ -7772,6 +8351,71 @@ fn delivery_for(server_url: &str) -> HttpRuntimeDelivery<ReqwestHttpRuntimeTrans
     HttpRuntimeDelivery::new(ReqwestHttpRuntimeTransport::new(server_url))
 }
 
+fn verify_server_contract(server_url: &str) -> Result<(), FiniteChatCoreError> {
+    let health_url = format!("{}/health", server_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(SERVER_CONTRACT_HEALTH_TIMEOUT_SECS))
+        .build()
+        .map_err(delivery_error)?;
+    let response = client.get(&health_url).send().map_err(delivery_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(FiniteChatCoreError::ServerRejected {
+            reason: format!(
+                "server contract check failed at {health_url}: server returned {status}: {body}"
+            ),
+        });
+    }
+    let health = response.json::<HealthResponse>().map_err(delivery_error)?;
+    validate_server_contract_health(server_url, &health)
+}
+
+fn validate_server_contract_health(
+    server_url: &str,
+    health: &HealthResponse,
+) -> Result<(), FiniteChatCoreError> {
+    if health.status != "ok" {
+        return Err(FiniteChatCoreError::ServerRejected {
+            reason: format!(
+                "server {server_url} reported health status '{}'; expected ok",
+                health.status
+            ),
+        });
+    }
+    match health.server_contract_version {
+        Some(actual) if actual >= FINITECHAT_SERVER_CONTRACT_VERSION => Ok(()),
+        Some(actual) => Err(FiniteChatCoreError::ServerRejected {
+            reason: format!(
+                "server {server_url} reports finitechat {} contract {actual}; this client requires server contract at least {}. Deploy a compatible finitechat-server before joining or admitting invites.",
+                server_build_label(health),
+                FINITECHAT_SERVER_CONTRACT_VERSION
+            ),
+        }),
+        None => Err(FiniteChatCoreError::ServerRejected {
+            reason: format!(
+                "server {server_url} reports finitechat {} without a server_contract_version; this client expects contract {}. Deploy a compatible finitechat-server before joining or admitting invites.",
+                server_build_label(health),
+                FINITECHAT_SERVER_CONTRACT_VERSION
+            ),
+        }),
+    }
+}
+
+fn server_build_label(health: &HealthResponse) -> String {
+    let version = health
+        .server_version
+        .as_deref()
+        .unwrap_or("unknown-version");
+    let commit = health.source_commit.as_deref().unwrap_or("unknown-commit");
+    let dirty = match health.source_dirty {
+        Some(true) => " dirty",
+        Some(false) => "",
+        None => " unknown-dirty",
+    };
+    format!("{version}@{commit}{dirty}")
+}
+
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7884,6 +8528,55 @@ mod tests {
     use finitechat_server::{HttpServerState, http_router};
 
     const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn server_contract_check_rejects_old_health_without_contract_version() {
+        let health = HealthResponse {
+            status: "ok".to_owned(),
+            server_contract_version: None,
+            server_version: Some("0.1.0".to_owned()),
+            source_commit: Some("00aa753093c9".to_owned()),
+            source_branch: Some("HEAD".to_owned()),
+            source_dirty: Some(false),
+        };
+
+        let error = validate_server_contract_health("https://chat.finite.computer", &health)
+            .expect_err("old server health is rejected");
+
+        assert!(matches!(error, FiniteChatCoreError::ServerRejected { .. }));
+        assert!(error.to_string().contains("server_contract_version"));
+        assert!(error.to_string().contains("00aa753093c9"));
+    }
+
+    #[test]
+    fn server_contract_check_accepts_current_contract_version() {
+        let health = HealthResponse {
+            status: "ok".to_owned(),
+            server_contract_version: Some(FINITECHAT_SERVER_CONTRACT_VERSION),
+            server_version: Some("0.1.0".to_owned()),
+            source_commit: Some("9dd1e11ce6b".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_dirty: Some(false),
+        };
+
+        validate_server_contract_health("http://127.0.0.1:8787", &health)
+            .expect("current server contract is accepted");
+    }
+
+    #[test]
+    fn server_contract_check_accepts_newer_server_contract_version() {
+        let health = HealthResponse {
+            status: "ok".to_owned(),
+            server_contract_version: Some(FINITECHAT_SERVER_CONTRACT_VERSION + 1),
+            server_version: Some("0.1.0".to_owned()),
+            source_commit: Some("future".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_dirty: Some(false),
+        };
+
+        validate_server_contract_health("http://127.0.0.1:8787", &health)
+            .expect("newer server contract is accepted as long as it includes this contract");
+    }
 
     /// Tests always pass an explicit account secret so they never touch the
     /// shared Finite identity in the developer's real `$HOME`/`$FINITE_HOME`.
@@ -8157,6 +8850,62 @@ mod tests {
                 .iter()
                 .any(|message| message.text == "hello from ios")
         );
+    }
+
+    #[test]
+    fn app_runtime_finalizes_invite_when_home_server_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let room_server_url = spawn_live_http_server(dir.path().join("server.sqlite3"));
+        let alice = FiniteChatRuntime::open(with_test_secret(OpenOptions {
+            data_dir: dir.path().join("alice").to_string_lossy().into_owned(),
+            server_url: room_server_url.clone(),
+            device_id: "alice-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        }))
+        .unwrap();
+        let bob = FiniteChatRuntime::open(with_test_secret(OpenOptions {
+            data_dir: dir.path().join("bob").to_string_lossy().into_owned(),
+            server_url: unavailable_http_server_url(),
+            device_id: "electron-Pauls-MacBook-Pro-2.local".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        }))
+        .unwrap();
+
+        let alice_state = alice
+            .dispatch_and_wait(AppAction::CreateRoom {
+                display_name: "Room Server Invite".to_owned(),
+            })
+            .unwrap();
+        let room_id = alice_state
+            .selected_room_id
+            .expect("created room is selected");
+        let invite = alice
+            .dispatch_and_wait(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap()
+            .active_invite
+            .expect("invite is projected through app state");
+
+        bob.dispatch_and_wait(AppAction::ScanTarget {
+            value: invite.invite_url.clone(),
+        })
+        .unwrap();
+        bob.dispatch_and_wait(AppAction::SubmitInviteJoin {
+            pending_room_id: room_id.clone(),
+        })
+        .unwrap();
+        alice.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+
+        let bob_joined = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+
+        assert_eq!(
+            app_room(&bob_joined, &room_id).state,
+            AppRoomState::Connected
+        );
+        assert_eq!(bob_joined.status, "ready");
     }
 
     #[test]
@@ -8456,6 +9205,121 @@ mod tests {
                 display_text: "Read by 1".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn chat_projection_builds_app_topics_from_conversation_events_and_messages() {
+        let owner = DeviceRef {
+            account_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            device_id: "phone".to_owned(),
+        };
+        let peer = DeviceRef {
+            account_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+            device_id: "tablet".to_owned(),
+        };
+        let metadata = ConversationMetadataV1 {
+            title: Some("Build Electron".to_owned()),
+            description: Some("Desktop daemon topic".to_owned()),
+            external_topic: None,
+            skill_binding: None,
+        };
+        let create_topic = encode_application_event(
+            DurableAppEventKind::ConversationCreate,
+            Some("topic-main".to_owned()),
+            &serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let topic_message = encode_application_event(
+            DurableAppEventKind::ChatMessage,
+            Some("topic-main".to_owned()),
+            &encode_text_message_payload("hello topic", None).unwrap(),
+        )
+        .unwrap();
+        let segment = ConversationSegmentStartV1 {
+            segment_id: "segment-2".to_owned(),
+            reason: Some("slash_new".to_owned()),
+        };
+        let start_segment = encode_application_event(
+            DurableAppEventKind::ConversationSegmentStart,
+            Some("topic-main".to_owned()),
+            &serde_json::to_vec(&segment).unwrap(),
+        )
+        .unwrap();
+        let message_only_topic = encode_application_event(
+            DurableAppEventKind::ChatMessage,
+            Some("topic-only".to_owned()),
+            &encode_text_message_payload("message only topic", None).unwrap(),
+        )
+        .unwrap();
+        let projection = ChatProjectionState::from_stored(
+            Vec::new(),
+            vec![
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 1,
+                    message_id: "topic-create".to_owned(),
+                    sender: owner.clone(),
+                    plaintext: create_topic,
+                    timestamp_unix_seconds: NOW,
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 2,
+                    message_id: "message-2".to_owned(),
+                    sender: peer.clone(),
+                    plaintext: topic_message,
+                    timestamp_unix_seconds: NOW + 1,
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 3,
+                    message_id: "segment-2".to_owned(),
+                    sender: owner,
+                    plaintext: start_segment,
+                    timestamp_unix_seconds: NOW + 2,
+                },
+                StoredAppEvent {
+                    room_id: "room-main".to_owned(),
+                    seq: 4,
+                    message_id: "message-4".to_owned(),
+                    sender: peer,
+                    plaintext: message_only_topic,
+                    timestamp_unix_seconds: NOW + 3,
+                },
+            ],
+            &DeviceRef {
+                account_id: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_owned(),
+                device_id: "desktop".to_owned(),
+            },
+        );
+
+        let topics = projection.topics(&BTreeMap::new());
+        let topic = topics
+            .iter()
+            .find(|topic| topic.topic_id == "topic-main")
+            .expect("created topic projects");
+        assert_eq!(topic.title, "Build Electron");
+        assert_eq!(topic.description.as_deref(), Some("Desktop daemon topic"));
+        assert_eq!(topic.last_message_preview, "hello topic");
+        assert_eq!(topic.message_count, 1);
+        assert_eq!(topic.unread_count, 1);
+        assert_eq!(topic.created_seq, 1);
+        assert_eq!(topic.updated_seq, 3);
+        assert_eq!(topic.active_segment_id.as_deref(), Some("segment-2"));
+        assert_eq!(topic.segments.len(), 1);
+        assert_eq!(topic.segments[0].started_seq, 3);
+
+        let message_only = topics
+            .iter()
+            .find(|topic| topic.topic_id == "topic-only")
+            .expect("message-only topic projects");
+        assert_eq!(message_only.title, "message only topic");
+        assert_eq!(message_only.created_seq, 4);
+        assert_eq!(message_only.updated_seq, 4);
+        assert_eq!(message_only.message_count, 1);
     }
 
     #[test]

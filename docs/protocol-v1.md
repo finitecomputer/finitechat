@@ -282,6 +282,24 @@ metadata the server uses for routing/cache checks. Claiming a KeyPackage returns
 those exact bytes to the adding client; clients parse and verify MLS credential
 identity locally.
 
+Delivery-layer `MemberId` values are compact opaque route ids derived from the
+typed `DeviceRef` with the versioned `fcdev1` projection. They are not identity
+proof and must not be JSON-encoded `DeviceRef` blobs. Server paths that need
+typed Finite identity must read it from Finite payloads, KeyPackage metadata,
+Welcome records, or room-membership projections, then verify the compact route
+id matches where relevant. This keeps routing under the HTTP id size bound for
+real desktop/iOS device ids and prevents product device-name length from
+changing protocol validity.
+
+The room server is a delivery/admission service, not an application-protocol
+interpreter. It may validate server-visible envelopes, limits, ordering,
+membership intervals, KeyPackage metadata, Welcome routing, idempotency, and
+push policy. It must store and route encrypted durable and ephemeral application
+payloads without understanding their inner client protocol version. Two clients
+that share an encrypted application protocol version should keep working through
+any server whose advertised transport/admission contract is at least the minimum
+they require.
+
 Each device has a bounded KeyPackage inventory. The cap counts available
 packages plus leased packages because both are unconsumed server-held material;
 accepted add Commits consume leased packages and free inventory space. Clients

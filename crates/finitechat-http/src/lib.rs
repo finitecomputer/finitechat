@@ -11,9 +11,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Exact HTTP delivery/admission contract spoken by this build.
+///
+/// Bump this when client, Hermes bridge, or server behavior changes in a way
+/// that must not silently interoperate with an older deployed server.
+pub const FINITECHAT_SERVER_CONTRACT_VERSION: u32 = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_contract_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -6,7 +6,7 @@ use finitechat_blob::BlobDescriptor;
 use finitechat_delivery::{
     HTTP_SERVER_SOURCE, HttpClaimedKeyPackage, HttpCommitAdmission, HttpDeliveryPlane,
     HttpKeyPackageId, HttpKeyPackagePublication, HttpPublishReceipt, HttpPublishTarget,
-    HttpSyncPage, MAX_HTTP_SYNC_PAGE_ENTRIES,
+    HttpSyncPage, MAX_HTTP_ID_BYTES, MAX_HTTP_SYNC_PAGE_ENTRIES,
 };
 use finitechat_http::{
     AckLinkPayloadRequest, AckLinkPayloadResponse, AckPushWakeRequest, AckPushWakeResponse,
@@ -40,6 +40,7 @@ use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, EphemeralActivityAccepted,
     EventAccepted, RoomProtocol, SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord,
+    delivery_member_id_for_device,
 };
 use finitechat_proto::{
     ApplicationDeliveryPolicy, CommandInboxPolicy, DeviceRef, DurableAppEventKind, FiniteEnvelope,
@@ -476,15 +477,25 @@ async fn sqlite_invite_availability_batches_accounts_without_claiming_key_packag
     let carol = DeviceRef::new(String::from_utf8(vec![b'c'; 64]).unwrap(), "phone");
     let dave = DeviceRef::new(String::from_utf8(vec![b'd'; 64]).unwrap(), "phone");
 
-    let alice_owner = member_for_device(&alice);
     let carol_owner = member_for_device(&carol);
-    let dave_owner = member_for_device(&dave);
 
     let app = persistent_app(&db_path);
     for publication in [
-        key_package_publication("kp-alice-available", alice_owner.clone(), b"alice"),
-        key_package_publication("kp-carol-claimed", carol_owner.clone(), b"carol"),
-        key_package_publication("kp-dave-revoked", dave_owner.clone(), b"dave"),
+        finite_key_package_publication(
+            &alice,
+            "kp-alice-available",
+            "ref-alice",
+            "hash-alice",
+            b"alice",
+        ),
+        finite_key_package_publication(
+            &carol,
+            "kp-carol-claimed",
+            "ref-carol",
+            "hash-carol",
+            b"carol",
+        ),
+        finite_key_package_publication(&dave, "kp-dave-revoked", "ref-dave", "hash-dave", b"dave"),
     ] {
         assert_eq!(
             post_json(app.clone(), "/key-packages", &publication)
@@ -535,9 +546,9 @@ async fn sqlite_invite_availability_batches_accounts_without_claiming_key_packag
         ]
     );
 
-    assert_inventory(app.clone(), alice_owner.clone(), 1, 0).await;
+    assert_inventory(app.clone(), member_for_device(&alice), 1, 0).await;
     assert_inventory(app.clone(), carol_owner, 0, 1).await;
-    assert_inventory(app, dave_owner, 1, 0).await;
+    assert_inventory(app, member_for_device(&dave), 1, 0).await;
 
     let app = persistent_app(&db_path);
     let response = post_json(
@@ -895,8 +906,20 @@ async fn sqlite_revoked_device_status_survives_restart_and_blocks_key_packages_o
     let db_path = temp.path().join("delivery.sqlite3");
     let bob = DeviceRef::new("bob", "bob-phone");
     let owner = member_for_device(&bob);
-    let first = key_package_publication("kp-revoked-bob-1", owner.clone(), b"revoked-one");
-    let second = key_package_publication("kp-revoked-bob-2", owner.clone(), b"revoked-two");
+    let first = finite_key_package_publication(
+        &bob,
+        "kp-revoked-bob-1",
+        "ref-revoked-one",
+        "hash-revoked-one",
+        b"revoked-one",
+    );
+    let second = finite_key_package_publication(
+        &bob,
+        "kp-revoked-bob-2",
+        "ref-revoked-two",
+        "hash-revoked-two",
+        b"revoked-two",
+    );
 
     let app = persistent_app(&db_path);
     assert_eq!(
@@ -1873,6 +1896,58 @@ async fn sqlite_submit_commit_route_publishes_room_entry_and_derives_membership_
         "alice-phone"
     );
     assert_eq!(page.rooms[0]["devices"][1]["active"], false);
+}
+
+#[tokio::test]
+async fn sqlite_submit_commit_routes_welcome_to_electron_length_device_id() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("delivery.sqlite3");
+    let account_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let creator = DeviceRef::new(account_id, "ios-device");
+    let electron = DeviceRef::new(account_id, "electron-Pauls-MacBook-Pro-2.local");
+    let room_id = "room-electron-device-route".to_owned();
+    let mls_group_id = "mls-electron-device-route".to_owned();
+    let welcome_id = "welcome-electron-device-route".to_owned();
+    let request = submit_add_device_request(
+        &room_id,
+        &mls_group_id,
+        &creator,
+        &electron,
+        &welcome_id,
+        "electron-device-route",
+    );
+
+    assert_eq!(
+        serde_json::to_vec(&electron).expect("device json").len(),
+        130
+    );
+    assert!(member_for_device(&electron).as_slice().len() <= MAX_HTTP_ID_BYTES);
+
+    let app = persistent_app(&db_path);
+    bootstrap_room(&app, &room_id, &mls_group_id, &creator).await;
+    publish_and_claim_key_package_for_add(&app, &request).await;
+
+    let response = post_json(app.clone(), "/commits", &request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(accepted.released_welcomes, vec![welcome_id.clone()]);
+
+    let response = post_json(
+        app,
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: member_for_device(&electron),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].message.id, id(&welcome_id));
+    let welcome: WelcomeRecord =
+        serde_json::from_slice(&claims[0].message.payload).expect("welcome payload");
+    assert_eq!(welcome.recipient, electron);
 }
 
 #[tokio::test]
@@ -6084,7 +6159,7 @@ fn member(label: &str) -> MemberId {
 }
 
 fn member_for_device(device: &DeviceRef) -> MemberId {
-    MemberId::new(serde_json::to_vec(device).expect("device member id json"))
+    MemberId::new(delivery_member_id_for_device(device))
 }
 
 #[tokio::test]

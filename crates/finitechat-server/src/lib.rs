@@ -26,15 +26,16 @@ pub use finitechat_http::{
     ClaimPushWakesResponse, ClaimWelcomesRequest, CreateInviteSessionRequest,
     CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse, ExpireInviteSessionRequest,
     ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse,
-    ExpireLinkSessionRequest, ExpireLinkSessionResponse, FailPushWakeRequest, FailPushWakeResponse,
-    FiniteAccountRoomCommitProjection, GetDeviceLivenessRequest, GetDeviceLivenessResponse,
-    GetEphemeralActivitiesRequest, GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest,
-    GetInviteAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
-    GetNostrProfilesResponse, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
-    HttpClaimedWelcome, HttpInviteJoinRequestRecord, HttpInviteJoinState, HttpInviteSessionRecord,
-    HttpInviteSessionState, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
-    HttpLinkSessionState, InboxSyncRequest, InviteAvailabilityEntry, InviteJoinStatusRequest,
-    InviteJoinStatusResponse, KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
+    ExpireLinkSessionRequest, ExpireLinkSessionResponse, FINITECHAT_SERVER_CONTRACT_VERSION,
+    FailPushWakeRequest, FailPushWakeResponse, FiniteAccountRoomCommitProjection,
+    GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetEphemeralActivitiesRequest,
+    GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
+    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
+    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
+    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
+    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
+    InviteAvailabilityEntry, InviteJoinStatusRequest, InviteJoinStatusResponse,
+    KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
     ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
     ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileCacheEntry,
     NostrProfileRecord, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
@@ -51,8 +52,8 @@ use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
     AppendEphemeralActivityRequest, AppendEventRequest, CommitAccepted, DeviceMembership,
     EphemeralActivityAccepted, EphemeralActivityRecord, EventAccepted, MembershipInterval,
-    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, lease_token_for,
-    staged_welcomes_by_id, validate_activity_expiry,
+    SubmitCommitRequest, UploadKeyPackageRequest, WelcomeRecord, delivery_member_id_for_device,
+    lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
 };
 use finitechat_proto::{
     DeviceRef, INVITE_JOIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
@@ -432,7 +433,9 @@ impl HttpServerState {
         &self,
         publication: HttpKeyPackagePublication,
     ) -> Result<PublishKeyPackageResponse, ServerHttpError> {
-        self.ensure_member_not_revoked(&publication.owner)?;
+        if let Some(metadata) = finite_key_package_metadata(&publication) {
+            self.ensure_device_not_revoked(&metadata.owner)?;
+        }
         let mut inventory = self
             .key_package_inventory
             .lock()
@@ -453,13 +456,21 @@ impl HttpServerState {
         &self,
         request: ClaimKeyPackageRequest,
     ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
-        self.ensure_member_not_revoked(&request.owner)?;
         let mut inventory = self
             .key_package_inventory
             .lock()
             .expect("HTTP KeyPackage inventory mutex");
+        let revoked_devices = self.revoked_device_keys();
+        if let Some(device) = available_finite_owner_revoked_in_inventory(
+            &inventory,
+            &request.owner,
+            &revoked_devices,
+        ) {
+            return Err(ServerHttpError::DeviceRevoked { device });
+        }
         let mut candidate = inventory.clone();
-        let claimed = claim_next_key_package_from_inventory(&mut candidate, &request.owner);
+        let claimed =
+            claim_next_key_package_from_inventory(&mut candidate, &request.owner, &revoked_devices);
         let changed = claimed
             .as_ref()
             .and_then(|package| candidate.get(&package.key_package_id).cloned());
@@ -791,16 +802,16 @@ impl HttpServerState {
             if record.state != KeyPackageInventoryState::Available {
                 continue;
             }
-            let Some(device) = finite_device_for_member_id(&record.owner) else {
+            let Some(metadata) = &record.finite_metadata else {
                 continue;
             };
-            if !requested.contains(device.account_id.as_str()) {
+            if !requested.contains(metadata.owner.account_id.as_str()) {
                 continue;
             }
-            if revoked_devices.contains(&DeviceMembership::key(&device)) {
+            if revoked_devices.contains(&DeviceMembership::key(&metadata.owner)) {
                 continue;
             }
-            available_accounts.insert(device.account_id);
+            available_accounts.insert(metadata.owner.account_id.clone());
         }
         let accounts = request
             .account_ids
@@ -831,13 +842,6 @@ impl HttpServerState {
     fn ensure_device_not_revoked(&self, device: &DeviceRef) -> Result<(), ServerHttpError> {
         let revoked_devices = self.revoked_devices.lock().expect("HTTP device mutex");
         ensure_device_not_revoked_in(&revoked_devices, device)
-    }
-
-    fn ensure_member_not_revoked(&self, member: &MemberId) -> Result<(), ServerHttpError> {
-        if let Some(device) = finite_device_for_member_id(member) {
-            self.ensure_device_not_revoked(&device)?;
-        }
-        Ok(())
     }
 
     fn key_package_inventory(
@@ -2620,7 +2624,7 @@ impl HttpServerState {
                 max: MAX_HTTP_SYNC_PAGE_ENTRIES,
             });
         }
-        self.ensure_member_not_revoked(&request.recipient)?;
+        let revoked_devices = self.revoked_device_keys();
 
         let service = self.service.lock().expect("HTTP delivery service mutex");
         let mut claims = self
@@ -2639,6 +2643,7 @@ impl HttpServerState {
                 if !matches!(entry.message.envelope, TransportEnvelope::Welcome { .. }) {
                     continue;
                 }
+                ensure_welcome_message_recipient_not_revoked(&revoked_devices, &entry.message)?;
                 if claims.contains_key(&entry.message.id) {
                     continue;
                 }
@@ -3069,7 +3074,6 @@ impl HttpServerState {
         let Some(requester) = &request.requester else {
             return Ok(page);
         };
-        let requester = device_for_member_id(requester)?;
         let room_id = room_id_for_group_id(&request.group_id)?;
         let rooms = self
             .room_memberships
@@ -3078,9 +3082,13 @@ impl HttpServerState {
         let Some(projection) = rooms.get(&room_id) else {
             return Ok(page);
         };
-        if !projection.membership_complete && !projection.tracks_device(&requester) {
-            return Ok(page);
-        }
+        let Some(requester) = projection.device_for_member_id(requester).cloned() else {
+            return Ok(HttpSyncPage {
+                entries: Vec::new(),
+                next_after_seq: page.next_after_seq,
+                has_more: page.has_more,
+            });
+        };
 
         let mut entries = Vec::new();
         let mut scanned_to_seq = request.after_seq;
@@ -3205,6 +3213,7 @@ pub fn http_router(state: HttpServerState) -> Router {
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
+        server_contract_version: Some(FINITECHAT_SERVER_CONTRACT_VERSION),
         server_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         source_commit: non_empty_build_value(option_env!("FINITECHAT_BUILD_COMMIT")),
         source_branch: non_empty_build_value(option_env!("FINITECHAT_BUILD_BRANCH")),
@@ -3973,6 +3982,17 @@ struct ObservedRoomHead {
 }
 
 impl HttpRoomMembershipProjection {
+    fn device_for_member_id(&self, member_id: &MemberId) -> Option<&DeviceRef> {
+        self.membership
+            .values()
+            .map(|membership| &membership.device)
+            .find(|device| {
+                member_id_for_device(device)
+                    .ok()
+                    .is_some_and(|candidate| candidate == *member_id)
+            })
+    }
+
     fn tracks_device(&self, device: &DeviceRef) -> bool {
         self.membership.contains_key(&DeviceMembership::key(device))
     }
@@ -6324,23 +6344,7 @@ fn welcome_publish_request(
 }
 
 fn member_id_for_device(device: &DeviceRef) -> Result<MemberId, ServerHttpError> {
-    serde_json::to_vec(device)
-        .map(MemberId::new)
-        .map_err(|error| ServerHttpError::InvalidCommitRequest {
-            reason: error.to_string(),
-        })
-}
-
-fn finite_device_for_member_id(member_id: &MemberId) -> Option<DeviceRef> {
-    serde_json::from_slice(member_id.as_slice()).ok()
-}
-
-fn device_for_member_id(member_id: &MemberId) -> Result<DeviceRef, ServerHttpError> {
-    serde_json::from_slice(member_id.as_slice()).map_err(|error| {
-        ServerHttpError::InvalidGroupSyncRequest {
-            reason: format!("requester must encode a Finite DeviceRef: {error}"),
-        }
-    })
+    Ok(MemberId::new(delivery_member_id_for_device(device)))
 }
 
 fn ensure_device_not_revoked_in(
@@ -6354,12 +6358,6 @@ fn ensure_device_not_revoked_in(
     } else {
         Ok(())
     }
-}
-
-fn member_id_is_revoked(member_id: &MemberId, revoked_devices: &BTreeSet<String>) -> bool {
-    finite_device_for_member_id(member_id)
-        .as_ref()
-        .is_some_and(|device| revoked_devices.contains(&DeviceMembership::key(device)))
 }
 
 fn ensure_welcome_message_recipient_not_revoked(
@@ -6637,11 +6635,7 @@ fn claim_key_packages_from_inventory(
     owners
         .iter()
         .map(|owner| {
-            let claimed = if member_id_is_revoked(owner, revoked_devices) {
-                None
-            } else {
-                claim_next_key_package_from_inventory(inventory, owner)
-            };
+            let claimed = claim_next_key_package_from_inventory(inventory, owner, revoked_devices);
             HttpKeyPackageClaim {
                 owner: owner.clone(),
                 claimed,
@@ -6700,11 +6694,14 @@ fn record_key_package_publication(
 fn claim_next_key_package_from_inventory(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     owner: &MemberId,
+    revoked_devices: &BTreeSet<String>,
 ) -> Option<HttpClaimedKeyPackage> {
     let selected = inventory
         .iter()
         .filter(|(_, record)| {
-            record.owner == *owner && record.state == KeyPackageInventoryState::Available
+            record.owner == *owner
+                && record.state == KeyPackageInventoryState::Available
+                && !record_finite_owner_is_revoked(record, revoked_devices)
         })
         .map(|(key_package_id, _)| key_package_id.clone())
         .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
@@ -6731,11 +6728,11 @@ fn claim_next_key_package_for_account_from_inventory(
             if record.state != KeyPackageInventoryState::Available {
                 return false;
             }
-            let Some(device) = finite_device_for_member_id(&record.owner) else {
+            let Some(metadata) = &record.finite_metadata else {
                 return false;
             };
-            device.account_id == account_id
-                && !revoked_devices.contains(&DeviceMembership::key(&device))
+            metadata.owner.account_id == account_id
+                && !revoked_devices.contains(&DeviceMembership::key(&metadata.owner))
         })
         .map(|(key_package_id, _)| key_package_id.clone())
         .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
@@ -6749,6 +6746,31 @@ fn claim_next_key_package_for_account_from_inventory(
         owner: record.owner.clone(),
         key_package: record.key_package.clone(),
     })
+}
+
+fn record_finite_owner_is_revoked(
+    record: &KeyPackageInventoryRecord,
+    revoked_devices: &BTreeSet<String>,
+) -> bool {
+    record
+        .finite_metadata
+        .as_ref()
+        .is_some_and(|metadata| revoked_devices.contains(&DeviceMembership::key(&metadata.owner)))
+}
+
+fn available_finite_owner_revoked_in_inventory(
+    inventory: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    owner: &MemberId,
+    revoked_devices: &BTreeSet<String>,
+) -> Option<DeviceRef> {
+    inventory
+        .values()
+        .filter(|record| {
+            record.owner == *owner && record.state == KeyPackageInventoryState::Available
+        })
+        .filter_map(|record| record.finite_metadata.as_ref())
+        .find(|metadata| revoked_devices.contains(&DeviceMembership::key(&metadata.owner)))
+        .map(|metadata| metadata.owner.clone())
 }
 
 fn key_package_claim_inventory_records(
