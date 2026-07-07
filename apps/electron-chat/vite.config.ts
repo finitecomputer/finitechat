@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 
 const legacyDashboardSrc =
   process.env.FINITE_LEGACY_DASHBOARD_SRC
-  ?? path.resolve(__dirname, "../../../../finitecomputer/apps/dashboard/src");
+  ?? path.resolve(__dirname, "../../../finitecomputer/apps/dashboard/src");
 
 export default defineConfig({
   base: "./",
