@@ -676,13 +676,17 @@ function DesktopOnboarding({
         </div>
         <div className="finite-chat__onboarding-copy">
           <h1 id="finite-chat-onboarding-title">Finite Chat</h1>
-          <p>{identityStatus?.hasStoredAccountSecret ? "Imported account ready." : "Set up this device."}</p>
+          <p>
+            {identityStatus?.hasStoredAccountSecret
+              ? "Imported account ready."
+              : "Generate a new local key for this desktop."}
+          </p>
         </div>
 
         <button type="button" className="finite-chat__onboarding-choice" onClick={onUseLocal} disabled={busy}>
           <ShieldCheckIcon aria-hidden />
           <span>
-            <strong>Use this Mac</strong>
+            <strong>Generate local key</strong>
             <small>{accountId}</small>
           </span>
         </button>
