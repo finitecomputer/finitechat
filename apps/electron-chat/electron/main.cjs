@@ -69,7 +69,6 @@ function createWindow() {
   mainWindow.webContents.once("did-finish-load", () => {
     if (pendingInviteUrl) {
       mainWindow.webContents.send("finitechat:invite-url", pendingInviteUrl);
-      pendingInviteUrl = null;
     }
     maybeCaptureWindow();
   });
@@ -326,10 +325,15 @@ function restartDaemon() {
   setTimeout(() => startDaemon(), 300);
 }
 
+function findInviteUrl(argv) {
+  return argv.find((arg) => typeof arg === "string" && arg.startsWith("finite://join")) || null;
+}
+
 function handleInviteUrl(url) {
   if (!url || !url.startsWith("finite://join")) {
     return;
   }
+  pendingInviteUrl = url;
   if (mainWindow) {
     mainWindow.webContents.send("finitechat:invite-url", url);
     mainWindow.focus();
@@ -342,8 +346,13 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  const initialInviteUrl = findInviteUrl(process.argv);
+  if (initialInviteUrl) {
+    pendingInviteUrl = initialInviteUrl;
+  }
+
   app.on("second-instance", (_event, argv) => {
-    const inviteUrl = argv.find((arg) => arg.startsWith("finite://join"));
+    const inviteUrl = findInviteUrl(argv);
     if (inviteUrl) {
       handleInviteUrl(inviteUrl);
     }
@@ -383,6 +392,12 @@ if (!gotLock) {
 
 ipcMain.handle("finitechat:daemon-url", () => {
   return daemonUrl;
+});
+
+ipcMain.handle("finitechat:consume-pending-invite-url", () => {
+  const url = pendingInviteUrl;
+  pendingInviteUrl = null;
+  return url;
 });
 
 ipcMain.handle("finitechat:identity-status", () => {

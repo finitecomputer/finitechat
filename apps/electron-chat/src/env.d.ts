@@ -1,5 +1,6 @@
 interface FiniteChatDesktopBridge {
   daemonUrl(): Promise<string>;
+  consumePendingInviteUrl(): Promise<string | null>;
   identityStatus(): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
   onboardingStatus(): Promise<{ completed: boolean }>;
   completeOnboarding(): Promise<{ completed: boolean }>;

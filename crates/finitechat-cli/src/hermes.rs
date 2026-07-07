@@ -1816,6 +1816,22 @@ fn initialize_hermes_inbox_cursors(
     home: &AgentHome,
     inbox: &mut HermesInboxState,
 ) -> Result<(), CliError> {
+    let recent_events = load_recent_agent_app_events(home)?;
+    initialize_hermes_inbox_cursors_from_events(
+        home_dir,
+        inbox,
+        &home.config.account_id,
+        recent_events.iter(),
+    )
+}
+
+fn initialize_hermes_inbox_cursors_from_events<'a>(
+    home_dir: &Path,
+    inbox: &mut HermesInboxState,
+    own_account: &str,
+    recent_events: impl IntoIterator<Item = &'a StoredAppEvent>,
+) -> Result<(), CliError> {
+    let recent_events = recent_events.into_iter().collect::<Vec<_>>();
     if !inbox.cursors.is_empty() {
         return Ok(());
     }
@@ -1835,8 +1851,24 @@ fn initialize_hermes_inbox_cursors(
         return Ok(());
     }
 
-    for event in load_recent_agent_app_events(home)? {
-        changed |= advance_hermes_inbox_cursor(inbox, &event.room_id, event.seq);
+    let mut first_counterparty_seq_by_room = BTreeMap::<&str, u64>::new();
+    for event in &recent_events {
+        if event.sender.account_id != own_account {
+            first_counterparty_seq_by_room
+                .entry(event.room_id.as_str())
+                .and_modify(|seq| *seq = (*seq).min(event.seq))
+                .or_insert(event.seq);
+        }
+    }
+
+    for event in recent_events {
+        if event.sender.account_id == own_account
+            && first_counterparty_seq_by_room
+                .get(event.room_id.as_str())
+                .map_or(true, |seq| event.seq < *seq)
+        {
+            changed |= advance_hermes_inbox_cursor(inbox, &event.room_id, event.seq);
+        }
     }
     if changed {
         save_hermes_inbox(home_dir, inbox)?;
@@ -3451,6 +3483,65 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].message_id, "msg-11");
         assert_eq!(hermes_inbox_cursor(&inbox, "room-a"), 11);
+    }
+
+    #[test]
+    fn inbox_initialization_does_not_consume_first_counterparty_message() {
+        let home = tempfile::tempdir().unwrap();
+        let mut inbox = HermesInboxState::default();
+        let events = vec![
+            StoredAppEvent {
+                room_id: "room-a".to_owned(),
+                seq: 1,
+                message_id: "agent-setup".to_owned(),
+                sender: finitechat_proto::DeviceRef::new("agent-account", "agent-device"),
+                plaintext: b"agent setup".to_vec(),
+                timestamp_unix_seconds: 1,
+            },
+            StoredAppEvent {
+                room_id: "room-a".to_owned(),
+                seq: 2,
+                message_id: "user-first".to_owned(),
+                sender: finitechat_proto::DeviceRef::new("user-account", "electron"),
+                plaintext: b"hello agent".to_vec(),
+                timestamp_unix_seconds: 2,
+            },
+            StoredAppEvent {
+                room_id: "room-a".to_owned(),
+                seq: 3,
+                message_id: "agent-after".to_owned(),
+                sender: finitechat_proto::DeviceRef::new("agent-account", "agent-device"),
+                plaintext: b"agent after".to_vec(),
+                timestamp_unix_seconds: 3,
+            },
+        ];
+
+        initialize_hermes_inbox_cursors_from_events(
+            home.path(),
+            &mut inbox,
+            "agent-account",
+            events.iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            hermes_inbox_cursor(&inbox, "room-a"),
+            1,
+            "first run must not advance past unseen counterparty messages"
+        );
+
+        let user_event = HermesPollEventV1::finite_chat_text(
+            "room-a",
+            2,
+            "user-first",
+            "user-account",
+            "electron",
+            "hello agent",
+        )
+        .unwrap();
+        enqueue_hermes_inbox_event(home.path(), &mut inbox, user_event).unwrap();
+        let pending = pending_hermes_inbox_events(&inbox, None, 10);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, "user-first");
     }
 
     fn invite_status_code() -> InviteCodeV1 {

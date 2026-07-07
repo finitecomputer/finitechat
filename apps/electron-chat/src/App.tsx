@@ -87,6 +87,7 @@ export function App() {
   const joinInviteInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptRef = useRef<HTMLElement | null>(null);
+  const lastDesktopInviteUrlRef = useRef<{ url: string; timestamp: number } | null>(null);
   const typingRoomRef = useRef<string | null>(null);
   const typingStopTimerRef = useRef<number | null>(null);
 
@@ -218,15 +219,35 @@ export function App() {
     void loadDesktopState();
   }, [loadDesktopState]);
 
+  const handleDesktopInviteUrl = useCallback(
+    (url: string | null | undefined) => {
+      const value = url?.trim();
+      if (!value) {
+        return;
+      }
+      const last = lastDesktopInviteUrlRef.current;
+      const now = Date.now();
+      if (last?.url === value && now - last.timestamp < 2000) {
+        return;
+      }
+      lastDesktopInviteUrlRef.current = { url: value, timestamp: now };
+      setInviteUrl(value);
+      void run({ ScanTarget: { value } });
+    },
+    [run]
+  );
+
   useEffect(() => {
-    if (!window.finiteChatDesktop) {
+    if (!window.finiteChatDesktop || !daemonUrl) {
       return;
     }
-    return window.finiteChatDesktop.onInviteUrl((url) => {
-      setInviteUrl(url);
-      void run({ ScanTarget: { value: url } });
-    });
-  }, [run]);
+    const unsubscribe = window.finiteChatDesktop.onInviteUrl(handleDesktopInviteUrl);
+    void window.finiteChatDesktop
+      .consumePendingInviteUrl()
+      .then(handleDesktopInviteUrl)
+      .catch((reason: unknown) => setError(errorMessage(reason)));
+    return unsubscribe;
+  }, [daemonUrl, handleDesktopInviteUrl]);
 
   const selectedRoom = useMemo(
     () => state?.rooms.find((room) => room.room_id === state.selected_room_id) ?? null,

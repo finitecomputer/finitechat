@@ -15,6 +15,7 @@ import os
 import shlex
 import shutil
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +36,7 @@ DEFAULT_ACTIVITY_START_GRACE_SECS = 0.1
 ACTIVE_TURN_POLL_TIMEOUT_MILLIS = 100
 DEFAULT_SERVICE_ADDR = "127.0.0.1:0"
 SERVICE_READY_FILE = "hermes-service.json"
+BRIDGE_STATUS_FILE = "hermes-bridge-status.json"
 SERVICE_START_TIMEOUT_SECS = 5.0
 MAX_DELIVERED_EVENT_KEYS = 256
 MAX_OUTBOUND_MESSAGE_ROUTES = 256
@@ -156,6 +158,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         await self._recover_interrupted_turns()
         await self._surface_invite()
         self._mark_connected()
+        self._write_bridge_status("connected")
         if self.inbound_stream and self.service_url:
             self._poll_task = asyncio.create_task(self._stream_loop())
         else:
@@ -227,6 +230,7 @@ class FiniteChatAdapter(BasePlatformAdapter):
         await self._stop_service()
         await self.cancel_background_tasks()
         self._mark_disconnected()
+        self._write_bridge_status("disconnected")
         logger.info("[finitechat] disconnected")
 
     async def send(
@@ -426,8 +430,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
         )
         if not result.ok:
             logger.warning("[finitechat] poll failed: %s", result.error)
+            self._write_bridge_status("poll_error", result.error)
             return False
         await self._process_poll_payload(result.data)
+        self._write_bridge_status("connected")
         return True
 
     async def _stream_loop(self) -> None:
@@ -458,8 +464,10 @@ class FiniteChatAdapter(BasePlatformAdapter):
                     result = await queue.get()
                     if result.ok:
                         await self._process_inbound_records(result.data.get("records") or [])
+                        self._write_bridge_status("connected")
                         continue
                     logger.warning("[finitechat] inbound stream failed: %s", result.error)
+                    self._write_bridge_status("stream_error", result.error)
                     if result.transport_error:
                         self.service_url = ""
                     break
@@ -894,6 +902,28 @@ class FiniteChatAdapter(BasePlatformAdapter):
         except TimeoutError:
             proc.kill()
             await proc.wait()
+
+    def _write_bridge_status(self, status: str, error: str | None = None) -> None:
+        if not self.home:
+            return
+        payload: dict[str, Any] = {
+            "status": status,
+            "ok": not status.endswith("_error"),
+            "updated_at_ms": int(time.time() * 1000),
+            "inbound_stream": bool(self.inbound_stream),
+        }
+        if self.service_url:
+            payload["service_url"] = self.service_url
+        if error:
+            payload["error"] = str(error)
+        path = Path(self.home) / BRIDGE_STATUS_FILE
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            logger.debug("[finitechat] could not write bridge status: %s", exc)
 
 
 class _FiniteChatResult:

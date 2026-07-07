@@ -15,6 +15,7 @@ FINITECHAT_BIN = os.environ.get("FINITECHAT_BIN", "/usr/local/bin/finitechat")
 HOST = os.environ.get("FINITE_AGENT_HTTP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FINITE_AGENT_HTTP_PORT", "8080"))
 INVITE_FILE = AGENT_HOME / "current-invite.json"
+BRIDGE_STATUS_FILE = AGENT_HOME / "hermes-bridge-status.json"
 ROOM_NAME = os.environ.get(
     "FINITECHAT_HERMES_ROOM_NAME",
     os.environ.get("FINITE_AGENT_NAME", "Finite Agent"),
@@ -52,6 +53,24 @@ def identity() -> dict[str, Any]:
         "npub": value.get("npub"),
         "account_id": value.get("account_id"),
     }
+
+
+def bridge_status() -> dict[str, Any]:
+    try:
+        payload = json.loads(BRIDGE_STATUS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"status": "starting", "ok": False}
+    except Exception as exc:
+        return {"status": "unavailable", "ok": False, "error": str(exc)}
+    if not isinstance(payload, dict):
+        return {"status": "unavailable", "ok": False, "error": "bridge status is not an object"}
+    return payload
+
+
+def runtime_health() -> dict[str, Any]:
+    payload = identity()
+    payload["bridge"] = bridge_status()
+    return payload
 
 
 def finitechat_json(args: list[str]) -> dict[str, Any]:
@@ -116,6 +135,7 @@ def invite_base_payload(
 ) -> dict[str, Any]:
     return {
         "ready": True,
+        "bridge": bridge_status(),
         "agent_npub": identity_payload.get("npub"),
         "account_id": identity_payload.get("account_id"),
         "room_id": invite_payload.get("room_id"),
@@ -249,8 +269,9 @@ def invite() -> dict[str, Any]:
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/healthz":
-            payload = identity()
-            self._write(200 if payload["ready"] else 503, payload)
+            payload = runtime_health()
+            bridge_ok = payload.get("bridge", {}).get("ok") is not False
+            self._write(200 if payload["ready"] and bridge_ok else 503, payload)
             return
         if self.path == "/invite":
             payload = invite()
