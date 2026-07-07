@@ -1072,6 +1072,13 @@ function agentConnectionCopy(
   hasAgentRoom: boolean,
   pendingInviteRoomId: string | null
 ) {
+  const admissionDetail = selectedRoom ? roomAdmissionDetail(selectedRoom) : null;
+  if (admissionDetail) {
+    return {
+      title: "Hermes admission needs attention",
+      body: admissionDetail,
+    };
+  }
   if (pendingInviteRoomId || selectedRoom?.state === "WaitingForApproval" || selectedRoom?.state === "Joining") {
     return {
       title: "Waiting for Hermes",
@@ -1096,6 +1103,25 @@ function agentConnectionCopy(
   };
 }
 
+function roomAdmissionDetail(room: AppRoomSummary) {
+  if (room.state !== "WaitingForApproval" && room.state !== "Joining") {
+    return null;
+  }
+  const status = room.status.trim();
+  if (!status) {
+    return null;
+  }
+  const normalized = status.toLowerCase();
+  if (
+    normalized === "requesting room admission" ||
+    normalized === "waiting for room admission" ||
+    normalized === "joining"
+  ) {
+    return null;
+  }
+  return status.replace(/^client error:\s*/i, "");
+}
+
 function composerPlaceholder(
   state: AppState | null,
   selectedRoom: AppRoomSummary | null,
@@ -1107,6 +1133,9 @@ function composerPlaceholder(
   }
   if (!selectedRoom) {
     return "Connect Hermes to chat";
+  }
+  if (roomAdmissionDetail(selectedRoom)) {
+    return "Hermes admission needs attention";
   }
   if (selectedRoom.state === "WaitingForApproval" || selectedRoom.state === "Joining") {
     return "Waiting for Hermes to admit this device";

@@ -4985,16 +4985,13 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
     }
 
     // The joiner's KeyPackage rides inline in the join request. The proof is
-    // bound to that exact package, so admission must not accept an older
-    // available package for the same device.
+    // bound to that exact package, so invite admission must not depend on the
+    // global KeyPackage inventory path or accept any other available package
+    // for the same device.
     let mut claimed_key_packages = Vec::with_capacity(verified.len());
     let mut welcome_ids = Vec::with_capacity(verified.len());
     for (join, upload) in &verified {
-        delivery
-            .upload_key_package(upload.clone())
-            .map_err(RuntimeWorkerError::Delivery)?;
-        let claimed = claim_invite_key_package_for_device(delivery, &join.joiner, upload)?;
-        claimed_key_packages.push(claimed);
+        claimed_key_packages.push(invite_claimed_key_package_from_upload(upload));
         welcome_ids.push(format!(
             "invite-welcome-{}-{}",
             code.invite_id, join.request_id
@@ -5030,27 +5027,17 @@ pub fn accept_pending_invite_joins<D: RuntimeDelivery>(
     Ok(report)
 }
 
-fn claim_invite_key_package_for_device<D: RuntimeDelivery>(
-    delivery: &mut D,
-    joiner: &DeviceRef,
-    expected: &UploadKeyPackageRequest,
-) -> Result<ClaimKeyPackageResult, RuntimeWorkerError<D::Error>> {
-    for _ in 0..=MAX_KEY_PACKAGES_PER_DEVICE {
-        let Some(claimed) = delivery
-            .claim_key_package_for_device(joiner)
-            .map_err(RuntimeWorkerError::Delivery)?
-        else {
-            break;
-        };
-        if claimed.key_package_id == expected.key_package_id
-            && claimed.key_package_ref == expected.key_package_ref
-            && claimed.key_package_hash == expected.key_package_hash
-            && claimed.key_package_payload == expected.key_package_payload
-        {
-            return Ok(claimed);
-        }
+fn invite_claimed_key_package_from_upload(
+    upload: &UploadKeyPackageRequest,
+) -> ClaimKeyPackageResult {
+    ClaimKeyPackageResult {
+        lease_token: lease_token_for(&upload.key_package_id, &upload.owner),
+        key_package_id: upload.key_package_id.clone(),
+        owner: upload.owner.clone(),
+        key_package_ref: upload.key_package_ref.clone(),
+        key_package_hash: upload.key_package_hash.clone(),
+        key_package_payload: upload.key_package_payload.clone(),
     }
-    Err(ClientError::InviteKeyPackageUnavailable(joiner.device_id.clone()).into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

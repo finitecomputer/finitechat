@@ -2590,6 +2590,7 @@ enum InProcessHttpTransportError {
     Router(String),
     InjectedSubmitBeforeAccept,
     InjectedSubmitAfterAccept,
+    InjectedKeyPackageInventory,
 }
 
 impl std::fmt::Display for InProcessHttpTransportError {
@@ -2602,6 +2603,9 @@ impl std::fmt::Display for InProcessHttpTransportError {
             Self::Router(error) => write!(formatter, "router error: {error}"),
             Self::InjectedSubmitBeforeAccept => write!(formatter, "injected submit before accept"),
             Self::InjectedSubmitAfterAccept => write!(formatter, "injected submit after accept"),
+            Self::InjectedKeyPackageInventory => {
+                write!(formatter, "injected KeyPackage inventory failure")
+            }
         }
     }
 }
@@ -2647,6 +2651,7 @@ struct InProcessHttpTransport {
     runtime: tokio::runtime::Runtime,
     fail_next_submit_before_accept: bool,
     fail_next_submit_after_accept: bool,
+    fail_key_package_inventory: bool,
 }
 
 impl InProcessHttpTransport {
@@ -2656,6 +2661,7 @@ impl InProcessHttpTransport {
             runtime: tokio::runtime::Runtime::new().unwrap(),
             fail_next_submit_before_accept: false,
             fail_next_submit_after_accept: false,
+            fail_key_package_inventory: false,
         }
     }
 }
@@ -2671,6 +2677,14 @@ impl HttpRuntimeTransport for InProcessHttpTransport {
         if uri == "/commits" && self.fail_next_submit_before_accept {
             self.fail_next_submit_before_accept = false;
             return Err(InProcessHttpTransportError::InjectedSubmitBeforeAccept);
+        }
+        if self.fail_key_package_inventory
+            && matches!(
+                uri,
+                "/key-packages" | "/key-packages/claim" | "/key-packages/claims"
+            )
+        {
+            return Err(InProcessHttpTransportError::InjectedKeyPackageInventory);
         }
         let result = self.runtime.block_on(async {
             let request = Request::builder()
@@ -2713,6 +2727,7 @@ trait TestHttpRuntimeDeliveryExt {
     fn from_sqlite_path(path: &std::path::Path) -> Self;
     fn with_submit_before_accept_failure_from_sqlite_path(path: &std::path::Path) -> Self;
     fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self;
+    fn with_key_package_inventory_failure_from_sqlite_path(path: &std::path::Path) -> Self;
 }
 
 impl TestHttpRuntimeDeliveryExt for TestHttpRuntimeDelivery {
@@ -2729,6 +2744,12 @@ impl TestHttpRuntimeDeliveryExt for TestHttpRuntimeDelivery {
     fn with_submit_response_loss_from_sqlite_path(path: &std::path::Path) -> Self {
         let mut transport = InProcessHttpTransport::from_sqlite_path(path);
         transport.fail_next_submit_after_accept = true;
+        Self::new(transport)
+    }
+
+    fn with_key_package_inventory_failure_from_sqlite_path(path: &std::path::Path) -> Self {
+        let mut transport = InProcessHttpTransport::from_sqlite_path(path);
+        transport.fail_key_package_inventory = true;
         Self::new(transport)
     }
 }
@@ -2766,7 +2787,8 @@ fn invite_flow_admits_via_url_and_join_proof_and_pins_room_server_over_http() {
     agent_store.save_device_state(&agent).unwrap();
     bob_store.save_device_state(&bob).unwrap();
 
-    let mut delivery = HttpRuntimeDelivery::from_sqlite_path(&server_db);
+    let mut delivery =
+        HttpRuntimeDelivery::with_key_package_inventory_failure_from_sqlite_path(&server_db);
 
     // The agent creates its room and an invite, printed as a URL + QR.
     agent.create_group_state(ROOM_ID, MLS_GROUP_ID).unwrap();

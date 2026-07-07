@@ -2011,6 +2011,10 @@ impl HttpServerState {
             .room_memberships
             .lock()
             .expect("HTTP room-membership mutex");
+        let invite_sessions = self
+            .invite_sessions
+            .lock()
+            .expect("HTTP invite-session mutex");
         let mut key_package_inventory = self
             .key_package_inventory
             .lock()
@@ -2046,6 +2050,7 @@ impl HttpServerState {
         let key_package_inventory_mutation = consume_claimed_key_packages_for_commit(
             &mut candidate_key_package_inventory,
             &request,
+            &invite_sessions,
         )?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
@@ -2084,6 +2089,7 @@ impl HttpServerState {
         drop(publish_idempotency);
         drop(account_rooms);
         drop(room_memberships);
+        drop(invite_sessions);
         drop(key_package_inventory);
 
         Ok(CommitAccepted {
@@ -5685,12 +5691,16 @@ fn mark_next_key_package_claimed(
 fn consume_claimed_key_packages_for_commit(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     request: &SubmitCommitRequest,
+    invite_sessions: &BTreeMap<String, HttpInviteSessionRecord>,
 ) -> Result<Vec<KeyPackageInventoryRecord>, ServerHttpError> {
     let mut changed = Vec::new();
     for add in &request.membership_delta.adds {
-        let record = validate_claimed_key_package_for_add(inventory, add)?;
-        record.state = KeyPackageInventoryState::Consumed;
-        changed.push(record.clone());
+        if let Some(record) = validate_claimed_key_package_for_add(inventory, add)? {
+            record.state = KeyPackageInventoryState::Consumed;
+            changed.push(record.clone());
+            continue;
+        }
+        validate_invite_key_package_for_add(invite_sessions, &request.room_id, add)?;
     }
     Ok(changed)
 }
@@ -5698,15 +5708,10 @@ fn consume_claimed_key_packages_for_commit(
 fn validate_claimed_key_package_for_add<'a>(
     inventory: &'a mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     add: &MembershipAddV1,
-) -> Result<&'a mut KeyPackageInventoryRecord, ServerHttpError> {
+) -> Result<Option<&'a mut KeyPackageInventoryRecord>, ServerHttpError> {
     let key_package_id = HttpKeyPackageId::new(add.key_package_id.as_bytes().to_vec());
     let Some(record) = inventory.get_mut(&key_package_id) else {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "KeyPackage {} must be published and claimed before a typed commit can add {:?}",
-                add.key_package_id, add.device
-            ),
-        });
+        return Ok(None);
     };
     match record.state {
         KeyPackageInventoryState::Claimed => {}
@@ -5760,7 +5765,96 @@ fn validate_claimed_key_package_for_add<'a>(
             ),
         });
     }
-    Ok(record)
+    Ok(Some(record))
+}
+
+fn validate_invite_key_package_for_add(
+    invite_sessions: &BTreeMap<String, HttpInviteSessionRecord>,
+    room_id: &str,
+    add: &MembershipAddV1,
+) -> Result<(), ServerHttpError> {
+    let Some((session, join)) = invite_join_request_for_add(invite_sessions, room_id, add) else {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} must be claimed or match a pending invite join before a typed commit can add {:?}",
+                add.key_package_id, add.device
+            ),
+        });
+    };
+    if !matches!(
+        join.state,
+        HttpInviteJoinState::Pending | HttpInviteJoinState::Accepted
+    ) {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "invite join request {} for KeyPackage {} is {:?}",
+                join.request_id, add.key_package_id, join.state
+            ),
+        });
+    }
+    if join.joiner != add.device {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "invite join request {} device does not match added device",
+                join.request_id
+            ),
+        });
+    }
+    let upload =
+        serde_json::from_slice::<UploadKeyPackageRequest>(&join.key_package).map_err(|error| {
+            ServerHttpError::InvalidCommitRequest {
+                reason: format!(
+                    "invite join request {} KeyPackage is not a Finite upload: {error}",
+                    join.request_id
+                ),
+            }
+        })?;
+    if upload.owner != add.device {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "invite join request {} KeyPackage owner does not match added device",
+                join.request_id
+            ),
+        });
+    }
+    if upload.key_package_id != add.key_package_id
+        || upload.key_package_ref != add.key_package_ref
+        || upload.key_package_hash != add.key_package_hash
+    {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "invite join request {} KeyPackage metadata does not match add",
+                join.request_id
+            ),
+        });
+    }
+    if session.accepted_joins >= session.max_joins && join.state == HttpInviteJoinState::Pending {
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!("invite session {} is already full", session.invite_id),
+        });
+    }
+    Ok(())
+}
+
+fn invite_join_request_for_add<'a>(
+    invite_sessions: &'a BTreeMap<String, HttpInviteSessionRecord>,
+    room_id: &str,
+    add: &MembershipAddV1,
+) -> Option<(&'a HttpInviteSessionRecord, &'a HttpInviteJoinRequestRecord)> {
+    for (invite_id, session) in invite_sessions {
+        if session.room_id != room_id {
+            continue;
+        }
+        let prefix = format!("invite-welcome-{invite_id}-");
+        let Some(request_id) = add.welcome_id.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(join) = session.join_requests.get(request_id) else {
+            continue;
+        };
+        return Some((session, join));
+    }
+    None
 }
 
 fn consume_key_packages_from_persisted_message(

@@ -3819,7 +3819,11 @@ impl AppRuntimeState {
                 Err(error) => {
                     if let Some(room) = self.room_mut(&room_id) {
                         room.state = AppRoomState::WaitingForApproval;
-                        room.status = error.to_string();
+                        room.status = if pending_invite_not_ready_error(&error) {
+                            "waiting for room admission".to_owned()
+                        } else {
+                            error.to_string()
+                        };
                         room.user_status_text = app_room_user_status_text(room);
                         self.persist_room_projection(&room_id)?;
                     }
@@ -7987,6 +7991,13 @@ fn invite_join_failure_message(error: &FiniteChatCoreError) -> String {
     } else {
         "The join request failed. Check your connection and try again.".to_owned()
     }
+}
+
+fn pending_invite_not_ready_error(error: &FiniteChatCoreError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no accepted welcome")
 }
 
 fn selected_room_id_from_stored(
