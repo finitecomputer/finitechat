@@ -11,6 +11,7 @@ let daemonProcess = null;
 
 const rendererUrl = process.env.FINITECHAT_RENDERER_URL;
 const daemonUrl = process.env.FINITECHAT_DAEMON_URL || "http://127.0.0.1:38917";
+const shouldStartBundledDaemon = !process.env.FINITECHAT_DAEMON_URL || process.env.FINITECHAT_START_DAEMON === "1";
 const defaultServerUrl = process.env.FINITECHAT_SERVER_URL || "https://chat.finite.computer";
 const appProtocol = "finitechat-app";
 
@@ -265,7 +266,7 @@ function daemonDeviceId() {
 }
 
 function startDaemon() {
-  if (process.env.FINITECHAT_DAEMON_URL || daemonProcess) {
+  if (!shouldStartBundledDaemon || daemonProcess) {
     return;
   }
   const root = repoRoot();
@@ -342,7 +343,8 @@ function handleTargetUrl(url) {
   }
 }
 
-const gotLock = app.requestSingleInstanceLock();
+const useSingleInstanceLock = process.env.FINITECHAT_DISABLE_SINGLE_INSTANCE_LOCK !== "1";
+const gotLock = useSingleInstanceLock ? app.requestSingleInstanceLock() : true;
 if (!gotLock) {
   app.quit();
 } else {
@@ -351,12 +353,14 @@ if (!gotLock) {
     pendingTargetUrl = initialTargetUrl;
   }
 
-  app.on("second-instance", (_event, argv) => {
-    const targetUrl = findTargetUrl(argv);
-    if (targetUrl) {
-      handleTargetUrl(targetUrl);
-    }
-  });
+  if (useSingleInstanceLock) {
+    app.on("second-instance", (_event, argv) => {
+      const targetUrl = findTargetUrl(argv);
+      if (targetUrl) {
+        handleTargetUrl(targetUrl);
+      }
+    });
+  }
 
   app.on("open-url", (event, url) => {
     event.preventDefault();
@@ -366,10 +370,12 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     registerAppProtocol();
     configureSessionSecurity();
-    if (process.defaultApp && process.argv.length >= 2) {
-      app.setAsDefaultProtocolClient("finite", process.execPath, [path.resolve(process.argv[1])]);
-    } else {
-      app.setAsDefaultProtocolClient("finite");
+    if (process.env.FINITECHAT_SKIP_PROTOCOL_REGISTRATION !== "1") {
+      if (process.defaultApp && process.argv.length >= 2) {
+        app.setAsDefaultProtocolClient("finite", process.execPath, [path.resolve(process.argv[1])]);
+      } else {
+        app.setAsDefaultProtocolClient("finite");
+      }
     }
     startDaemon();
     await waitForDaemonReady();
