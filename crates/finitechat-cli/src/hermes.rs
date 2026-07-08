@@ -692,10 +692,7 @@ fn handle_hermes_service_poll(
         }
 
         let remaining = timeout.saturating_sub(started.elapsed()).as_millis() as u64;
-        let bridge = state
-            .runtime
-            .agent_bridge_wait_for_update(invite_urls.clone(), remaining)
-            .map_err(map_core_hermes_error)?;
+        let bridge = wait_for_hermes_bridge_update_or_poll(state, invite_urls.clone(), remaining)?;
         let payload = collect_hermes_service_inbound_payload(state, &home, &request, Some(bridge))?;
         if hermes_inbound_payload_has_records(&payload) || started.elapsed() >= timeout {
             return Ok(payload);
@@ -775,14 +772,35 @@ fn run_hermes_inbound_stream(
             continue;
         }
 
-        let bridge = state
-            .runtime
-            .agent_bridge_wait_for_update(invite_urls.clone(), timeout_millis)
-            .map_err(map_core_hermes_error)?;
+        let bridge =
+            wait_for_hermes_bridge_update_or_poll(&state, invite_urls.clone(), timeout_millis)?;
         let payload =
             collect_hermes_service_inbound_payload(&state, &home, &request, Some(bridge))?;
         if !send_hermes_inbound_payload(&tx, &payload)? {
             return Ok(());
+        }
+    }
+}
+
+fn wait_for_hermes_bridge_update_or_poll(
+    state: &HermesServiceState,
+    invite_urls: Vec<String>,
+    timeout_millis: u64,
+) -> Result<finitechat_core::AppBridgeSync, CliError> {
+    match state
+        .runtime
+        .agent_bridge_wait_for_update(invite_urls.clone(), timeout_millis)
+    {
+        Ok(bridge) => Ok(bridge),
+        Err(_) => {
+            let fallback_sleep_ms = timeout_millis.min(POLL_SLEEP_MS);
+            if fallback_sleep_ms > 0 {
+                std::thread::sleep(Duration::from_millis(fallback_sleep_ms));
+            }
+            state
+                .runtime
+                .agent_bridge_poll_once(invite_urls)
+                .map_err(map_core_hermes_error)
         }
     }
 }

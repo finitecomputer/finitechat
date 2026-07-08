@@ -1503,6 +1503,19 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
             .send()
             .expect("idle inbound stream response");
         assert_eq!(idle_response.status().as_u16(), 200);
+        let mut idle_reader = std::io::BufReader::new(idle_response);
+        let mut idle_line = String::new();
+        let idle_read = idle_reader
+            .read_line(&mut idle_line)
+            .expect("read idle inbound heartbeat");
+        assert!(
+            idle_read > 0,
+            "idle inbound stream ended instead of staying resident"
+        );
+        assert!(
+            idle_line.trim().is_empty(),
+            "idle inbound stream should emit a blank heartbeat, got {idle_line:?}"
+        );
         std::thread::sleep(Duration::from_millis(150));
 
         let activity_started = Instant::now();
@@ -1531,7 +1544,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
             "activity was blocked by an open inbound stream"
         );
         std::thread::sleep(Duration::from_millis(5));
-        drop(idle_response);
+        drop(idle_reader);
     });
 
     let _ = stream_child.kill();
