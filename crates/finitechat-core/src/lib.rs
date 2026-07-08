@@ -10911,6 +10911,21 @@ mod tests {
             app_room(&app_state, &room_id).state,
             AppRoomState::Connected
         );
+
+        agent
+            .send_encoded_chat_message_and_wait(
+                room_id.clone(),
+                encode_text_message_payload("agent reply", None).unwrap(),
+                "agent reply".to_owned(),
+            )
+            .unwrap();
+        let bridge = agent
+            .agent_bridge_poll_once(vec![invite.invite_url.clone()])
+            .unwrap();
+        assert!(
+            bridge.events.is_empty(),
+            "agent bridge poll should not surface its own sent message"
+        );
     }
 
     #[test]
