@@ -401,6 +401,8 @@ pub struct StreamFinishV1 {
 pub struct DecryptedApplicationEventV1 {
     pub kind: DurableAppEventKind,
     pub conversation_id: Option<ConversationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<ConversationSegmentId>,
     #[serde(with = "bytes_as_vec")]
     pub payload: Vec<u8>,
 }
@@ -2204,6 +2206,10 @@ impl DecryptedApplicationEventV1 {
             validate_bytes_non_empty("conversation_id", conversation_id.len())?;
             validate_string_bytes("conversation_id", conversation_id, MAX_OBJECT_ID_BYTES)?;
         }
+        if let Some(segment_id) = &self.segment_id {
+            validate_bytes_non_empty("segment_id", segment_id.len())?;
+            validate_string_bytes("segment_id", segment_id, MAX_OBJECT_ID_BYTES)?;
+        }
         let max_payload = if self.kind == DurableAppEventKind::RuntimeStateSnapshot {
             MAX_RUNTIME_STATE_SNAPSHOT_PAYLOAD_BYTES
         } else {
@@ -2933,6 +2939,7 @@ mod tests {
         let event = DecryptedApplicationEventV1 {
             kind: DurableAppEventKind::ChatMessage,
             conversation_id: Some(String::new()),
+            segment_id: None,
             payload: b"hello".to_vec(),
         };
 
@@ -5627,6 +5634,7 @@ mod tests {
         DecryptedApplicationEventV1 {
             kind,
             conversation_id: conversation_id.map(str::to_string),
+            segment_id: None,
             payload: payload.to_vec(),
         }
     }

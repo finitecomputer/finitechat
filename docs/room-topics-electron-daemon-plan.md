@@ -1,10 +1,10 @@
-# Room/Topics Electron Daemon Plan
+# Room/Topics/Chats Electron Daemon Plan
 
 Status: active implementation plan.
 
 ## Goal
 
-Build a desktop Finite Chat client that proves the room/topic/segment product
+Build a desktop Finite Chat client that proves the room/topic/chat product
 model end to end while keeping `finitechat-core::AppState` and `AppAction` as
 the source of truth for CLI, iOS, Electron, hosted web bridge, and runtime
 daemon behavior.
@@ -13,20 +13,36 @@ This is not a compatibility layer for legacy dashboard chat. The legacy web UI
 is a source of proven frontend code and interaction detail, not an API or data
 model to preserve. The implementation should deepen the Finite Chat model:
 Rooms own membership and encryption, Topics own work lanes inside a Room, and
-Segments mark context/reset boundaries inside a Topic.
+Chats own resumable context sessions inside a Topic. Protocol-level segments
+are the durable backing record for product chats; "segment" is not user-facing
+product language.
 
 ## Product Shape
 
 - A Room is the MLS-backed membership and delivery boundary.
-- A Topic is the normal user-facing "new chat" lane inside a Room.
-- A Segment is a context boundary inside a Topic, usually created by `/new` or a
-  first-class reset action.
-- Messages belong to a Room and may belong to a Topic.
+- A Topic is a user-facing grouping lane inside a Room.
+- A Chat is a resumable context/session inside a Topic.
+- A protocol Segment is the durable backing identity for a Chat.
+- Every Room has a durable `Home` Topic. New Chats default to Home unless the
+  user is inside another Topic.
+- Home has a deterministic default Chat id, `home-chat`, so two devices that
+  join the same Room do not invent different empty first Chats before either
+  device sends a message.
+- Creating a new Topic immediately creates a first Chat under that Topic.
+- `/new` inside a Chat creates a new Chat in the current Topic.
+- Messages belong to a Room, Topic, and, for all newly produced topic messages,
+  a Chat.
+- Unscoped legacy/plain Hermes messages are accepted into `Home`/`home-chat`;
+  new product sends should produce explicit Topic and Chat ids.
 - Runtime state, command results, and activity are projected through typed
   Finite Chat app events, not inferred from transcript strings.
 - Electron and iOS render Rust-projected state; they do not own sync, room
   admission, retries, send eligibility, topic semantics, or runtime command
   policy.
+- Adding people is a Room membership operation. Pasting an invite code joins a
+  Room through invite-session admission; pasting an npub performs an MLS add
+  using that account's published KeyPackage. It is not a pending notification
+  channel.
 
 ## Musts
 
@@ -53,26 +69,35 @@ Segments mark context/reset boundaries inside a Topic.
 - Do not recreate `chat.bootstrap`, `chat.list_threads`, `chat.send_message`,
   or the machine relay API as the desktop daemon contract.
 - Do not map Topics through a legacy `Thread` compatibility model.
-- Do not make "new chat" create a new Room unless membership changes.
+- Do not make "new chat" create a new Room. New Rooms are only for new
+  membership boundaries.
 - Do not hide topic/segment gaps in Electron-local state.
 - Do not create a second desktop-only projection that iOS cannot reuse.
 - Do not add hosted web E2EE product copy. Hosted web bridge mode is useful web
   chat, but it is a trusted server client if the server holds device secrets.
+- Do not make npub invites look like out-of-band notifications. If the target
+  account has no KeyPackage, surface that honestly and use invite codes for
+  rendezvous.
 
-## Phase 1: Core Topic Projection
+## Phase 1: Core Topic/Chat Projection
 
-Add first-class topic/segment projection to `finitechat-core`.
+Hard-cut `finitechat-core` so AppState exposes Topics with Chats underneath.
 
 Scope:
 
 - Add `AppTopicSummary` and selected-topic fields to `AppState`.
+- Add `AppChatSummary` and `selected_chat_id` to `AppState`.
 - Add topic-aware room details where useful.
-- Project messages for the selected `(room_id, topic_id)` pair.
+- Project messages for the selected `(room_id, topic_id, chat_id)` tuple.
 - Preserve unscoped room messages for older or system events.
+- Preserve old topic messages without a chat id by projecting them into an
+  inferred active/default Chat when possible; strict writes produce chat ids.
 - Add `AppAction::CreateTopic`, `OpenTopic`, `RenameTopic`, `ArchiveTopic`,
-  and `StartSegment`.
+  `OpenChat`, and `StartTopicChat`.
 - Add topic-aware message send actions or extend send actions with
-  `conversation_id`.
+  `conversation_id` and `segment_id`.
+- Ensure `Home` exists for every created Room and for joined Rooms once they are
+  connected.
 - Keep existing iOS-compatible behavior compiling while the iOS UI remains
   room-first.
 
@@ -81,8 +106,13 @@ Acceptance:
 - Rust tests prove creating a topic appends/loads conversation metadata.
 - Rust tests prove opening a topic changes selected messages without changing
   Room membership.
-- Rust tests prove `/new`-equivalent segment creation appends a segment boundary
-  in the selected topic, not a new Room or Topic.
+- Rust tests prove `/new`-equivalent chat creation appends a segment boundary
+  in the selected Topic, not a new Room or Topic.
+- Rust tests prove selecting an older Chat and sending keeps messages scoped to
+  that Chat even when another Chat in the same Topic is active elsewhere.
+- Rust tests prove a newly created Topic has its first Chat immediately.
+- Rust and CLI integration tests prove two devices converge on the same
+  default Home Chat and do not strand messages behind device-local empty Chats.
 - Existing invite, send, attachment, poll, receipt, and device tests still pass.
 
 ## Phase 2: Daemon Surface
@@ -133,21 +163,20 @@ Scope:
 
 Acceptance:
 
-- Electron renders Rooms, Topics, selected Topic transcript, composer,
+- Electron renders Rooms, Topics, selected Chat transcript, composer,
   attachments, activity, and runtime state from daemon `AppState`.
-- Topics render as sidebar headers, with topic segments shown as chat rows
-  beneath them when the core has segment boundaries.
-- Creating "New chat" dispatches `StartTopicSegment` when a topic is selected,
-  preserving the legacy "start a fresh chat without a fresh pairing" feel; when
-  no topic is selected it dispatches `CreateRoom`.
+- Topics render as sidebar headers, with Chats shown as rows beneath them.
+- Creating "New chat" dispatches `StartTopicChat` in the current Topic, falling
+  back to the Room's `Home` Topic.
 - Creating "New topic" dispatches `CreateTopic` inside the selected room and
-  shows that topic in the sidebar under its room.
+  selects the first Chat under that Topic.
+- Hovering a Topic header reveals a compact new-chat icon.
 - Adding another participant uses one AppState path:
   - invite-code paste dispatches `ScanTarget`;
   - npub paste dispatches `ScanTarget`, then `StartProfileChat` or
     `AddRoomMembers` with the resolved `AppProfileSummary`;
   - room invite generation dispatches `CreateInvite`.
-- `/new` or reset creates a Segment boundary in the selected Topic.
+- `/new` or reset creates a Chat in the selected Topic.
 - UI updates arrive from daemon SSE and reconcile with local draft/layout state.
 - `finite://join?...` links open the app and dispatch `ScanTarget`.
 - For renderer iteration, run `npm run dev:renderer` and launch Electron with
@@ -184,16 +213,26 @@ Use the Electron-proven room/topic model to reshape the iOS app.
 
 Scope:
 
-- Add topic navigation to iOS over the same `AppState`.
-- Move the single Start Chat flow toward selecting/creating Rooms and Topics.
-- Render Segment boundaries in the transcript.
+- Replace the generic chat-list product surface with the same Room/Topic/Chat
+  hierarchy as Electron.
+- Use the top-left hamburger menu as the iOS sidebar: Rooms are membership
+  contexts, Topics are headers, Chats are rows.
+- The initial home screen composer sends into a new Chat in the Home Topic with
+  the default agent Room.
+- Support invite-code agent connect, Home chat, new Topic, new Chat in Topic,
+  and shared multi-device sync.
+- Defer people/contact lists until Electron and iOS share the same core
+  multiplayer surface.
 - Keep SwiftUI as a renderer and OS-capability bridge.
 
 Acceptance:
 
-- iOS uses the same topic/segment state and action names as Electron.
-- Product harness proves topic create/open/send/segment on iOS simulator and
-  then physical device.
+- iOS uses the same topic/chat state and action names as Electron.
+- Electron and iOS logged in with the same nsec show the same Topics, Chats,
+  messages, and room members while presenting one user account with distinct
+  devices.
+- Product harness proves invite join, Home chat send, topic create, chat create,
+  open/send, and sync on iOS Simulator and then physical device.
 - No Electron-only topic semantics remain.
 
 ## Phase 6: Hosted Web Bridge And TEE Candidate
@@ -249,9 +288,13 @@ protocol or release alignment instead.
 Core tests:
 
 - Topic create/open/rename/archive projection.
-- Topic-scoped message send and selected-message window.
-- Segment boundary projection and replay.
+- Chat-scoped message send and selected-message window.
+- Chat/segment boundary projection and replay.
+- Home Topic creation and default-chat selection.
 - Invite scan/join does not lose selected topic state.
+- Invite code generation from Electron produces a joinable URL.
+- npub member add succeeds when the target account has a KeyPackage and
+  honestly reports unavailable when it does not.
 - Same-account multi-device visibility.
 
 Daemon tests:

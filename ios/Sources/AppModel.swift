@@ -2038,6 +2038,7 @@ final class AppModel: ObservableObject, AppReconciler {
             seq: Self.optimisticSequenceBase + sequenceOffset,
             messageId: messageID,
             conversationId: nil,
+            chatId: nil,
             senderAccountId: state.identity.accountId,
             senderDeviceId: state.identity.deviceId,
             senderDisplayName: state.identity.deviceId,
@@ -2228,6 +2229,12 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "open_topic",
                 details: ["room": roomId, "topic": topicId]
             )
+        case .openChat(let roomId, let topicId, let chatId):
+            return DiagnosticActionSummary(
+                category: "runtime",
+                name: "open_chat",
+                details: ["room": roomId, "topic": topicId, "chat": chatId]
+            )
         case .createRoom:
             return DiagnosticActionSummary(
                 category: "transport",
@@ -2240,10 +2247,10 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "create_topic",
                 details: ["room": roomId]
             )
-        case .startTopicSegment(let roomId, let topicId, _):
+        case .startTopicChat(let roomId, let topicId, _):
             return DiagnosticActionSummary(
                 category: "transport",
-                name: "start_topic_segment",
+                name: "start_topic_chat",
                 details: ["room": roomId, "topic": topicId]
             )
         case .saveProfile:
@@ -2311,6 +2318,12 @@ final class AppModel: ObservableObject, AppReconciler {
                 category: "transport",
                 name: "send_topic_message",
                 details: ["room": roomId, "topic": topicId]
+            )
+        case .sendChatMessage(let roomId, let topicId, let chatId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_chat_message",
+                details: ["room": roomId, "topic": topicId, "chat": chatId]
             )
         case .sendReply(let roomId, _, let replyToMessageId):
             return DiagnosticActionSummary(

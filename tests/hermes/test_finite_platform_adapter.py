@@ -237,7 +237,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 "room-agent-1",
                 "hello",
                 reply_to="msg-0",
-                metadata={"thread_id": "topic-build", "priority": "low"},
+                metadata={"conversation_id": "topic-build", "thread_id": "chat-build-1", "priority": "low"},
             )
         )
 
@@ -247,6 +247,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         payload = calls[0][1]
         self.assertEqual(payload["room_id"], "room-agent-1")
         self.assertEqual(payload["conversation_id"], "topic-build")
+        self.assertEqual(payload["segment_id"], "chat-build-1")
         self.assertEqual(payload["reply_to_message_id"], "msg-0")
         self.assertEqual(payload["kind"], "message")
         self.assertEqual(payload["status"], "complete")
@@ -268,7 +269,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             adapter.send(
                 "room-agent-1",
                 "running draft",
-                metadata={"thread_id": "topic-build"},
+                metadata={"conversation_id": "topic-build", "thread_id": "chat-build-1"},
             )
         )
         edit_result = asyncio.run(
@@ -285,11 +286,14 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(edit_result.message_id, "edit-1")
         self.assertEqual([call[0] for call in calls], ["send", "edit"])
         self.assertEqual(calls[1][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[1][1]["segment_id"], "chat-build-1")
         self.assertEqual(calls[1][1]["message_id"], "out-1")
         self.assertEqual(calls[1][1]["status"], "complete")
         self.assertTrue(calls[1][1]["finalize"])
         self.assertEqual(adapter._outbound_message_conversations["out-1"], "topic-build")
         self.assertEqual(adapter._outbound_message_conversations["edit-1"], "topic-build")
+        self.assertEqual(adapter._outbound_message_segments["out-1"], "chat-build-1")
+        self.assertEqual(adapter._outbound_message_segments["edit-1"], "chat-build-1")
 
     def test_media_send_uses_typed_attachment_payload(self):
         adapter = self.adapter()
@@ -305,13 +309,14 @@ class FinitePlatformAdapterTests(unittest.TestCase):
                 "room-agent-1",
                 "/tmp/report.pdf",
                 caption="report",
-                metadata={"thread_id": "topic-docs"},
+                metadata={"conversation_id": "topic-docs", "thread_id": "chat-docs-1"},
             )
         )
 
         self.assertTrue(result.success)
         payload = calls[0][1]
         self.assertEqual(payload["conversation_id"], "topic-docs")
+        self.assertEqual(payload["segment_id"], "chat-docs-1")
         self.assertEqual(payload["kind"], "media")
         self.assertEqual(payload["attachments"][0]["kind"], "file")
         self.assertEqual(payload["attachments"][0]["mime_type"], "application/pdf")
@@ -330,6 +335,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             "seq": 12,
             "message_id": "msg-12",
             "conversation_id": "topic-build",
+            "segment_id": "chat-build-1",
             "text": "please build",
             "message_type": "text",
             "source": {
@@ -362,13 +368,16 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.text, "please build")
         self.assertEqual(event.message_type, MessageType.PHOTO)
         self.assertEqual(event.source.chat_id, "room-agent-1")
-        self.assertEqual(event.source.thread_id, "topic-build")
+        self.assertEqual(event.source.thread_id, "chat-build-1")
         self.assertEqual(event.source.chat_topic, "Builds")
+        self.assertEqual(event.raw_message["conversation_id"], "topic-build")
+        self.assertEqual(event.raw_message["segment_id"], "chat-build-1")
         self.assertEqual(event.media_urls, ["/tmp/screenshot.png"])
         self.assertEqual(event.reply_to_message_id, "msg-11")
         self.assertEqual([call[0] for call in calls], ["activity", "ack"])
         self.assertEqual(calls[0][1]["action"], "set")
         self.assertEqual(calls[0][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[0][1]["segment_id"], "chat-build-1")
         self.assertEqual(calls[0][1]["expires_in_millis"], self.module.PROCESSING_ACTIVITY_TTL_MILLIS)
         ack_calls = [call for call in calls if call[0] == "ack"]
         self.assertEqual(
@@ -386,6 +395,7 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             "seq": 42,
             "message_id": "msg-42",
             "conversation_id": "topic-chat",
+            "segment_id": "chat-group-1",
             "text": "hello group",
             "source": {
                 "platform": "finitechat",
@@ -414,10 +424,49 @@ class FinitePlatformAdapterTests(unittest.TestCase):
         self.assertEqual(event.source.user_id_alt, "alice-phone")
         self.assertEqual(event.source.chat_id_alt, "mls-group-id")
         self.assertFalse(event.source.is_bot)
-        self.assertEqual(event.source.thread_id, "topic-chat")
+        self.assertEqual(event.source.thread_id, "chat-group-1")
         self.assertEqual([call[0] for call in calls], ["activity", "ack"])
+        self.assertEqual(calls[0][1]["conversation_id"], "topic-chat")
+        self.assertEqual(calls[0][1]["segment_id"], "chat-group-1")
         ack_calls = [call for call in calls if call[0] == "ack"]
         self.assertEqual(ack_calls[0][1]["message_id"], "msg-42")
+
+    def test_reply_uses_inbound_chat_thread_to_restore_topic_route(self):
+        adapter = self.adapter()
+        calls = []
+
+        async def fake_json(action, payload, *, timeout):
+            calls.append((action, payload, timeout))
+            if action == "send":
+                return self.module._FiniteChatResult(True, {"message_id": "out-1"}, None, False)
+            return self.module._FiniteChatResult(True, {}, None, False)
+
+        adapter._finitechat_json = fake_json
+        asyncio.run(
+            adapter._handle_finitechat_event(
+                {
+                    "room_id": "room-agent-1",
+                    "seq": 7,
+                    "message_id": "msg-7",
+                    "conversation_id": "topic-build",
+                    "segment_id": "chat-build-1",
+                    "text": "please build",
+                }
+            )
+        )
+
+        result = asyncio.run(
+            adapter.send(
+                "room-agent-1",
+                "done",
+                metadata={"thread_id": "chat-build-1"},
+            )
+        )
+
+        self.assertTrue(result.success)
+        send_payload = [call[1] for call in calls if call[0] == "send"][0]
+        self.assertEqual(send_payload["conversation_id"], "topic-build")
+        self.assertEqual(send_payload["segment_id"], "chat-build-1")
 
     def test_duplicate_redelivery_is_acked_without_second_dispatch(self):
         adapter = self.adapter()
@@ -603,17 +652,25 @@ class FinitePlatformAdapterTests(unittest.TestCase):
             return self.module._FiniteChatResult(True, {}, None, False)
 
         adapter._finitechat_json = fake_json
-        asyncio.run(adapter.send_typing("room-agent-1", metadata={"thread_id": "topic-build"}))
+        asyncio.run(
+            adapter.send_typing(
+                "room-agent-1",
+                metadata={"conversation_id": "topic-build", "thread_id": "chat-build-1"},
+            )
+        )
         asyncio.run(adapter.stop_typing("room-agent-1"))
 
         self.assertEqual(calls[0][0], "activity")
         self.assertEqual(calls[0][1]["action"], "set")
         self.assertEqual(calls[0][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[0][1]["segment_id"], "chat-build-1")
         self.assertEqual(calls[0][1]["expires_in_millis"], 60 * 1000)
         self.assertEqual(calls[1][0], "activity")
         self.assertEqual(calls[1][1]["action"], "clear")
         self.assertEqual(calls[1][1]["conversation_id"], "topic-build")
+        self.assertEqual(calls[1][1]["segment_id"], "chat-build-1")
         self.assertEqual(adapter._activity_conversations, {})
+        self.assertEqual(adapter._activity_segments, {})
 
     def test_poll_loop_uses_short_poll_while_agent_turn_is_active(self):
         adapter = self.adapter()

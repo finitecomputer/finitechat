@@ -50,8 +50,17 @@ export type AppTopicSummary = {
   created_seq: number;
   updated_seq: number;
   archived: boolean;
-  active_segment_id?: string | null;
-  segments: { segment_id: string; started_seq: number }[];
+  active_chat_id?: string | null;
+  chats: {
+    chat_id: string;
+    title: string;
+    last_message_preview: string;
+    unread_count: number;
+    message_count: number;
+    started_seq: number;
+    updated_seq: number;
+    active: boolean;
+  }[];
 };
 
 export type ChatMediaKind = "Image" | "VoiceNote" | "Video" | "File";
@@ -85,6 +94,7 @@ export type ChatMessage = {
   seq: number;
   message_id: string;
   conversation_id?: string | null;
+  chat_id?: string | null;
   sender_account_id: string;
   sender_device_id: string;
   sender_display_name: string;
@@ -135,6 +145,7 @@ export type AppState = {
   selected_room_id?: string | null;
   topics: AppTopicSummary[];
   selected_topic_id?: string | null;
+  selected_chat_id?: string | null;
   active_invite?: { room_id: string; invite_url: string } | null;
   active_profile_id?: string | null;
   status: string;
@@ -158,9 +169,10 @@ export type AppAction =
   | { StopRuntime: null }
   | { OpenRoom: { room_id: string } }
   | { OpenTopic: { room_id: string; topic_id: string } }
+  | { OpenChat: { room_id: string; topic_id: string; chat_id: string } }
   | { CreateRoom: { display_name: string } }
   | { CreateTopic: { room_id: string; title: string } }
-  | { StartTopicSegment: { room_id: string; topic_id: string; reason?: string | null } }
+  | { StartTopicChat: { room_id: string; topic_id: string; reason?: string | null } }
   | { StartProfileChat: { profile: AppProfileSummary; display_name: string } }
   | { StartGroupChat: { profiles: AppProfileSummary[]; display_name: string } }
   | { AddRoomMembers: { room_id: string; profiles: AppProfileSummary[] } }
@@ -169,6 +181,7 @@ export type AppAction =
   | { SubmitInviteJoin: { pending_room_id: string } }
   | { SendMessage: { room_id: string; text: string } }
   | { SendTopicMessage: { room_id: string; topic_id: string; text: string } }
+  | { SendChatMessage: { room_id: string; topic_id: string; chat_id: string; text: string } }
   | {
       SendAttachments: {
         room_id: string;

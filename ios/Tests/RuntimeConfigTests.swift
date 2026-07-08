@@ -767,6 +767,7 @@ final class ChatTimelineActivityTests: XCTestCase {
             seq: seq,
             messageId: id,
             conversationId: nil,
+            chatId: nil,
             senderAccountId: "alice-account",
             senderDeviceId: "alice-ios",
             senderDisplayName: "Alice",
@@ -791,10 +792,16 @@ final class ChatTimelineActivityTests: XCTestCase {
 @MainActor
 final class AppModelPersistenceTests: XCTestCase {
     func testMyProfileUsesSignedInProfileNotActiveScannedProfile() async throws {
+        let material = try createNostrIdentity()
         var state = savedChatState()
+        state.identity = Identity(
+            accountId: material.accountId,
+            deviceId: state.identity.deviceId,
+            accountSecretHex: material.accountSecretHex
+        )
         let ownProfile = AppProfileSummary(
-            accountId: state.identity.accountId,
-            npub: "npub1paul",
+            accountId: material.accountId,
+            npub: material.npub,
             displayName: "Paul",
             about: nil,
             picture: "https://example.invalid/paul.png",
@@ -823,6 +830,8 @@ final class AppModelPersistenceTests: XCTestCase {
             ),
             applicationSupportURL: try temporarySupportURL(),
             args: ["FiniteChat"],
+            requiresNostrLogin: true,
+            nostrIdentityStore: MemoryNostrIdentityStore(identity: AppNostrIdentity(material: material)),
             startsUpdateLoop: false
         ) { _ in
             runtime
@@ -1792,6 +1801,7 @@ final class AppModelPersistenceTests: XCTestCase {
                     seq: 1,
                     messageId: "message-bob",
                     conversationId: nil,
+                    chatId: nil,
                     senderAccountId: "alice-account",
                     senderDeviceId: "qt433",
                     senderDisplayName: "qt433",
@@ -2581,6 +2591,7 @@ final class AppModelPersistenceTests: XCTestCase {
                 seq: 1,
                 messageId: id,
                 conversationId: nil,
+                chatId: nil,
                 senderAccountId: isMine ? "alice-account" : "bob-account",
                 senderDeviceId: isMine ? "qt433" : "bob-ios",
                 senderDisplayName: isMine ? "qt433" : "Bob",
@@ -3743,6 +3754,7 @@ final class AppModelPersistenceTests: XCTestCase {
             seq: 1,
             messageId: "message-1",
             conversationId: nil,
+            chatId: nil,
             senderAccountId: "alice-account",
             senderDeviceId: "qt433",
             senderDisplayName: "qt433",
@@ -3769,6 +3781,9 @@ final class AppModelPersistenceTests: XCTestCase {
             identity: identity,
             rooms: [room],
             selectedRoomId: "room-main",
+            topics: [],
+            selectedTopicId: nil,
+            selectedChatId: nil,
             activeInvite: nil,
             activeProfileId: nil,
             status: status,
@@ -3814,6 +3829,7 @@ final class AppModelPersistenceTests: XCTestCase {
             seq: seq,
             messageId: id,
             conversationId: nil,
+            chatId: nil,
             senderAccountId: "alice-account",
             senderDeviceId: "qt433",
             senderDisplayName: "qt433",
@@ -3863,6 +3879,9 @@ final class AppModelPersistenceTests: XCTestCase {
             ),
             rooms: [],
             selectedRoomId: nil,
+            topics: [],
+            selectedTopicId: nil,
+            selectedChatId: nil,
             activeInvite: nil,
             activeProfileId: nil,
             status: status,
@@ -4187,6 +4206,7 @@ final class OutboundDeliveryAccessibilityTests: XCTestCase {
             seq: 1,
             messageId: id,
             conversationId: nil,
+            chatId: nil,
             senderAccountId: isMine ? "alice-account" : "bob-account",
             senderDeviceId: isMine ? "alice-ios" : "bob-ios",
             senderDisplayName: isMine ? "Alice" : "Bob",
@@ -4333,6 +4353,7 @@ final class SaveMediaActionTests: XCTestCase {
             seq: 1,
             messageId: "message-1",
             conversationId: nil,
+            chatId: nil,
             senderAccountId: "alice-account",
             senderDeviceId: "alice-ios",
             senderDisplayName: "Alice",

@@ -53,6 +53,7 @@ type DesktopOnboardingStatus = {
 };
 
 const MAX_COMPOSER_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const HOME_TOPIC_ID = "home";
 
 type ComposerAttachment = OutboundAttachment & {
   id: string;
@@ -63,6 +64,7 @@ type LocalPendingMessage = {
   local_id: string;
   room_id: string;
   conversation_id: string | null;
+  chat_id: string | null;
   text: string;
   attachments: Pick<ComposerAttachment, "id" | "filename" | "mime_type" | "kind" | "size">[];
   state: "sending" | "failed";
@@ -266,6 +268,10 @@ export function App() {
       ) ?? null,
     [state]
   );
+  const selectedChat = useMemo(
+    () => selectedTopic?.chats.find((chat) => chat.chat_id === state?.selected_chat_id) ?? selectedTopic?.chats[0] ?? null,
+    [selectedTopic, state?.selected_chat_id]
+  );
   const topicsByRoom = useMemo(() => {
     const grouped = new Map<string, AppTopicSummary[]>();
     for (const topic of state?.topics ?? []) {
@@ -277,7 +283,15 @@ export function App() {
       grouped.set(topic.room_id, topics);
     }
     for (const topics of grouped.values()) {
-      topics.sort((left, right) => right.updated_seq - left.updated_seq || left.title.localeCompare(right.title));
+      topics.sort((left, right) => {
+        if (left.topic_id === HOME_TOPIC_ID) {
+          return -1;
+        }
+        if (right.topic_id === HOME_TOPIC_ID) {
+          return 1;
+        }
+        return right.updated_seq - left.updated_seq || left.title.localeCompare(right.title);
+      });
     }
     return grouped;
   }, [state?.topics]);
@@ -309,9 +323,11 @@ export function App() {
       localPendingMessages.filter(
         (message) =>
           message.room_id === selectedRoom?.room_id &&
-          (selectedTopic ? message.conversation_id === selectedTopic.topic_id : message.conversation_id === null)
+          (selectedTopic
+            ? message.conversation_id === selectedTopic.topic_id && message.chat_id === (selectedChat?.chat_id ?? null)
+            : message.conversation_id === null)
       ),
-    [localPendingMessages, selectedRoom?.room_id, selectedTopic]
+    [localPendingMessages, selectedChat?.chat_id, selectedRoom?.room_id, selectedTopic]
   );
   const hasComposerContent = Boolean(composer.trim() || composerAttachments.length > 0);
   const awaitingSelectedAgent =
@@ -333,7 +349,14 @@ export function App() {
       return;
     }
     transcript.scrollTo({ top: transcript.scrollHeight, behavior: "smooth" });
-  }, [selectedMessages.length, visiblePendingMessages.length, selectedLiveMembers.length, selectedRoom?.room_id, selectedTopic?.topic_id]);
+  }, [
+    selectedMessages.length,
+    visiblePendingMessages.length,
+    selectedLiveMembers.length,
+    selectedRoom?.room_id,
+    selectedTopic?.topic_id,
+    selectedChat?.chat_id,
+  ]);
 
   useEffect(() => {
     if (!selectedRoom || selectedMessages.length === 0) {
@@ -414,6 +437,27 @@ export function App() {
       focusJoinInvite();
       return;
     }
+    if (text === "/new" && attachments.length === 0) {
+      const topicForNewChat =
+        selectedTopic ??
+        (topicsByRoom.get(selectedRoom.room_id) ?? []).find((topic) => topic.topic_id === HOME_TOPIC_ID) ??
+        (topicsByRoom.get(selectedRoom.room_id) ?? [])[0] ??
+        null;
+      if (!topicForNewChat) {
+        setError("Create a topic before starting another chat.");
+        return;
+      }
+      stopTyping(selectedRoom.room_id);
+      setComposer("");
+      await runComposerAction({
+        StartTopicChat: {
+          room_id: topicForNewChat.room_id,
+          topic_id: topicForNewChat.topic_id,
+          reason: null,
+        },
+      });
+      return;
+    }
     if (!canSendToSelectedRoom) {
       setError(
         selectedRoom.state === "Connected"
@@ -437,6 +481,7 @@ export function App() {
         local_id: pendingId,
         room_id: selectedRoom.room_id,
         conversation_id: selectedTopic?.topic_id ?? null,
+        chat_id: selectedChat?.chat_id ?? null,
         text,
         attachments: attachments.map(({ id, filename, mime_type, kind, size }) => ({ id, filename, mime_type, kind, size })),
         state: "sending",
@@ -456,13 +501,22 @@ export function App() {
           },
         })
       : selectedTopic
-        ? await runComposerAction({
-            SendTopicMessage: {
-              room_id: selectedTopic.room_id,
-              topic_id: selectedTopic.topic_id,
-              text,
-            },
-          })
+        ? selectedChat
+          ? await runComposerAction({
+              SendChatMessage: {
+                room_id: selectedTopic.room_id,
+                topic_id: selectedTopic.topic_id,
+                chat_id: selectedChat.chat_id,
+                text,
+              },
+            })
+          : await runComposerAction({
+              SendTopicMessage: {
+                room_id: selectedTopic.room_id,
+                topic_id: selectedTopic.topic_id,
+                text,
+              },
+            })
         : await runComposerAction({ SendMessage: { room_id: selectedRoom.room_id, text } });
     if (next) {
       setLocalPendingMessages((messages) => messages.filter((message) => message.local_id !== pendingId));
@@ -522,11 +576,16 @@ export function App() {
     setCreateTitle("");
     setCreateMode(null);
     if (createMode === "chat") {
-      if (selectedTopic) {
+      const topicForNewChat =
+        selectedTopic ??
+        (selectedRoom ? (topicsByRoom.get(selectedRoom.room_id) ?? []).find((topic) => topic.topic_id === HOME_TOPIC_ID) : null) ??
+        (selectedRoom ? (topicsByRoom.get(selectedRoom.room_id) ?? [])[0] : null) ??
+        null;
+      if (topicForNewChat) {
         await run({
-          StartTopicSegment: {
-            room_id: selectedTopic.room_id,
-            topic_id: selectedTopic.topic_id,
+          StartTopicChat: {
+            room_id: topicForNewChat.room_id,
+            topic_id: topicForNewChat.topic_id,
             reason: title || null,
           },
         });
@@ -572,6 +631,10 @@ export function App() {
           },
         });
     if (next) {
+      if (next.status === "chat unavailable" || next.toast) {
+        setError(next.toast ?? "That npub is not available for an encrypted chat yet.");
+        return;
+      }
       setParticipantInput("");
       setParticipantOpen(false);
     }
@@ -585,7 +648,10 @@ export function App() {
     if (!selectedRoom) {
       return;
     }
-    await run({ CreateInvite: { room_id: selectedRoom.room_id } });
+    const next = await run({ CreateInvite: { room_id: selectedRoom.room_id } });
+    if (!next?.active_invite || next.active_invite.room_id !== selectedRoom.room_id) {
+      setError(next?.toast ?? "Invite could not be created for this chat.");
+    }
   }
 
   async function copyInvite() {
@@ -743,92 +809,84 @@ export function App() {
             </form>
           ) : null}
 
-          <details className="finite-chat__folder finite-chat__folder--flat" open>
-            <summary className="finite-chat__folder-summary">
-              <span className="finite-chat__folder-main">
-                <span className="finite-chat__folder-icon" aria-hidden>
-                  <HashIcon />
-                </span>
-                <span className="finite-chat__folder-label">Topics</span>
-              </span>
-              <ChevronRightIcon className="finite-chat__folder-chevron" aria-hidden />
-            </summary>
-
-            <div className="finite-chat__folder-body">
-              {(state?.rooms ?? []).map((room) => {
-                const roomTopics = topicsByRoom.get(room.room_id) ?? [];
-                if (roomTopics.length === 0) {
-                  return null;
-                }
+          <div className="finite-chat__folder-body finite-chat__topic-list">
+            {(state?.rooms ?? []).map((room) => {
+              const roomTopics = topicsByRoom.get(room.room_id) ?? [];
+              if (roomTopics.length === 0) {
                 return (
-                  <div className="finite-chat__sidebar-topic-room-group" key={room.room_id}>
-                    <div className="finite-chat__sidebar-topic-room-label">{room.display_name}</div>
-                    {roomTopics.map((topic) => (
-                      <div className="finite-chat__sidebar-topic-group" key={`${topic.room_id}:${topic.topic_id}`}>
-                        <TopicThreadButton
-                          topic={topic}
-                          active={topic.room_id === state?.selected_room_id && topic.topic_id === state?.selected_topic_id}
-                          onClick={() => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
-                        />
-                        {topic.segments.length > 0 ? (
-                          <div className="finite-chat__sidebar-segment-list">
-                            {topic.segments.map((segment, index) => (
-                              <TopicSegmentButton
-                                key={segment.segment_id}
-                                segment={segment}
-                                index={index}
-                                active={
-                                  topic.room_id === state?.selected_room_id &&
-                                  topic.topic_id === state?.selected_topic_id &&
-                                  topic.active_segment_id === segment.segment_id
-                                }
-                                onClick={() => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
-                              />
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
+                  <RoomThreadButton
+                    key={room.room_id}
+                    room={room}
+                    active={room.room_id === state?.selected_room_id}
+                    onClick={() => void run({ OpenRoom: { room_id: room.room_id } })}
+                  />
                 );
-              })}
-              {state && state.topics.filter((topic) => !topic.archived).length === 0 ? (
-                <div className="finite-chat__thread-empty">
-                  <HashIcon aria-hidden />
-                  <span>No topics</span>
+              }
+              return (
+                <div className="finite-chat__sidebar-topic-room-group" key={room.room_id}>
+                  {state && state.rooms.length > 1 ? (
+                    <button
+                      type="button"
+                      className="finite-chat__sidebar-topic-room-label"
+                      onClick={() => void run({ OpenRoom: { room_id: room.room_id } })}
+                    >
+                      <ThreadActivityIndicator active={room.state === "Joining" || room.state === "WaitingForApproval"} />
+                      <span>{room.display_name}</span>
+                    </button>
+                  ) : null}
+                  {roomTopics.map((topic) => (
+                    <div className="finite-chat__sidebar-topic-group" key={`${topic.room_id}:${topic.topic_id}`}>
+                      <TopicThreadButton
+                        topic={topic}
+                        active={topic.room_id === state?.selected_room_id && topic.topic_id === state?.selected_topic_id}
+                        onClick={() => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
+                        onNewChat={() =>
+                          void run({
+                            StartTopicChat: {
+                              room_id: topic.room_id,
+                              topic_id: topic.topic_id,
+                              reason: null,
+                            },
+                          })
+                        }
+                      />
+                      {topic.chats.length > 0 ? (
+                        <div className="finite-chat__sidebar-segment-list">
+                          {topic.chats.map((chat, index) => (
+                            <TopicChatButton
+                              key={chat.chat_id}
+                              chat={chat}
+                              index={index}
+                              active={
+                                topic.room_id === state?.selected_room_id &&
+                                topic.topic_id === state?.selected_topic_id &&
+                                chat.chat_id === state?.selected_chat_id
+                              }
+                              onClick={() =>
+                                void run({
+                                  OpenChat: {
+                                    room_id: topic.room_id,
+                                    topic_id: topic.topic_id,
+                                    chat_id: chat.chat_id,
+                                  },
+                                })
+                              }
+                            />
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
                 </div>
-              ) : null}
-            </div>
-          </details>
-
-          <details className="finite-chat__folder finite-chat__folder--flat" open>
-            <summary className="finite-chat__folder-summary">
-              <span className="finite-chat__folder-main">
-                <span className="finite-chat__folder-icon" aria-hidden>
-                  <MessageCircleIcon />
-                </span>
-                <span className="finite-chat__folder-label">Chats</span>
-              </span>
-              <ChevronRightIcon className="finite-chat__folder-chevron" aria-hidden />
-            </summary>
-
-            <div className="finite-chat__folder-body">
-              {(state?.rooms ?? []).map((room) => (
-                <RoomThreadButton
-                  key={room.room_id}
-                  room={room}
-                  active={room.room_id === state?.selected_room_id && !state?.selected_topic_id}
-                  onClick={() => void run({ OpenRoom: { room_id: room.room_id } })}
-                />
-              ))}
-              {state && state.rooms.length === 0 ? (
-                <div className="finite-chat__thread-empty">
-                  <MessageCircleIcon aria-hidden />
-                  <span>No chats</span>
-                </div>
-              ) : null}
-            </div>
-          </details>
+              );
+            })}
+            {state && state.rooms.length === 0 ? (
+              <div className="finite-chat__thread-empty">
+                <MessageCircleIcon aria-hidden />
+                <span>No chats</span>
+              </div>
+            ) : null}
+          </div>
         </nav>
 
         <div className="finite-chat__sidebar-footer">
@@ -1300,6 +1358,12 @@ function ParticipantPanel({
           </span>
         </div>
       ) : null}
+      {activeInvite ? (
+        <div className="finite-chat__participant-invite">
+          <LinkIcon aria-hidden />
+          <span>{activeInvite.invite_url}</span>
+        </div>
+      ) : null}
       <div className="finite-chat__participant-actions">
         <button type="button" className="finite-chat__command-button" onClick={onCreateInvite} disabled={!canCreateInvite || busy}>
           <LinkIcon aria-hidden />
@@ -1344,41 +1408,48 @@ function RoomThreadButton({
 
 function TopicThreadButton({
   active,
+  onNewChat,
   onClick,
   topic,
 }: {
   active: boolean;
+  onNewChat: () => void;
   onClick: () => void;
   topic: AppTopicSummary;
 }) {
   return (
-    <button type="button" className={`finite-chat__topic-thread finite-chat__topic-header ${active ? "is-active" : ""}`} onClick={onClick}>
-      <HashIcon aria-hidden />
-      <span className="finite-chat__thread-main">
-        <span className="finite-chat__thread-title">{topic.title}</span>
-        <span className="finite-chat__thread-time">{topic.unread_count > 0 ? topic.unread_count : topic.message_count}</span>
-      </span>
-    </button>
+    <div className={`finite-chat__topic-thread-row ${active ? "is-active" : ""}`}>
+      <button type="button" className="finite-chat__topic-thread finite-chat__topic-header" onClick={onClick}>
+        <HashIcon aria-hidden />
+        <span className="finite-chat__thread-main">
+          <span className="finite-chat__thread-title">{topic.title}</span>
+          <span className="finite-chat__thread-time">{topic.unread_count > 0 ? topic.unread_count : topic.message_count}</span>
+        </span>
+      </button>
+      <button type="button" className="finite-chat__topic-new-chat" aria-label={`New chat in ${topic.title}`} onClick={onNewChat}>
+        <SquarePenIcon aria-hidden />
+      </button>
+    </div>
   );
 }
 
-function TopicSegmentButton({
+function TopicChatButton({
   active,
+  chat,
   index,
   onClick,
-  segment,
 }: {
   active: boolean;
+  chat: AppTopicSummary["chats"][number];
   index: number;
   onClick: () => void;
-  segment: AppTopicSummary["segments"][number];
 }) {
   return (
     <button type="button" className={`finite-chat__topic-segment ${active ? "is-active" : ""}`} onClick={onClick}>
       <MessageCircleIcon aria-hidden />
       <span className="finite-chat__thread-main">
-        <span className="finite-chat__thread-title">Chat {index + 1}</span>
-        <span className="finite-chat__thread-time">#{segment.started_seq}</span>
+        <span className="finite-chat__thread-title">{chat.title || `Chat ${index + 1}`}</span>
+        <span className="finite-chat__thread-time">{chat.unread_count > 0 ? chat.unread_count : chat.message_count}</span>
       </span>
     </button>
   );

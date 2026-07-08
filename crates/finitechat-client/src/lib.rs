@@ -531,6 +531,8 @@ struct StoredAppRoomMetadataV1 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredAppState {
     pub selected_room_id: Option<RoomId>,
+    pub selected_topic_id: Option<String>,
+    pub selected_chat_id: Option<String>,
     pub revoked_devices: BTreeSet<DeviceRef>,
 }
 
@@ -538,6 +540,14 @@ impl StoredAppState {
     fn validate_limits(&self) -> Result<(), ClientError> {
         if let Some(room_id) = &self.selected_room_id {
             validate_room_id(room_id)?;
+        }
+        if let Some(topic_id) = &self.selected_topic_id {
+            validate_bytes_non_empty("app_state.selected_topic_id", topic_id.len())?;
+            validate_string_bytes("app_state.selected_topic_id", topic_id, MAX_OBJECT_ID_BYTES)?;
+        }
+        if let Some(chat_id) = &self.selected_chat_id {
+            validate_bytes_non_empty("app_state.selected_chat_id", chat_id.len())?;
+            validate_string_bytes("app_state.selected_chat_id", chat_id, MAX_OBJECT_ID_BYTES)?;
         }
         validate_item_count(
             "app_state.revoked_devices",
@@ -555,6 +565,10 @@ impl StoredAppState {
 struct StoredAppStateMetadataV1 {
     #[serde(deserialize_with = "deserialize_required_option")]
     selected_room_id: Option<RoomId>,
+    #[serde(default)]
+    selected_topic_id: Option<String>,
+    #[serde(default)]
+    selected_chat_id: Option<String>,
     revoked_devices: BTreeSet<DeviceRef>,
 }
 
@@ -3430,6 +3444,8 @@ impl SqliteClientStore {
             decrypt_app_state_metadata(&self.options.encryption_key, owner, &nonce, &ciphertext)?;
         let state = StoredAppState {
             selected_room_id: metadata.selected_room_id,
+            selected_topic_id: metadata.selected_topic_id,
+            selected_chat_id: metadata.selected_chat_id,
             revoked_devices: metadata.revoked_devices,
         };
         state.validate_limits()?;
@@ -7442,6 +7458,8 @@ fn encrypt_app_state_metadata(
     state.validate_limits()?;
     let metadata = StoredAppStateMetadataV1 {
         selected_room_id: state.selected_room_id.clone(),
+        selected_topic_id: state.selected_topic_id.clone(),
+        selected_chat_id: state.selected_chat_id.clone(),
         revoked_devices: state.revoked_devices.clone(),
     };
     let plaintext =
@@ -7801,6 +7819,18 @@ fn decrypt_app_state_metadata(
         .map_err(|_| ClientStoreError::DecodeAppStateMetadata)?;
     if let Some(room_id) = &metadata.selected_room_id {
         validate_room_id(room_id).map_err(ClientError::from)?;
+    }
+    if let Some(topic_id) = &metadata.selected_topic_id {
+        validate_bytes_non_empty("app_state.selected_topic_id", topic_id.len())
+            .map_err(ClientError::from)?;
+        validate_string_bytes("app_state.selected_topic_id", topic_id, MAX_OBJECT_ID_BYTES)
+            .map_err(ClientError::from)?;
+    }
+    if let Some(chat_id) = &metadata.selected_chat_id {
+        validate_bytes_non_empty("app_state.selected_chat_id", chat_id.len())
+            .map_err(ClientError::from)?;
+        validate_string_bytes("app_state.selected_chat_id", chat_id, MAX_OBJECT_ID_BYTES)
+            .map_err(ClientError::from)?;
     }
     validate_item_count(
         "app_state.revoked_devices",
@@ -10035,6 +10065,8 @@ mod tests {
 
         let selected = StoredAppState {
             selected_room_id: Some("room-main".to_owned()),
+            selected_topic_id: Some("home".to_owned()),
+            selected_chat_id: Some("segment-main".to_owned()),
             revoked_devices: [DeviceRef {
                 account_id: owner.account_id.clone(),
                 device_id: "tablet".to_owned(),
@@ -10051,6 +10083,8 @@ mod tests {
 
         let cleared = StoredAppState {
             selected_room_id: None,
+            selected_topic_id: None,
+            selected_chat_id: None,
             revoked_devices: BTreeSet::new(),
         };
         reopened.save_app_state(&owner, &cleared).unwrap();
@@ -10079,6 +10113,8 @@ mod tests {
 
             let mut metadata = serde_json::to_value(StoredAppStateMetadataV1 {
                 selected_room_id: Some("room-main".to_owned()),
+                selected_topic_id: Some("home".to_owned()),
+                selected_chat_id: Some("segment-main".to_owned()),
                 revoked_devices: [DeviceRef {
                     account_id: owner.account_id.clone(),
                     device_id: "tablet".to_owned(),

@@ -270,6 +270,7 @@ impl TestHermesUser {
         let payload = HermesMessagePayloadV1 {
             payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
             conversation_id: None,
+            segment_id: None,
             text: text.to_owned(),
             kind: HermesSendKindV1::Message,
             status: HermesMessageStatusV1::Complete,
@@ -1011,13 +1012,14 @@ fn hermes_poll_recovers_messages_already_applied_by_runtime_sync() {
 }
 
 fn wait_for_ready_file(path: &std::path::Path) -> Result<Value, String> {
-    for _ in 0..100 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
         if let Ok(raw) = std::fs::read_to_string(path)
             && let Ok(value) = serde_json::from_str::<Value>(&raw)
         {
             return Ok(value);
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(25));
     }
     Err(format!("Hermes service did not write {}", path.display()))
 }
@@ -1266,6 +1268,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let reply = HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
         conversation_id: None,
+        segment_id: None,
         text: "hi agent".to_owned(),
         kind: HermesSendKindV1::Message,
         status: HermesMessageStatusV1::Complete,
@@ -1336,6 +1339,7 @@ fn hermes_cli_inits_invites_admits_and_round_trips_messages() {
     let stored_reply = HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
         conversation_id: None,
+        segment_id: None,
         text: "already synced followup".to_owned(),
         kind: HermesSendKindV1::Message,
         status: HermesMessageStatusV1::Complete,
@@ -1780,6 +1784,7 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
     let alice_payload = HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
         conversation_id: None,
+        segment_id: None,
         text: "alice checking in".to_owned(),
         kind: HermesSendKindV1::Message,
         status: HermesMessageStatusV1::Complete,
@@ -1803,6 +1808,7 @@ fn hermes_cli_group_room_preserves_two_human_sender_identities() {
     let bob_payload = HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
         conversation_id: None,
+        segment_id: None,
         text: "bob checking in".to_owned(),
         kind: HermesSendKindV1::Message,
         status: HermesMessageStatusV1::Complete,

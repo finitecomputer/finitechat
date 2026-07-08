@@ -1782,10 +1782,23 @@ mod tests {
             .find(|room| room.room_id == room_id)
             .expect("bob room projects");
         assert_eq!(format!("{:?}", bob_room.state), "Connected");
+        let bob_home_topic = joined
+            .topics
+            .iter()
+            .find(|topic| {
+                topic.room_id == room_id && topic.topic_id == finitechat_core::HOME_TOPIC_ID
+            })
+            .expect("bob home topic projects");
+        let bob_home_chat_id = bob_home_topic
+            .active_chat_id
+            .clone()
+            .expect("bob home topic has an active chat");
 
         open_bob()
-            .dispatch_and_wait(finitechat_core::AppAction::SendMessage {
+            .dispatch_and_wait(finitechat_core::AppAction::SendChatMessage {
                 room_id: room_id.clone(),
+                topic_id: finitechat_core::HOME_TOPIC_ID.to_owned(),
+                chat_id: bob_home_chat_id.clone(),
                 text: "hello from app cli".to_owned(),
             })
             .expect("bob sends");

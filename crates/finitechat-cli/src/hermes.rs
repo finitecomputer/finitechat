@@ -708,6 +708,7 @@ fn handle_hermes_service_recover(state: &HermesServiceState) -> Result<Value, Cl
         let recovery = HermesEditRequestV1 {
             room_id: message.room_id.clone(),
             conversation_id: message.conversation_id.clone(),
+            segment_id: message.segment_id.clone(),
             message_id: message.message_id.clone(),
             text: "Hermes gateway restarted before this turn completed.".to_owned(),
             status: HermesMessageStatusV1::Complete,
@@ -836,6 +837,7 @@ fn collect_hermes_service_inbound_payload(
                 sender_account_id: &applied.sender_account_id,
                 sender_device_id: &applied.sender_device_id,
                 conversation_id: None,
+                segment_id: None,
             };
             if let Some(event) =
                 hermes_poll_event_from_application_plaintext(context, &applied.plaintext)?
@@ -1733,6 +1735,7 @@ fn cmd_poll<W: Write>(home_dir: &Path, request: Value, output: &mut W) -> Result
                 sender_account_id: &applied.sender_account_id,
                 sender_device_id: &applied.sender_device_id,
                 conversation_id: None,
+                segment_id: None,
             };
             if let Some(event) =
                 hermes_poll_event_from_application_plaintext(context, &applied.plaintext)?
@@ -1922,6 +1925,7 @@ fn recover_stored_hermes_events(
             sender_account_id: &stored.sender.account_id,
             sender_device_id: &stored.sender.device_id,
             conversation_id: None,
+            segment_id: None,
         };
         match hermes_poll_event_from_application_plaintext(context, &stored.plaintext)? {
             Some(event) => enqueue_hermes_inbox_event(home_dir, inbox, event)?,
@@ -2095,6 +2099,7 @@ struct HermesPollEventContext<'a> {
     sender_account_id: &'a str,
     sender_device_id: &'a str,
     conversation_id: Option<&'a str>,
+    segment_id: Option<&'a str>,
 }
 
 fn hermes_poll_event_from_application_plaintext(
@@ -2109,6 +2114,7 @@ fn hermes_poll_event_from_application_plaintext(
             DurableAppEventKind::ChatMessage => {
                 let context = HermesPollEventContext {
                     conversation_id: event.conversation_id.as_deref(),
+                    segment_id: event.segment_id.as_deref(),
                     ..context
                 };
                 hermes_poll_event_from_chat_payload(context, &event.payload, true)
@@ -2152,6 +2158,12 @@ fn hermes_poll_event_from_chat_payload(
             event.conversation_id = context.conversation_id.map(ToOwned::to_owned);
             event.source.thread_id = event.conversation_id.clone();
         }
+        if event.segment_id.is_none() {
+            event.segment_id = context.segment_id.map(ToOwned::to_owned);
+        }
+        if event.segment_id.is_some() {
+            event.source.thread_id = event.segment_id.clone();
+        }
         materialize_poll_event_attachments(context.home_dir, &mut event)?;
         return Ok(Some(event));
     }
@@ -2176,7 +2188,8 @@ fn hermes_poll_event_from_chat_payload(
     )
     .map_err(|error| CliError::Hermes(error.to_string()))?;
     event.conversation_id = context.conversation_id.map(ToOwned::to_owned);
-    event.source.thread_id = event.conversation_id.clone();
+    event.segment_id = context.segment_id.map(ToOwned::to_owned);
+    event.source.thread_id = event.segment_id.clone().or(event.conversation_id.clone());
     event
         .validate_limits()
         .map_err(|error| CliError::Hermes(error.to_string()))?;
@@ -2281,11 +2294,13 @@ fn payload_is_typed_json(payload: &[u8]) -> bool {
 fn encode_application_event(
     kind: DurableAppEventKind,
     conversation_id: Option<String>,
+    segment_id: Option<String>,
     payload: &[u8],
 ) -> Result<Vec<u8>, CliError> {
     let event = DecryptedApplicationEventV1 {
         kind,
         conversation_id,
+        segment_id,
         payload: payload.to_vec(),
     };
     event
@@ -2325,6 +2340,7 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
         let recovery = HermesEditRequestV1 {
             room_id: message.room_id.clone(),
             conversation_id: message.conversation_id.clone(),
+            segment_id: message.segment_id.clone(),
             message_id: message.message_id.clone(),
             text: "Hermes gateway restarted before this turn completed.".to_owned(),
             status: HermesMessageStatusV1::Complete,
@@ -2337,6 +2353,7 @@ fn cmd_recover<W: Write>(home_dir: &Path, _request: Value, output: &mut W) -> Re
         let app_payload = encode_application_event(
             DurableAppEventKind::ChatMessage,
             recovery.conversation_id.clone(),
+            recovery.segment_id.clone(),
             &hermes_payload,
         )?;
         let home = load_home(home_dir)?;
@@ -2368,6 +2385,7 @@ fn send_hermes_request_with_runtime(
     let app_payload = encode_application_event(
         DurableAppEventKind::ChatMessage,
         request.conversation_id.clone(),
+        request.segment_id.clone(),
         &hermes_payload,
     )?;
     append_payload_to_room_with_runtime(
@@ -2388,6 +2406,7 @@ fn edit_hermes_request_with_runtime(
     let app_payload = encode_application_event(
         DurableAppEventKind::ChatMessage,
         request.conversation_id.clone(),
+        request.segment_id.clone(),
         &hermes_payload,
     )?;
     append_payload_to_room_with_runtime(
@@ -2427,6 +2446,8 @@ struct HermesRunningState {
 struct HermesRunningMessage {
     room_id: String,
     conversation_id: Option<String>,
+    #[serde(default)]
+    segment_id: Option<String>,
     message_id: String,
 }
 
@@ -2460,6 +2481,7 @@ fn update_running_after_send(
         HermesRunningMessage {
             room_id: request.room_id.clone(),
             conversation_id: request.conversation_id.clone(),
+            segment_id: request.segment_id.clone(),
             message_id: message_id.to_owned(),
         },
     )
@@ -2477,6 +2499,7 @@ fn update_running_after_edit(
         HermesRunningMessage {
             room_id: request.room_id.clone(),
             conversation_id: request.conversation_id.clone(),
+            segment_id: request.segment_id.clone(),
             message_id: request.message_id.clone(),
         },
     )
@@ -3355,6 +3378,7 @@ mod tests {
         let wrapped_poll = DecryptedApplicationEventV1 {
             kind: DurableAppEventKind::ChatMessage,
             conversation_id: None,
+            segment_id: None,
             payload: br#"{"type":"finitechat.chat.poll.v1","question":"Lunch?","options":[]}"#
                 .to_vec(),
         };
@@ -3368,6 +3392,7 @@ mod tests {
                 sender_account_id: "alice",
                 sender_device_id: "ios",
                 conversation_id: None,
+                segment_id: None,
             },
             &plaintext,
         )
@@ -3380,6 +3405,7 @@ mod tests {
         let wrapped_text = DecryptedApplicationEventV1 {
             kind: DurableAppEventKind::ChatMessage,
             conversation_id: None,
+            segment_id: None,
             payload: b"plain hello".to_vec(),
         };
         let plaintext = serde_json::to_vec(&wrapped_text).unwrap();
@@ -3392,6 +3418,7 @@ mod tests {
                 sender_account_id: "alice",
                 sender_device_id: "ios",
                 conversation_id: None,
+                segment_id: None,
             },
             &plaintext,
         )
@@ -3407,6 +3434,7 @@ mod tests {
         let hermes_payload = HermesMessagePayloadV1 {
             payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
             conversation_id: None,
+            segment_id: None,
             text: "topic hello".to_owned(),
             kind: finitechat_hermes::HermesSendKindV1::Message,
             status: HermesMessageStatusV1::Complete,
@@ -3421,6 +3449,7 @@ mod tests {
         let wrapped = DecryptedApplicationEventV1 {
             kind: DurableAppEventKind::ChatMessage,
             conversation_id: Some("topic-main".to_owned()),
+            segment_id: None,
             payload: hermes_payload,
         };
         let plaintext = serde_json::to_vec(&wrapped).unwrap();
@@ -3433,6 +3462,7 @@ mod tests {
                 sender_account_id: "alice",
                 sender_device_id: "electron",
                 conversation_id: None,
+                segment_id: None,
             },
             &plaintext,
         )

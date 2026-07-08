@@ -400,10 +400,47 @@ svg {
 
 .finite-chat__folder-body button.finite-chat__topic-thread.finite-chat__topic-header {
   min-height: 30px;
+  flex: 1;
   padding-left: 8px;
   color: var(--text-primary);
   font-size: 13px;
   font-weight: 760;
+}
+
+.finite-chat__topic-thread-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  border-radius: 8px;
+}
+
+.finite-chat__topic-thread-row:hover,
+.finite-chat__topic-thread-row.is-active {
+  background: var(--bg-hover);
+}
+
+.finite-chat__folder-body .finite-chat__topic-thread-row button {
+  background: transparent;
+}
+
+.finite-chat__folder-body button.finite-chat__topic-new-chat {
+  width: 28px;
+  min-height: 28px;
+  flex: 0 0 28px;
+  justify-content: center;
+  opacity: 0;
+  padding: 0;
+}
+
+.finite-chat__topic-thread-row:hover button.finite-chat__topic-new-chat,
+.finite-chat__topic-thread-row:focus-within button.finite-chat__topic-new-chat {
+  opacity: 1;
+}
+
+.finite-chat__folder-body button.finite-chat__topic-new-chat svg {
+  width: 14px;
+  height: 14px;
+  color: var(--text-secondary);
 }
 
 .finite-chat__folder-body button.finite-chat__topic-thread > svg,
@@ -418,6 +455,7 @@ svg {
   background: var(--bg-hover);
 }
 
+.finite-chat__topic-thread-row.is-active button.finite-chat__topic-thread,
 .finite-chat__folder-body button.finite-chat__topic-thread.is-active {
   color: var(--text-primary);
 }
@@ -466,17 +504,19 @@ svg {
   white-space: nowrap;
 }
 
-.finite-chat__sidebar-topic-room-label {
-  min-width: 0;
-  overflow: hidden;
-  padding: 9px 8px 4px;
+.finite-chat__folder-body button.finite-chat__sidebar-topic-room-label {
+  min-height: 30px;
+  padding-left: 8px;
   color: var(--text-tertiary);
   font-size: 10px;
   font-weight: 760;
-  letter-spacing: 0;
-  line-height: 1;
-  text-overflow: ellipsis;
   text-transform: uppercase;
+}
+
+.finite-chat__sidebar-topic-room-label span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1042,6 +1082,34 @@ svg {
 .finite-chat__participant-profile small {
   color: var(--text-secondary);
   font-size: 11px;
+}
+
+.finite-chat__participant-invite {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--chat-composer);
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 8px 10px;
+}
+
+.finite-chat__participant-invite svg {
+  width: 14px;
+  height: 14px;
+  color: var(--text-tertiary);
+}
+
+.finite-chat__participant-invite span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .finite-chat__split {
