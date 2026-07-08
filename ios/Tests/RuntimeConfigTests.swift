@@ -2276,6 +2276,78 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(text, "send to the visible thread only")
     }
 
+    func testSendUsesSelectedTopicChatWhenAvailable() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        var state = savedChatState()
+        state.selectedTopicId = "home"
+        state.selectedChatId = "home-chat"
+        state.topics = [
+            AppTopicSummary(
+                roomId: "room-main",
+                topicId: "home",
+                title: "Home",
+                description: nil,
+                lastMessagePreview: "",
+                unreadCount: 0,
+                messageCount: 0,
+                createdSeq: 1,
+                updatedSeq: 1,
+                archived: false,
+                activeChatId: "home-chat",
+                chats: [
+                    AppChatSummary(
+                        chatId: "home-chat",
+                        title: "Chat 1",
+                        lastMessagePreview: "",
+                        unreadCount: 0,
+                        messageCount: 0,
+                        startedSeq: 1,
+                        updatedSeq: 1,
+                        active: true
+                    ),
+                ]
+            ),
+        ]
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        model.outboundText = "send through selected chat"
+        XCTAssertTrue(model.send(roomID: "room-main"))
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendChatMessage = $0 { return true }
+                return false
+            }
+        }
+        guard case .sendChatMessage(
+            let roomID,
+            let topicID,
+            let chatID,
+            let text
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendChatMessage for selected chat")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(topicID, "home")
+        XCTAssertEqual(chatID, "home-chat")
+        XCTAssertEqual(text, "send through selected chat")
+    }
+
     func testRuntimeDispatchesAreFifoAcrossStartupAndUserActions() async throws {
         let config = RuntimeConfig(
             serverURL: "http://127.0.0.1:1",

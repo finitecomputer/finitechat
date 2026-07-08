@@ -1654,6 +1654,140 @@ private struct RoomOptionsSheet: View {
     }
 }
 
+private struct TopicChatPickerSheet: View {
+    @ObservedObject var model: AppModel
+    let roomID: String
+    let onClose: () -> Void
+    @State private var topicTitle = ""
+
+    private var room: AppRoomSummary? {
+        model.state?.rooms.first(where: { $0.roomId == roomID })
+    }
+
+    private var topics: [AppTopicSummary] {
+        model.topics(for: roomID)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    HStack(spacing: 8) {
+                        TextField("New topic", text: $topicTitle)
+                            .textInputAutocapitalization(.sentences)
+                            .submitLabel(.done)
+                            .onSubmit(createTopic)
+
+                        Button(action: createTopic) {
+                            Image(systemName: "plus")
+                        }
+                        .disabled(topicTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityLabel("Create topic")
+                    }
+                }
+
+                if topics.isEmpty {
+                    ContentUnavailableView("No topics", systemImage: "sidebar.left")
+                        .listRowSeparator(.hidden)
+                } else {
+                    ForEach(topics, id: \.topicId) { topic in
+                        Section {
+                            if topic.chats.isEmpty {
+                                Button {
+                                    _ = model.startChat(in: topic)
+                                    onClose()
+                                } label: {
+                                    Label("New chat", systemImage: "square.and.pencil")
+                                }
+                            } else {
+                                ForEach(topic.chats, id: \.chatId) { chat in
+                                    Button {
+                                        model.openChat(chat, in: topic)
+                                        onClose()
+                                    } label: {
+                                        TopicChatRow(
+                                            chat: chat,
+                                            selected: model.state?.selectedChatId == chat.chatId
+                                                && model.state?.selectedTopicId == topic.topicId
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        } header: {
+                            HStack {
+                                Text(topic.title)
+                                Spacer()
+                                Button {
+                                    _ = model.startChat(in: topic)
+                                    onClose()
+                                } label: {
+                                    Image(systemName: "square.and.pencil")
+                                }
+                                .accessibilityLabel("New chat in \(topic.title)")
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(room?.displayName ?? "Chats")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done", action: onClose)
+                }
+            }
+        }
+    }
+
+    private func createTopic() {
+        let title = topicTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        if model.createTopic(roomID: roomID, title: title) {
+            topicTitle = ""
+        }
+    }
+}
+
+private struct TopicChatRow: View {
+    let chat: AppChatSummary
+    let selected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: selected ? "checkmark.circle.fill" : "bubble.left")
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                .frame(width: 22)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(chat.title)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                if !chat.lastMessagePreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(chat.lastMessagePreview)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer()
+
+            if chat.unreadCount > 0 {
+                Text("\(chat.unreadCount)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.accentColor))
+            }
+        }
+        .contentShape(Rectangle())
+    }
+}
+
 private struct RoomThreadView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var people: NostrPeopleModel
@@ -1673,6 +1807,7 @@ private struct RoomThreadView: View {
     @State private var showMediaGallery = false
     @State private var showRoomDetails = false
     @State private var showRoomOptions = false
+    @State private var showChatPicker = false
     @State private var showAddPeople = false
     @State private var composerText = ""
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
@@ -1689,6 +1824,28 @@ private struct RoomThreadView: View {
 
     private var projection: ChatRoomProjection {
         model.projection(for: roomID)
+    }
+
+    private var selectedTopic: AppTopicSummary? {
+        model.selectedTopic(in: roomID)
+    }
+
+    private var selectedChat: AppChatSummary? {
+        selectedTopic.flatMap { model.selectedChat(in: $0) }
+    }
+
+    private var chatNavigationTitle: String {
+        if let title = selectedChat?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty
+        {
+            return title
+        }
+        if let title = selectedTopic?.title.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty
+        {
+            return title
+        }
+        return room?.displayName ?? "Chat"
     }
 
     private var mediaGalleryItems: [ChatMediaGalleryItem] {
@@ -1777,10 +1934,20 @@ private struct RoomThreadView: View {
             }
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle(room?.displayName ?? "Chat")
+        .navigationTitle(chatNavigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .chatNavigationBarChrome()
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showChatPicker = true
+                } label: {
+                    Image(systemName: "line.3.horizontal")
+                }
+                .accessibilityLabel("Chats")
+                .accessibilityIdentifier("ChatPickerButton")
+            }
+
             if let room, room.state == .connected {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -1825,6 +1992,12 @@ private struct RoomThreadView: View {
                 }
             )
             .presentationDetents([.medium])
+        }
+        .sheet(isPresented: $showChatPicker) {
+            TopicChatPickerSheet(model: model, roomID: roomID) {
+                showChatPicker = false
+            }
+            .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $showAddPeople) {
             if let room {

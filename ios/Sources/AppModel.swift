@@ -581,6 +581,43 @@ final class AppModel: ObservableObject, AppReconciler {
         return projection(for: roomId).messages
     }
 
+    func topics(for roomID: String) -> [AppTopicSummary] {
+        state?.topics.filter { $0.roomId == roomID && !$0.archived } ?? []
+    }
+
+    func selectedTopic(in roomID: String) -> AppTopicSummary? {
+        let roomTopics = topics(for: roomID)
+        if let selectedTopicID = state?.selectedTopicId,
+           let topic = roomTopics.first(where: { $0.topicId == selectedTopicID })
+        {
+            return topic
+        }
+        return roomTopics.first
+    }
+
+    func selectedChat(in topic: AppTopicSummary) -> AppChatSummary? {
+        if let selectedChatID = state?.selectedChatId,
+           let chat = topic.chats.first(where: { $0.chatId == selectedChatID })
+        {
+            return chat
+        }
+        if let activeChatID = topic.activeChatId,
+           let chat = topic.chats.first(where: { $0.chatId == activeChatID })
+        {
+            return chat
+        }
+        return topic.chats.first
+    }
+
+    func selectedChatRoute(for roomID: String) -> (topicID: String, chatID: String)? {
+        guard let topic = selectedTopic(in: roomID),
+              let chat = selectedChat(in: topic)
+        else {
+            return nil
+        }
+        return (topic.topicId, chat.chatId)
+    }
+
     var roomListEmptyDescription: String {
         if developerErrorText != nil {
             return "Open Settings to check connection."
@@ -1023,6 +1060,18 @@ final class AppModel: ObservableObject, AppReconciler {
         }
     }
 
+    func openTopic(_ topic: AppTopicSummary) {
+        dispatchInBackground(.openTopic(roomId: topic.roomId, topicId: topic.topicId))
+    }
+
+    func openChat(_ chat: AppChatSummary, in topic: AppTopicSummary) {
+        dispatchInBackground(.openChat(
+            roomId: topic.roomId,
+            topicId: topic.topicId,
+            chatId: chat.chatId
+        ))
+    }
+
     func projection(for roomID: String) -> ChatRoomProjection {
         chatProjections[roomID] ?? .empty(roomID: roomID)
     }
@@ -1032,6 +1081,22 @@ final class AppModel: ObservableObject, AppReconciler {
         guard !name.isEmpty else { return }
         roomDraft = ""
         dispatchInBackground(.createRoom(displayName: name))
+    }
+
+    @discardableResult
+    func createTopic(roomID: String, title rawTitle: String) -> Bool {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return false }
+        return dispatchInBackground(.createTopic(roomId: roomID, title: title))
+    }
+
+    @discardableResult
+    func startChat(in topic: AppTopicSummary) -> Bool {
+        dispatchInBackground(.startTopicChat(
+            roomId: topic.roomId,
+            topicId: topic.topicId,
+            reason: nil
+        ))
     }
 
     func createInvite(
@@ -1405,10 +1470,15 @@ final class AppModel: ObservableObject, AppReconciler {
         guard roomAllowsComposition(roomID) else { return false }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return false }
+        let selectedRoute = selectedChatRoute(for: roomID)
+        let optimisticConversationID = message?.conversationId ?? selectedRoute?.topicID
+        let optimisticChatID = message?.chatId ?? selectedRoute?.chatID
         let optimisticMessageID = installOptimisticMessage(
             roomID: roomID,
             text: text,
-            replyToMessageID: message?.messageId
+            replyToMessageID: message?.messageId,
+            conversationID: optimisticConversationID,
+            chatID: optimisticChatID
         )
         let action: AppAction
         if let message {
@@ -1416,6 +1486,13 @@ final class AppModel: ObservableObject, AppReconciler {
                 roomId: roomID,
                 text: text,
                 replyToMessageId: message.messageId
+            )
+        } else if let selectedRoute {
+            action = .sendChatMessage(
+                roomId: roomID,
+                topicId: selectedRoute.topicID,
+                chatId: selectedRoute.chatID,
+                text: text
             )
         } else {
             action = .sendMessage(roomId: roomID, text: text)
@@ -2025,7 +2102,9 @@ final class AppModel: ObservableObject, AppReconciler {
     private func installOptimisticMessage(
         roomID: String,
         text: String,
-        replyToMessageID: String?
+        replyToMessageID: String?,
+        conversationID: String? = nil,
+        chatID: String? = nil
     ) -> String? {
         guard let state else { return nil }
         optimisticMessageCounter &+= 1
@@ -2037,8 +2116,8 @@ final class AppModel: ObservableObject, AppReconciler {
             roomId: roomID,
             seq: Self.optimisticSequenceBase + sequenceOffset,
             messageId: messageID,
-            conversationId: nil,
-            chatId: nil,
+            conversationId: conversationID,
+            chatId: chatID,
             senderAccountId: state.identity.accountId,
             senderDeviceId: state.identity.deviceId,
             senderDisplayName: state.identity.deviceId,
