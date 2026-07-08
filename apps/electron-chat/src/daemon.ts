@@ -182,6 +182,8 @@ export type AppAction =
   | { SendMessage: { room_id: string; text: string } }
   | { SendTopicMessage: { room_id: string; topic_id: string; text: string } }
   | { SendChatMessage: { room_id: string; topic_id: string; chat_id: string; text: string } }
+  | { SendReply: { room_id: string; text: string; reply_to_message_id: string } }
+  | { SendChatReply: { room_id: string; topic_id: string; chat_id: string; text: string; reply_to_message_id: string } }
   | {
       SendAttachments: {
         room_id: string;
@@ -190,6 +192,18 @@ export type AppAction =
         reply_to_message_id?: string | null;
       };
     }
+  | {
+      SendChatAttachments: {
+        room_id: string;
+        topic_id: string;
+        chat_id: string;
+        attachments: OutboundAttachment[];
+        caption: string;
+        reply_to_message_id?: string | null;
+      };
+    }
+  | { SendPoll: { room_id: string; question: string; options: string[] } }
+  | { SendChatPoll: { room_id: string; topic_id: string; chat_id: string; question: string; options: string[] } }
   | { LoadOlderMessages: { room_id: string; before_message_id: string; limit: number } }
   | { MarkRoomRead: { room_id: string } }
   | { RetryMessage: { room_id: string; message_id: string } }

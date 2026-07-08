@@ -467,8 +467,8 @@ export function App() {
       focusJoinInvite();
       return;
     }
-    if (selectedTopic && attachments.length > 0) {
-      setError("Attachments are room-scoped in the current core. Open the room view to attach files.");
+    if (selectedTopic && attachments.length > 0 && !selectedChat) {
+      setError("Start a chat in this topic before attaching files.");
       return;
     }
     stopTyping(selectedRoom.room_id);
@@ -492,14 +492,25 @@ export function App() {
       setAwaitingReplyRoomIds((roomIds) => (roomIds.includes(selectedRoom.room_id) ? roomIds : [...roomIds, selectedRoom.room_id]));
     }
     const next = attachments.length
-      ? await runComposerAction({
-          SendAttachments: {
-            room_id: selectedRoom.room_id,
-            attachments: attachments.map(({ filename, mime_type, kind, bytes }) => ({ filename, mime_type, kind, bytes })),
-            caption: text,
-            reply_to_message_id: null,
-          },
-        })
+      ? selectedTopic && selectedChat
+        ? await runComposerAction({
+            SendChatAttachments: {
+              room_id: selectedTopic.room_id,
+              topic_id: selectedTopic.topic_id,
+              chat_id: selectedChat.chat_id,
+              attachments: attachments.map(({ filename, mime_type, kind, bytes }) => ({ filename, mime_type, kind, bytes })),
+              caption: text,
+              reply_to_message_id: null,
+            },
+          })
+        : await runComposerAction({
+            SendAttachments: {
+              room_id: selectedRoom.room_id,
+              attachments: attachments.map(({ filename, mime_type, kind, bytes }) => ({ filename, mime_type, kind, bytes })),
+              caption: text,
+              reply_to_message_id: null,
+            },
+          })
       : selectedTopic
         ? selectedChat
           ? await runComposerAction({
@@ -1095,8 +1106,8 @@ export function App() {
                       type="button"
                       className="finite-chat__tool-button"
                       aria-label="Attach file"
-                      disabled={!state || busy || !canSendToSelectedRoom || Boolean(selectedTopic)}
-                      title={selectedTopic ? "Attachments are available in the room view" : "Attach file"}
+                      disabled={!state || busy || !canSendToSelectedRoom}
+                      title="Attach file"
                       onClick={() => fileInputRef.current?.click()}
                     >
                       <PaperclipIcon aria-hidden />

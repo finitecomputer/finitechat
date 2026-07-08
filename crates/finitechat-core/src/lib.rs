@@ -665,6 +665,13 @@ pub enum AppAction {
         text: String,
         reply_to_message_id: String,
     },
+    SendChatReply {
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
+        text: String,
+        reply_to_message_id: String,
+    },
     SendAttachment {
         room_id: String,
         filename: String,
@@ -680,8 +687,34 @@ pub enum AppAction {
         caption: String,
         reply_to_message_id: Option<String>,
     },
+    SendChatAttachment {
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
+        filename: String,
+        mime_type: String,
+        kind: ChatMediaKind,
+        bytes: Vec<u8>,
+        caption: String,
+        reply_to_message_id: Option<String>,
+    },
+    SendChatAttachments {
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
+        attachments: Vec<OutboundAttachment>,
+        caption: String,
+        reply_to_message_id: Option<String>,
+    },
     SendPoll {
         room_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    SendChatPoll {
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
         question: String,
         options: Vec<String>,
     },
@@ -853,6 +886,8 @@ struct AppRuntimeState {
 
 struct SendAttachmentInput {
     room_id: String,
+    conversation_id: Option<String>,
+    chat_id: Option<String>,
     attachments: Vec<OutboundAttachment>,
     caption: String,
     reply_to_message_id: Option<String>,
@@ -1960,6 +1995,13 @@ impl AppRuntimeState {
                 text,
                 reply_to_message_id,
             } => self.send_reply(room_id, text, reply_to_message_id)?,
+            AppAction::SendChatReply {
+                room_id,
+                topic_id,
+                chat_id,
+                text,
+                reply_to_message_id,
+            } => self.send_chat_reply(room_id, topic_id, chat_id, text, reply_to_message_id)?,
             AppAction::SendAttachment {
                 room_id,
                 filename,
@@ -1970,6 +2012,31 @@ impl AppRuntimeState {
                 reply_to_message_id,
             } => self.send_attachment(SendAttachmentInput {
                 room_id,
+                conversation_id: None,
+                chat_id: None,
+                attachments: vec![OutboundAttachment {
+                    filename,
+                    mime_type,
+                    kind,
+                    bytes,
+                }],
+                caption,
+                reply_to_message_id,
+            })?,
+            AppAction::SendChatAttachment {
+                room_id,
+                topic_id,
+                chat_id,
+                filename,
+                mime_type,
+                kind,
+                bytes,
+                caption,
+                reply_to_message_id,
+            } => self.send_chat_attachment(SendAttachmentInput {
+                room_id,
+                conversation_id: Some(topic_id),
+                chat_id: Some(chat_id),
                 attachments: vec![OutboundAttachment {
                     filename,
                     mime_type,
@@ -1986,6 +2053,23 @@ impl AppRuntimeState {
                 reply_to_message_id,
             } => self.send_attachment(SendAttachmentInput {
                 room_id,
+                conversation_id: None,
+                chat_id: None,
+                attachments,
+                caption,
+                reply_to_message_id,
+            })?,
+            AppAction::SendChatAttachments {
+                room_id,
+                topic_id,
+                chat_id,
+                attachments,
+                caption,
+                reply_to_message_id,
+            } => self.send_chat_attachment(SendAttachmentInput {
+                room_id,
+                conversation_id: Some(topic_id),
+                chat_id: Some(chat_id),
                 attachments,
                 caption,
                 reply_to_message_id,
@@ -1995,6 +2079,13 @@ impl AppRuntimeState {
                 question,
                 options,
             } => self.send_poll(room_id, question, options)?,
+            AppAction::SendChatPoll {
+                room_id,
+                topic_id,
+                chat_id,
+                question,
+                options,
+            } => self.send_chat_poll(room_id, topic_id, chat_id, question, options)?,
             AppAction::VotePoll {
                 room_id,
                 message_id,
@@ -3337,14 +3428,7 @@ impl AppRuntimeState {
         chat_id: String,
         text: String,
     ) -> Result<(), FiniteChatCoreError> {
-        self.validate_topic(&room_id, &topic_id)?;
-        if !self.chat_exists(&room_id, &topic_id, &chat_id) {
-            return Err(FiniteChatCoreError::Client {
-                reason: format!(
-                    "chat '{chat_id}' is not available in topic '{topic_id}' in room '{room_id}'"
-                ),
-            });
-        }
+        self.validate_chat_route(&room_id, &topic_id, &chat_id)?;
         self.send_message_with_conversation_and_chat(
             room_id,
             Some(topic_id),
@@ -3363,6 +3447,26 @@ impl AppRuntimeState {
         let target_id = reply_to_message_id.trim();
         self.validate_reply_target(&room_id, target_id)?;
         self.send_message_with_reply(room_id, text, Some(target_id.to_owned()))
+    }
+
+    fn send_chat_reply(
+        &mut self,
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
+        text: String,
+        reply_to_message_id: String,
+    ) -> Result<(), FiniteChatCoreError> {
+        self.validate_chat_route(&room_id, &topic_id, &chat_id)?;
+        let target_id = reply_to_message_id.trim();
+        self.validate_reply_target(&room_id, target_id)?;
+        self.send_message_with_conversation_and_chat(
+            room_id,
+            Some(topic_id),
+            Some(chat_id),
+            text,
+            Some(target_id.to_owned()),
+        )
     }
 
     fn send_message_with_reply(
@@ -3529,6 +3633,27 @@ impl AppRuntimeState {
         Ok(sent)
     }
 
+    fn send_chat_attachment(
+        &mut self,
+        input: SendAttachmentInput,
+    ) -> Result<(), FiniteChatCoreError> {
+        let topic_id =
+            input
+                .conversation_id
+                .clone()
+                .ok_or_else(|| FiniteChatCoreError::Client {
+                    reason: "chat attachment must include a topic id".to_owned(),
+                })?;
+        let chat_id = input
+            .chat_id
+            .clone()
+            .ok_or_else(|| FiniteChatCoreError::Client {
+                reason: "chat attachment must include a chat id".to_owned(),
+            })?;
+        self.validate_chat_route(&input.room_id, &topic_id, &chat_id)?;
+        self.send_attachment(input)
+    }
+
     fn append_ephemeral_activity(
         &mut self,
         input: AppBridgeActivityInput,
@@ -3551,6 +3676,8 @@ impl AppRuntimeState {
         mut input: SendAttachmentInput,
     ) -> Result<(), FiniteChatCoreError> {
         let room_id = input.room_id.clone();
+        let selected_topic_id = input.conversation_id.clone();
+        let selected_chat_id = input.chat_id.clone();
         if !self.room_is_connected(&room_id) {
             return Err(FiniteChatCoreError::Client {
                 reason: format!("room '{room_id}' is not ready to send"),
@@ -3573,6 +3700,11 @@ impl AppRuntimeState {
         match self.core.send_attachment(input) {
             Ok(result) => {
                 self.append_messages(result.messages);
+                if selected_topic_id.is_some() || selected_chat_id.is_some() {
+                    self.app.selected_topic_id = selected_topic_id;
+                    self.app.selected_chat_id = selected_chat_id;
+                    self.sync_selected_room_messages();
+                }
                 self.app.status = "sent".to_owned();
             }
             Err(error) => {
@@ -3602,6 +3734,35 @@ impl AppRuntimeState {
         let app_event_plaintext =
             encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
         self.send_chat_message_with_local_outbox(room_id, app_event_plaintext, preview, "sent")
+    }
+
+    fn send_chat_poll(
+        &mut self,
+        room_id: String,
+        topic_id: String,
+        chat_id: String,
+        question: String,
+        options: Vec<String>,
+    ) -> Result<(), FiniteChatCoreError> {
+        self.validate_chat_route(&room_id, &topic_id, &chat_id)?;
+        if !self.room_is_connected(&room_id) {
+            return Err(FiniteChatCoreError::Client {
+                reason: format!("room '{room_id}' is not ready to send"),
+            });
+        }
+        let chat_payload = encode_poll_message_payload(&question, options)?;
+        let preview = chat_projection_payload(&chat_payload).text;
+        let app_event_plaintext = encode_application_event_with_segment(
+            DurableAppEventKind::ChatMessage,
+            Some(topic_id.clone()),
+            Some(chat_id.clone()),
+            &chat_payload,
+        )?;
+        self.send_chat_message_with_local_outbox(room_id, app_event_plaintext, preview, "sent")?;
+        self.app.selected_topic_id = Some(topic_id);
+        self.app.selected_chat_id = Some(chat_id);
+        self.sync_selected_room_messages();
+        Ok(())
     }
 
     fn vote_poll(
@@ -5137,6 +5298,24 @@ impl AppRuntimeState {
         }
     }
 
+    fn validate_chat_route(
+        &self,
+        room_id: &str,
+        topic_id: &str,
+        chat_id: &str,
+    ) -> Result<(), FiniteChatCoreError> {
+        self.validate_topic(room_id, topic_id)?;
+        if self.chat_exists(room_id, topic_id, chat_id) {
+            Ok(())
+        } else {
+            Err(FiniteChatCoreError::Client {
+                reason: format!(
+                    "chat '{chat_id}' is not available in topic '{topic_id}' in room '{room_id}'"
+                ),
+            })
+        }
+    }
+
     fn normalize_reply_target(
         &self,
         room_id: &str,
@@ -5883,21 +6062,28 @@ impl CoreState {
         &mut self,
         input: SendAttachmentInput,
     ) -> Result<SyncResult, FiniteChatCoreError> {
-        let room_id = input.room_id;
-        if input.attachments.is_empty() {
+        let SendAttachmentInput {
+            room_id,
+            conversation_id,
+            chat_id,
+            attachments: input_attachments,
+            caption,
+            reply_to_message_id,
+        } = input;
+        if input_attachments.is_empty() {
             return Err(FiniteChatCoreError::Client {
                 reason: "attachment message must include at least one attachment".to_owned(),
             });
         }
         validate_item_count(
             "attachments",
-            input.attachments.len(),
+            input_attachments.len(),
             MAX_ATTACHMENTS_PER_MESSAGE,
         )
         .map_err(client_error)?;
         let room_server_url = self.room_server_url(&room_id);
-        let mut attachments = Vec::with_capacity(input.attachments.len());
-        for attachment in input.attachments {
+        let mut attachments = Vec::with_capacity(input_attachments.len());
+        for attachment in input_attachments {
             let filename = attachment.filename.trim().to_owned();
             let mime_type = attachment.mime_type.trim().to_owned();
             let metadata = AttachmentBlobMetadataV1 {
@@ -5919,11 +6105,14 @@ impl CoreState {
             });
         }
         let chat_payload = encode_attachment_message_payload(
-            input.caption.trim(),
+            caption.trim(),
             attachments,
-            input.reply_to_message_id.as_deref(),
+            reply_to_message_id.as_deref(),
+            conversation_id.as_deref(),
+            chat_id.as_deref(),
         )?;
-        let mut result = self.send_chat_payload(&room_id, chat_payload)?;
+        let mut result =
+            self.send_chat_payload(&room_id, conversation_id, chat_id, chat_payload)?;
         self.apply_attachment_cache_paths(&mut result.messages);
         Ok(result)
     }
@@ -5931,10 +6120,16 @@ impl CoreState {
     fn send_chat_payload(
         &mut self,
         room_id: &str,
+        conversation_id: Option<String>,
+        chat_id: Option<String>,
         chat_payload: Vec<u8>,
     ) -> Result<SyncResult, FiniteChatCoreError> {
-        let app_event_plaintext =
-            encode_application_event(DurableAppEventKind::ChatMessage, None, &chat_payload)?;
+        let app_event_plaintext = encode_application_event_with_segment(
+            DurableAppEventKind::ChatMessage,
+            conversation_id,
+            chat_id,
+            &chat_payload,
+        )?;
         self.send_application_plaintext(room_id, app_event_plaintext)
     }
 
@@ -7122,6 +7317,8 @@ fn encode_attachment_message_payload(
     caption: &str,
     attachments: Vec<HermesAttachmentV1>,
     reply_to_message_id: Option<&str>,
+    conversation_id: Option<&str>,
+    chat_id: Option<&str>,
 ) -> Result<Vec<u8>, FiniteChatCoreError> {
     validate_item_count(
         "attachments",
@@ -7131,8 +7328,8 @@ fn encode_attachment_message_payload(
     .map_err(client_error)?;
     HermesMessagePayloadV1 {
         payload_type: finitechat_hermes::HERMES_MESSAGE_PAYLOAD_TYPE_V1.to_owned(),
-        conversation_id: None,
-        segment_id: None,
+        conversation_id: conversation_id.map(ToOwned::to_owned),
+        segment_id: chat_id.map(ToOwned::to_owned),
         text: caption.to_owned(),
         kind: finitechat_hermes::HermesSendKindV1::Media,
         status: finitechat_hermes::HermesMessageStatusV1::Complete,
@@ -9843,6 +10040,47 @@ mod tests {
         );
         assert_eq!(reopened_first.messages.len(), 1);
         assert_eq!(reopened_first.messages[0].text, "first Home chat");
+        let home_parent_id = reopened_first.messages[0].message_id.clone();
+
+        let home_reply = app
+            .dispatch_and_wait(AppAction::SendChatReply {
+                room_id: room_id.clone(),
+                topic_id: HOME_TOPIC_ID.to_owned(),
+                chat_id: home_chat_id.clone(),
+                text: "reply in Home chat".to_owned(),
+                reply_to_message_id: home_parent_id.clone(),
+            })
+            .unwrap();
+        let reply = home_reply
+            .messages
+            .iter()
+            .find(|message| message.text == "reply in Home chat")
+            .expect("scoped reply projects in the selected chat");
+        assert_eq!(reply.conversation_id.as_deref(), Some(HOME_TOPIC_ID));
+        assert_eq!(reply.chat_id.as_deref(), Some(home_chat_id.as_str()));
+        assert_eq!(
+            reply.reply_to_message_id.as_deref(),
+            Some(home_parent_id.as_str())
+        );
+        let DecodedAppEvent::ChatMessage {
+            conversation_id,
+            segment_id,
+            payload,
+        } = decode_application_event(&reply.payload)
+        else {
+            panic!("scoped reply row must carry a chat message application event");
+        };
+        assert_eq!(conversation_id.as_deref(), Some(HOME_TOPIC_ID));
+        assert_eq!(segment_id.as_deref(), Some(home_chat_id.as_str()));
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("scoped reply row must carry Hermes message payload");
+        assert_eq!(hermes.conversation_id.as_deref(), Some(HOME_TOPIC_ID));
+        assert_eq!(hermes.segment_id.as_deref(), Some(home_chat_id.as_str()));
+        assert_eq!(
+            hermes.reply_to_message_id.as_deref(),
+            Some(home_parent_id.as_str())
+        );
 
         let topic = app
             .dispatch_and_wait(AppAction::CreateTopic {
@@ -9869,6 +10107,114 @@ mod tests {
         assert_eq!(build_topic.title, "Build");
         assert_eq!(build_topic.chats.len(), 1);
         assert_eq!(build_topic.chats[0].chat_id, build_chat_id);
+
+        let build_media = app
+            .dispatch_and_wait(AppAction::SendChatAttachment {
+                room_id: room_id.clone(),
+                topic_id: build_topic_id.clone(),
+                chat_id: build_chat_id.clone(),
+                filename: "scope-proof.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                kind: ChatMediaKind::Image,
+                bytes: b"scoped media bytes".to_vec(),
+                caption: "scoped media".to_owned(),
+                reply_to_message_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            build_media.selected_topic_id.as_deref(),
+            Some(build_topic_id.as_str())
+        );
+        assert_eq!(
+            build_media.selected_chat_id.as_deref(),
+            Some(build_chat_id.as_str())
+        );
+        let media_message = build_media
+            .messages
+            .iter()
+            .find(|message| message.text == "scoped media")
+            .expect("scoped attachment projects in the selected chat");
+        assert_eq!(
+            media_message.conversation_id.as_deref(),
+            Some(build_topic_id.as_str())
+        );
+        assert_eq!(
+            media_message.chat_id.as_deref(),
+            Some(build_chat_id.as_str())
+        );
+        assert_eq!(media_message.media.len(), 1);
+        let DecodedAppEvent::ChatMessage {
+            conversation_id,
+            segment_id,
+            payload,
+        } = decode_application_event(&media_message.payload)
+        else {
+            panic!("scoped attachment row must carry a chat message application event");
+        };
+        assert_eq!(conversation_id.as_deref(), Some(build_topic_id.as_str()));
+        assert_eq!(segment_id.as_deref(), Some(build_chat_id.as_str()));
+        let hermes = HermesMessagePayloadV1::decode(&payload)
+            .unwrap()
+            .expect("scoped attachment row must carry Hermes message payload");
+        assert_eq!(
+            hermes.conversation_id.as_deref(),
+            Some(build_topic_id.as_str())
+        );
+        assert_eq!(hermes.segment_id.as_deref(), Some(build_chat_id.as_str()));
+
+        let build_poll = app
+            .dispatch_and_wait(AppAction::SendChatPoll {
+                room_id: room_id.clone(),
+                topic_id: build_topic_id.clone(),
+                chat_id: build_chat_id.clone(),
+                question: "Ship scoped rich messages?".to_owned(),
+                options: vec!["Yes".to_owned(), "Also yes".to_owned()],
+            })
+            .unwrap();
+        let poll_message = build_poll
+            .messages
+            .iter()
+            .find(|message| message.poll.is_some())
+            .expect("scoped poll projects in the selected chat");
+        assert_eq!(
+            poll_message.conversation_id.as_deref(),
+            Some(build_topic_id.as_str())
+        );
+        assert_eq!(
+            poll_message.chat_id.as_deref(),
+            Some(build_chat_id.as_str())
+        );
+        let DecodedAppEvent::ChatMessage {
+            conversation_id,
+            segment_id,
+            payload,
+        } = decode_application_event(&poll_message.payload)
+        else {
+            panic!("scoped poll row must carry a chat message application event");
+        };
+        assert_eq!(conversation_id.as_deref(), Some(build_topic_id.as_str()));
+        assert_eq!(segment_id.as_deref(), Some(build_chat_id.as_str()));
+        assert_eq!(
+            poll_message_payload(&payload)
+                .expect("scoped poll payload decodes")
+                .question,
+            "Ship scoped rich messages?"
+        );
+
+        let reopened_home = app
+            .dispatch_and_wait(AppAction::OpenChat {
+                room_id: room_id.clone(),
+                topic_id: HOME_TOPIC_ID.to_owned(),
+                chat_id: home_chat_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            reopened_home
+                .messages
+                .iter()
+                .all(|message| message.chat_id.as_deref() == Some(home_chat_id.as_str())),
+            "messages from the Build chat must not leak into the Home chat transcript"
+        );
     }
 
     #[test]

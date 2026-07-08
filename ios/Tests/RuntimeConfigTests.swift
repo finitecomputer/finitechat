@@ -2281,36 +2281,7 @@ final class AppModelPersistenceTests: XCTestCase {
             serverURL: "http://127.0.0.1:1",
             deviceID: "qt433"
         )
-        var state = savedChatState()
-        state.selectedTopicId = "home"
-        state.selectedChatId = "home-chat"
-        state.topics = [
-            AppTopicSummary(
-                roomId: "room-main",
-                topicId: "home",
-                title: "Home",
-                description: nil,
-                lastMessagePreview: "",
-                unreadCount: 0,
-                messageCount: 0,
-                createdSeq: 1,
-                updatedSeq: 1,
-                archived: false,
-                activeChatId: "home-chat",
-                chats: [
-                    AppChatSummary(
-                        chatId: "home-chat",
-                        title: "Chat 1",
-                        lastMessagePreview: "",
-                        unreadCount: 0,
-                        messageCount: 0,
-                        startedSeq: 1,
-                        updatedSeq: 1,
-                        active: true
-                    ),
-                ]
-            ),
-        ]
+        let state = savedChatStateWithSelectedHomeTopicChat()
         let runtime = FakeFiniteChatRuntime(
             initialState: state,
             startRuntimeState: state
@@ -2346,6 +2317,158 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(topicID, "home")
         XCTAssertEqual(chatID, "home-chat")
         XCTAssertEqual(text, "send through selected chat")
+    }
+
+    func testReplyUsesMessageTopicChatWhenAvailable() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let state = savedChatStateWithSelectedHomeTopicChat()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        XCTAssertTrue(model.send(
+            roomID: "room-main",
+            text: "reply through selected chat",
+            replyTo: state.messages[0]
+        ))
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendChatReply = $0 { return true }
+                return false
+            }
+        }
+        guard case .sendChatReply(
+            let roomID,
+            let topicID,
+            let chatID,
+            let text,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendChatReply for routed reply")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(topicID, "home")
+        XCTAssertEqual(chatID, "home-chat")
+        XCTAssertEqual(text, "reply through selected chat")
+        XCTAssertEqual(replyToMessageID, "message-1")
+    }
+
+    func testAttachmentsUseSelectedTopicChatWhenAvailable() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let state = savedChatStateWithSelectedHomeTopicChat()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+        let attachment = OutboundAttachment(
+            filename: "proof.txt",
+            mimeType: "text/plain",
+            kind: .file,
+            bytes: Data("proof".utf8)
+        )
+
+        model.start()
+        XCTAssertTrue(model.sendAttachments(
+            roomID: "room-main",
+            attachments: [attachment],
+            captionOverride: "caption"
+        ))
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendChatAttachments = $0 { return true }
+                return false
+            }
+        }
+        guard case .sendChatAttachments(
+            let roomID,
+            let topicID,
+            let chatID,
+            let attachments,
+            let caption,
+            let replyToMessageID
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendChatAttachments for selected chat")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(topicID, "home")
+        XCTAssertEqual(chatID, "home-chat")
+        XCTAssertEqual(attachments, [attachment])
+        XCTAssertEqual(caption, "caption")
+        XCTAssertNil(replyToMessageID)
+    }
+
+    func testPollUsesSelectedTopicChatWhenAvailable() async throws {
+        let config = RuntimeConfig(
+            serverURL: "http://127.0.0.1:1",
+            deviceID: "qt433"
+        )
+        let state = savedChatStateWithSelectedHomeTopicChat()
+        let runtime = FakeFiniteChatRuntime(
+            initialState: state,
+            startRuntimeState: state
+        )
+        let model = AppModel(
+            config: config,
+            applicationSupportURL: try temporarySupportURL(),
+            args: ["FiniteChat"],
+            startsUpdateLoop: false
+        ) { _ in
+            runtime
+        }
+
+        model.start()
+        XCTAssertTrue(model.sendPoll(
+            roomID: "room-main",
+            question: "Ship it?",
+            options: ["Yes", "Also yes"]
+        ))
+
+        try await waitUntil {
+            runtime.dispatchedActions.contains {
+                if case .sendChatPoll = $0 { return true }
+                return false
+            }
+        }
+        guard case .sendChatPoll(
+            let roomID,
+            let topicID,
+            let chatID,
+            let question,
+            let options
+        ) = runtime.dispatchedActions.last else {
+            return XCTFail("expected sendChatPoll for selected chat")
+        }
+        XCTAssertEqual(roomID, "room-main")
+        XCTAssertEqual(topicID, "home")
+        XCTAssertEqual(chatID, "home-chat")
+        XCTAssertEqual(question, "Ship it?")
+        XCTAssertEqual(options, ["Yes", "Also yes"])
     }
 
     func testRuntimeDispatchesAreFifoAcrossStartupAndUserActions() async throws {
@@ -3868,6 +3991,42 @@ final class AppModelPersistenceTests: XCTestCase {
             typingMembers: [],
             flow: flow
         )
+    }
+
+    private func savedChatStateWithSelectedHomeTopicChat() -> AppState {
+        var state = savedChatState()
+        state.selectedTopicId = "home"
+        state.selectedChatId = "home-chat"
+        state.topics = [
+            AppTopicSummary(
+                roomId: "room-main",
+                topicId: "home",
+                title: "Home",
+                description: nil,
+                lastMessagePreview: "",
+                unreadCount: 0,
+                messageCount: 1,
+                createdSeq: 1,
+                updatedSeq: 1,
+                archived: false,
+                activeChatId: "home-chat",
+                chats: [
+                    AppChatSummary(
+                        chatId: "home-chat",
+                        title: "Chat 1",
+                        lastMessagePreview: "saved before force close",
+                        unreadCount: 0,
+                        messageCount: 1,
+                        startedSeq: 1,
+                        updatedSeq: 1,
+                        active: true
+                    ),
+                ]
+            ),
+        ]
+        state.messages[0].conversationId = "home"
+        state.messages[0].chatId = "home-chat"
+        return state
     }
 
     private func productHarnessDeliveredTranscriptState() -> AppState {
