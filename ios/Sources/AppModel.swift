@@ -2222,11 +2222,29 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "open_room",
                 details: ["room": roomId]
             )
+        case .openTopic(let roomId, let topicId):
+            return DiagnosticActionSummary(
+                category: "runtime",
+                name: "open_topic",
+                details: ["room": roomId, "topic": topicId]
+            )
         case .createRoom:
             return DiagnosticActionSummary(
                 category: "transport",
                 name: "create_room",
                 details: [:]
+            )
+        case .createTopic(let roomId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "create_topic",
+                details: ["room": roomId]
+            )
+        case .startTopicSegment(let roomId, let topicId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "start_topic_segment",
+                details: ["room": roomId, "topic": topicId]
             )
         case .saveProfile:
             return DiagnosticActionSummary(
@@ -2287,6 +2305,12 @@ final class AppModel: ObservableObject, AppReconciler {
                 category: "transport",
                 name: "send_message",
                 details: ["room": roomId]
+            )
+        case .sendTopicMessage(let roomId, let topicId, _):
+            return DiagnosticActionSummary(
+                category: "transport",
+                name: "send_topic_message",
+                details: ["room": roomId, "topic": topicId]
             )
         case .sendReply(let roomId, _, let replyToMessageId):
             return DiagnosticActionSummary(

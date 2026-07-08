@@ -29,7 +29,7 @@ export type AppRoomSummary = {
   state: "Connected" | "WaitingForApproval" | "Joining" | "UnavailableOnDevice";
   status: string;
   user_status_text: string;
-  can_create_invite: boolean;
+  can_create_invite?: boolean;
   last_message_preview: string;
   unread_count: number;
   can_load_older: boolean;
@@ -111,6 +111,16 @@ export type AppTypingMember = {
   activity_kind: "typing" | "thinking" | "working" | string;
 };
 
+export type AppProfileSummary = {
+  account_id: string;
+  npub: string;
+  display_name: string;
+  about?: string | null;
+  picture?: string | null;
+  stale: boolean;
+  is_agent: boolean;
+};
+
 export type OutboundAttachment = {
   filename: string;
   mime_type: string;
@@ -130,7 +140,7 @@ export type AppState = {
   status: string;
   toast?: string | null;
   messages: ChatMessage[];
-  profiles: unknown[];
+  profiles: AppProfileSummary[];
   devices: unknown[];
   typing_members: AppTypingMember[];
   flow: {
@@ -151,6 +161,9 @@ export type AppAction =
   | { CreateRoom: { display_name: string } }
   | { CreateTopic: { room_id: string; title: string } }
   | { StartTopicSegment: { room_id: string; topic_id: string; reason?: string | null } }
+  | { StartProfileChat: { profile: AppProfileSummary; display_name: string } }
+  | { StartGroupChat: { profiles: AppProfileSummary[]; display_name: string } }
+  | { AddRoomMembers: { room_id: string; profiles: AppProfileSummary[] } }
   | { CreateInvite: { room_id: string } }
   | { ScanTarget: { value: string } }
   | { SubmitInviteJoin: { pending_room_id: string } }

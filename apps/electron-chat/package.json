@@ -5,6 +5,8 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:electron": "FINITECHAT_RENDERER_URL=http://127.0.0.1:5173 electron .",
     "build": "vite build",
     "electron": "electron .",
     "play": "npm run build && electron ."

@@ -7,6 +7,7 @@ import {
   ChevronRightIcon,
   CopyIcon,
   FileIcon,
+  HashIcon,
   ImageIcon,
   KeyRoundIcon,
   LinkIcon,
@@ -14,12 +15,13 @@ import {
   MessageCircleIcon,
   MoreHorizontalIcon,
   PaperclipIcon,
-  PlusIcon,
   RefreshCwIcon,
   SendIcon,
   ShieldCheckIcon,
   SparklesIcon,
   SquarePenIcon,
+  UserPlusIcon,
+  UsersIcon,
   XIcon,
 } from "lucide-react";
 import { FiniteBrand } from "@/components/finite-brand";
@@ -27,6 +29,7 @@ import {
   AppRoomMemberSummary,
   AppRoomSummary,
   AppState,
+  AppProfileSummary,
   AppTopicSummary,
   AppTypingMember,
   ChatMediaAttachment,
@@ -73,8 +76,11 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [composer, setComposer] = useState("");
   const [inviteUrl, setInviteUrl] = useState("");
-  const [roomTitle, setRoomTitle] = useState("");
-  const [newRoomOpen, setNewRoomOpen] = useState(false);
+  const [createMode, setCreateMode] = useState<"chat" | "topic" | null>(null);
+  const [createTitle, setCreateTitle] = useState("");
+  const [participantOpen, setParticipantOpen] = useState(false);
+  const [participantMode, setParticipantMode] = useState<"invite" | "npub">("invite");
+  const [participantInput, setParticipantInput] = useState("");
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [identityStatus, setIdentityStatus] = useState<DesktopIdentityStatus | null>(null);
@@ -260,9 +266,24 @@ export function App() {
       ) ?? null,
     [state]
   );
-  const visibleTopics = useMemo(
-    () => state?.topics.filter((topic) => topic.room_id === state.selected_room_id && !topic.archived) ?? [],
-    [state]
+  const topicsByRoom = useMemo(() => {
+    const grouped = new Map<string, AppTopicSummary[]>();
+    for (const topic of state?.topics ?? []) {
+      if (topic.archived) {
+        continue;
+      }
+      const topics = grouped.get(topic.room_id) ?? [];
+      topics.push(topic);
+      grouped.set(topic.room_id, topics);
+    }
+    for (const topics of grouped.values()) {
+      topics.sort((left, right) => right.updated_seq - left.updated_seq || left.title.localeCompare(right.title));
+    }
+    return grouped;
+  }, [state?.topics]);
+  const activeProfile = useMemo(
+    () => state?.profiles.find((profile) => profile.account_id === state.active_profile_id) ?? null,
+    [state?.active_profile_id, state?.profiles]
   );
   const activeInvite =
     selectedRoom && state?.active_invite?.room_id === selectedRoom.room_id ? state.active_invite : null;
@@ -275,7 +296,6 @@ export function App() {
     : false;
   const canSendToSelectedRoom =
     Boolean(selectedRoom) && selectedRoom?.state === "Connected" && selectedRoomHasCounterparty;
-  const selectedAgentRoom = selectedRoom?.is_agent_chat ? selectedRoom : agentRooms[0] ?? null;
   const selectedRoomNeedsAgent = Boolean(selectedRoom) && !selectedRoomHasCounterparty;
   const statusText = state ? (error ?? state.flow.notice_text ?? state.toast ?? state.status) : "starting daemon";
   const shortAccount = state?.identity.account_id ? shortId(state.identity.account_id) : "not connected";
@@ -493,19 +513,68 @@ export function App() {
     }
   }
 
-  async function createRoom(event?: FormEvent) {
+  async function submitCreate(event?: FormEvent) {
     event?.preventDefault();
-    if (!selectedAgentRoom) {
-      setNewRoomOpen(false);
-      setRoomTitle("");
-      setError("Connect Hermes before starting a new chat.");
-      focusJoinInvite();
+    if (!createMode) {
       return;
     }
-    const displayName = roomTitle.trim() || "New topic";
-    setRoomTitle("");
-    setNewRoomOpen(false);
-    await run({ CreateTopic: { room_id: selectedAgentRoom.room_id, title: displayName } });
+    const title = createTitle.trim();
+    setCreateTitle("");
+    setCreateMode(null);
+    if (createMode === "chat") {
+      if (selectedTopic) {
+        await run({
+          StartTopicSegment: {
+            room_id: selectedTopic.room_id,
+            topic_id: selectedTopic.topic_id,
+            reason: title || null,
+          },
+        });
+        return;
+      }
+      await run({ CreateRoom: { display_name: title || "New chat" } });
+      return;
+    }
+    if (!selectedRoom) {
+      setError("Select a chat before creating a topic.");
+      return;
+    }
+    await run({ CreateTopic: { room_id: selectedRoom.room_id, title: title || "New topic" } });
+  }
+
+  async function submitParticipant(event: FormEvent) {
+    event.preventDefault();
+    const value = participantInput.trim();
+    if (!value) {
+      return;
+    }
+    if (participantMode === "invite") {
+      const next = await run({ ScanTarget: { value } });
+      if (next) {
+        setParticipantInput("");
+      }
+      return;
+    }
+
+    const scanned = await run({ ScanTarget: { value } });
+    const profile = scanned ? profileFromState(scanned, scanned.active_profile_id) : null;
+    if (!profile) {
+      setError("That npub could not be resolved into a Finite profile.");
+      return;
+    }
+    const roomForAdd = selectedRoom?.state === "Connected" ? selectedRoom : null;
+    const next = roomForAdd
+      ? await run({ AddRoomMembers: { room_id: roomForAdd.room_id, profiles: [profile] } })
+      : await run({
+          StartProfileChat: {
+            profile,
+            display_name: `Chat with ${profile.display_name}`,
+          },
+        });
+    if (next) {
+      setParticipantInput("");
+      setParticipantOpen(false);
+    }
   }
 
   async function syncRuntime() {
@@ -608,13 +677,137 @@ export function App() {
         </div>
 
         <nav className="finite-chat__sidebar-nav" aria-label="Chat navigation">
+          <div className="finite-chat__sidebar-actions">
+            <button
+              type="button"
+              className="finite-chat__sidebar-action"
+              onClick={() => {
+                setCreateMode("chat");
+                setCreateTitle("");
+              }}
+              disabled={busy}
+            >
+              <SquarePenIcon aria-hidden />
+              <span>New chat</span>
+            </button>
+            <button
+              type="button"
+              className="finite-chat__sidebar-action"
+              onClick={() => {
+                setCreateMode("topic");
+                setCreateTitle("");
+              }}
+              disabled={busy || !selectedRoom}
+            >
+              <HashIcon aria-hidden />
+              <span>New topic</span>
+            </button>
+          </div>
+
+          {createMode ? (
+            <form className="finite-chat__sidebar-create" onSubmit={submitCreate}>
+              <input
+                value={createTitle}
+                onChange={(event) => setCreateTitle(event.target.value)}
+                placeholder={
+                  createMode === "chat"
+                    ? selectedTopic
+                      ? "Chat note"
+                      : "Chat name"
+                    : selectedRoom
+                      ? "Topic name"
+                      : "Select a chat first"
+                }
+                autoFocus
+                disabled={busy || (createMode === "topic" && !selectedRoom)}
+              />
+              <button
+                type="submit"
+                className="ocean-icon-button"
+                aria-label={createMode === "chat" ? "Create chat" : "Create topic"}
+                disabled={busy || (createMode === "topic" && !selectedRoom)}
+              >
+                <CheckIcon aria-hidden />
+              </button>
+              <button
+                type="button"
+                className="ocean-icon-button"
+                aria-label="Cancel"
+                onClick={() => {
+                  setCreateMode(null);
+                  setCreateTitle("");
+                }}
+              >
+                <XIcon aria-hidden />
+              </button>
+            </form>
+          ) : null}
+
           <details className="finite-chat__folder finite-chat__folder--flat" open>
             <summary className="finite-chat__folder-summary">
               <span className="finite-chat__folder-main">
                 <span className="finite-chat__folder-icon" aria-hidden>
-                  <BotIcon />
+                  <HashIcon />
                 </span>
-                <span className="finite-chat__folder-label">Hermes</span>
+                <span className="finite-chat__folder-label">Topics</span>
+              </span>
+              <ChevronRightIcon className="finite-chat__folder-chevron" aria-hidden />
+            </summary>
+
+            <div className="finite-chat__folder-body">
+              {(state?.rooms ?? []).map((room) => {
+                const roomTopics = topicsByRoom.get(room.room_id) ?? [];
+                if (roomTopics.length === 0) {
+                  return null;
+                }
+                return (
+                  <div className="finite-chat__sidebar-topic-room-group" key={room.room_id}>
+                    <div className="finite-chat__sidebar-topic-room-label">{room.display_name}</div>
+                    {roomTopics.map((topic) => (
+                      <div className="finite-chat__sidebar-topic-group" key={`${topic.room_id}:${topic.topic_id}`}>
+                        <TopicThreadButton
+                          topic={topic}
+                          active={topic.room_id === state?.selected_room_id && topic.topic_id === state?.selected_topic_id}
+                          onClick={() => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
+                        />
+                        {topic.segments.length > 0 ? (
+                          <div className="finite-chat__sidebar-segment-list">
+                            {topic.segments.map((segment, index) => (
+                              <TopicSegmentButton
+                                key={segment.segment_id}
+                                segment={segment}
+                                index={index}
+                                active={
+                                  topic.room_id === state?.selected_room_id &&
+                                  topic.topic_id === state?.selected_topic_id &&
+                                  topic.active_segment_id === segment.segment_id
+                                }
+                                onClick={() => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              {state && state.topics.filter((topic) => !topic.archived).length === 0 ? (
+                <div className="finite-chat__thread-empty">
+                  <HashIcon aria-hidden />
+                  <span>No topics</span>
+                </div>
+              ) : null}
+            </div>
+          </details>
+
+          <details className="finite-chat__folder finite-chat__folder--flat" open>
+            <summary className="finite-chat__folder-summary">
+              <span className="finite-chat__folder-main">
+                <span className="finite-chat__folder-icon" aria-hidden>
+                  <MessageCircleIcon />
+                </span>
+                <span className="finite-chat__folder-label">Chats</span>
               </span>
               <ChevronRightIcon className="finite-chat__folder-chevron" aria-hidden />
             </summary>
@@ -624,7 +817,7 @@ export function App() {
                 <RoomThreadButton
                   key={room.room_id}
                   room={room}
-                  active={room.room_id === state?.selected_room_id}
+                  active={room.room_id === state?.selected_room_id && !state?.selected_topic_id}
                   onClick={() => void run({ OpenRoom: { room_id: room.room_id } })}
                 />
               ))}
@@ -636,47 +829,7 @@ export function App() {
               ) : null}
             </div>
           </details>
-
-          {newRoomOpen ? (
-            <form className="finite-chat__sidebar-create" onSubmit={createRoom}>
-              <input
-                value={roomTitle}
-                onChange={(event) => setRoomTitle(event.target.value)}
-                placeholder={selectedAgentRoom ? "Topic name" : "Connect Hermes first"}
-                autoFocus
-                disabled={!selectedAgentRoom}
-              />
-              <button type="submit" className="ocean-icon-button" aria-label="Create chat" disabled={busy || !selectedAgentRoom}>
-                <CheckIcon aria-hidden />
-              </button>
-              <button
-                type="button"
-                className="ocean-icon-button"
-                aria-label="Cancel"
-                onClick={() => {
-                  setNewRoomOpen(false);
-                  setRoomTitle("");
-                }}
-              >
-                <XIcon aria-hidden />
-              </button>
-            </form>
-          ) : null}
-
         </nav>
-
-        {selectedAgentRoom ? (
-          <button
-            type="button"
-            className="finite-chat__sidebar-new-chat-fab"
-            aria-label="New topic"
-            disabled={busy}
-            onClick={() => setNewRoomOpen(true)}
-          >
-            <PlusIcon aria-hidden />
-            <span>New topic</span>
-          </button>
-        ) : null}
 
         <div className="finite-chat__sidebar-footer">
           {accountMenuOpen ? (
@@ -750,15 +903,33 @@ export function App() {
               <button
                 type="button"
                 className="ocean-icon-button"
-                aria-label="Create invite"
-                onClick={() => void createInvite()}
-                disabled={busy || selectedRoom.can_create_invite === false}
+                aria-label="Add participant"
+                onClick={() => setParticipantOpen((open) => !open)}
+                disabled={busy}
               >
-                <LinkIcon aria-hidden />
+                <UserPlusIcon aria-hidden />
               </button>
             ) : null}
           </div>
         </header>
+
+        {participantOpen ? (
+          <ParticipantPanel
+            activeInvite={activeInvite}
+            activeProfile={activeProfile}
+            busy={busy}
+            copiedInvite={copiedInvite}
+            mode={participantMode}
+            selectedRoom={selectedRoom}
+            value={participantInput}
+            onClose={() => setParticipantOpen(false)}
+            onCopyInvite={() => void copyInvite()}
+            onCreateInvite={() => void createInvite()}
+            onModeChange={setParticipantMode}
+            onSubmit={submitParticipant}
+            onValueChange={setParticipantInput}
+          />
+        ) : null}
 
         {pendingInviteRoomId ? (
           <section className="finite-chat__notice finite-chat__notice--inline">
@@ -786,16 +957,6 @@ export function App() {
             <strong>Daemon</strong>
             <span>{error}</span>
           </section>
-        ) : null}
-
-        {selectedRoom && visibleTopics.length > 0 ? (
-          <TopicStrip
-            topics={visibleTopics}
-            selectedTopic={selectedTopic}
-            selectedRoom={selectedRoom}
-            onOpenRoom={() => void run({ OpenRoom: { room_id: selectedRoom.room_id } })}
-            onOpenTopic={(topic) => void run({ OpenTopic: { room_id: topic.room_id, topic_id: topic.topic_id } })}
-          />
         ) : null}
 
         {state && (!selectedRoom || selectedRoomNeedsAgent || selectedRoom.state !== "Connected") ? (
@@ -827,7 +988,7 @@ export function App() {
                 {!state ? (
                   <EmptyState title="Starting daemon" busy />
                 ) : selectedMessages.length === 0 && visiblePendingMessages.length === 0 ? (
-                  <EmptyState title={selectedRoom ? selectedRoom.display_name : "Finite Chat"} />
+                  <EmptyState title={selectedTopic?.title ?? selectedRoom?.display_name ?? "Finite Chat"} />
                 ) : null}
               </div>
             </section>
@@ -1062,6 +1223,99 @@ function AgentConnectionPanel({
   );
 }
 
+function ParticipantPanel({
+  activeInvite,
+  activeProfile,
+  busy,
+  copiedInvite,
+  mode,
+  onClose,
+  onCopyInvite,
+  onCreateInvite,
+  onModeChange,
+  onSubmit,
+  onValueChange,
+  selectedRoom,
+  value,
+}: {
+  activeInvite: { room_id: string; invite_url: string } | null;
+  activeProfile: AppProfileSummary | null;
+  busy: boolean;
+  copiedInvite: boolean;
+  mode: "invite" | "npub";
+  onClose: () => void;
+  onCopyInvite: () => void;
+  onCreateInvite: () => void;
+  onModeChange: (mode: "invite" | "npub") => void;
+  onSubmit: (event: FormEvent) => void;
+  onValueChange: (value: string) => void;
+  selectedRoom: AppRoomSummary | null;
+  value: string;
+}) {
+  const canCreateInvite = Boolean(
+    selectedRoom && selectedRoom.state === "Connected" && selectedRoom.can_create_invite !== false
+  );
+  const submitLabel = mode === "invite" ? "Open invite" : selectedRoom?.state === "Connected" ? "Add to chat" : "Start chat";
+  return (
+    <section className="finite-chat__participant-panel">
+      <div className="finite-chat__participant-heading">
+        <span>
+          <UserPlusIcon aria-hidden />
+          <strong>Add to chat</strong>
+        </span>
+        <button type="button" className="ocean-icon-button" aria-label="Close" onClick={onClose}>
+          <XIcon aria-hidden />
+        </button>
+      </div>
+      <div className="finite-chat__participant-modes" role="tablist" aria-label="Participant source">
+        <button type="button" className={mode === "invite" ? "is-active" : ""} onClick={() => onModeChange("invite")}>
+          <LinkIcon aria-hidden />
+          <span>Invite code</span>
+        </button>
+        <button type="button" className={mode === "npub" ? "is-active" : ""} onClick={() => onModeChange("npub")}>
+          <UsersIcon aria-hidden />
+          <span>npub</span>
+        </button>
+      </div>
+      <form className="finite-chat__participant-form" onSubmit={onSubmit}>
+        <input
+          value={value}
+          onChange={(event) => onValueChange(event.target.value)}
+          placeholder={mode === "invite" ? "finite://join..." : "npub1..."}
+          disabled={busy}
+        />
+        <button type="submit" className="finite-chat__command-button" disabled={!value.trim() || busy}>
+          {mode === "invite" ? <LinkIcon aria-hidden /> : <UserPlusIcon aria-hidden />}
+          {submitLabel}
+        </button>
+      </form>
+      {activeProfile && mode === "npub" ? (
+        <div className="finite-chat__participant-profile">
+          <span className="finite-chat__avatar" aria-hidden>
+            {initials(activeProfile.display_name)}
+          </span>
+          <span>
+            <strong>{activeProfile.display_name}</strong>
+            <small>{activeProfile.npub}</small>
+          </span>
+        </div>
+      ) : null}
+      <div className="finite-chat__participant-actions">
+        <button type="button" className="finite-chat__command-button" onClick={onCreateInvite} disabled={!canCreateInvite || busy}>
+          <LinkIcon aria-hidden />
+          Generate invite
+        </button>
+        {activeInvite ? (
+          <button type="button" className="finite-chat__command-button" onClick={onCopyInvite} disabled={busy}>
+            {copiedInvite ? <CheckIcon aria-hidden /> : <CopyIcon aria-hidden />}
+            {copiedInvite ? "Copied" : "Copy invite"}
+          </button>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function RoomThreadButton({
   active,
   onClick,
@@ -1083,6 +1337,48 @@ function RoomThreadButton({
       <span className="finite-chat__thread-main">
         <span className="finite-chat__thread-title">{room.display_name}</span>
         <span className="finite-chat__thread-time">{room.unread_count > 0 ? room.unread_count : room.state}</span>
+      </span>
+    </button>
+  );
+}
+
+function TopicThreadButton({
+  active,
+  onClick,
+  topic,
+}: {
+  active: boolean;
+  onClick: () => void;
+  topic: AppTopicSummary;
+}) {
+  return (
+    <button type="button" className={`finite-chat__topic-thread finite-chat__topic-header ${active ? "is-active" : ""}`} onClick={onClick}>
+      <HashIcon aria-hidden />
+      <span className="finite-chat__thread-main">
+        <span className="finite-chat__thread-title">{topic.title}</span>
+        <span className="finite-chat__thread-time">{topic.unread_count > 0 ? topic.unread_count : topic.message_count}</span>
+      </span>
+    </button>
+  );
+}
+
+function TopicSegmentButton({
+  active,
+  index,
+  onClick,
+  segment,
+}: {
+  active: boolean;
+  index: number;
+  onClick: () => void;
+  segment: AppTopicSummary["segments"][number];
+}) {
+  return (
+    <button type="button" className={`finite-chat__topic-segment ${active ? "is-active" : ""}`} onClick={onClick}>
+      <MessageCircleIcon aria-hidden />
+      <span className="finite-chat__thread-main">
+        <span className="finite-chat__thread-title">Chat {index + 1}</span>
+        <span className="finite-chat__thread-time">#{segment.started_seq}</span>
       </span>
     </button>
   );
@@ -1172,40 +1468,6 @@ function ThreadActivityIndicator({ active }: { active: boolean }) {
     <span className={`finite-chat__thread-indicator ${active ? "is-thinking" : ""}`} aria-hidden>
       {active ? <span className="finite-chat__thread-pulse" /> : <MessageCircleIcon />}
     </span>
-  );
-}
-
-function TopicStrip({
-  onOpenRoom,
-  onOpenTopic,
-  selectedRoom,
-  selectedTopic,
-  topics,
-}: {
-  onOpenRoom: () => void;
-  onOpenTopic: (topic: AppTopicSummary) => void;
-  selectedRoom: AppRoomSummary;
-  selectedTopic: AppTopicSummary | null;
-  topics: AppTopicSummary[];
-}) {
-  return (
-    <div className="finite-chat__topic-strip" aria-label="Topics">
-      <button type="button" className={!selectedTopic ? "is-active" : ""} onClick={onOpenRoom}>
-        Room
-      </button>
-      {topics.map((topic) => (
-        <button
-          key={`${topic.room_id}:${topic.topic_id}`}
-          type="button"
-          className={topic.topic_id === selectedTopic?.topic_id ? "is-active" : ""}
-          onClick={() => onOpenTopic(topic)}
-        >
-          {topic.title}
-          {topic.unread_count > 0 ? <span>{topic.unread_count}</span> : null}
-        </button>
-      ))}
-      <small>{selectedRoom.display_name}</small>
-    </div>
   );
 }
 
@@ -1400,6 +1662,13 @@ function shortId(value: string) {
     return value;
   }
   return `${value.slice(0, 8)}...${value.slice(-4)}`;
+}
+
+function profileFromState(state: AppState, accountId: string | null | undefined) {
+  if (!accountId) {
+    return null;
+  }
+  return state.profiles.find((profile) => profile.account_id === accountId) ?? null;
 }
 
 function errorMessage(reason: unknown) {

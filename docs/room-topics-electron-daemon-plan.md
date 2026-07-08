@@ -135,10 +135,25 @@ Acceptance:
 
 - Electron renders Rooms, Topics, selected Topic transcript, composer,
   attachments, activity, and runtime state from daemon `AppState`.
-- Creating "New chat" creates a Topic.
+- Topics render as sidebar headers, with topic segments shown as chat rows
+  beneath them when the core has segment boundaries.
+- Creating "New chat" dispatches `StartTopicSegment` when a topic is selected,
+  preserving the legacy "start a fresh chat without a fresh pairing" feel; when
+  no topic is selected it dispatches `CreateRoom`.
+- Creating "New topic" dispatches `CreateTopic` inside the selected room and
+  shows that topic in the sidebar under its room.
+- Adding another participant uses one AppState path:
+  - invite-code paste dispatches `ScanTarget`;
+  - npub paste dispatches `ScanTarget`, then `StartProfileChat` or
+    `AddRoomMembers` with the resolved `AppProfileSummary`;
+  - room invite generation dispatches `CreateInvite`.
 - `/new` or reset creates a Segment boundary in the selected Topic.
 - UI updates arrive from daemon SSE and reconcile with local draft/layout state.
 - `finite://join?...` links open the app and dispatch `ScanTarget`.
+- For renderer iteration, run `npm run dev:renderer` and launch Electron with
+  `npm run dev:electron`; the Electron main process loads
+  `FINITECHAT_RENDERER_URL` in development and falls back to the built
+  `dist/` app for packaged/static runs.
 
 ## Phase 4: Cross-Device And Hosted Runtime Proof
 
