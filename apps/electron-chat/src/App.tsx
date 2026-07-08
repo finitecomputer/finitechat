@@ -669,9 +669,17 @@ export function App() {
     if (!activeInvite) {
       return;
     }
-    await navigator.clipboard.writeText(activeInvite.invite_url);
-    setCopiedInvite(true);
-    window.setTimeout(() => setCopiedInvite(false), 1400);
+    try {
+      if (window.finiteChatDesktop) {
+        await window.finiteChatDesktop.copyText(activeInvite.invite_url);
+      } else {
+        await navigator.clipboard.writeText(activeInvite.invite_url);
+      }
+      setCopiedInvite(true);
+      window.setTimeout(() => setCopiedInvite(false), 1400);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Invite could not be copied.");
+    }
   }
 
   async function submitPendingInviteJoin() {

@@ -6,6 +6,7 @@ interface FiniteChatDesktopBridge {
   completeOnboarding(): Promise<{ completed: boolean }>;
   importAccountSecret(secret: string): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
   clearAccountSecret(): Promise<{ secureStorageAvailable: boolean; hasStoredAccountSecret: boolean }>;
+  copyText(text: string): Promise<boolean>;
   onInviteUrl(callback: (url: string) => void): () => void;
 }
 

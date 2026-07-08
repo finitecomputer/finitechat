@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
-const { app, BrowserWindow, ipcMain, net, protocol, safeStorage, session, shell } = require("electron");
+const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage, session, shell } = require("electron");
 
 let mainWindow = null;
 let pendingInviteUrl = null;
@@ -422,4 +422,13 @@ ipcMain.handle("finitechat:clear-account-secret", () => {
   clearStoredAccountSecret();
   restartDaemon();
   return desktopIdentityStatus();
+});
+
+ipcMain.handle("finitechat:copy-text", (_event, text) => {
+  const value = String(text ?? "");
+  if (!value) {
+    throw new Error("Nothing to copy");
+  }
+  clipboard.writeText(value);
+  return true;
 });

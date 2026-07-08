@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("finiteChatDesktop", {
   completeOnboarding: () => ipcRenderer.invoke("finitechat:complete-onboarding"),
   importAccountSecret: (secret) => ipcRenderer.invoke("finitechat:import-account-secret", secret),
   clearAccountSecret: () => ipcRenderer.invoke("finitechat:clear-account-secret"),
+  copyText: (text) => ipcRenderer.invoke("finitechat:copy-text", text),
   onInviteUrl: (callback) => {
     const listener = (_event, url) => callback(url);
     ipcRenderer.on("finitechat:invite-url", listener);
