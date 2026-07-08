@@ -142,8 +142,8 @@ final class RuntimeConfigTests: XCTestCase {
                 "http://127.0.0.1:1",
                 "--finitechat-device",
                 "codex-persist-check",
-                "--finitechat-auto-join",
-                "finite://join?v=1&s=http%3A%2F%2F127.0.0.1%3A1&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
+                "--finitechat-auto-start-profile-chat-npub",
+                "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
                 "--finitechat-auto-send",
                 "probe",
             ],
@@ -234,8 +234,8 @@ final class RuntimeConfigTests: XCTestCase {
                 "http://127.0.0.1:1",
                 "--finitechat-device",
                 "codex-persist-check",
-                "--finitechat-auto-join",
-                "finite://join?v=1&s=http%3A%2F%2F127.0.0.1%3A1&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
+                "--finitechat-auto-start-profile-chat-npub",
+                "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3",
                 "--finitechat-auto-send",
                 "probe",
                 "--finitechat-transient-config",
@@ -2650,7 +2650,6 @@ final class AppModelPersistenceTests: XCTestCase {
         ])
         XCTAssertFalse(model.canSend)
         XCTAssertFalse(model.send())
-        XCTAssertFalse(model.createInvite(for: selectedRoom))
         XCTAssertFalse(model.sendPoll(
             roomID: selectedRoom.roomId,
             question: "Should not leave Swift?",
@@ -2675,68 +2674,6 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertEqual(model.outboundText, "this should not send yet")
         try await waitForActions(runtime, [.startRuntime])
         XCTAssertNil(model.errorText)
-    }
-
-    func testScanningExistingInviteRoomSurfacesWhereUserLanded() async throws {
-        let config = RuntimeConfig(
-            serverURL: "https://chat.finite.computer",
-            deviceID: "qt433"
-        )
-        let readyState = savedChatState()
-        let scannedState = savedChatState(
-            status: "join requested",
-            roomState: .waitingForApproval,
-            roomStatus: "waiting for room admission",
-            flow: AppFlowState(
-                noticeText: "Access requested for Main Room. Waiting for the agent to approve this device.",
-                noticeBusy: false,
-                scanInFlight: false,
-                inviteJoinSubmissionRoomId: nil,
-                scanResult: .room,
-                imageUploadUrl: nil
-            )
-        )
-        let runtime = FakeFiniteChatRuntime(
-            initialState: readyState,
-            startRuntimeState: readyState
-        ) { action, current in
-            if case .scanTarget = action {
-                return scannedState
-            }
-            return current
-        }
-        let model = AppModel(
-            config: config,
-            applicationSupportURL: try temporarySupportURL(),
-            args: ["FiniteChat"],
-            startsUpdateLoop: false
-        ) { _ in
-            runtime
-        }
-
-        model.start()
-        model.scanDraft = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgcpfl3"
-
-        var scanResult: AppScanTargetResult?
-        XCTAssertTrue(model.scanTarget { result in
-            scanResult = result
-        })
-
-        try await waitUntil {
-            scanResult != nil
-        }
-
-        guard case .room(let room) = scanResult else {
-            return XCTFail("scan should resolve to the selected room")
-        }
-
-        XCTAssertEqual(room.roomId, "room-main")
-        XCTAssertEqual(model.state?.selectedRoomId, "room-main")
-        XCTAssertEqual(model.scanDraft, "")
-        XCTAssertEqual(
-            model.userNoticeText,
-            "Access requested for Main Room. Waiting for the agent to approve this device."
-        )
     }
 
     func testPendingRoomPresentationHidesLowLevelWelcomeErrors() {
@@ -3113,7 +3050,6 @@ final class AppModelPersistenceTests: XCTestCase {
         }
         XCTAssertEqual(runtime.dispatchedActions, expectedActions)
         XCTAssertEqual(model.selectedRoom?.roomId, "room-bob")
-        XCTAssertNil(model.state?.activeInvite)
     }
 
     @MainActor
@@ -3598,7 +3534,6 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeText: "Profile unavailable",
                     noticeBusy: false,
                     scanInFlight: false,
-                    inviteJoinSubmissionRoomId: nil,
                     scanResult: .unavailable,
                     imageUploadUrl: nil
                 )
@@ -3659,7 +3594,6 @@ final class AppModelPersistenceTests: XCTestCase {
                     noticeText: "Profile opened.",
                     noticeBusy: false,
                     scanInFlight: false,
-                    inviteJoinSubmissionRoomId: nil,
                     scanResult: .profile,
                     imageUploadUrl: nil
                 )
@@ -3905,14 +3839,6 @@ final class AppModelPersistenceTests: XCTestCase {
         XCTAssertTrue(profile.stale)
     }
 
-    func testFiniteJoinCodeIsReservedForInviteHandlingEvenWhenItCarriesInviterNpub() throws {
-        let inviter = try createNostrIdentity()
-        let inviteCode = "finite://join?v=1&s=https%3A%2F%2Fchat.finite.computer&r=room-main&i=invite-1&t=token&a=\(inviter.npub)"
-
-        XCTAssertTrue(isFiniteChatInviteCode(inviteCode))
-        XCTAssertEqual(try profileNpub(from: inviteCode), inviter.npub)
-    }
-
     private func savedChatState(
         status: String = "ready",
         toast: String? = nil,
@@ -3922,7 +3848,6 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeText: nil,
             noticeBusy: false,
             scanInFlight: false,
-            inviteJoinSubmissionRoomId: nil,
             scanResult: .none,
             imageUploadUrl: nil
         )
@@ -3979,7 +3904,6 @@ final class AppModelPersistenceTests: XCTestCase {
             topics: [],
             selectedTopicId: nil,
             selectedChatId: nil,
-            activeInvite: nil,
             activeProfileId: nil,
             status: status,
             toast: toast,
@@ -4096,7 +4020,6 @@ final class AppModelPersistenceTests: XCTestCase {
             noticeText: nil,
             noticeBusy: false,
             scanInFlight: false,
-            inviteJoinSubmissionRoomId: nil,
             scanResult: .none,
             imageUploadUrl: nil
         )
@@ -4113,7 +4036,6 @@ final class AppModelPersistenceTests: XCTestCase {
             topics: [],
             selectedTopicId: nil,
             selectedChatId: nil,
-            activeInvite: nil,
             activeProfileId: nil,
             status: status,
             toast: toast,

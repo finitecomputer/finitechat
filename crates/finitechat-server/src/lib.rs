@@ -23,30 +23,26 @@ pub use finitechat_http::{
     ApplicationEffectRequest, BootstrapAccountRoomRequest, BootstrapAccountRoomResponse,
     ClaimKeyPackageForAccountRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
     ClaimLinkPayloadRequest, ClaimLinkPayloadResponse, ClaimPushWakesRequest,
-    ClaimPushWakesResponse, ClaimWelcomesRequest, CreateInviteSessionRequest,
-    CreateLinkSessionRequest, DeviceLivenessRecord, ErrorResponse, ExpireInviteSessionRequest,
-    ExpireInviteSessionResponse, ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse,
+    ClaimPushWakesResponse, ClaimWelcomesRequest, CreateLinkSessionRequest, DeviceLivenessRecord,
+    ErrorResponse, ExpireKeyPackageLeaseRequest, ExpireKeyPackageLeaseResponse,
     ExpireLinkSessionRequest, ExpireLinkSessionResponse, FINITECHAT_SERVER_CONTRACT_VERSION,
     FailPushWakeRequest, FailPushWakeResponse, FiniteAccountRoomCommitProjection,
     GetDeviceLivenessRequest, GetDeviceLivenessResponse, GetEphemeralActivitiesRequest,
-    GetEphemeralActivitiesResponse, GetInviteAvailabilityRequest, GetInviteAvailabilityResponse,
-    GetLinkSessionRequest, GetNostrProfilesRequest, GetNostrProfilesResponse, GroupSyncRequest,
-    HealthResponse, HttpApplicationDeliveryEffect, HttpClaimedWelcome, HttpInviteJoinRequestRecord,
-    HttpInviteJoinState, HttpInviteSessionRecord, HttpInviteSessionState, HttpKeyPackageClaim,
-    HttpKeyPackageInventory, HttpLinkSessionRecord, HttpLinkSessionState, InboxSyncRequest,
-    InviteAvailabilityEntry, InviteJoinStatusRequest, InviteJoinStatusResponse,
+    GetEphemeralActivitiesResponse, GetKeyPackageAvailabilityRequest,
+    GetKeyPackageAvailabilityResponse, GetLinkSessionRequest, GetNostrProfilesRequest,
+    GetNostrProfilesResponse, GroupSyncRequest, HealthResponse, HttpApplicationDeliveryEffect,
+    HttpClaimedWelcome, HttpKeyPackageClaim, HttpKeyPackageInventory, HttpLinkSessionRecord,
+    HttpLinkSessionState, InboxSyncRequest, KeyPackageAvailabilityEntry,
     KeyPackageInventoryRequest, LeaveRoomRequest, LeaveRoomResponse,
-    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse,
-    ListInviteJoinRequestsRequest, ListInviteJoinRequestsResponse, NostrProfileCacheEntry,
+    ListAccountRoomDirectoryRequest, ListAccountRoomDirectoryResponse, NostrProfileCacheEntry,
     NostrProfileRecord, ObserveDeviceLivenessRequest, PublishKeyPackageResponse,
     PublishMessageRequest, PushTokenRecord, PushWakeDelivery, PushWakePayload,
     PutNostrProfileRequest, PutNostrProfileResponse, RegisterPushTokenRequest,
     RegisterPushTokenResponse, ReleaseLinkClaimRequest, ReleaseLinkClaimResponse,
     RemovePushTokenRequest, RemovePushTokenResponse, ReportInvalidCommitRequest,
-    ReportInvalidCommitResponse, RespondInviteJoinRequest, RevokeDeviceRequest,
-    RevokeDeviceResponse, SaveAccountRoomRequest, SaveAccountRoomResponse, SubmitInviteJoinRequest,
-    SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse, UpdateRoomAdminsRequest,
-    UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
+    ReportInvalidCommitResponse, RevokeDeviceRequest, RevokeDeviceResponse, SaveAccountRoomRequest,
+    SaveAccountRoomResponse, SyncHintEvent, SyncStreamRequest, SyncWaitRequest, SyncWaitResponse,
+    UpdateRoomAdminsRequest, UpdateRoomAdminsResponse, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{
     AccountRoomDevice, AccountRoomRecord, AppendApplicationEventRequest,
@@ -56,14 +52,12 @@ use finitechat_proto::{
     lease_token_for, staged_welcomes_by_id, validate_activity_expiry,
 };
 use finitechat_proto::{
-    DeviceRef, INVITE_JOIN_PROOF_HEX_BYTES, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM,
-    MAX_ATTACHMENT_CIPHERTEXT_BYTES, MAX_DEVICE_LIVENESS_EXPIRY_MILLIS,
-    MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE, MAX_INVITE_DISPLAY_NAME_BYTES,
-    MAX_INVITE_JOIN_REQUESTS_PER_SESSION, MAX_INVITE_MAX_JOINS, MAX_KEY_PACKAGE_PAYLOAD_BYTES,
+    DeviceRef, LogEntryKind, MAX_ACCOUNT_DEVICES_PER_ROOM, MAX_ATTACHMENT_CIPHERTEXT_BYTES,
+    MAX_DEVICE_LIVENESS_EXPIRY_MILLIS, MAX_EPHEMERAL_ACTIVITY_CACHE_ENTRIES_PER_ROUTE,
     MAX_KEY_PACKAGES_PER_DEVICE, MAX_LINK_SESSION_PAYLOAD_BYTES, MAX_OBJECT_ID_BYTES,
-    MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT, MIN_SUPPORTED_PROTOCOL_VERSION, MembershipAddV1,
-    MembershipDeltaV1, PROTOCOL_VERSION_V1, RoomLogEntry, RoomProtocol, RoomStatus, WelcomeState,
-    validate_bytes_len, validate_bytes_non_empty, validate_string_bytes,
+    MIN_SUPPORTED_PROTOCOL_VERSION, MembershipAddV1, MembershipDeltaV1, PROTOCOL_VERSION_V1,
+    RoomLogEntry, RoomProtocol, RoomStatus, WelcomeState, validate_bytes_len,
+    validate_bytes_non_empty, validate_string_bytes,
 };
 use finitechat_transport::engine::KeyPackage;
 use finitechat_transport::transport::{
@@ -78,7 +72,7 @@ use thiserror::Error;
 
 const MAX_HTTP_ACCOUNT_ROOM_ID_BYTES: usize = 128;
 const MAX_HTTP_BLOB_UPLOAD_BODY_BYTES: usize = MAX_ATTACHMENT_CIPHERTEXT_BYTES as usize;
-const MAX_INVITE_AVAILABILITY_BATCH: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
+const MAX_KEY_PACKAGE_AVAILABILITY_BATCH: usize = MAX_HTTP_SYNC_PAGE_ENTRIES;
 const MAX_NOSTR_PROFILE_BATCH: usize = 64;
 const MAX_NOSTR_PROFILE_NAME_BYTES: usize = 128;
 const MAX_NOSTR_PROFILE_ABOUT_BYTES: usize = 4 * 1024;
@@ -117,7 +111,6 @@ pub struct HttpServerState {
     key_package_inventory: Arc<Mutex<HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>>>,
     revoked_devices: Arc<Mutex<BTreeSet<String>>>,
     link_sessions: Arc<Mutex<BTreeMap<String, HttpLinkSessionRecord>>>,
-    invite_sessions: Arc<Mutex<BTreeMap<String, HttpInviteSessionRecord>>>,
     account_rooms: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
     room_memberships: Arc<Mutex<BTreeMap<String, HttpRoomMembershipProjection>>>,
     application_effects: Arc<Mutex<BTreeMap<String, HttpApplicationDeliveryEffect>>>,
@@ -129,10 +122,10 @@ pub struct HttpServerState {
     push_wakes: Arc<Mutex<BTreeMap<String, PushWakeOutboxRecord>>>,
     blob_objects: Arc<Mutex<BTreeMap<String, BlobObject>>>,
     ops_since_snapshot: Arc<Mutex<u64>>,
-    /// Long-poll wake signal (/sync/wait). A single hub: every accepted
-    /// publish or invite mutation wakes all waiters, who re-check their
-    /// own predicates. Sized for the current phase (hundreds of users);
-    /// per-key channels are the documented next step if waiter counts grow.
+    /// Long-poll wake signal (/sync/wait). A single hub: every accepted publish
+    /// wakes all waiters, who re-check their own predicates. Sized for the
+    /// current phase (hundreds of users); per-key channels are the documented
+    /// next step if waiter counts grow.
     wake: Arc<tokio::sync::Notify>,
     store: Option<Arc<SqliteHttpDeliveryStore>>,
 }
@@ -146,7 +139,6 @@ struct BlobObject {
 #[derive(Clone)]
 struct SyncStreamCursors {
     rooms: Vec<SyncStreamRoomCursor>,
-    invites: Vec<SyncStreamInviteCursor>,
 }
 
 #[derive(Clone)]
@@ -154,14 +146,6 @@ struct SyncStreamRoomCursor {
     room_id: String,
     after_seq: u64,
     seen_activity_received_at_ms: u64,
-}
-
-#[derive(Clone)]
-struct SyncStreamInviteCursor {
-    invite_id: String,
-    seen_requests: u32,
-    seen_resolved: u32,
-    seen_state: Option<HttpInviteSessionState>,
 }
 
 struct SyncStreamLoop {
@@ -180,7 +164,6 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(HashMap::new())),
             revoked_devices: Arc::new(Mutex::new(BTreeSet::new())),
             link_sessions: Arc::new(Mutex::new(BTreeMap::new())),
-            invite_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             account_rooms: Arc::new(Mutex::new(BTreeMap::new())),
             room_memberships: Arc::new(Mutex::new(BTreeMap::new())),
             application_effects: Arc::new(Mutex::new(BTreeMap::new())),
@@ -239,7 +222,6 @@ impl HttpServerState {
             }
         }
         let link_sessions = store.load_link_sessions()?;
-        let invite_sessions = store.load_invite_sessions()?;
         let account_rooms = store.load_account_room_directory()?;
         let room_memberships = store.load_room_memberships()?;
         let application_effects = store.load_application_effects()?;
@@ -255,7 +237,6 @@ impl HttpServerState {
             key_package_inventory: Arc::new(Mutex::new(key_package_inventory)),
             revoked_devices: Arc::new(Mutex::new(revoked_devices)),
             link_sessions: Arc::new(Mutex::new(link_sessions)),
-            invite_sessions: Arc::new(Mutex::new(invite_sessions)),
             account_rooms: Arc::new(Mutex::new(account_rooms)),
             room_memberships: Arc::new(Mutex::new(room_memberships)),
             application_effects: Arc::new(Mutex::new(application_effects)),
@@ -441,12 +422,13 @@ impl HttpServerState {
             .lock()
             .expect("HTTP KeyPackage inventory mutex");
         let mut candidate = inventory.clone();
-        let Some(record) = record_key_package_publication(&mut candidate, &publication)? else {
+        let Some(_) = record_key_package_publication(&mut candidate, &publication)? else {
             return Ok(PublishKeyPackageResponse { published: true });
         };
+        let changed = changed_key_package_inventory_records(&inventory, &candidate);
         let operation = PersistedOperation::PublishKeyPackage { publication };
         if let Some(store) = &self.store {
-            store.append_key_package_inventory_operation(&operation, &record)?;
+            store.append_key_package_claim_mutation(Some(&operation), None, &changed)?;
         }
         *inventory = candidate;
         Ok(PublishKeyPackageResponse { published: true })
@@ -495,7 +477,7 @@ impl HttpServerState {
         &self,
         request: ClaimKeyPackageForAccountRequest,
     ) -> Result<Option<HttpClaimedKeyPackage>, ServerHttpError> {
-        validate_invite_availability_account_id(&request.account_id)?;
+        validate_key_package_availability_account_id(&request.account_id)?;
         let mut inventory = self
             .key_package_inventory
             .lock()
@@ -786,11 +768,11 @@ impl HttpServerState {
         Ok(GetNostrProfilesResponse { profiles: response })
     }
 
-    fn get_invite_availability(
+    fn get_key_package_availability(
         &self,
-        request: GetInviteAvailabilityRequest,
-    ) -> Result<GetInviteAvailabilityResponse, ServerHttpError> {
-        validate_invite_availability_batch(&request.account_ids)?;
+        request: GetKeyPackageAvailabilityRequest,
+    ) -> Result<GetKeyPackageAvailabilityResponse, ServerHttpError> {
+        validate_key_package_availability_batch(&request.account_ids)?;
         let requested: BTreeSet<&str> = request.account_ids.iter().map(String::as_str).collect();
         let revoked_devices = self.revoked_devices.lock().expect("HTTP device mutex");
         let inventory = self
@@ -816,12 +798,12 @@ impl HttpServerState {
         let accounts = request
             .account_ids
             .into_iter()
-            .map(|account_id| InviteAvailabilityEntry {
+            .map(|account_id| KeyPackageAvailabilityEntry {
                 available: available_accounts.contains(&account_id),
                 account_id,
             })
             .collect();
-        Ok(GetInviteAvailabilityResponse { accounts })
+        Ok(GetKeyPackageAvailabilityResponse { accounts })
     }
 
     fn device_active_in_any_room(&self, device: &DeviceRef) -> bool {
@@ -1072,300 +1054,7 @@ impl HttpServerState {
         Ok(ExpireLinkSessionResponse { expired: true })
     }
 
-    fn create_invite_session(
-        &self,
-        request: CreateInviteSessionRequest,
-    ) -> Result<HttpInviteSessionRecord, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        validate_invite_room_id(&request.room_id)?;
-        if request.max_joins == 0 || request.max_joins > MAX_INVITE_MAX_JOINS {
-            return Err(ServerHttpError::InvalidInviteRequest {
-                reason: format!("max_joins must be between 1 and {MAX_INVITE_MAX_JOINS}"),
-            });
-        }
-        {
-            let rooms = self
-                .room_memberships
-                .lock()
-                .expect("HTTP room-membership mutex");
-            let projection = rooms.get(&request.room_id).ok_or_else(|| {
-                ServerHttpError::InvalidInviteRequest {
-                    reason: format!("room {} does not exist", request.room_id),
-                }
-            })?;
-            if projection.status != RoomStatus::Open {
-                return Err(ServerHttpError::InvalidInviteRequest {
-                    reason: format!("room {} is not open", request.room_id),
-                });
-            }
-            if !projection.device_active_at_head(&request.inviter) {
-                return Err(ServerHttpError::InvalidInviteRequest {
-                    reason: format!(
-                        "inviter device {:?} is not active in room {}",
-                        request.inviter, request.room_id
-                    ),
-                });
-            }
-        }
-
-        let mut sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        if sessions.contains_key(&request.invite_id) {
-            return Err(ServerHttpError::InviteSessionAlreadyExists {
-                invite_id: request.invite_id,
-            });
-        }
-        let open_for_account = sessions
-            .values()
-            .filter(|session| {
-                session.state == HttpInviteSessionState::Open
-                    && session.inviter.account_id == request.inviter.account_id
-            })
-            .count();
-        if open_for_account >= MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT as usize {
-            return Err(ServerHttpError::InviteSessionConflict {
-                invite_id: request.invite_id,
-                reason: format!(
-                    "account {} already has {MAX_OPEN_INVITE_SESSIONS_PER_ACCOUNT} open invites",
-                    request.inviter.account_id
-                ),
-            });
-        }
-        let record = HttpInviteSessionRecord {
-            invite_id: request.invite_id,
-            room_id: request.room_id,
-            inviter: request.inviter,
-            max_joins: request.max_joins,
-            accepted_joins: 0,
-            expires_at_ms: request.expires_at_ms,
-            state: HttpInviteSessionState::Open,
-            join_requests: BTreeMap::new(),
-        };
-        sessions.insert(record.invite_id.clone(), record.clone());
-        drop(sessions);
-
-        if let Some(store) = &self.store {
-            store.upsert_invite_session(&record)?;
-        }
-        Ok(record)
-    }
-
-    fn submit_invite_join(
-        &self,
-        request: SubmitInviteJoinRequest,
-    ) -> Result<HttpInviteJoinRequestRecord, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        validate_invite_request_id(&request.request_id)?;
-        validate_invite_join_proof(&request.join_proof)?;
-        validate_invite_key_package(&request.key_package)?;
-        validate_invite_display_name(request.display_name.as_deref())?;
-
-        let mut sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        let session = sessions.get_mut(&request.invite_id).ok_or_else(|| {
-            ServerHttpError::InviteSessionNotFound {
-                invite_id: request.invite_id.clone(),
-            }
-        })?;
-        if session.state != HttpInviteSessionState::Open {
-            return Err(ServerHttpError::InviteSessionClosed {
-                invite_id: request.invite_id,
-            });
-        }
-        if request.submitted_at_ms > session.expires_at_ms {
-            return Err(ServerHttpError::InviteSessionClosed {
-                invite_id: request.invite_id,
-            });
-        }
-        if let Some(existing) = session.join_requests.get(&request.request_id) {
-            // Idempotent resubmission replays the original record; the same
-            // request_id with different content is a conflict.
-            if existing.joiner == request.joiner
-                && existing.key_package == request.key_package
-                && existing.join_proof == request.join_proof
-            {
-                return Ok(existing.clone());
-            }
-            return Err(ServerHttpError::InviteSessionConflict {
-                invite_id: request.invite_id,
-                reason: format!(
-                    "join request {} was already submitted with different content",
-                    request.request_id
-                ),
-            });
-        }
-        if session.join_requests.len() >= MAX_INVITE_JOIN_REQUESTS_PER_SESSION as usize {
-            return Err(ServerHttpError::InviteSessionConflict {
-                invite_id: request.invite_id,
-                reason: format!(
-                    "invite already holds {MAX_INVITE_JOIN_REQUESTS_PER_SESSION} join requests"
-                ),
-            });
-        }
-        let record = HttpInviteJoinRequestRecord {
-            request_id: request.request_id,
-            joiner: request.joiner,
-            key_package: request.key_package,
-            join_proof: request.join_proof,
-            display_name: request.display_name,
-            submitted_at_ms: request.submitted_at_ms,
-            state: HttpInviteJoinState::Pending,
-        };
-        session
-            .join_requests
-            .insert(record.request_id.clone(), record.clone());
-        let session_record = session.clone();
-        drop(sessions);
-
-        if let Some(store) = &self.store {
-            store.upsert_invite_session(&session_record)?;
-        }
-        Ok(record)
-    }
-
-    fn list_invite_join_requests(
-        &self,
-        request: ListInviteJoinRequestsRequest,
-    ) -> Result<ListInviteJoinRequestsResponse, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        let sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        let session = sessions.get(&request.invite_id).ok_or_else(|| {
-            ServerHttpError::InviteSessionNotFound {
-                invite_id: request.invite_id.clone(),
-            }
-        })?;
-        Ok(ListInviteJoinRequestsResponse {
-            session: session.summary(),
-            requests: session.join_requests.values().cloned().collect(),
-        })
-    }
-
-    fn respond_invite_join(
-        &self,
-        request: RespondInviteJoinRequest,
-    ) -> Result<HttpInviteJoinRequestRecord, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        validate_invite_request_id(&request.request_id)?;
-        let mut sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        let session = sessions.get_mut(&request.invite_id).ok_or_else(|| {
-            ServerHttpError::InviteSessionNotFound {
-                invite_id: request.invite_id.clone(),
-            }
-        })?;
-        let verdict = if request.accept {
-            HttpInviteJoinState::Accepted
-        } else {
-            HttpInviteJoinState::Rejected
-        };
-        let join = session
-            .join_requests
-            .get_mut(&request.request_id)
-            .ok_or_else(|| ServerHttpError::InviteJoinRequestNotFound {
-                invite_id: request.invite_id.clone(),
-                request_id: request.request_id.clone(),
-            })?;
-        if join.state == verdict {
-            return Ok(join.clone());
-        }
-        if join.state != HttpInviteJoinState::Pending {
-            return Err(ServerHttpError::InviteSessionConflict {
-                invite_id: request.invite_id,
-                reason: format!(
-                    "join request {} was already resolved as {:?}",
-                    request.request_id, join.state
-                ),
-            });
-        }
-        join.state = verdict;
-        let record = join.clone();
-        if request.accept {
-            session.accepted_joins += 1;
-            if session.accepted_joins >= session.max_joins {
-                session.state = HttpInviteSessionState::Closed;
-            }
-        }
-        let session_record = session.clone();
-        drop(sessions);
-
-        if let Some(store) = &self.store {
-            store.upsert_invite_session(&session_record)?;
-        }
-        Ok(record)
-    }
-
-    fn invite_join_status(
-        &self,
-        request: InviteJoinStatusRequest,
-    ) -> Result<InviteJoinStatusResponse, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        validate_invite_request_id(&request.request_id)?;
-        let sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        let session = sessions.get(&request.invite_id).ok_or_else(|| {
-            ServerHttpError::InviteSessionNotFound {
-                invite_id: request.invite_id.clone(),
-            }
-        })?;
-        let join = session
-            .join_requests
-            .get(&request.request_id)
-            .ok_or_else(|| ServerHttpError::InviteJoinRequestNotFound {
-                invite_id: request.invite_id.clone(),
-                request_id: request.request_id.clone(),
-            })?;
-        let resolved_requests = session
-            .join_requests
-            .values()
-            .filter(|request| request.state != HttpInviteJoinState::Pending)
-            .count() as u32;
-        Ok(InviteJoinStatusResponse {
-            room_id: session.room_id.clone(),
-            state: join.state.clone(),
-            resolved_requests,
-        })
-    }
-
-    fn expire_invite_session(
-        &self,
-        request: ExpireInviteSessionRequest,
-    ) -> Result<ExpireInviteSessionResponse, ServerHttpError> {
-        validate_invite_id(&request.invite_id)?;
-        let mut sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        let session = sessions.get_mut(&request.invite_id).ok_or_else(|| {
-            ServerHttpError::InviteSessionNotFound {
-                invite_id: request.invite_id.clone(),
-            }
-        })?;
-        if session.state == HttpInviteSessionState::Expired {
-            return Ok(ExpireInviteSessionResponse { expired: true });
-        }
-        session.state = HttpInviteSessionState::Expired;
-        let record = session.clone();
-        drop(sessions);
-
-        if let Some(store) = &self.store {
-            store.upsert_invite_session(&record)?;
-        }
-        Ok(ExpireInviteSessionResponse { expired: true })
-    }
-
-    /// The /sync/wait predicate: any watched room advanced past its cursor,
-    /// or any watched invite session gained requests / resolutions / closed.
+    /// The /sync/wait predicate: any watched room advanced past its cursor.
     fn check_wait_signal(&self, request: &SyncWaitRequest) -> Option<String> {
         {
             let rooms = self
@@ -1378,26 +1067,6 @@ impl HttpServerState {
                 {
                     return Some(format!("room:{}", watch.room_id));
                 }
-            }
-        }
-        let sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        for watch in &request.invites {
-            let Some(session) = sessions.get(&watch.invite_id) else {
-                continue;
-            };
-            let resolved = session
-                .join_requests
-                .values()
-                .filter(|join| join.state != HttpInviteJoinState::Pending)
-                .count();
-            if session.join_requests.len() > watch.seen_requests as usize
-                || resolved > watch.seen_resolved as usize
-                || session.state != HttpInviteSessionState::Open
-            {
-                return Some(format!("invite:{}", watch.invite_id));
             }
         }
         None
@@ -1431,41 +1100,6 @@ impl HttpServerState {
                 events.push(SyncHintEvent::ActivityChanged {
                     room_id: watch.room_id.clone(),
                     received_at_ms: highwater,
-                });
-            }
-        }
-
-        let sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
-        for watch in &mut cursors.invites {
-            let Some(session) = sessions.get(&watch.invite_id) else {
-                continue;
-            };
-            let requests = u32::try_from(session.join_requests.len()).unwrap_or(u32::MAX);
-            let resolved = u32::try_from(
-                session
-                    .join_requests
-                    .values()
-                    .filter(|join| join.state != HttpInviteJoinState::Pending)
-                    .count(),
-            )
-            .unwrap_or(u32::MAX);
-            let state_changed = watch
-                .seen_state
-                .as_ref()
-                .is_some_and(|seen| seen != &session.state)
-                || (watch.seen_state.is_none() && session.state != HttpInviteSessionState::Open);
-            if requests > watch.seen_requests || resolved > watch.seen_resolved || state_changed {
-                watch.seen_requests = requests;
-                watch.seen_resolved = resolved;
-                watch.seen_state = Some(session.state.clone());
-                events.push(SyncHintEvent::InviteChanged {
-                    invite_id: watch.invite_id.clone(),
-                    requests,
-                    resolved,
-                    state: session.state.clone(),
                 });
             }
         }
@@ -2016,10 +1650,6 @@ impl HttpServerState {
             .room_memberships
             .lock()
             .expect("HTTP room-membership mutex");
-        let invite_sessions = self
-            .invite_sessions
-            .lock()
-            .expect("HTTP invite-session mutex");
         let mut key_package_inventory = self
             .key_package_inventory
             .lock()
@@ -2055,7 +1685,6 @@ impl HttpServerState {
         let key_package_inventory_mutation = consume_claimed_key_packages_for_commit(
             &mut candidate_key_package_inventory,
             &request,
-            &invite_sessions,
         )?;
 
         let welcomes = released_welcome_records_for_commit(&request, receipt.seq)?;
@@ -2094,7 +1723,6 @@ impl HttpServerState {
         drop(publish_idempotency);
         drop(account_rooms);
         drop(room_memberships);
-        drop(invite_sessions);
         drop(key_package_inventory);
 
         Ok(CommitAccepted {
@@ -3154,8 +2782,8 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/profiles/nostr", post(put_nostr_profile))
         .route("/profiles/nostr/get", post(get_nostr_profiles))
         .route(
-            "/key-packages/invite-availability",
-            post(get_invite_availability),
+            "/key-packages/availability",
+            post(get_key_package_availability),
         )
         .route("/key-packages", post(publish_key_package))
         .route("/key-packages/inventory", post(key_package_inventory))
@@ -3176,12 +2804,6 @@ pub fn http_router(state: HttpServerState) -> Router {
         .route("/link-sessions/ack", post(ack_link_payload))
         .route("/link-sessions/release", post(release_link_claim))
         .route("/link-sessions/expire", post(expire_link_session))
-        .route("/invites", post(create_invite_session))
-        .route("/invites/join", post(submit_invite_join))
-        .route("/invites/requests", post(list_invite_join_requests))
-        .route("/invites/respond", post(respond_invite_join))
-        .route("/invites/status", post(invite_join_status))
-        .route("/invites/expire", post(expire_invite_session))
         .route("/account-rooms/bootstrap", post(bootstrap_account_room))
         .route("/account-rooms", post(save_account_room))
         .route("/account-rooms/list", post(list_account_rooms))
@@ -3322,16 +2944,6 @@ async fn sync_stream(
                 seen_activity_received_at_ms: 0,
             })
             .collect(),
-        invites: request
-            .invites
-            .into_iter()
-            .map(|invite| SyncStreamInviteCursor {
-                invite_id: invite.invite_id,
-                seen_requests: invite.seen_requests,
-                seen_resolved: invite.seen_resolved,
-                seen_state: None,
-            })
-            .collect(),
     };
     let stream = futures_util::stream::unfold(
         SyncStreamLoop {
@@ -3372,7 +2984,6 @@ fn sync_sse_event(event: SyncHintEvent) -> Event {
     let name = match &event {
         SyncHintEvent::RoomAdvanced { .. } => "room_advanced",
         SyncHintEvent::ActivityChanged { .. } => "activity_changed",
-        SyncHintEvent::InviteChanged { .. } => "invite_changed",
         SyncHintEvent::Heartbeat => "heartbeat",
     };
     Event::default()
@@ -3449,11 +3060,11 @@ async fn get_nostr_profiles(
     Ok(Json(response))
 }
 
-async fn get_invite_availability(
+async fn get_key_package_availability(
     State(state): State<HttpServerState>,
-    Json(request): Json<GetInviteAvailabilityRequest>,
-) -> Result<Json<GetInviteAvailabilityResponse>, ServerHttpError> {
-    let response = state.get_invite_availability(request)?;
+    Json(request): Json<GetKeyPackageAvailabilityRequest>,
+) -> Result<Json<GetKeyPackageAvailabilityResponse>, ServerHttpError> {
+    let response = state.get_key_package_availability(request)?;
     Ok(Json(response))
 }
 
@@ -3559,57 +3170,6 @@ async fn expire_link_session(
     Json(request): Json<ExpireLinkSessionRequest>,
 ) -> Result<Json<ExpireLinkSessionResponse>, ServerHttpError> {
     let response = state.expire_link_session(request)?;
-    Ok(Json(response))
-}
-
-async fn create_invite_session(
-    State(state): State<HttpServerState>,
-    Json(request): Json<CreateInviteSessionRequest>,
-) -> Result<Json<HttpInviteSessionRecord>, ServerHttpError> {
-    let record = state.create_invite_session(request)?;
-    Ok(Json(record))
-}
-
-async fn submit_invite_join(
-    State(state): State<HttpServerState>,
-    Json(request): Json<SubmitInviteJoinRequest>,
-) -> Result<Json<HttpInviteJoinRequestRecord>, ServerHttpError> {
-    let record = state.submit_invite_join(request)?;
-    state.wake.notify_waiters();
-    Ok(Json(record))
-}
-
-async fn list_invite_join_requests(
-    State(state): State<HttpServerState>,
-    Json(request): Json<ListInviteJoinRequestsRequest>,
-) -> Result<Json<ListInviteJoinRequestsResponse>, ServerHttpError> {
-    let response = state.list_invite_join_requests(request)?;
-    Ok(Json(response))
-}
-
-async fn respond_invite_join(
-    State(state): State<HttpServerState>,
-    Json(request): Json<RespondInviteJoinRequest>,
-) -> Result<Json<HttpInviteJoinRequestRecord>, ServerHttpError> {
-    let record = state.respond_invite_join(request)?;
-    state.wake.notify_waiters();
-    Ok(Json(record))
-}
-
-async fn invite_join_status(
-    State(state): State<HttpServerState>,
-    Json(request): Json<InviteJoinStatusRequest>,
-) -> Result<Json<InviteJoinStatusResponse>, ServerHttpError> {
-    let response = state.invite_join_status(request)?;
-    Ok(Json(response))
-}
-
-async fn expire_invite_session(
-    State(state): State<HttpServerState>,
-    Json(request): Json<ExpireInviteSessionRequest>,
-) -> Result<Json<ExpireInviteSessionResponse>, ServerHttpError> {
-    let response = state.expire_invite_session(request)?;
-    state.wake.notify_waiters();
     Ok(Json(response))
 }
 
@@ -4100,10 +3660,6 @@ impl SqliteHttpDeliveryStore {
             );
             CREATE TABLE IF NOT EXISTS http_link_sessions (
                 link_session_id TEXT PRIMARY KEY,
-                record_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS http_invite_sessions (
-                invite_id TEXT PRIMARY KEY,
                 record_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS http_nostr_profiles (
@@ -4668,41 +4224,6 @@ impl SqliteHttpDeliveryStore {
         for row in rows {
             let (link_session_id, record_json) = row?;
             sessions.insert(link_session_id, serde_json::from_str(&record_json)?);
-        }
-        Ok(sessions)
-    }
-
-    fn upsert_invite_session(
-        &self,
-        record: &HttpInviteSessionRecord,
-    ) -> Result<(), DurableStoreError> {
-        let conn = self.connection();
-        conn.execute(
-            "INSERT INTO http_invite_sessions (invite_id, record_json)
-             VALUES (?1, ?2)
-             ON CONFLICT(invite_id) DO UPDATE SET
-                record_json = excluded.record_json",
-            params![record.invite_id, serde_json::to_string(record)?],
-        )?;
-        Ok(())
-    }
-
-    fn load_invite_sessions(
-        &self,
-    ) -> Result<BTreeMap<String, HttpInviteSessionRecord>, DurableStoreError> {
-        let conn = self.connection();
-        let mut statement = conn.prepare(
-            "SELECT invite_id, record_json
-             FROM http_invite_sessions
-             ORDER BY invite_id ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut sessions = BTreeMap::new();
-        for row in rows {
-            let (invite_id, record_json) = row?;
-            sessions.insert(invite_id, serde_json::from_str(&record_json)?);
         }
         Ok(sessions)
     }
@@ -5599,6 +5120,13 @@ fn apply_operations_to_key_package_inventory(
     for operation in operations {
         match operation {
             PersistedOperation::PublishKeyPackage { publication } => {
+                if let Some(metadata) = finite_key_package_metadata(publication) {
+                    retire_older_finite_key_packages(
+                        inventory,
+                        &metadata.owner,
+                        &publication.key_package_id,
+                    );
+                }
                 let record = inventory
                     .entry(publication.key_package_id.clone())
                     .or_insert_with(|| KeyPackageInventoryRecord {
@@ -5673,7 +5201,6 @@ fn mark_next_key_package_claimed(
 fn consume_claimed_key_packages_for_commit(
     inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
     request: &SubmitCommitRequest,
-    invite_sessions: &BTreeMap<String, HttpInviteSessionRecord>,
 ) -> Result<Vec<KeyPackageInventoryRecord>, ServerHttpError> {
     let mut changed = Vec::new();
     for add in &request.membership_delta.adds {
@@ -5682,7 +5209,12 @@ fn consume_claimed_key_packages_for_commit(
             changed.push(record.clone());
             continue;
         }
-        validate_invite_key_package_for_add(invite_sessions, &request.room_id, add)?;
+        return Err(ServerHttpError::InvalidCommitRequest {
+            reason: format!(
+                "KeyPackage {} must be claimed before a typed commit can add {:?}",
+                add.key_package_id, add.device
+            ),
+        });
     }
     Ok(changed)
 }
@@ -5748,95 +5280,6 @@ fn validate_claimed_key_package_for_add<'a>(
         });
     }
     Ok(Some(record))
-}
-
-fn validate_invite_key_package_for_add(
-    invite_sessions: &BTreeMap<String, HttpInviteSessionRecord>,
-    room_id: &str,
-    add: &MembershipAddV1,
-) -> Result<(), ServerHttpError> {
-    let Some((session, join)) = invite_join_request_for_add(invite_sessions, room_id, add) else {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "KeyPackage {} must be claimed or match a pending invite join before a typed commit can add {:?}",
-                add.key_package_id, add.device
-            ),
-        });
-    };
-    if !matches!(
-        join.state,
-        HttpInviteJoinState::Pending | HttpInviteJoinState::Accepted
-    ) {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "invite join request {} for KeyPackage {} is {:?}",
-                join.request_id, add.key_package_id, join.state
-            ),
-        });
-    }
-    if join.joiner != add.device {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "invite join request {} device does not match added device",
-                join.request_id
-            ),
-        });
-    }
-    let upload =
-        serde_json::from_slice::<UploadKeyPackageRequest>(&join.key_package).map_err(|error| {
-            ServerHttpError::InvalidCommitRequest {
-                reason: format!(
-                    "invite join request {} KeyPackage is not a Finite upload: {error}",
-                    join.request_id
-                ),
-            }
-        })?;
-    if upload.owner != add.device {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "invite join request {} KeyPackage owner does not match added device",
-                join.request_id
-            ),
-        });
-    }
-    if upload.key_package_id != add.key_package_id
-        || upload.key_package_ref != add.key_package_ref
-        || upload.key_package_hash != add.key_package_hash
-    {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!(
-                "invite join request {} KeyPackage metadata does not match add",
-                join.request_id
-            ),
-        });
-    }
-    if session.accepted_joins >= session.max_joins && join.state == HttpInviteJoinState::Pending {
-        return Err(ServerHttpError::InvalidCommitRequest {
-            reason: format!("invite session {} is already full", session.invite_id),
-        });
-    }
-    Ok(())
-}
-
-fn invite_join_request_for_add<'a>(
-    invite_sessions: &'a BTreeMap<String, HttpInviteSessionRecord>,
-    room_id: &str,
-    add: &MembershipAddV1,
-) -> Option<(&'a HttpInviteSessionRecord, &'a HttpInviteJoinRequestRecord)> {
-    for (invite_id, session) in invite_sessions {
-        if session.room_id != room_id {
-            continue;
-        }
-        let prefix = format!("invite-welcome-{invite_id}-");
-        let Some(request_id) = add.welcome_id.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(join) = session.join_requests.get(request_id) else {
-            continue;
-        };
-        return Some((session, join));
-    }
-    None
 }
 
 fn consume_key_packages_from_persisted_message(
@@ -6223,15 +5666,15 @@ fn validate_nostr_profile_batch(account_ids: &[String]) -> Result<(), ServerHttp
     Ok(())
 }
 
-fn validate_invite_availability_batch(account_ids: &[String]) -> Result<(), ServerHttpError> {
-    if account_ids.is_empty() || account_ids.len() > MAX_INVITE_AVAILABILITY_BATCH {
-        return Err(ServerHttpError::InvalidInviteAvailabilityBatch {
+fn validate_key_package_availability_batch(account_ids: &[String]) -> Result<(), ServerHttpError> {
+    if account_ids.is_empty() || account_ids.len() > MAX_KEY_PACKAGE_AVAILABILITY_BATCH {
+        return Err(ServerHttpError::InvalidKeyPackageAvailabilityBatch {
             actual: account_ids.len(),
-            max: MAX_INVITE_AVAILABILITY_BATCH,
+            max: MAX_KEY_PACKAGE_AVAILABILITY_BATCH,
         });
     }
     for account_id in account_ids {
-        validate_invite_availability_account_id(account_id)?;
+        validate_key_package_availability_account_id(account_id)?;
     }
     Ok(())
 }
@@ -6249,14 +5692,15 @@ fn validate_nostr_account_id(account_id: &str) -> Result<(), ServerHttpError> {
     Ok(())
 }
 
-fn validate_invite_availability_account_id(account_id: &str) -> Result<(), ServerHttpError> {
+fn validate_key_package_availability_account_id(account_id: &str) -> Result<(), ServerHttpError> {
     if account_id.len() != 64
         || !account_id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(ServerHttpError::InvalidInviteAvailabilityRequest {
-            reason: "invite_availability.account_id must be 64 lowercase hex characters".to_owned(),
+        return Err(ServerHttpError::InvalidKeyPackageAvailabilityRequest {
+            reason: "key_package_availability.account_id must be 64 lowercase hex characters"
+                .to_owned(),
         });
     }
     Ok(())
@@ -6541,103 +5985,39 @@ fn validate_link_claim_token(claim_token: &str) -> Result<(), ServerHttpError> {
 
 const MAX_SYNC_WAIT_MILLIS: u64 = 25_000;
 const MAX_SYNC_WAIT_ROOMS: usize = 256;
-const MAX_SYNC_WAIT_INVITES: usize = 64;
 const DEFAULT_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 15_000;
 const MIN_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 1_000;
 const MAX_SYNC_STREAM_HEARTBEAT_MILLIS: u64 = 60_000;
 
 fn validate_sync_wait_request(request: &SyncWaitRequest) -> Result<(), ServerHttpError> {
-    validate_sync_watch_bounds(&request.rooms, &request.invites, "sync_wait")
+    validate_sync_watch_bounds(&request.rooms, "sync_wait")
 }
 
 fn validate_sync_stream_request(request: &SyncStreamRequest) -> Result<(), ServerHttpError> {
-    validate_sync_watch_bounds(&request.rooms, &request.invites, "sync_stream")
+    validate_sync_watch_bounds(&request.rooms, "sync_stream")
 }
 
 fn validate_sync_watch_bounds(
     rooms: &[finitechat_http::SyncWaitRoom],
-    invites: &[finitechat_http::SyncWaitInvite],
     route: &str,
 ) -> Result<(), ServerHttpError> {
     if rooms.len() > MAX_SYNC_WAIT_ROOMS {
-        return Err(ServerHttpError::InvalidInviteRequest {
+        return Err(ServerHttpError::InvalidSyncRequest {
             reason: format!("{route} watches at most {MAX_SYNC_WAIT_ROOMS} rooms"),
         });
     }
-    if invites.len() > MAX_SYNC_WAIT_INVITES {
-        return Err(ServerHttpError::InvalidInviteRequest {
-            reason: format!("{route} watches at most {MAX_SYNC_WAIT_INVITES} invites"),
-        });
-    }
     for room in rooms {
-        validate_invite_room_id(&room.room_id)?;
-    }
-    for invite in invites {
-        validate_invite_id(&invite.invite_id)?;
+        validate_sync_room_id(&room.room_id)?;
     }
     Ok(())
 }
 
-fn validate_invite_id(invite_id: &str) -> Result<(), ServerHttpError> {
-    validate_string_bytes("invite_id", invite_id, MAX_OBJECT_ID_BYTES).map_err(|error| {
-        ServerHttpError::InvalidInviteRequest {
+fn validate_sync_room_id(room_id: &str) -> Result<(), ServerHttpError> {
+    validate_string_bytes("sync.room_id", room_id, MAX_OBJECT_ID_BYTES).map_err(|error| {
+        ServerHttpError::InvalidSyncRequest {
             reason: error.to_string(),
         }
     })
-}
-
-fn validate_invite_request_id(request_id: &str) -> Result<(), ServerHttpError> {
-    validate_string_bytes("invite.request_id", request_id, MAX_OBJECT_ID_BYTES).map_err(|error| {
-        ServerHttpError::InvalidInviteRequest {
-            reason: error.to_string(),
-        }
-    })
-}
-
-fn validate_invite_room_id(room_id: &str) -> Result<(), ServerHttpError> {
-    validate_string_bytes("invite.room_id", room_id, MAX_OBJECT_ID_BYTES).map_err(|error| {
-        ServerHttpError::InvalidInviteRequest {
-            reason: error.to_string(),
-        }
-    })
-}
-
-fn validate_invite_join_proof(join_proof: &str) -> Result<(), ServerHttpError> {
-    if join_proof.len() != INVITE_JOIN_PROOF_HEX_BYTES as usize
-        || !join_proof.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Err(ServerHttpError::InvalidInviteRequest {
-            reason: format!(
-                "join_proof must be exactly {INVITE_JOIN_PROOF_HEX_BYTES} hex characters"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_invite_key_package(key_package: &[u8]) -> Result<(), ServerHttpError> {
-    validate_bytes_non_empty("invite.key_package", key_package.len())
-        .and_then(|()| {
-            validate_bytes_len(
-                "invite.key_package",
-                key_package.len(),
-                MAX_KEY_PACKAGE_PAYLOAD_BYTES,
-            )
-        })
-        .map_err(|error| ServerHttpError::InvalidInviteRequest {
-            reason: error.to_string(),
-        })
-}
-
-fn validate_invite_display_name(display_name: Option<&str>) -> Result<(), ServerHttpError> {
-    if let Some(name) = display_name {
-        validate_string_bytes("invite.display_name", name, MAX_INVITE_DISPLAY_NAME_BYTES).map_err(
-            |error| ServerHttpError::InvalidInviteRequest {
-                reason: error.to_string(),
-            },
-        )?;
-    }
-    Ok(())
 }
 
 fn link_session_claim_token(session: &HttpLinkSessionRecord) -> String {
@@ -6738,6 +6118,10 @@ fn record_key_package_publication(
         return Ok(None);
     }
 
+    if let Some(metadata) = finite_key_package_metadata(publication) {
+        retire_older_finite_key_packages(inventory, &metadata.owner, &publication.key_package_id);
+    }
+
     let unconsumed = inventory
         .values()
         .filter(|record| {
@@ -6765,6 +6149,21 @@ fn record_key_package_publication(
     };
     inventory.insert(publication.key_package_id.clone(), record.clone());
     Ok(Some(record))
+}
+
+fn changed_key_package_inventory_records(
+    before: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    after: &HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+) -> Vec<KeyPackageInventoryRecord> {
+    after
+        .values()
+        .filter(|record| {
+            before
+                .get(&record.key_package_id)
+                .is_none_or(|previous| previous != *record)
+        })
+        .cloned()
+        .collect()
 }
 
 fn claim_next_key_package_from_inventory(
@@ -6811,7 +6210,11 @@ fn claim_next_key_package_for_account_from_inventory(
                 && !revoked_devices.contains(&DeviceMembership::key(&metadata.owner))
         })
         .map(|(key_package_id, _)| key_package_id.clone())
-        .min_by(|left, right| left.as_slice().cmp(right.as_slice()));
+        .max_by(|left, right| {
+            key_package_freshness_rank(left.as_slice())
+                .cmp(&key_package_freshness_rank(right.as_slice()))
+                .then_with(|| left.as_slice().cmp(right.as_slice()))
+        });
     let key_package_id = selected?;
     let record = inventory
         .get_mut(&key_package_id)
@@ -6822,6 +6225,52 @@ fn claim_next_key_package_for_account_from_inventory(
         owner: record.owner.clone(),
         key_package: record.key_package.clone(),
     })
+}
+
+fn key_package_freshness_rank(key_package_id: &[u8]) -> (u8, u64) {
+    let Some(rest) = key_package_id.strip_prefix(b"kp_t") else {
+        return (0, 0);
+    };
+    let Some((timestamp, _suffix)) = rest.split_first_chunk::<20>() else {
+        return (0, 0);
+    };
+    let Ok(timestamp) = std::str::from_utf8(timestamp) else {
+        return (0, 0);
+    };
+    if !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (0, 0);
+    }
+    timestamp
+        .parse::<u64>()
+        .map(|value| (1, value))
+        .unwrap_or((0, 0))
+}
+
+fn retire_older_finite_key_packages(
+    inventory: &mut HashMap<HttpKeyPackageId, KeyPackageInventoryRecord>,
+    owner: &DeviceRef,
+    new_key_package_id: &HttpKeyPackageId,
+) {
+    let new_rank = key_package_freshness_rank(new_key_package_id.as_slice());
+    if new_rank.0 == 0 {
+        return;
+    }
+    for record in inventory.values_mut() {
+        if record.key_package_id == *new_key_package_id {
+            continue;
+        }
+        if record.state != KeyPackageInventoryState::Available {
+            continue;
+        }
+        let Some(metadata) = &record.finite_metadata else {
+            continue;
+        };
+        if metadata.owner == *owner
+            && key_package_freshness_rank(record.key_package_id.as_slice()) < new_rank
+        {
+            record.state = KeyPackageInventoryState::Consumed;
+        }
+    }
 }
 
 fn record_finite_owner_is_revoked(
@@ -6931,10 +6380,10 @@ pub enum ServerHttpError {
         actual: usize,
         max: usize,
     },
-    InvalidInviteAvailabilityRequest {
+    InvalidKeyPackageAvailabilityRequest {
         reason: String,
     },
-    InvalidInviteAvailabilityBatch {
+    InvalidKeyPackageAvailabilityBatch {
         actual: usize,
         max: usize,
     },
@@ -7034,25 +6483,8 @@ pub enum ServerHttpError {
     BadLinkSessionClaimToken {
         link_session_id: String,
     },
-    InvalidInviteRequest {
+    InvalidSyncRequest {
         reason: String,
-    },
-    InviteSessionAlreadyExists {
-        invite_id: String,
-    },
-    InviteSessionNotFound {
-        invite_id: String,
-    },
-    InviteSessionClosed {
-        invite_id: String,
-    },
-    InviteSessionConflict {
-        invite_id: String,
-        reason: String,
-    },
-    InviteJoinRequestNotFound {
-        invite_id: String,
-        request_id: String,
     },
     InvalidAccountRoomRequest {
         reason: String,
@@ -7175,16 +6607,16 @@ impl IntoResponse for ServerHttpError {
                     "Nostr profile batch must contain between 1 and {max} accounts, got {actual}"
                 ),
             ),
-            Self::InvalidInviteAvailabilityRequest { reason } => (
+            Self::InvalidKeyPackageAvailabilityRequest { reason } => (
                 StatusCode::BAD_REQUEST,
-                "invalid_invite_availability_request".to_owned(),
+                "invalid_key_package_availability_request".to_owned(),
                 reason,
             ),
-            Self::InvalidInviteAvailabilityBatch { actual, max } => (
+            Self::InvalidKeyPackageAvailabilityBatch { actual, max } => (
                 StatusCode::BAD_REQUEST,
-                "invalid_invite_availability_batch".to_owned(),
+                "invalid_key_package_availability_batch".to_owned(),
                 format!(
-                    "Invite availability batch must contain between 1 and {max} accounts, got {actual}"
+                    "KeyPackage availability batch must contain between 1 and {max} accounts, got {actual}"
                 ),
             ),
             Self::DeviceNotActive { device } => (
@@ -7350,38 +6782,10 @@ impl IntoResponse for ServerHttpError {
                 "bad_link_session_claim_token".to_owned(),
                 format!("link session {link_session_id} claim token does not match"),
             ),
-            Self::InvalidInviteRequest { reason } => (
+            Self::InvalidSyncRequest { reason } => (
                 StatusCode::BAD_REQUEST,
-                "invalid_invite_request".to_owned(),
+                "invalid_sync_request".to_owned(),
                 reason,
-            ),
-            Self::InviteSessionAlreadyExists { invite_id } => (
-                StatusCode::CONFLICT,
-                "invite_session_already_exists".to_owned(),
-                format!("invite session {invite_id} already exists"),
-            ),
-            Self::InviteSessionNotFound { invite_id } => (
-                StatusCode::NOT_FOUND,
-                "invite_session_not_found".to_owned(),
-                format!("invite session {invite_id} was not found"),
-            ),
-            Self::InviteSessionClosed { invite_id } => (
-                StatusCode::BAD_REQUEST,
-                "invite_session_closed".to_owned(),
-                format!("invite session {invite_id} is closed"),
-            ),
-            Self::InviteSessionConflict { invite_id, reason } => (
-                StatusCode::CONFLICT,
-                "invite_session_conflict".to_owned(),
-                format!("invite session {invite_id} conflict: {reason}"),
-            ),
-            Self::InviteJoinRequestNotFound {
-                invite_id,
-                request_id,
-            } => (
-                StatusCode::NOT_FOUND,
-                "invite_join_request_not_found".to_owned(),
-                format!("invite session {invite_id} has no join request {request_id}"),
             ),
             Self::InvalidAccountRoomRequest { reason } => (
                 StatusCode::BAD_REQUEST,

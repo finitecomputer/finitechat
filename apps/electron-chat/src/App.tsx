@@ -5,12 +5,10 @@ import {
   BotIcon,
   CheckIcon,
   ChevronRightIcon,
-  CopyIcon,
   FileIcon,
   HashIcon,
   ImageIcon,
   KeyRoundIcon,
-  LinkIcon,
   Loader2Icon,
   MessageCircleIcon,
   MoreHorizontalIcon,
@@ -77,13 +75,11 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [composer, setComposer] = useState("");
-  const [inviteUrl, setInviteUrl] = useState("");
+  const [agentProfileInput, setAgentProfileInput] = useState("");
   const [createMode, setCreateMode] = useState<"chat" | "topic" | null>(null);
   const [createTitle, setCreateTitle] = useState("");
   const [participantOpen, setParticipantOpen] = useState(false);
-  const [participantMode, setParticipantMode] = useState<"invite" | "npub">("invite");
   const [participantInput, setParticipantInput] = useState("");
-  const [copiedInvite, setCopiedInvite] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [identityStatus, setIdentityStatus] = useState<DesktopIdentityStatus | null>(null);
   const [onboardingStatus, setOnboardingStatus] = useState<DesktopOnboardingStatus | null>(null);
@@ -92,10 +88,10 @@ export function App() {
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [localPendingMessages, setLocalPendingMessages] = useState<LocalPendingMessage[]>([]);
   const [awaitingReplyRoomIds, setAwaitingReplyRoomIds] = useState<string[]>([]);
-  const joinInviteInputRef = useRef<HTMLInputElement | null>(null);
+  const agentProfileInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptRef = useRef<HTMLElement | null>(null);
-  const lastDesktopInviteUrlRef = useRef<{ url: string; timestamp: number } | null>(null);
+  const lastDesktopTargetUrlRef = useRef<{ url: string; timestamp: number } | null>(null);
   const typingRoomRef = useRef<string | null>(null);
   const typingStopTimerRef = useRef<number | null>(null);
 
@@ -227,19 +223,18 @@ export function App() {
     void loadDesktopState();
   }, [loadDesktopState]);
 
-  const handleDesktopInviteUrl = useCallback(
+  const handleDesktopTargetUrl = useCallback(
     (url: string | null | undefined) => {
       const value = url?.trim();
       if (!value) {
         return;
       }
-      const last = lastDesktopInviteUrlRef.current;
+      const last = lastDesktopTargetUrlRef.current;
       const now = Date.now();
       if (last?.url === value && now - last.timestamp < 2000) {
         return;
       }
-      lastDesktopInviteUrlRef.current = { url: value, timestamp: now };
-      setInviteUrl(value);
+      lastDesktopTargetUrlRef.current = { url: value, timestamp: now };
       void run({ ScanTarget: { value } });
     },
     [run]
@@ -249,13 +244,13 @@ export function App() {
     if (!window.finiteChatDesktop || !daemonUrl) {
       return;
     }
-    const unsubscribe = window.finiteChatDesktop.onInviteUrl(handleDesktopInviteUrl);
+    const unsubscribe = window.finiteChatDesktop.onTargetUrl(handleDesktopTargetUrl);
     void window.finiteChatDesktop
-      .consumePendingInviteUrl()
-      .then(handleDesktopInviteUrl)
+      .consumePendingTargetUrl()
+      .then(handleDesktopTargetUrl)
       .catch((reason: unknown) => setError(errorMessage(reason)));
     return unsubscribe;
-  }, [daemonUrl, handleDesktopInviteUrl]);
+  }, [daemonUrl, handleDesktopTargetUrl]);
 
   const selectedRoom = useMemo(
     () => state?.rooms.find((room) => room.room_id === state.selected_room_id) ?? null,
@@ -299,9 +294,6 @@ export function App() {
     () => state?.profiles.find((profile) => profile.account_id === state.active_profile_id) ?? null,
     [state?.active_profile_id, state?.profiles]
   );
-  const activeInvite =
-    selectedRoom && state?.active_invite?.room_id === selectedRoom.room_id ? state.active_invite : null;
-  const pendingInviteRoomId = state?.flow.invite_join_submission_room_id ?? null;
   const selectedMessages = state?.messages ?? [];
   const selectedMembers = selectedRoom?.members ?? [];
   const agentRooms = state?.rooms.filter((room) => room.is_agent_chat) ?? [];
@@ -335,9 +327,9 @@ export function App() {
     Boolean(selectedRoom?.room_id && awaitingReplyRoomIds.includes(selectedRoom.room_id)) &&
     selectedLiveMembers.length === 0;
 
-  const focusJoinInvite = useCallback(() => {
+  const focusAgentInput = useCallback(() => {
     window.requestAnimationFrame(() => {
-      const input = joinInviteInputRef.current;
+      const input = agentProfileInputRef.current;
       input?.closest(".finite-chat__agent-panel")?.scrollIntoView({ block: "center", behavior: "smooth" });
       input?.focus();
     });
@@ -434,7 +426,7 @@ export function App() {
     }
     if (!selectedRoom) {
       setError(agentRooms.length > 0 ? "Select an agent chat before sending." : "Connect Hermes before sending.");
-      focusJoinInvite();
+      focusAgentInput();
       return;
     }
     if (text === "/new" && attachments.length === 0) {
@@ -464,7 +456,7 @@ export function App() {
           ? "This chat has no other member. Connect Hermes before sending."
           : "This chat is not ready for messages yet."
       );
-      focusJoinInvite();
+      focusAgentInput();
       return;
     }
     if (selectedTopic && attachments.length > 0 && !selectedChat) {
@@ -570,11 +562,11 @@ export function App() {
     setComposerAttachments((attachments) => attachments.filter((attachment) => attachment.id !== id));
   }
 
-  async function submitInvite(event: FormEvent) {
+  async function submitAgentProfile(event: FormEvent) {
     event.preventDefault();
-    const value = inviteUrl.trim();
-    if (value) {
-      await run({ ScanTarget: { value } });
+    const added = await connectProfileTarget(agentProfileInput, selectedRoom);
+    if (added) {
+      setAgentProfileInput("");
     }
   }
 
@@ -614,25 +606,25 @@ export function App() {
 
   async function submitParticipant(event: FormEvent) {
     event.preventDefault();
-    const value = participantInput.trim();
-    if (!value) {
-      return;
+    const added = await connectProfileTarget(participantInput, selectedRoom);
+    if (added) {
+      setParticipantInput("");
+      setParticipantOpen(false);
     }
-    if (participantMode === "invite") {
-      const next = await run({ ScanTarget: { value } });
-      if (next) {
-        setParticipantInput("");
-      }
-      return;
-    }
+  }
 
-    const scanned = await run({ ScanTarget: { value } });
+  async function connectProfileTarget(value: string, roomOverride: AppRoomSummary | null) {
+    const target = value.trim();
+    if (!target) {
+      return false;
+    }
+    const scanned = await run({ ScanTarget: { value: target } });
     const profile = scanned ? profileFromState(scanned, scanned.active_profile_id) : null;
     if (!profile) {
-      setError("That npub could not be resolved into a Finite profile.");
-      return;
+      setError("Paste a Finite npub or profile link.");
+      return false;
     }
-    const roomForAdd = selectedRoom?.state === "Connected" ? selectedRoom : null;
+    const roomForAdd = roomOverride?.state === "Connected" ? roomOverride : null;
     const next = roomForAdd
       ? await run({ AddRoomMembers: { room_id: roomForAdd.room_id, profiles: [profile] } })
       : await run({
@@ -641,52 +633,18 @@ export function App() {
             display_name: `Chat with ${profile.display_name}`,
           },
         });
-    if (next) {
-      if (next.status === "chat unavailable" || next.toast) {
-        setError(next.toast ?? "That npub is not available for an encrypted chat yet.");
-        return;
-      }
-      setParticipantInput("");
-      setParticipantOpen(false);
+    if (!next) {
+      return false;
     }
+    if (next.status === "chat unavailable" || next.toast) {
+      setError(next.toast ?? "That npub is not available for an encrypted chat yet.");
+      return false;
+    }
+    return true;
   }
 
   async function syncRuntime() {
     await run({ StartRuntime: null });
-  }
-
-  async function createInvite() {
-    if (!selectedRoom) {
-      return;
-    }
-    const next = await run({ CreateInvite: { room_id: selectedRoom.room_id } });
-    if (!next?.active_invite || next.active_invite.room_id !== selectedRoom.room_id) {
-      setError(next?.toast ?? "Invite could not be created for this chat.");
-    }
-  }
-
-  async function copyInvite() {
-    if (!activeInvite) {
-      return;
-    }
-    try {
-      if (window.finiteChatDesktop) {
-        await window.finiteChatDesktop.copyText(activeInvite.invite_url);
-      } else {
-        await navigator.clipboard.writeText(activeInvite.invite_url);
-      }
-      setCopiedInvite(true);
-      window.setTimeout(() => setCopiedInvite(false), 1400);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Invite could not be copied.");
-    }
-  }
-
-  async function submitPendingInviteJoin() {
-    if (!pendingInviteRoomId) {
-      return;
-    }
-    await run({ SubmitInviteJoin: { pending_room_id: pendingInviteRoomId } });
   }
 
   async function finishOnboarding() {
@@ -992,41 +950,14 @@ export function App() {
 
         {participantOpen ? (
           <ParticipantPanel
-            activeInvite={activeInvite}
             activeProfile={activeProfile}
             busy={busy}
-            copiedInvite={copiedInvite}
-            mode={participantMode}
             selectedRoom={selectedRoom}
             value={participantInput}
             onClose={() => setParticipantOpen(false)}
-            onCopyInvite={() => void copyInvite()}
-            onCreateInvite={() => void createInvite()}
-            onModeChange={setParticipantMode}
             onSubmit={submitParticipant}
             onValueChange={setParticipantInput}
           />
-        ) : null}
-
-        {pendingInviteRoomId ? (
-          <section className="finite-chat__notice finite-chat__notice--inline">
-            <strong>Invite found</strong>
-            <span>{pendingInviteRoomId}</span>
-            <button type="button" className="finite-chat__command-button" onClick={() => void submitPendingInviteJoin()} disabled={busy}>
-              Join
-            </button>
-          </section>
-        ) : null}
-
-        {activeInvite ? (
-          <section className="finite-chat__notice finite-chat__notice--inline">
-            <strong>Invite ready</strong>
-            <span>{activeInvite.invite_url}</span>
-            <button type="button" className="finite-chat__command-button" onClick={() => void copyInvite()} disabled={busy}>
-              {copiedInvite ? <CheckIcon aria-hidden /> : <CopyIcon aria-hidden />}
-              {copiedInvite ? "Copied" : "Copy"}
-            </button>
-          </section>
         ) : null}
 
         {error ? (
@@ -1038,15 +969,13 @@ export function App() {
 
         {state && (!selectedRoom || selectedRoomNeedsAgent || selectedRoom.state !== "Connected") ? (
           <AgentConnectionPanel
+            value={agentProfileInput}
             busy={busy}
-            inviteUrl={inviteUrl}
-            inputRef={joinInviteInputRef}
-            pendingInviteRoomId={pendingInviteRoomId}
+            inputRef={agentProfileInputRef}
             selectedRoom={selectedRoom}
             hasAgentRoom={agentRooms.length > 0}
-            onInviteUrlChange={setInviteUrl}
-            onSubmitInvite={submitInvite}
-            onSubmitPendingInviteJoin={submitPendingInviteJoin}
+            onSubmit={submitAgentProfile}
+            onValueChange={setAgentProfileInput}
           />
         ) : null}
 
@@ -1247,24 +1176,20 @@ function AgentConnectionPanel({
   busy,
   hasAgentRoom,
   inputRef,
-  inviteUrl,
-  onInviteUrlChange,
-  onSubmitInvite,
-  onSubmitPendingInviteJoin,
-  pendingInviteRoomId,
+  onSubmit,
+  onValueChange,
   selectedRoom,
+  value,
 }: {
   busy: boolean;
   hasAgentRoom: boolean;
   inputRef: { current: HTMLInputElement | null };
-  inviteUrl: string;
-  onInviteUrlChange: (value: string) => void;
-  onSubmitInvite: (event: FormEvent) => void;
-  onSubmitPendingInviteJoin: () => void;
-  pendingInviteRoomId: string | null;
+  onSubmit: (event: FormEvent) => void;
+  onValueChange: (value: string) => void;
   selectedRoom: AppRoomSummary | null;
+  value: string;
 }) {
-  const copy = agentConnectionCopy(selectedRoom, hasAgentRoom, pendingInviteRoomId);
+  const copy = agentConnectionCopy(selectedRoom, hasAgentRoom);
   return (
     <section className="finite-chat__agent-panel">
       <div className="finite-chat__agent-panel-icon" aria-hidden>
@@ -1278,61 +1203,40 @@ function AgentConnectionPanel({
         <strong>{copy.title}</strong>
         <span>{copy.body}</span>
       </div>
-      {pendingInviteRoomId ? (
-        <button type="button" className="finite-chat__command-button" onClick={onSubmitPendingInviteJoin} disabled={busy}>
-          Join
+      <form className="finite-chat__agent-panel-form" onSubmit={onSubmit}>
+        <input
+          ref={inputRef}
+          value={value}
+          onChange={(event) => onValueChange(event.target.value)}
+          placeholder="Paste Hermes npub or profile link"
+          disabled={busy}
+        />
+        <button type="submit" className="finite-chat__send-button" aria-label="Connect Hermes" disabled={!value.trim() || busy}>
+          <UserPlusIcon aria-hidden />
         </button>
-      ) : (
-        <form className="finite-chat__agent-panel-form" onSubmit={onSubmitInvite}>
-          <input
-            ref={inputRef}
-            value={inviteUrl}
-            onChange={(event) => onInviteUrlChange(event.target.value)}
-            placeholder="Paste finite:// join invite"
-            disabled={busy}
-          />
-          <button type="submit" className="finite-chat__send-button" aria-label="Connect Hermes" disabled={!inviteUrl.trim() || busy}>
-            <LinkIcon aria-hidden />
-          </button>
-        </form>
-      )}
+      </form>
     </section>
   );
 }
 
 function ParticipantPanel({
-  activeInvite,
   activeProfile,
   busy,
-  copiedInvite,
-  mode,
   onClose,
-  onCopyInvite,
-  onCreateInvite,
-  onModeChange,
   onSubmit,
   onValueChange,
   selectedRoom,
   value,
 }: {
-  activeInvite: { room_id: string; invite_url: string } | null;
   activeProfile: AppProfileSummary | null;
   busy: boolean;
-  copiedInvite: boolean;
-  mode: "invite" | "npub";
   onClose: () => void;
-  onCopyInvite: () => void;
-  onCreateInvite: () => void;
-  onModeChange: (mode: "invite" | "npub") => void;
   onSubmit: (event: FormEvent) => void;
   onValueChange: (value: string) => void;
   selectedRoom: AppRoomSummary | null;
   value: string;
 }) {
-  const canCreateInvite = Boolean(
-    selectedRoom && selectedRoom.state === "Connected" && selectedRoom.can_create_invite !== false
-  );
-  const submitLabel = mode === "invite" ? "Open invite" : selectedRoom?.state === "Connected" ? "Add to chat" : "Start chat";
+  const submitLabel = selectedRoom?.state === "Connected" ? "Add to chat" : "Start chat";
   return (
     <section className="finite-chat__participant-panel">
       <div className="finite-chat__participant-heading">
@@ -1344,29 +1248,19 @@ function ParticipantPanel({
           <XIcon aria-hidden />
         </button>
       </div>
-      <div className="finite-chat__participant-modes" role="tablist" aria-label="Participant source">
-        <button type="button" className={mode === "invite" ? "is-active" : ""} onClick={() => onModeChange("invite")}>
-          <LinkIcon aria-hidden />
-          <span>Invite code</span>
-        </button>
-        <button type="button" className={mode === "npub" ? "is-active" : ""} onClick={() => onModeChange("npub")}>
-          <UsersIcon aria-hidden />
-          <span>npub</span>
-        </button>
-      </div>
       <form className="finite-chat__participant-form" onSubmit={onSubmit}>
         <input
           value={value}
           onChange={(event) => onValueChange(event.target.value)}
-          placeholder={mode === "invite" ? "finite://join..." : "npub1..."}
+          placeholder="npub1... or nprofile1..."
           disabled={busy}
         />
         <button type="submit" className="finite-chat__command-button" disabled={!value.trim() || busy}>
-          {mode === "invite" ? <LinkIcon aria-hidden /> : <UserPlusIcon aria-hidden />}
+          <UserPlusIcon aria-hidden />
           {submitLabel}
         </button>
       </form>
-      {activeProfile && mode === "npub" ? (
+      {activeProfile ? (
         <div className="finite-chat__participant-profile">
           <span className="finite-chat__avatar" aria-hidden>
             {initials(activeProfile.display_name)}
@@ -1377,24 +1271,6 @@ function ParticipantPanel({
           </span>
         </div>
       ) : null}
-      {activeInvite ? (
-        <div className="finite-chat__participant-invite">
-          <LinkIcon aria-hidden />
-          <span>{activeInvite.invite_url}</span>
-        </div>
-      ) : null}
-      <div className="finite-chat__participant-actions">
-        <button type="button" className="finite-chat__command-button" onClick={onCreateInvite} disabled={!canCreateInvite || busy}>
-          <LinkIcon aria-hidden />
-          Generate invite
-        </button>
-        {activeInvite ? (
-          <button type="button" className="finite-chat__command-button" onClick={onCopyInvite} disabled={busy}>
-            {copiedInvite ? <CheckIcon aria-hidden /> : <CopyIcon aria-hidden />}
-            {copiedInvite ? "Copied" : "Copy invite"}
-          </button>
-        ) : null}
-      </div>
     </section>
   );
 }
@@ -1476,8 +1352,7 @@ function TopicChatButton({
 
 function agentConnectionCopy(
   selectedRoom: AppRoomSummary | null,
-  hasAgentRoom: boolean,
-  pendingInviteRoomId: string | null
+  hasAgentRoom: boolean
 ) {
   const admissionDetail = selectedRoom ? roomAdmissionDetail(selectedRoom) : null;
   if (admissionDetail) {
@@ -1486,16 +1361,16 @@ function agentConnectionCopy(
       body: admissionDetail,
     };
   }
-  if (pendingInviteRoomId || selectedRoom?.state === "WaitingForApproval" || selectedRoom?.state === "Joining") {
+  if (selectedRoom?.state === "WaitingForApproval" || selectedRoom?.state === "Joining") {
     return {
       title: "Waiting for Hermes",
-      body: "The join request has been sent. Hermes needs to admit this device before messages can flow.",
+      body: "Hermes needs to publish key packages and receive this room's Welcome before messages can flow.",
     };
   }
   if (selectedRoom && !selectedRoom.is_agent_chat) {
     return {
       title: "No agent in this chat",
-      body: "This room does not contain Hermes. Join a runtime invite to start an agent chat.",
+      body: "Paste the Hermes npub to add it to this room.",
     };
   }
   if (hasAgentRoom) {
@@ -1506,7 +1381,7 @@ function agentConnectionCopy(
   }
   return {
     title: "Connect Hermes",
-    body: "Paste the invite from your local or hosted Hermes runtime. Browser finite:// links are handled automatically.",
+    body: "Paste the npub or profile link for a local or hosted Hermes runtime.",
   };
 }
 

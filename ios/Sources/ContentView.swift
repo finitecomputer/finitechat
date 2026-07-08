@@ -9,7 +9,6 @@ private enum AppSheet: Identifiable {
     case newChat
     case myProfile
     case scan
-    case invite
     case settings
 
     var id: String {
@@ -20,8 +19,6 @@ private enum AppSheet: Identifiable {
             "myProfile"
         case .scan:
             "scan"
-        case .invite:
-            "invite"
         case .settings:
             "settings"
         }
@@ -82,8 +79,6 @@ struct ContentView: View {
                 ScanSheet(model: model) { profile in
                     startChatFromScannedProfile(profile)
                 }
-            case .invite:
-                InviteSheet(invite: model.state?.activeInvite)
             case .settings:
                 SettingsSheet(model: model) { profile in
                     startChatFromScannedProfile(profile)
@@ -184,9 +179,7 @@ struct ContentView: View {
                 }
             )
             .navigationDestination(for: String.self) { roomID in
-                RoomThreadView(model: model, people: people, roomID: roomID) {
-                    sheet = .invite
-                }
+                RoomThreadView(model: model, people: people, roomID: roomID)
                 .toolbar(.hidden, for: .tabBar)
             }
         }
@@ -655,8 +648,7 @@ private struct ChatPeoplePickerSheet: View {
             .sheet(isPresented: $showingScan) {
                 ScanSheet(
                     model: model,
-                    onStartProfileChat: handleScannedProfile,
-                    onRoomJoined: { dismiss() }
+                    onStartProfileChat: handleScannedProfile
                 )
             }
             .task {
@@ -1203,13 +1195,6 @@ func profileSummaryFromScannedProfileCode(
     )
 }
 
-func isFiniteChatInviteCode(_ value: String) -> Bool {
-    value
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-        .hasPrefix("finite://join")
-}
-
 private struct ProfileCodeTarget {
     let accountID: String
     let npub: String
@@ -1486,7 +1471,7 @@ private struct NewGroupFollowRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                Label(profile.inviteAvailability.userStatusText, systemImage: statusSystemImage)
+                Label(profile.keyPackageAvailability.userStatusText, systemImage: statusSystemImage)
                     .font(.caption2)
                     .foregroundStyle(statusTint)
                     .lineLimit(1)
@@ -1501,7 +1486,7 @@ private struct NewGroupFollowRow: View {
         .accessibilityElement(children: .combine)
     }
     private var statusSystemImage: String {
-        switch profile.inviteAvailability {
+        switch profile.keyPackageAvailability {
         case .available:
             return "checkmark.circle.fill"
         case .unavailable:
@@ -1512,7 +1497,7 @@ private struct NewGroupFollowRow: View {
     }
 
     private var statusTint: Color {
-        switch profile.inviteAvailability {
+        switch profile.keyPackageAvailability {
         case .available:
             return .green
         case .unavailable:
@@ -1590,7 +1575,6 @@ private struct RoomAvatar: View {
 private struct RoomOptionsSheet: View {
     @Environment(\.dismiss) private var dismiss
     let showAddPeople: () -> Void
-    let showInvite: () -> Void
     let showRoomDetails: () -> Void
     let showMediaGallery: () -> Void
 
@@ -1606,17 +1590,6 @@ private struct RoomOptionsSheet: View {
                             title: "Add people",
                             subtitle: nil,
                             systemImage: "person.badge.plus"
-                        )
-                    }
-
-                    Button {
-                        dismiss()
-                        showInvite()
-                    } label: {
-                        SettingsRowLabel(
-                            title: "Invite",
-                            subtitle: nil,
-                            systemImage: "qrcode"
                         )
                     }
 
@@ -1792,7 +1765,6 @@ private struct RoomThreadView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var people: NostrPeopleModel
     let roomID: String
-    let showInvite: () -> Void
     @State private var followsBottom = true
     @State private var importingAttachment = false
     @State private var replyDraftMessage: ChatMessage?
@@ -1968,16 +1940,6 @@ private struct RoomThreadView: View {
                         showAddPeople = true
                     }
                 },
-                showInvite: {
-                    showRoomOptions = false
-                    Task { @MainActor in
-                        if let room {
-                            _ = model.createInvite(for: room) {
-                                showInvite()
-                            }
-                        }
-                    }
-                },
                 showRoomDetails: {
                     showRoomOptions = false
                     Task { @MainActor in
@@ -2016,13 +1978,6 @@ private struct RoomThreadView: View {
                         messageID: item.messageId,
                         attachment: item.attachment
                     )
-                },
-                onCreateInvite: {
-                    if let room {
-                        _ = model.createInvite(for: room) {
-                            showInvite()
-                        }
-                    }
                 },
                 onAddPeople: {
                     showAddPeople = true
@@ -3035,14 +2990,14 @@ private struct PendingRoomView: View {
 
             ProgressView()
                 .controlSize(.large)
-                .accessibilityLabel(isSubmitting ? "Requesting access" : room.userStatusText)
+                .accessibilityLabel(isSubmitting ? "Waiting for Welcome" : room.userStatusText)
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var isSubmitting: Bool {
-        model.inviteJoinSubmissionRoomID == room.roomId
+        room.state == .joining || room.state == .waitingForApproval
     }
 
     private var detailText: String? {
@@ -3072,7 +3027,6 @@ private struct ScanSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: AppModel
     let onStartProfileChat: (AppProfileSummary) -> Bool
-    var onRoomJoined: (() -> Void)? = nil
     @State private var scanError: String?
 
     var body: some View {
@@ -3156,7 +3110,7 @@ private struct ScanSheet: View {
     private func pasteAndContinue() {
         let value = UIPasteboard.general.string ?? ""
         guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            scanError = "There is no invite or profile code on the clipboard."
+            scanError = "There is no profile code on the clipboard."
             return
         }
         processScannedTarget(value)
@@ -3170,83 +3124,18 @@ private struct ScanSheet: View {
             return
         }
 
-        if !isFiniteChatInviteCode(value) {
-            do {
-                let profile = try profileSummaryFromScannedProfileCode(value, model: model)
-                scanError = nil
-                if onStartProfileChat(profile) {
-                    model.scanDraft = ""
-                    dismiss()
-                }
-            } catch {
-                scanError = "That code is not a valid invite or profile code."
-            }
-            return
-        }
-
-        guard !model.scanInFlight else { return }
-        model.scanTarget { result in
-            handleScanResult(result)
-        }
-    }
-
-    private func handleScanResult(_ result: AppScanTargetResult) {
-        switch result {
-        case .empty:
+        do {
+            let profile = try profileSummaryFromScannedProfileCode(value, model: model)
             scanError = nil
-            dismiss()
-        case .profile(let profile):
             if onStartProfileChat(profile) {
-                scanError = nil
+                model.scanDraft = ""
                 dismiss()
             }
-        case .room:
-            scanError = nil
-            dismiss()
-            onRoomJoined?()
-        case .unavailable:
-            break
+        } catch {
+            scanError = "That code is not a valid profile code."
         }
     }
-}
 
-private struct InviteSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let invite: AppInviteState?
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 18) {
-                if let invite {
-                    QRCodeView(value: invite.inviteUrl)
-                        .frame(width: 220, height: 220)
-                        .accessibilityLabel("Invite QR")
-
-                    Text(invite.inviteUrl)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .textSelection(.enabled)
-                        .lineLimit(4)
-
-                    ShareLink(item: invite.inviteUrl) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    ContentUnavailableView("Invite unavailable", systemImage: "qrcode")
-                }
-            }
-            .padding()
-            .navigationTitle("Invite")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    GlassCircleCloseButton { dismiss() }
-                }
-            }
-        }
-    }
 }
 
 private struct SettingsSheet: View {
@@ -3297,7 +3186,7 @@ private struct SettingsSheet: View {
                     } label: {
                         SettingsRowLabel(
                             title: "Scan code",
-                            subtitle: "Invite, profile, or agent code",
+                            subtitle: "Profile or agent code",
                             systemImage: "qrcode.viewfinder"
                         )
                     }

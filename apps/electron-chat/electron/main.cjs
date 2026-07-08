@@ -6,7 +6,7 @@ const { pathToFileURL } = require("node:url");
 const { app, BrowserWindow, clipboard, ipcMain, net, protocol, safeStorage, session, shell } = require("electron");
 
 let mainWindow = null;
-let pendingInviteUrl = null;
+let pendingTargetUrl = null;
 let daemonProcess = null;
 
 const rendererUrl = process.env.FINITECHAT_RENDERER_URL;
@@ -67,8 +67,8 @@ function createWindow() {
   }
 
   mainWindow.webContents.once("did-finish-load", () => {
-    if (pendingInviteUrl) {
-      mainWindow.webContents.send("finitechat:invite-url", pendingInviteUrl);
+    if (pendingTargetUrl) {
+      mainWindow.webContents.send("finitechat:target-url", pendingTargetUrl);
     }
     maybeCaptureWindow();
   });
@@ -325,20 +325,20 @@ function restartDaemon() {
   setTimeout(() => startDaemon(), 300);
 }
 
-function findInviteUrl(argv) {
-  return argv.find((arg) => typeof arg === "string" && arg.startsWith("finite://join")) || null;
+function findTargetUrl(argv) {
+  return argv.find((arg) => typeof arg === "string" && arg.startsWith("finite://")) || null;
 }
 
-function handleInviteUrl(url) {
-  if (!url || !url.startsWith("finite://join")) {
+function handleTargetUrl(url) {
+  if (!url || !url.startsWith("finite://")) {
     return;
   }
-  pendingInviteUrl = url;
+  pendingTargetUrl = url;
   if (mainWindow) {
-    mainWindow.webContents.send("finitechat:invite-url", url);
+    mainWindow.webContents.send("finitechat:target-url", url);
     mainWindow.focus();
   } else {
-    pendingInviteUrl = url;
+    pendingTargetUrl = url;
   }
 }
 
@@ -346,21 +346,21 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  const initialInviteUrl = findInviteUrl(process.argv);
-  if (initialInviteUrl) {
-    pendingInviteUrl = initialInviteUrl;
+  const initialTargetUrl = findTargetUrl(process.argv);
+  if (initialTargetUrl) {
+    pendingTargetUrl = initialTargetUrl;
   }
 
   app.on("second-instance", (_event, argv) => {
-    const inviteUrl = findInviteUrl(argv);
-    if (inviteUrl) {
-      handleInviteUrl(inviteUrl);
+    const targetUrl = findTargetUrl(argv);
+    if (targetUrl) {
+      handleTargetUrl(targetUrl);
     }
   });
 
   app.on("open-url", (event, url) => {
     event.preventDefault();
-    handleInviteUrl(url);
+    handleTargetUrl(url);
   });
 
   app.whenReady().then(async () => {
@@ -394,9 +394,9 @@ ipcMain.handle("finitechat:daemon-url", () => {
   return daemonUrl;
 });
 
-ipcMain.handle("finitechat:consume-pending-invite-url", () => {
-  const url = pendingInviteUrl;
-  pendingInviteUrl = null;
+ipcMain.handle("finitechat:consume-pending-target-url", () => {
+  const url = pendingTargetUrl;
+  pendingTargetUrl = null;
   return url;
 });
 

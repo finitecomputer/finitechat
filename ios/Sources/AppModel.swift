@@ -253,7 +253,7 @@ private struct PersistedRuntimeConfig: Codable, Equatable {
 typealias AppRuntimeFactory = (OpenOptions) throws -> any FiniteChatRuntimeProtocol
 
 extension AppRoomSummary {
-    var isWaitingForInviteApproval: Bool {
+    var isWaitingForWelcome: Bool {
         state == .waitingForApproval
             && status.localizedCaseInsensitiveContains("waiting for room admission")
     }
@@ -350,7 +350,6 @@ struct RuntimeDataStore {
 enum AppScanTargetResult {
     case empty
     case profile(AppProfileSummary)
-    case room(AppRoomSummary)
     case unavailable
 }
 
@@ -649,10 +648,6 @@ final class AppModel: ObservableObject, AppReconciler {
 
     var actionNoticeText: String? {
         userNoticeText ?? developerErrorText
-    }
-
-    var inviteJoinSubmissionRoomID: String? {
-        state?.flow.inviteJoinSubmissionRoomId
     }
 
     var scanInFlight: Bool {
@@ -1109,19 +1104,6 @@ final class AppModel: ObservableObject, AppReconciler {
         ))
     }
 
-    func createInvite(
-        for room: AppRoomSummary,
-        onCreated: (@MainActor () -> Void)? = nil
-    ) -> Bool {
-        guard room.state == .connected else { return false }
-        return dispatchInBackground(.createInvite(roomId: room.roomId)) { [weak self] in
-            guard let self else { return }
-            if self.state?.activeInvite?.roomId == room.roomId {
-                onCreated?()
-            }
-        }
-    }
-
     func startProfileChat(
         for profile: AppProfileSummary,
         onStarted: (@MainActor (AppRoomSummary) -> Void)? = nil
@@ -1281,6 +1263,26 @@ final class AppModel: ObservableObject, AppReconciler {
         return true
     }
 
+    func openTargetURL(_ url: URL) {
+        let value = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+        appendDiagnostic(
+            category: "transport",
+            event: "open_target_url.requested",
+            details: ["scheme": url.scheme ?? "none"]
+        )
+        launchAutomationTask?.cancel()
+        launchAutomationTask = Task { [weak self] in
+            guard let self else { return }
+            await MainActor.run {
+                self.scanDraft = value
+                _ = self.scanTarget { [weak self] result in
+                    guard let self, case .profile(let profile) = result else { return }
+                    _ = self.startProfileChat(for: profile)
+                }
+            }
+        }
+    }
+
     private func scanTargetResultFromUpdatedState() -> AppScanTargetResult {
         guard let scanResult = state?.flow.scanResult else { return .unavailable }
         switch scanResult {
@@ -1288,10 +1290,6 @@ final class AppModel: ObservableObject, AppReconciler {
             guard let profile = activeProfile else { return .unavailable }
             scanDraft = ""
             return .profile(profile)
-        case .room:
-            guard let room = selectedRoom else { return .unavailable }
-            scanDraft = ""
-            return .room(room)
         case .unavailable, .none:
             return .unavailable
         }
@@ -2426,23 +2424,11 @@ final class AppModel: ObservableObject, AppReconciler {
                 name: "add_room_members",
                 details: ["room": roomId, "members": "\(profiles.count)"]
             )
-        case .createInvite(let roomId):
-            return DiagnosticActionSummary(
-                category: "transport",
-                name: "create_invite",
-                details: ["room": roomId]
-            )
         case .scanTarget:
             return DiagnosticActionSummary(
                 category: "transport",
                 name: "scan_target",
                 details: [:]
-            )
-        case .submitInviteJoin(let pendingRoomId):
-            return DiagnosticActionSummary(
-                category: "transport",
-                name: "submit_invite_join",
-                details: ["room": pendingRoomId]
             )
         case .sendMessage(let roomId, _):
             return DiagnosticActionSummary(
@@ -2703,7 +2689,6 @@ final class AppModel: ObservableObject, AppReconciler {
 
     private func runLaunchAutomationIfRequested() {
         guard !didRunLaunchAutomation else { return }
-        let inviteURL = Self.argumentValue("--finitechat-auto-join", in: args)
         let createRoomName = Self.argumentValue("--finitechat-auto-create-room", in: args)
         let profileChatNpub = Self.argumentValue("--finitechat-auto-start-profile-chat-npub", in: args)
         let outbound = Self.argumentValue("--finitechat-auto-send", in: args)
@@ -2731,8 +2716,7 @@ final class AppModel: ObservableObject, AppReconciler {
             "--finitechat-auto-send-attachment-caption",
             in: args
         )
-        guard inviteURL != nil
-            || createRoomName != nil
+        guard createRoomName != nil
             || profileChatNpub != nil
             || outbound != nil
             || attachmentText != nil
@@ -2753,11 +2737,6 @@ final class AppModel: ObservableObject, AppReconciler {
             {
                 self.roomDraft = createRoomName
                 self.createRoom()
-            }
-            if let inviteURL {
-                if case .room(let room) = await self.scanLaunchAutomationInvite(inviteURL) {
-                    await self.submitLaunchAutomationInviteJoin(roomID: room.roomId)
-                }
             }
             if let profileChatNpub,
                !profileChatNpub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2792,70 +2771,6 @@ final class AppModel: ObservableObject, AppReconciler {
                     mimeType: attachmentMimeType,
                     caption: attachmentCaption ?? ""
                 )
-            }
-        }
-    }
-
-    private func submitLaunchAutomationInviteJoin(roomID: String) async {
-        await withCheckedContinuation { continuation in
-            let action = AppAction.submitInviteJoin(pendingRoomId: roomID)
-            let diagnostic = diagnosticAction(action)
-            do {
-                let runtime = try currentRuntime()
-                let runtimeKey = openKey
-                enqueueRuntimeDispatch(
-                    action,
-                    runtime: runtime,
-                    runtimeKey: runtimeKey,
-                    priority: .userInitiated,
-                    onSuccess: { [weak self] nextState in
-                        guard let self else {
-                            continuation.resume()
-                            return
-                        }
-                        self.applyRuntimeSnapshot(nextState)
-                        self.errorText = nil
-                        self.appendDiagnostic(
-                            category: diagnostic.category,
-                            event: "\(diagnostic.name).succeeded",
-                            details: diagnostic.details
-                        )
-                        self.restartUpdateLoopIfEnabled()
-                        continuation.resume()
-                    },
-                    onFailure: { [weak self] error in
-                        guard let self else {
-                            continuation.resume()
-                            return
-                        }
-                        self.appendDiagnostic(
-                            category: diagnostic.category,
-                            event: "\(diagnostic.name).failed",
-                            details: self.diagnosticErrorDetails(error)
-                        )
-                        self.errorText = String(describing: error)
-                        continuation.resume()
-                    }
-                )
-            } catch {
-                errorText = String(describing: error)
-                continuation.resume()
-            }
-        }
-    }
-
-    private func scanLaunchAutomationInvite(_ inviteURL: String) async -> AppScanTargetResult {
-        await withCheckedContinuation { continuation in
-            var didResume = false
-            func finish(_ result: AppScanTargetResult) {
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume(returning: result)
-            }
-
-            scanDraft = inviteURL
-            _ = scanTarget { result in
-                finish(result)
             }
         }
     }
@@ -3009,7 +2924,6 @@ final class AppModel: ObservableObject, AppReconciler {
 
     private static func hasLaunchAutomation(args: [String]) -> Bool {
         [
-            "--finitechat-auto-join",
             "--finitechat-auto-create-room",
             "--finitechat-auto-start-profile-chat-npub",
             "--finitechat-auto-send",

@@ -225,7 +225,7 @@ impl IntoResponse for DaemonError {
     fn into_response(self) -> Response {
         let status = match self {
             Self::Core(FiniteChatCoreError::Client { .. }) => StatusCode::BAD_REQUEST,
-            Self::Core(FiniteChatCoreError::Invite { .. }) => StatusCode::BAD_REQUEST,
+            Self::Core(FiniteChatCoreError::Profile { .. }) => StatusCode::BAD_REQUEST,
             Self::Core(FiniteChatCoreError::ServerRejected { .. }) => StatusCode::BAD_GATEWAY,
             Self::Core(FiniteChatCoreError::Delivery { .. }) => StatusCode::BAD_GATEWAY,
             Self::Core(FiniteChatCoreError::Filesystem { .. }) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -1084,34 +1084,6 @@ svg {
   font-size: 11px;
 }
 
-.finite-chat__participant-invite {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: 18px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--chat-composer);
-  color: var(--text-secondary);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px;
-  padding: 8px 10px;
-}
-
-.finite-chat__participant-invite svg {
-  width: 14px;
-  height: 14px;
-  color: var(--text-tertiary);
-}
-
-.finite-chat__participant-invite span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .finite-chat__split {
   display: flex;
   min-height: 0;

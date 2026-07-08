@@ -8,14 +8,12 @@ use finitechat_delivery::{HttpKeyPackageId, HttpKeyPackagePublication};
 use finitechat_http::{
     AckLinkPayloadRequest, AckWelcomeRequest, ApplicationEffectRequest,
     BootstrapAccountRoomRequest, ClaimKeyPackageRequest, ClaimKeyPackagesRequest,
-    ClaimLinkPayloadRequest, ClaimWelcomesRequest, CreateInviteSessionRequest,
-    CreateLinkSessionRequest, ExpireInviteSessionRequest, ExpireKeyPackageLeaseRequest,
-    ExpireLinkSessionRequest, GetDeviceLivenessRequest, GetLinkSessionRequest, GroupSyncRequest,
-    InboxSyncRequest, InviteJoinStatusRequest, KeyPackageInventoryRequest, LeaveRoomRequest,
-    ListAccountRoomDirectoryRequest, ListInviteJoinRequestsRequest, ObserveDeviceLivenessRequest,
-    ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RespondInviteJoinRequest,
-    RevokeDeviceRequest, SaveAccountRoomRequest, SubmitInviteJoinRequest, UpdateRoomAdminsRequest,
-    UploadLinkPayloadRequest,
+    ClaimLinkPayloadRequest, ClaimWelcomesRequest, CreateLinkSessionRequest,
+    ExpireKeyPackageLeaseRequest, ExpireLinkSessionRequest, GetDeviceLivenessRequest,
+    GetLinkSessionRequest, GroupSyncRequest, InboxSyncRequest, KeyPackageInventoryRequest,
+    LeaveRoomRequest, ListAccountRoomDirectoryRequest, ObserveDeviceLivenessRequest,
+    ReleaseLinkClaimRequest, ReportInvalidCommitRequest, RevokeDeviceRequest,
+    SaveAccountRoomRequest, UpdateRoomAdminsRequest, UploadLinkPayloadRequest,
 };
 use finitechat_proto::{DeviceRef, RoomProtocol};
 use finitechat_transport::engine::KeyPackage;
@@ -159,12 +157,6 @@ where
         "link-session-release" => link_session_release_request(&server, args),
         "link-session-ack" => link_session_ack_request(&server, args),
         "link-session-expire" => link_session_expire_request(&server, args),
-        "invite-create" => invite_create_request(&server, args),
-        "invite-join" => invite_join_request(&server, args),
-        "invite-requests" => invite_requests_request(&server, args),
-        "invite-respond" => invite_respond_request(&server, args),
-        "invite-status" => invite_status_request(&server, args),
-        "invite-expire" => invite_expire_request(&server, args),
         "account-room-bootstrap" => account_room_bootstrap_request(&server, args),
         "account-room-save" => account_room_save_request(&server, args),
         "account-rooms-list" => account_rooms_list_request(&server, args),
@@ -395,123 +387,6 @@ fn expire_key_package_lease_request(
         key_package_id: HttpKeyPackageId::new(key_package_id.into_bytes()),
     };
     post_json_request(server, "/key-packages/leases/expire", &request)
-}
-
-fn invite_create_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    let room_id = required_option(&mut args, "--room-id")?;
-    let account_id = required_option(&mut args, "--account-id")?;
-    let device_id = required_option(&mut args, "--device-id")?;
-    let max_joins = take_option(&mut args, "--max-joins")?.unwrap_or_else(|| "1".to_owned());
-    let expires_at_ms = required_option(&mut args, "--expires-at-ms")?;
-    reject_extra_args(&args)?;
-
-    let request = CreateInviteSessionRequest {
-        invite_id,
-        room_id,
-        inviter: DeviceRef {
-            account_id,
-            device_id,
-        },
-        max_joins: parse_u64("--max-joins", &max_joins)? as u32,
-        expires_at_ms: parse_u64("--expires-at-ms", &expires_at_ms)?,
-    };
-    post_json_request(server, "/invites", &request)
-}
-
-fn invite_join_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    let request_id = required_option(&mut args, "--request-id")?;
-    let account_id = required_option(&mut args, "--account-id")?;
-    let device_id = required_option(&mut args, "--device-id")?;
-    let key_package_hex = required_option(&mut args, "--key-package-hex")?;
-    let join_proof = required_option(&mut args, "--join-proof")?;
-    let display_name = take_option(&mut args, "--display-name")?;
-    let submitted_at_ms = required_option(&mut args, "--submitted-at-ms")?;
-    reject_extra_args(&args)?;
-
-    let request = SubmitInviteJoinRequest {
-        invite_id,
-        request_id,
-        joiner: DeviceRef {
-            account_id,
-            device_id,
-        },
-        key_package: parse_hex("--key-package-hex", &key_package_hex)?,
-        join_proof,
-        display_name,
-        submitted_at_ms: parse_u64("--submitted-at-ms", &submitted_at_ms)?,
-    };
-    post_json_request(server, "/invites/join", &request)
-}
-
-fn invite_requests_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    reject_extra_args(&args)?;
-
-    let request = ListInviteJoinRequestsRequest { invite_id };
-    post_json_request(server, "/invites/requests", &request)
-}
-
-fn invite_respond_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    let request_id = required_option(&mut args, "--request-id")?;
-    let accept = required_option(&mut args, "--accept")?;
-    reject_extra_args(&args)?;
-
-    let accept = match accept.as_str() {
-        "true" => true,
-        "false" => false,
-        other => {
-            return Err(CliError::Usage(format!(
-                "--accept must be true or false, got {other}"
-            )));
-        }
-    };
-    let request = RespondInviteJoinRequest {
-        invite_id,
-        request_id,
-        accept,
-    };
-    post_json_request(server, "/invites/respond", &request)
-}
-
-fn invite_status_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    let request_id = required_option(&mut args, "--request-id")?;
-    reject_extra_args(&args)?;
-
-    let request = InviteJoinStatusRequest {
-        invite_id,
-        request_id,
-    };
-    post_json_request(server, "/invites/status", &request)
-}
-
-fn invite_expire_request(
-    server: &str,
-    mut args: Vec<String>,
-) -> Result<PreparedHttpRequest, CliError> {
-    let invite_id = required_option(&mut args, "--invite-id")?;
-    reject_extra_args(&args)?;
-
-    let request = ExpireInviteSessionRequest { invite_id };
-    post_json_request(server, "/invites/expire", &request)
 }
 
 fn link_session_create_request(
@@ -882,21 +757,6 @@ pub(crate) fn parse_u64(name: &'static str, value: &str) -> Result<u64, CliError
         .map_err(|_| CliError::Usage(format!("{name} must be an unsigned integer")))
 }
 
-pub(crate) fn parse_hex(name: &'static str, value: &str) -> Result<Vec<u8>, CliError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(CliError::Usage(format!(
-            "{name} must be an even-length hex string"
-        )));
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16)
-                .map_err(|_| CliError::Usage(format!("{name} must be a hex string")))
-        })
-        .collect()
-}
-
 pub(crate) fn reject_extra_args(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         Ok(())
@@ -919,7 +779,7 @@ fn usage() -> String {
 }
 
 fn http_usage() -> String {
-    "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] invite-create --invite-id ID --room-id ID --account-id ID --device-id ID --expires-at-ms N [--max-joins N]\n  finitechat http [--server URL] invite-join --invite-id ID --request-id ID --account-id ID --device-id ID --key-package-hex HEX --join-proof PROOF --submitted-at-ms N [--display-name NAME]\n  finitechat http [--server URL] invite-requests --invite-id ID\n  finitechat http [--server URL] invite-respond --invite-id ID --request-id ID --accept BOOL\n  finitechat http [--server URL] invite-status --invite-id ID --request-id ID\n  finitechat http [--server URL] invite-expire --invite-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
+    "http commands:\n  finitechat http [--server URL] health\n  finitechat http [--server URL] submit-commit --request-json JSON\n  finitechat http [--server URL] append-event --request-json JSON\n  finitechat http [--server URL] application-effect-get --message-id ID\n  finitechat http [--server URL] application-effect-counts\n  finitechat http [--server URL] append-activity --request-json JSON\n  finitechat http [--server URL] sync-group --group-id ID [--after-seq N] [--limit N] [--requester ID]\n  finitechat http [--server URL] sync-inbox --recipient ID [--after-seq N] [--limit N]\n  finitechat http [--server URL] revoke-device --account-id ID --device-id ID\n  finitechat http [--server URL] observe-device-liveness --account-id ID --device-id ID --observed-at-ms N --expires-at-ms N\n  finitechat http [--server URL] get-device-liveness --account-id ID --device-id ID --now-ms N\n  finitechat http [--server URL] publish-key-package --owner ID --key-package-id ID --bytes BYTES\n  finitechat http [--server URL] key-package-inventory --owner ID\n  finitechat http [--server URL] claim-key-package --owner ID\n  finitechat http [--server URL] claim-key-packages --owner ID [--owner ID ...] [--idempotency-key KEY]\n  finitechat http [--server URL] expire-key-package-lease --key-package-id ID\n  finitechat http [--server URL] link-session-create --link-session-id ID --pairing-public-key KEY\n  finitechat http [--server URL] link-session-get --link-session-id ID\n  finitechat http [--server URL] link-session-upload --link-session-id ID --payload BYTES\n  finitechat http [--server URL] link-session-claim --link-session-id ID\n  finitechat http [--server URL] link-session-release --link-session-id ID\n  finitechat http [--server URL] link-session-ack --link-session-id ID --claim-token TOKEN\n  finitechat http [--server URL] link-session-expire --link-session-id ID\n  finitechat http [--server URL] account-room-bootstrap --room-id ID --mls-group-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] account-room-save --account-id ID --room-id ID --record-json JSON\n  finitechat http [--server URL] account-rooms-list --account-id ID [--after-room-id ID] [--limit N]\n  finitechat http [--server URL] room-leave --room-id ID --account-id ID --device-id ID\n  finitechat http [--server URL] room-admins --room-id ID --account-id ID --device-id ID [--grant ACCOUNT] [--revoke ACCOUNT]\n  finitechat http [--server URL] report-invalid-commit --room-id ID --account-id ID --device-id ID --offending-seq N\n  finitechat http [--server URL] claim-welcomes --recipient ID [--limit N]\n  finitechat http [--server URL] ack-welcome --message-id ID".to_owned()
 }
 
 /// Point `FINITE_HOME` at a process-wide throwaway directory so tests never
@@ -1698,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn app_cli_invite_join_and_message_flow_uses_runtime() {
+    fn app_cli_add_member_and_message_flow_uses_runtime() {
         crate::ensure_test_finite_home();
         let dir = tempfile::tempdir().unwrap();
         let server_url = spawn_live_cli_server(&dir.path().join("server.sqlite3"));
@@ -1737,7 +1597,13 @@ mod tests {
         let room_id = created["selected_room_id"].as_str().unwrap().to_owned();
         assert_eq!(created["status"], "room created");
 
-        let invite = run_cli_json([
+        let bob = open_bob();
+        let bob_account_id = bob.state().expect("bob state").identity.account_id.clone();
+        bob.dispatch_and_wait(finitechat_core::AppAction::StartRuntime)
+            .expect("bob publishes key packages");
+        drop(bob);
+
+        let added = run_cli_json([
             "app",
             "--data-dir",
             &alice_dir,
@@ -1747,19 +1613,15 @@ mod tests {
             "alice-cli",
             "--now",
             "1000",
-            "create-invite",
+            "add-member",
             "--room-id",
             &room_id,
+            "--account-id",
+            &bob_account_id,
+            "--display-name",
+            "Bob CLI",
         ]);
-        let invite_url = invite["invite_url"].as_str().unwrap().to_owned();
-
-        let scanned = open_bob()
-            .dispatch_and_wait(finitechat_core::AppAction::ScanTarget {
-                value: invite_url.clone(),
-            })
-            .expect("bob scans invite");
-        assert_eq!(scanned.selected_room_id.as_deref(), Some(room_id.as_str()));
-        assert_eq!(scanned.status, "join requested");
+        assert_eq!(added["status"], "people added");
 
         run_cli_json([
             "app",
