@@ -11834,6 +11834,15 @@ mod tests {
             now_unix_seconds: Some(NOW),
         }))
         .unwrap();
+        let carol = FiniteChatRuntime::open(with_test_secret(OpenOptions {
+            data_dir: dir.path().join("carol").to_string_lossy().into_owned(),
+            server_url: server_url.clone(),
+            device_id: "carol-ios".to_owned(),
+            account_secret_hex: None,
+            now_unix_seconds: Some(NOW),
+        }))
+        .unwrap();
+        let carol_account_id = carol.state().unwrap().identity.account_id;
 
         let alice_state = alice
             .dispatch_and_wait(AppAction::CreateRoom {
@@ -11874,6 +11883,31 @@ mod tests {
         let bob_state = bob.dispatch_and_wait(AppAction::StartRuntime).unwrap();
         assert_eq!(
             app_room(&bob_state, &room_id).state,
+            AppRoomState::Connected
+        );
+        let bob_invite = bob
+            .dispatch_and_wait(AppAction::CreateInvite {
+                room_id: room_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            bob_invite.active_invite.is_some(),
+            "a non-creator active member should be able to generate a room invite"
+        );
+
+        carol
+            .dispatch_and_wait(AppAction::StartRuntime)
+            .expect("carol publishes key packages");
+        let bob_added_carol = bob
+            .dispatch_and_wait(AppAction::AddRoomMembers {
+                room_id: room_id.clone(),
+                profiles: vec![test_profile(&carol_account_id, "Carol")],
+            })
+            .unwrap();
+        assert_eq!(bob_added_carol.status, "people added");
+        let carol_state = carol.dispatch_and_wait(AppAction::StartRuntime).unwrap();
+        assert_eq!(
+            app_room(&carol_state, &room_id).state,
             AppRoomState::Connected
         );
 

@@ -1986,7 +1986,13 @@ async fn sqlite_submit_commit_validates_and_consumes_claimed_key_package_after_r
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "invalid_commit_request");
-    assert!(error.error.contains("must be published and claimed"));
+    assert!(
+        error
+            .error
+            .contains("must be claimed or match a pending invite join"),
+        "unexpected error: {}",
+        error.error
+    );
     assert_submit_commit_had_no_side_effects(&app, &room_id, &phone).await;
 
     publish_and_claim_key_package_for_add(&app, &request).await;
@@ -6163,7 +6169,7 @@ fn member_for_device(device: &DeviceRef) -> MemberId {
 }
 
 #[tokio::test]
-async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart() {
+async fn sqlite_room_admin_metadata_does_not_gate_membership_commits_and_survives_restart() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
     let alice = DeviceRef::new("alice", "alice-laptop");
@@ -6186,7 +6192,8 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // The creator is admin: a cross-account add is allowed.
+    // The creator starts as admin metadata, but the relay does not use that
+    // metadata as room authority for encrypted membership commits.
     let add_bob = submit_add_device_request_at_epoch(&room_id, &mls_group_id, &alice, &bob, 0);
     publish_and_claim_key_package_for_add(&app, &add_bob).await;
     let response = post_json(app.clone(), "/commits", &add_bob).await;
@@ -6217,30 +6224,31 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // A non-admin cannot change another account's membership.
+    // A non-admin active member may still submit a structurally valid
+    // cross-account add. Server-side admin state is not protocol authority.
     let bob_adds_carol = submit_add_device_request_at_epoch_with_ids(
         &room_id,
         &mls_group_id,
         &bob,
         &carol,
         1,
-        "welcome-admin-carol-denied",
-        "commit-admin-carol-denied",
+        "welcome-admin-carol-open",
+        "commit-admin-carol-open",
     );
     publish_and_claim_key_package_for_add(&app, &bob_adds_carol).await;
     let response = post_json(app.clone(), "/commits", &bob_adds_carol).await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let error: ErrorResponse = read_json(response).await;
-    assert_eq!(error.kind, "commit_authority_required");
+    assert_eq!(response.status(), StatusCode::OK);
+    let carol_accepted: CommitAccepted = read_json(response).await;
+    assert_eq!(carol_accepted.seq, bob_accepted.seq + 1);
 
-    // A non-admin can still link their own account's device (fanout path).
+    // Same-account linking remains accepted as ordinary membership evolution.
     let bob_phone = DeviceRef::new("bob", "bob-phone");
     let bob_adds_own = submit_add_device_request_at_epoch_with_ids(
         &room_id,
         &mls_group_id,
         &bob,
         &bob_phone,
-        1,
+        2,
         "welcome-admin-bob-phone",
         "commit-admin-bob-phone",
     );
@@ -6248,7 +6256,7 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
     let response = post_json(app.clone(), "/commits", &bob_adds_own).await;
     assert_eq!(response.status(), StatusCode::OK);
     let own_accepted: CommitAccepted = read_json(response).await;
-    assert_eq!(own_accepted.seq, bob_accepted.seq + 1);
+    assert_eq!(own_accepted.seq, carol_accepted.seq + 1);
 
     // A non-admin cannot grant admin.
     let response = post_json(
@@ -6280,21 +6288,9 @@ async fn sqlite_admin_authority_gates_cross_account_commits_and_survives_restart
     let granted: UpdateRoomAdminsResponse = read_json(response).await;
     assert_eq!(granted.admins, vec!["alice".to_owned(), "bob".to_owned()]);
 
-    // The grant survives restart: bob can now add carol.
+    // The grant survives restart as advisory metadata, independent of commit
+    // acceptance.
     let app = persistent_app(&db_path);
-    let bob_adds_carol_retry = submit_add_device_request_at_epoch_with_ids(
-        &room_id,
-        &mls_group_id,
-        &bob,
-        &carol,
-        2,
-        "welcome-admin-carol-granted",
-        "commit-admin-carol-granted",
-    );
-    publish_and_claim_key_package_for_add(&app, &bob_adds_carol_retry).await;
-    let response = post_json(app.clone(), "/commits", &bob_adds_carol_retry).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
     // Admins may revoke other admins, but never the last one.
     let response = post_json(
         app.clone(),
@@ -8039,12 +8035,14 @@ async fn sqlite_invite_session_lifecycle_survives_restart_over_http() {
 }
 
 #[tokio::test]
-async fn sqlite_invite_create_requires_existing_room_and_admin_inviter() {
+async fn sqlite_invite_create_requires_existing_room_and_active_inviter() {
     let temp = TempDir::new().expect("tempdir");
     let db_path = temp.path().join("delivery.sqlite3");
     let alice = DeviceRef::new("alice", "alice-agent");
+    let bob = DeviceRef::new("bob", "bob-laptop");
     let mallory = DeviceRef::new("mallory", "mallory-laptop");
     let room_id = "room-invite-authority".to_owned();
+    let mls_group_id = "mls-invite-authority".to_owned();
 
     let app = persistent_app(&db_path);
 
@@ -8070,7 +8068,7 @@ async fn sqlite_invite_create_requires_existing_room_and_admin_inviter() {
         "/account-rooms/bootstrap",
         &BootstrapAccountRoomRequest {
             room_id: room_id.clone(),
-            mls_group_id: "mls-invite-authority".to_owned(),
+            mls_group_id: mls_group_id.clone(),
             creator: alice.clone(),
             protocol: RoomProtocol::default(),
         },
@@ -8078,7 +8076,7 @@ async fn sqlite_invite_create_requires_existing_room_and_admin_inviter() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // A non-admin account cannot open an invite session for the room.
+    // A device that is not active in the room cannot open an invite session.
     let response = post_json(
         app.clone(),
         "/invites",
@@ -8094,6 +8092,49 @@ async fn sqlite_invite_create_requires_existing_room_and_admin_inviter() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: ErrorResponse = read_json(response).await;
     assert_eq!(error.kind, "invalid_invite_request");
+
+    // A non-creator active member may open an invite session. The relay is not
+    // a room-authority service; it only checks that the inviter is a current
+    // participant before storing rendezvous state for the encrypted room.
+    let add_bob = submit_add_device_request_at_epoch(&room_id, &mls_group_id, &alice, &bob, 0);
+    publish_and_claim_key_package_for_add(&app, &add_bob).await;
+    let response = post_json(app.clone(), "/commits", &add_bob).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bob_recipient = member_for_device(&bob);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/claim",
+        &ClaimWelcomesRequest {
+            recipient: bob_recipient.clone(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let claims: Vec<HttpClaimedWelcome> = read_json(response).await;
+    assert_eq!(claims.len(), 1);
+    let response = post_json(
+        app.clone(),
+        "/welcomes/ack",
+        &AckWelcomeRequest {
+            message_id: claims[0].message.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = post_json(
+        app.clone(),
+        "/invites",
+        &CreateInviteSessionRequest {
+            invite_id: "invite-active-member".to_owned(),
+            room_id: room_id.clone(),
+            inviter: bob,
+            max_joins: 1,
+            expires_at_ms: 1_000,
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 
     // max_joins is bounded.
     let response = post_json(

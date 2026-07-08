@@ -1093,11 +1093,16 @@ impl HttpServerState {
                     reason: format!("room {} does not exist", request.room_id),
                 }
             })?;
-            if !projection.admins.contains(&request.inviter.account_id) {
+            if projection.status != RoomStatus::Open {
+                return Err(ServerHttpError::InvalidInviteRequest {
+                    reason: format!("room {} is not open", request.room_id),
+                });
+            }
+            if !projection.device_active_at_head(&request.inviter) {
                 return Err(ServerHttpError::InvalidInviteRequest {
                     reason: format!(
-                        "inviter account {} is not an admin of room {}",
-                        request.inviter.account_id, request.room_id
+                        "inviter device {:?} is not active in room {}",
+                        request.inviter, request.room_id
                     ),
                 });
             }
@@ -2155,29 +2160,6 @@ impl HttpServerState {
             return Err(ServerHttpError::SenderNotActive {
                 sender: request.sender.clone(),
             });
-        }
-        // Authority: changing another account's membership requires admin
-        // (ADR 0003 §2). Same-account linking and removal stay open to any
-        // active member, which keeps the device-link fanout admin-free.
-        if projection.membership_complete {
-            let touches_other_account = request
-                .membership_delta
-                .adds
-                .iter()
-                .map(|add| &add.device)
-                .chain(
-                    request
-                        .membership_delta
-                        .removes
-                        .iter()
-                        .map(|remove| &remove.device),
-                )
-                .any(|device| device.account_id != request.sender.account_id);
-            if touches_other_account && !projection.admins.contains(&request.sender.account_id) {
-                return Err(ServerHttpError::CommitAuthorityRequired {
-                    sender: request.sender.clone(),
-                });
-            }
         }
         validate_membership_adds_for_projection(projection, &request.membership_delta.adds)?;
         Ok(())
